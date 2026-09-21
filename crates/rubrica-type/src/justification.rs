@@ -1,0 +1,80 @@
+//! Justification: distribute a line's slack across its glue.
+//!
+//! Which glue is elastic is the whole subject. An English line stretches only at
+//! word spaces; a Chinese line has no word spaces, so it stretches at the thin
+//! join between ideographs -- which is why the join must be *compressible glue*
+//! and not a fixed gap. Because every ideograph pair carries the same recipe,
+//! proportional distribution spreads the slack evenly on its own.
+
+use crate::breaking::Line;
+use crate::paragraph::{Item, Paragraph};
+use crate::units::{EPSILON, Pt};
+
+/// A positioned slot: a box at `x` with width `w`, or glue (`node == None`).
+#[derive(Clone, Copy, Debug)]
+pub struct Placed {
+    pub x: Pt,
+    pub w: Pt,
+    pub node: Option<u32>,
+}
+
+/// Lay out one line at its target width. Ragged lines get natural widths.
+pub fn place(para: &Paragraph, line: &Line) -> Vec<Placed> {
+    let items = &para.items;
+    let slack: f64 = if line.is_ragged() { 0.0 } else { (line.target - line.natural).into() };
+    let eps = f64::from(EPSILON);
+
+    let mut total_stretch = 0.0;
+    let mut total_shrink = 0.0;
+    for i in line.items.clone() {
+        if let Item::Glue { stretch, shrink, .. } = items[i] {
+            if slack > 0.0 {
+                total_stretch += f64::from(stretch);
+            } else {
+                total_shrink += f64::from(shrink);
+            }
+        }
+    }
+
+    let mut out = Vec::with_capacity(line.items.len());
+    let mut x = 0.0f64;
+    for i in line.items.clone() {
+        match items[i] {
+            Item::Box { node } => {
+                let w = f64::from(para.node(node).advance);
+                out.push(Placed { x: x as Pt, w: w as Pt, node: Some(node) });
+                x += w;
+            }
+            Item::Glue { base, stretch, shrink, .. } => {
+                let mut w = f64::from(base);
+                if slack.abs() > eps {
+                    let (avail, total) = if slack > 0.0 {
+                        (f64::from(stretch), total_stretch)
+                    } else {
+                        (f64::from(shrink), total_shrink)
+                    };
+                    if total > eps {
+                        // Proportional to each glue's own elasticity, and unbounded:
+                        // TeX lets a line stretch past nominal, which is precisely
+                        // what a "lousy" fitness class records -- capping here would
+                        // silently stop short of the measure instead.
+                        w += slack * (avail / total);
+                    }
+                }
+                out.push(Placed { x: x as Pt, w: w as Pt, node: None });
+                x += w;
+            }
+            Item::Penalty { width, .. } => {
+                let w = f64::from(width);
+                out.push(Placed { x: x as Pt, w: w as Pt, node: None });
+                x += w;
+            }
+        }
+    }
+    out
+}
+
+/// Right edge of a placed line, for assertions and for hanging punctuation.
+pub fn line_width(placed: &[Placed]) -> Pt {
+    placed.last().map(|p| p.x + p.w).unwrap_or(0.0)
+}

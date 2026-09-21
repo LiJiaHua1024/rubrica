@@ -1,0 +1,12 @@
+[package]
+name = "rubrica-type"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Headless typesetting core: CJK-aware paragraph model, Knuth-Plass line breaking, justification"
+
+[dependencies]
+unicode-linebreak.workspace = true
+unicode-script.workspace = true
+
+[dev-dependencies]

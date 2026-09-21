@@ -1,0 +1,274 @@
+//! End-to-end checks of the typesetting core.
+//!
+//! Widths come from `MonospaceMeasure`, so every number below is arithmetic we can
+//! do by hand. The point is to test the *breaking decisions*, not font data.
+
+use rubrica_type::breaking::BreakOptions;
+use rubrica_type::classify::Role;
+use rubrica_type::justification::{line_width, place};
+use rubrica_type::paragraph::{Item, MonospaceMeasure, Spacing, StyleId};
+use rubrica_type::units::Pt;
+use rubrica_type::{Paragraph, Plan, typeset};
+
+const SIZE: Pt = 16.0;
+
+fn set(text: &str, column: Pt) -> (Paragraph, Plan) {
+    set_indent(text, column, 0.0)
+}
+
+/// `ems` is the measure in ems, so a test reads like the layout it means to check.
+fn set_ems(text: &str, ems: Pt) -> (Paragraph, Plan) {
+    set(text, ems * SIZE)
+}
+
+fn set_indent(text: &str, column: Pt, indent: Pt) -> (Paragraph, Plan) {
+    let spacing = Spacing::for_size(SIZE);
+    let mut measure = MonospaceMeasure { size: SIZE, factor: 0.5 };
+    let mut opts = BreakOptions::new(column);
+    opts.par_indent = indent;
+    typeset(text, &spacing, StyleId(0), &opts, &mut measure)
+}
+
+fn text_of(para: &Paragraph, src: &str, line: &rubrica_type::Line) -> String {
+    let mut s = String::new();
+    for i in line.items.clone() {
+        if let Item::Box { node } = para.items[i] {
+            let n = para.node(node);
+            s.push_str(&src[n.text.clone()]);
+        }
+    }
+    s
+}
+
+/// Sum of squared stretch ratios across justified lines; lower means more even.
+fn raggedness(plan: &Plan) -> f64 {
+    plan.lines
+        .iter()
+        .filter(|l| !l.is_ragged())
+        .map(|l| {
+            let need = f64::from(l.target) - f64::from(l.natural);
+            let r = if l.stretch > 0.0 { need / f64::from(l.stretch) } else { 10.0 };
+            r * r
+        })
+        .sum()
+}
+
+const PROSE: &str = "Typography is the art of arranging type so that written language stays legible and pleasant to read at a comfortable measure for long sessions";
+
+#[test]
+fn western_paragraph_is_flushed_to_the_measure() {
+    // 34 em, a normal book measure; the old 12.5 em test column was unjustifyable
+    // by any algorithm and only exercised the overfull fallback.
+    let (para, plan) = set_ems(PROSE, 34.0);
+    assert!(plan.lines.len() >= 2, "expected multiple lines, got {}", plan.lines.len());
+    let column = 34.0 * SIZE;
+    let mut justified = 0;
+    for l in plan.lines.iter().take(plan.lines.len() - 1) {
+        let w = line_width(&place(&para, l));
+        assert!(
+            (w - column).abs() < 0.5,
+            "line not flushed: wanted {column}, got {w:.3} in {:?}",
+            text_of(&para, PROSE, l)
+        );
+        assert!(l.badness < 10000, "line is overfull: {:?}", text_of(&para, PROSE, l));
+        justified += 1;
+    }
+    let last = plan.lines.last().unwrap();
+    assert!(last.is_ragged(), "final line must stay ragged");
+    assert!(justified >= 1);
+}
+
+#[test]
+fn chinese_justifies_without_any_word_spaces() {
+    // Not one ASCII space: the only elastic material is the ideograph join, which
+    // is exactly what a greedy or space-only engine has nothing to work with.
+    let text = "中文排版是一件需要认真对待的事情。行首与行尾都要对齐，才能形成稳定的版面节奏，\
+                这也是一篇长文读起来舒适的前提。引擎必须在整段范围内权衡每一行的松紧，\
+                而不是逐行填满以后再接受由此产生的参差。"
+        .to_string();
+    assert!(!text.contains(' '));
+    let column = 24.0 * SIZE;
+    let (para, plan) = set(&text, column);
+    assert!(plan.lines.len() >= 2, "expected multiple lines, got {}", plan.lines.len());
+    for l in plan.lines.iter().take(plan.lines.len() - 1) {
+        let w = line_width(&place(&para, l));
+        assert!(
+            (w - column).abs() < 0.5,
+            "CJK line not flushed: wanted {column}, got {w:.3} in {:?}",
+            text_of(&para, &text, l)
+        );
+        assert!(l.badness < 10000, "CJK line overfull: {:?}", text_of(&para, &text, l));
+    }
+    assert!(plan.lines.last().unwrap().is_ragged());
+}
+
+#[test]
+fn global_breaking_beats_greedy_on_the_same_paragraph() {
+    let column = 260.0;
+    let (para, plan) = set(PROSE, column);
+    let optimal = raggedness(&plan);
+
+    // Same paragraph, greedy: take the last legal break before overflow.
+    let mut greedy = 0.0;
+    let mut lines = 0;
+    let mut start = 0usize;
+    while start < para.items.len() {
+        let mut brk: Option<(usize, f64, f64)> = None;
+        let mut w = 0.0f64;
+        let mut i = start;
+        while i < para.items.len() {
+            match para.items[i] {
+                Item::Box { node } => w += f64::from(para.node(node).advance),
+                Item::Glue { base, stretch, shrink, breakable } => {
+                    w += f64::from(base);
+                    if breakable && w - f64::from(shrink) <= f64::from(column) + 0.02 {
+                        brk = Some((i, w, f64::from(stretch)));
+                    }
+                }
+                Item::Penalty { forced: true, .. } => break,
+                Item::Penalty { .. } => {}
+            }
+            if w > f64::from(column) + 25.0 {
+                break;
+            }
+            i += 1;
+        }
+        let Some((b, natural, stretch)) = brk else { break };
+        if b + 1 >= para.items.len() {
+            break; // the ragged remainder is not justified, so it is not scored
+        }
+        let r = if stretch > 0.0 { (f64::from(column) - natural) / stretch } else { 10.0 };
+        greedy += r * r;
+        lines += 1;
+        start = b + 1;
+    }
+    assert!(lines >= 2, "greedy baseline degenerate, test is meaningless");
+    assert!(
+        optimal < greedy,
+        "Knuth-Plass should set a more even paragraph than greedy: {optimal} vs {greedy}"
+    );
+}
+
+#[test]
+fn mixed_script_joins_get_the_quarter_em_glue() {
+    let spacing = Spacing::for_size(SIZE);
+    // No spaces typed around the Latin word: the gap is the engine's to supply,
+    // which is the case that actually distinguishes CJK-aware typesetting.
+    let text = "使用Rust实现";
+    let mut measure = MonospaceMeasure { size: SIZE, factor: 0.5 };
+    let (para, _) = typeset(text, &spacing, StyleId(0), &BreakOptions::new(500.0), &mut measure);
+
+    let near = |a: Pt, b: Pt| (a - b).abs() < 0.01;
+    let mixed = para
+        .items
+        .iter()
+        .filter(|it| matches!(**it, Item::Glue { base, stretch, shrink, .. }
+            if near(base, spacing.mixed.base)
+                && near(stretch, spacing.mixed.stretch)
+                && near(shrink, spacing.mixed.shrink)))
+        .count();
+    assert_eq!(mixed, 2, "expected elastic glue at both Han/Latin joins");
+    assert!(para.nodes.iter().any(|n| n.role == Role::Cjk));
+    assert!(para.nodes.iter().any(|n| n.role == Role::Western));
+    // No box may swallow a space or newline: that would double-count width.
+    assert!(
+        para.nodes.iter().all(|n| !text[n.text.clone()].contains(char::is_whitespace)),
+        "a box contains whitespace: {:?}",
+        para.nodes.iter().map(|n| &text[n.text.clone()]).collect::<Vec<_>>()
+    );
+}
+
+#[test]
+fn ideograph_join_glue_is_compressible() {
+    let spacing = Spacing::for_size(SIZE);
+    assert!(spacing.cjk_join.stretch > 0.0);
+    assert!(spacing.cjk_join.shrink > 0.0);
+    let text = "中文中文中文";
+    let mut measure = MonospaceMeasure { size: SIZE, factor: 0.5 };
+    let (para, _) = typeset(text, &spacing, StyleId(0), &BreakOptions::new(500.0), &mut measure);
+    let joins = para
+        .items
+        .iter()
+        .filter(|it| matches!(**it, Item::Glue { base, stretch, shrink, .. }
+            if (base - spacing.cjk_join.base).abs() < 0.01
+                && (stretch - spacing.cjk_join.stretch).abs() < 0.01
+                && (shrink - spacing.cjk_join.shrink).abs() < 0.01))
+        .count();
+    assert!(joins >= 5, "adjacent ideographs should be separated by glue, found {joins}");
+}
+
+#[test]
+fn closing_punctuation_never_opens_a_line() {
+    // Long enough that a naive per-character break would land before the final 。
+    let text = "这是一段用来测试行首禁则的中文文本它需要足够长以便在一行的末尾恰好落在句号之前这样才能够验证规则是否真的生效了呢。";
+    let (para, plan) = set(text, 160.0);
+    assert!(plan.lines.len() >= 2);
+    for l in &plan.lines {
+        let s = text_of(&para, text, l);
+        assert!(
+            !s.starts_with('。') && !s.starts_with('、') && !s.starts_with('」'),
+            "line opens with forbidden punctuation: {s:?}"
+        );
+    }
+}
+
+#[test]
+fn hard_break_ends_a_line_and_only_the_final_line_is_ragged() {
+    let text = "alpha beta gamma delta epsilon zeta eta theta\none two three four five six seven eight nine ten";
+    let (para, plan) = set(text, 20.0 * SIZE);
+    assert!(plan.lines.len() >= 3, "expected several lines, got {}", plan.lines.len());
+    let hard = plan.lines.iter().position(|l| l.forced).expect("no line ends at the hard break");
+    // Nothing after the newline may share a line with something before it.
+    let before = text_of(&para, text, &plan.lines[hard]);
+    let after = text_of(&para, text, &plan.lines[hard + 1]);
+    assert!(before.contains("theta"), "line before the break: {before:?}");
+    assert!(after.starts_with("one"), "line after the break: {after:?}");
+    assert!(plan.lines.last().unwrap().is_ragged());
+    assert!(plan.lines[..plan.lines.len() - 1].iter().all(|l| !l.is_ragged()));
+}
+
+#[test]
+fn par_indent_shortens_only_the_first_line() {
+    let column = 34.0 * SIZE;
+    let indent = 40.0;
+    let (para, plan) = set_indent(PROSE, column, indent);
+    assert!(plan.lines.len() >= 2, "need a second line to compare against");
+
+    assert!(plan.lines[0].first);
+    assert!(plan.lines.iter().skip(1).all(|l| !l.first));
+    let first = line_width(&place(&para, &plan.lines[0]));
+    let second = line_width(&place(&para, &plan.lines[1]));
+    assert!(
+        (first - (column - indent)).abs() < 0.5,
+        "first line must flush to measure minus indent: wanted {}, got {first:.3}",
+        column - indent
+    );
+    assert!(
+        (second - column).abs() < 0.5,
+        "second line must flush to the full measure: wanted {column}, got {second:.3}"
+    );
+}
+
+#[test]
+fn breaking_is_deterministic() {
+    let text = "排版引擎必须每次给出相同的结果，否则回归测试毫无意义，golden 文件也会不断漂移。".repeat(8);
+    let (_, a) = set(&text, 300.0);
+    let (_, b) = set(&text, 300.0);
+    assert_eq!(a.lines.len(), b.lines.len());
+    for (x, y) in a.lines.iter().zip(&b.lines) {
+        assert_eq!(x.items, y.items);
+    }
+}
+
+#[test]
+fn an_unsplittable_word_is_overfull_not_missing() {
+    let (_, plan) = set("antiestablishmentarianism", 20.0);
+    assert_eq!(plan.lines.len(), 1, "text must never be dropped, even when nothing fits");
+    assert!(plan.lines[0].badness >= 10000);
+}
+
+#[test]
+fn empty_input_yields_no_lines() {
+    let (_, plan) = set("", 200.0);
+    assert!(plan.lines.is_empty());
+}
