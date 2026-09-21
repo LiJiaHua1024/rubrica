@@ -141,3 +141,31 @@ fn empty_and_whitespace_only_input_produce_nothing() {
     assert!(Document::parse("\n\n   \n").blocks.is_empty());
     assert!(Document::parse("<!-- only a comment -->\n").blocks.is_empty());
 }
+
+#[test]
+fn an_image_becomes_one_object_box_not_prose() {
+    let doc = Document::parse("see ![the diagram](img/a.png) inline\n");
+    let b = &doc.blocks[0];
+    // The alt text must not be set as running prose.
+    assert!(!b.text.contains("the diagram"), "alt text leaked into prose: {:?}", b.text);
+    assert_eq!(b.objects.len(), 1, "{b:?}");
+    let o = &b.objects[0];
+    assert_eq!(&b.text[o.range.clone()], "\u{FFFC}");
+    match &o.kind {
+        rubrica_doc::ObjectKind::Image { src, alt } => {
+            assert_eq!(src, "img/a.png");
+            assert_eq!(alt, "the diagram");
+        }
+    }
+    let sp = b.spans.iter().find(|s| s.range == o.range).expect("no span for the object");
+    assert!(sp.style.contains(InlineStyle::OBJECT), "span style: {:?}", sp.style);
+    // The placeholder is one node, so surrounding prose still justifies around it.
+    assert_eq!(b.spans.len(), 3, "{:?}", b.spans.iter().map(|s| &b.text[s.range.clone()]).collect::<Vec<_>>());
+}
+
+#[test]
+fn an_image_alone_forms_its_own_block() {
+    let doc = Document::parse("![only](x.png)\n");
+    assert_eq!(doc.blocks.len(), 1);
+    assert_eq!(doc.blocks[0].objects.len(), 1);
+}

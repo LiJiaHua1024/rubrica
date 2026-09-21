@@ -23,6 +23,18 @@ pub struct Node {
     pub advance: Pt,
     /// Role of the first code point, used for glue selection.
     pub role: Role,
+    /// Vertical extent around the baseline. Zero for ordinary text, where the
+    /// font's own metrics apply; non-zero for an inline object such as an image or
+    /// a displayed formula, which has a height the line must make room for.
+    pub ascent: Pt,
+    pub descent: Pt,
+}
+
+impl Node {
+    #[inline]
+    pub fn is_text(&self) -> bool {
+        self.ascent == 0.0 && self.descent == 0.0
+    }
 }
 
 /// Elastic spacing recipe.
@@ -125,6 +137,13 @@ impl Paragraph {
 /// verifiable without a font on disk.
 pub trait Measure {
     fn advance(&mut self, text: &str, range: Range<usize>, style: StyleId) -> Pt;
+
+    /// Vertical extent an inline object claims around the baseline, as
+    /// `(ascent, descent)` in points. Returning zero -- the default -- means the
+    /// line box is derived from the font metrics of the glyphs on it.
+    fn extent(&mut self, _text: &str, _range: Range<usize>, _style: StyleId) -> (Pt, Pt) {
+        (0.0, 0.0)
+    }
 }
 
 /// `Measure` that charges `factor * size` per Unicode scalar -- a passable CJK
@@ -261,8 +280,9 @@ pub fn build(
                 p.items.push(Item::glue(recipe));
             }
             let advance = measure.advance(text, range.clone(), style);
+            let (ascent, descent) = measure.extent(text, range.clone(), style);
             let id = p.nodes.len() as u32;
-            p.nodes.push(Node { text: range, style, advance, role });
+            p.nodes.push(Node { text: range, style, advance, role, ascent, descent });
             p.items.push(Item::Box { node: id });
             prev_role = Some(role);
         }

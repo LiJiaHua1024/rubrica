@@ -20,7 +20,7 @@ use windows::Win32::Graphics::Direct2D::Common::{
     D2D1_ALPHA_MODE_PREMULTIPLIED, D2D1_COLOR_F, D2D1_PIXEL_FORMAT, D2D_RECT_F, D2D_SIZE_U,
 };
 use windows::Win32::Graphics::Direct2D::{
-    D2D1_FACTORY_TYPE_SINGLE_THREADED, D2D1_FEATURE_LEVEL_DEFAULT,
+    D2D1_BITMAP_INTERPOLATION_MODE_LINEAR, D2D1_FACTORY_TYPE_SINGLE_THREADED, D2D1_FEATURE_LEVEL_DEFAULT,
     D2D1_HWND_RENDER_TARGET_PROPERTIES, D2D1_PRESENT_OPTIONS_NONE, D2D1_RENDER_TARGET_PROPERTIES,
     D2D1_RENDER_TARGET_TYPE_DEFAULT, D2D1_RENDER_TARGET_USAGE_NONE,
     D2D1_TEXT_ANTIALIAS_MODE_CLEARTYPE, ID2D1Factory, ID2D1HwndRenderTarget, ID2D1RenderTarget,
@@ -32,6 +32,9 @@ use windows::Win32::Graphics::DirectWrite::{
 use windows::Win32::Graphics::Dwm::{DwmSetWindowAttribute, DWMWA_USE_IMMERSIVE_DARK_MODE};
 use windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_B8G8R8A8_UNORM;
 use windows::Win32::Graphics::Gdi::{HBRUSH, InvalidateRect};
+use windows::Win32::System::Com::{
+    CoInitializeEx, COINIT_APARTMENTTHREADED, COINIT_DISABLE_OLE1DDE,
+};
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::System::Registry::{RRF_RT_DWORD, RegGetValueW, HKEY_CURRENT_USER};
 use windows::Win32::UI::HiDpi::{
@@ -56,7 +59,8 @@ use windows::Win32::UI::WindowsAndMessaging::{
 };
 use windows_numerics::Vector2;
 
-use crate::font::{FaceRequest, FontEngine, Style as RunStyle};
+use crate::font::{FaceRequest, FontEngine, ObjectBox, Style as RunStyle};
+use crate::images::ImageStore;
 use crate::theme::{ColorRole, Theme};
 use crate::{Error, Result};
 
@@ -138,6 +142,10 @@ struct AppStyle {
     size: Pt,
     tracking: f32,
     color: ColorRole,
+    /// Set instead of font properties for an inline object such as an image.
+    object: Option<ObjectBox>,
+    /// The file an object style draws, when it has one.
+    image: Option<PathBuf>,
 }
 
 /// One face's positioned glyphs, in device independent pixels.
@@ -157,6 +165,8 @@ pub struct PaintRun {
 
 pub enum Op {
     Runs(Vec<PaintRun>),
+    /// An inline object, positioned in device independent pixels.
+    Image { path: PathBuf, x: f32, y: f32, w: f32, h: f32 },
     Rect { x: f32, y: f32, w: f32, h: f32, color: ColorRole },
     Line { x0: f32, y0: f32, x1: f32, y1: f32, thickness: f32, color: ColorRole },
 }
@@ -179,6 +189,8 @@ pub struct View {
     path: Option<PathBuf>,
     /// Set while the pointer is dragging the scroll thumb.
     dragging: bool,
+    /// Built once a render target exists, since bitmaps need one.
+    images: Option<ImageStore>,
 }
 
 /// Thumb geometry, in device independent pixels, or `None` when the document fits.
@@ -211,6 +223,9 @@ pub fn run(source: String, path: Option<PathBuf>) -> Result<()> {
     // bitmap-scaled and text on a secondary high-density monitor is soft.
     unsafe {
         let _ = SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
+        // WIC, and so every image, is created through COM: without this the factory
+        // call fails and figures silently degrade to their placeholder.
+        let _ = CoInitializeEx(None, COINIT_APARTMENTTHREADED | COINIT_DISABLE_OLE1DDE);
     }
 
     let font = FontEngine::new().map_err(|e| -> Error { format!("DirectWrite: {e}").into() })?;
@@ -237,6 +252,7 @@ pub fn run(source: String, path: Option<PathBuf>) -> Result<()> {
         dpi: 96.0,
         path,
         dragging: false,
+        images: None,
     });
 
     const CLASS: &str = "Rubrica.Main";
@@ -380,6 +396,10 @@ impl View {
             Err(e) => eprintln!("render target: {e}"),
         }
         DragAcceptFiles(hwnd, true);
+        // Sizing needs only WIC; bitmaps are made later against the render target.
+        if self.target.is_some() && self.images.is_none() {
+            self.images = ImageStore::new().ok();
+        }
         self.apply_dark_titlebar(hwnd);
         self.relayout();
     }
@@ -415,6 +435,8 @@ impl View {
                         push(r.color);
                     }
                 }
+                // Images are drawn with their own bitmap, not a brush.
+                Op::Image { .. } => {}
             }
         }
         for role in roles {
@@ -555,7 +577,15 @@ impl View {
 
     fn relayout(&mut self) {
         let (ops, h, _column, _left) =
-            build_ops(&mut self.font, &self.theme, &self.doc, self.client_w, self.dpi);
+            build_ops(
+                &mut self.font,
+                &self.theme,
+                &self.doc,
+                self.client_w,
+                self.dpi,
+                self.images.as_ref(),
+                self.path.as_deref().and_then(|p| p.parent()),
+            );
         self.content_h = h;
         self.ops = ops;
     }
@@ -584,6 +614,7 @@ struct Blk<'a> {
 fn layout_block(font: &mut FontEngine, ctx: &Ctx<'_>, blk: &Blk<'_>, ops: &mut Vec<Op>, mut y: Pt) -> Pt {
     let Ctx { theme, styles, k } = *ctx;
     let Blk { b, text, spans, base, left, column } = *blk;
+    let mut images_out: Vec<(PathBuf, f32, f32, Pt, Pt)> = Vec::new();
     if b.kind == BlockKind::Rule {
         y += theme.base * 0.6;
         ops.push(Op::Line {
@@ -626,6 +657,14 @@ fn layout_block(font: &mut FontEngine, ctx: &Ctx<'_>, blk: &Blk<'_>, ops: &mut V
             let Some(node_id) = slot.node else { continue };
             let node = para.node(node_id);
             let st = &styles[node.style.0 as usize];
+            if let (Some(o), Some(file)) = (st.object, st.image.clone()) {
+                // An object contributes its own box to the line and is drawn
+                // from its file, not from any glyph run.
+                ascent = ascent.max(o.ascent);
+                descent = descent.max(o.descent);
+                images_out.push((file, (left + slot.x) * k, o.advance * k, o.ascent, o.descent));
+                continue;
+            }
             let shaped = font.shape_runs(text, node.text.clone(), &st.face, st.size, st.tracking);
             for r in shaped {
                 ascent = ascent.max(r.ascent);
@@ -653,6 +692,9 @@ fn layout_block(font: &mut FontEngine, ctx: &Ctx<'_>, blk: &Blk<'_>, ops: &mut V
             run.baseline = baseline * k;
         }
         ops.push(Op::Runs(runs));
+        for (file, x, w, a, d) in images_out.drain(..) {
+            ops.push(Op::Image { path: file, x, y: (baseline - a) * k, w, h: (a + d) * k });
+        }
         panel_bottom = y + line_h;
         y += line_h;
     }
@@ -801,6 +843,24 @@ impl View {
                             );
                         }
                     }
+                    Op::Image { path, x, y, w, h } => {
+                        if y + h < top || *y > bottom {
+                            continue;
+                        }
+                        let (Some(t), Some(store)) = (self.target.clone(), self.images.as_ref()) else {
+                            continue;
+                        };
+                        if let Some(bmp) = store.bitmap(&t, path) {
+                            let r = D2D_RECT_F { left: *x, top: *y, right: x + w, bottom: y + h };
+                            target.DrawBitmap(
+                                &bmp,
+                                Some(&r),
+                                1.0,
+                                D2D1_BITMAP_INTERPOLATION_MODE_LINEAR,
+                                None,
+                            );
+                        }
+                    }
                     Op::Runs(runs) => {
                         for run in runs {
                             if run.baseline < top || run.baseline > bottom + 40.0 {
@@ -834,6 +894,29 @@ impl View {
     }
 }
 
+/// Intern a style for an inline object, which has no font properties at all.
+fn intern_object(styles: &mut Vec<AppStyle>, path: PathBuf, object: ObjectBox) -> StyleId {
+    let app = AppStyle {
+        face: FaceRequest {
+            family: String::new(),
+            cjk_family: String::new(),
+            fallback: vec![],
+            weight: 400,
+            italic: false,
+        },
+        size: 0.0,
+        tracking: 0.0,
+        color: ColorRole::Text,
+        object: Some(object),
+        image: Some(path),
+    };
+    if let Some(i) = styles.iter().position(|s| *s == app) {
+        return StyleId(i as u16);
+    }
+    styles.push(app);
+    StyleId((styles.len() - 1) as u16)
+}
+
 fn intern(styles: &mut Vec<AppStyle>, fallback: &[String], r: crate::theme::ResolvedStyle) -> StyleId {
     let app = AppStyle {
         face: FaceRequest {
@@ -846,6 +929,8 @@ fn intern(styles: &mut Vec<AppStyle>, fallback: &[String], r: crate::theme::Reso
         size: r.size,
         tracking: r.tracking,
         color: r.color,
+        object: None,
+        image: None,
     };
     if let Some(i) = styles.iter().position(|s| *s == app) {
         return StyleId(i as u16);
@@ -875,6 +960,8 @@ pub fn build_ops(
     doc: &Document,
     client_w: f32,
     dpi: f32,
+    images: Option<&ImageStore>,
+    base_dir: Option<&std::path::Path>,
 ) -> (Vec<Op>, Pt, Pt, Pt) {
     let k = scale_of(dpi);
     let margin = theme.base * MARGIN_EM;
@@ -906,7 +993,51 @@ pub fn build_ops(
         }
         let base = intern(&mut styles, &theme.fonts.fallback, theme.resolve(b.kind, InlineStyle::EMPTY));
         for s in &b.spans {
-            let id = intern(&mut styles, &theme.fonts.fallback, theme.resolve(b.kind, s.style));
+            // An object span is sized from its own file rather than from a font,
+            // and only the caller knows the document directory a relative source
+            // should resolve against.
+            let id = match s.style {
+                st if st.contains(InlineStyle::OBJECT) => {
+                    let obj = b.objects.iter().find(|o| o.range == s.range);
+                    match (obj, images) {
+                        (Some(o), Some(store)) => {
+                            let src = match &o.kind {
+                                rubrica_doc::ObjectKind::Image { src, .. } => src,
+                            };
+                            let path = ImageStore::resolve(base_dir, src);
+                            match store.fit(&path, column) {
+                                // Sit the figure on the baseline with a small
+                                // descent so it does not ride above the text.
+                                Some((w, h)) => {
+                                    let descent = (h * 0.15).min(theme.base * 0.4);
+                                    intern_object(&mut styles, path, ObjectBox {
+                                        advance: w,
+                                        ascent: h - descent,
+                                        descent,
+                                    })
+                                }
+                                None => {
+                                    // A missing figure keeps measuring nothing, and
+                                    // is reported once. Swapping in the alt text here
+                                    // would shift every later span offset, since the
+                                    // block's text and ranges were built already.
+                                    eprintln!("image not rendered: {}", path.display());
+                                    base
+                                }
+                            }
+                        }
+                        // A missing store means COM or WIC could not be started,
+                        // which is a different failure from one bad file and has to
+                        // be reported as such rather than passed off as prose.
+                        (Some(_), None) => {
+                            eprintln!("figures disabled: no image decoder");
+                            base
+                        }
+                        _ => base,
+                    }
+                }
+                _ => intern(&mut styles, &theme.fonts.fallback, theme.resolve(b.kind, s.style)),
+            };
             spans.push(StyleSpan { range: s.range.start + shift..s.range.end + shift, style: id });
         }
         prepared.push((text, spans, base.0 as usize));
@@ -915,7 +1046,7 @@ pub fn build_ops(
     font.begin_layout(
         styles
             .iter()
-            .map(|s| RunStyle { face: s.face.clone(), size: s.size, tracking: s.tracking })
+            .map(|s| RunStyle { face: s.face.clone(), size: s.size, tracking: s.tracking, object: s.object })
             .collect(),
     );
 

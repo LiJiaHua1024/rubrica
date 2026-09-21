@@ -82,12 +82,23 @@ pub struct FaceRequest {
     pub italic: bool,
 }
 
+/// The vertical box an inline object claims around the baseline, in points.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct ObjectBox {
+    pub advance: Pt,
+    pub ascent: Pt,
+    pub descent: Pt,
+}
+
 /// Style table entry: what a `StyleId` means to the renderer.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct Style {
     pub face: FaceRequest,
     pub size: Pt,
     pub tracking: f32,
+    /// Set for an inline object, which is measured from its own box rather than
+    /// from any font.
+    pub object: Option<ObjectBox>,
 }
 
 pub struct FontEngine {
@@ -128,6 +139,28 @@ impl FontEngine {
                 shaped: RefCell::new(HashMap::new()),
                 styles: RefCell::new(Vec::new()),
             })
+        }
+    }
+
+    /// Look up the style a `StyleId` denotes.
+    fn style_of(&self, style: StyleId) -> Style {
+        let s = self.styles.borrow();
+        match s.get(style.0 as usize) {
+            Some(st) => st.clone(),
+            // Measuring must not panic inside a paint callback, where there is no
+            // caller to report to, so an unknown id gets a plain body style.
+            None => Style {
+                face: FaceRequest {
+                    family: "Segoe UI".into(),
+                    cjk_family: "Microsoft YaHei".into(),
+                    fallback: vec![],
+                    weight: 400,
+                    italic: false,
+                },
+                size: 13.5,
+                tracking: 0.0,
+                object: None,
+            },
         }
     }
 
@@ -429,21 +462,24 @@ impl FontEngine {
 /// which is what keeps `rubrica-type` free of any theme knowledge.
 impl Measure for FontEngine {
     fn advance(&mut self, text: &str, range: Range<usize>, style: StyleId) -> Pt {
-        let (face, size, tracking) = {
-            let s = self.styles.borrow();
-            match s.get(style.0 as usize) {
-                Some(st) => (st.face.clone(), st.size, st.tracking),
-                None => return default_advance(text, range),
-            }
-        };
-        self.shape_runs(text, range, &face, size, tracking).iter().map(|r| r.width()).sum()
+        let st = self.style_of(style);
+        if let Some(o) = st.object {
+            return o.advance;
+        }
+        self.shape_runs(text, range, &st.face, st.size, st.tracking)
+            .iter()
+            .map(|r| r.width())
+            .sum()
     }
-}
 
-/// Only used when a style id escapes the installed table: keeps a bug from
-/// panicking inside a paint callback, where there is nothing to report to.
-fn default_advance(text: &str, range: Range<usize>) -> Pt {
-    text[range].chars().count() as Pt * 13.5 * 0.5
+    /// An inline object reports its own vertical extent; text leaves it zero so
+    /// the line box keeps coming from the fonts' metrics.
+    fn extent(&mut self, _text: &str, _range: Range<usize>, style: StyleId) -> (Pt, Pt) {
+        match self.style_of(style).object {
+            Some(o) => (o.ascent, o.descent),
+            None => (0.0, 0.0),
+        }
+    }
 }
 
 fn first_char_len(s: &str) -> usize {

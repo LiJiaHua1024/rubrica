@@ -325,3 +325,64 @@ fn empty_input_yields_no_lines() {
     let (_, plan) = set("", 200.0);
     assert!(plan.lines.is_empty());
 }
+
+/// A measure that gives one object node a real box, to prove the model carries it.
+#[derive(Default)]
+struct ObjectMeasure {
+    /// Byte start of the node that should be treated as an inline object.
+    object_at: Option<usize>,
+    box_: (Pt, Pt, Pt),
+}
+
+impl rubrica_type::paragraph::Measure for ObjectMeasure {
+    fn advance(&mut self, text: &str, range: std::ops::Range<usize>, _style: StyleId) -> Pt {
+        if self.object_at == Some(range.start) {
+            self.box_.0
+        } else {
+            text[range].chars().count() as Pt * SIZE * 0.5
+        }
+    }
+
+    fn extent(&mut self, _text: &str, range: std::ops::Range<usize>, _style: StyleId) -> (Pt, Pt) {
+        if self.object_at == Some(range.start) {
+            (self.box_.1, self.box_.2)
+        } else {
+            (0.0, 0.0)
+        }
+    }
+}
+
+#[test]
+fn an_inline_object_node_keeps_its_intrinsic_box() {
+    // A figure taller than the text line has to make the line taller, which is the
+    // reason nodes carry extents at all rather than only widths.
+    let text = "\u{FFFC}";
+    let spacing = Spacing::for_size(SIZE);
+    let mut m = ObjectMeasure { object_at: Some(0), box_: (240.0, 100.0, 20.0) };
+    let (para, plan) = typeset(text, &spacing, StyleId(0), &[], &BreakOptions::new(480.0), &mut m);
+    assert_eq!(para.nodes.len(), 1);
+    let n = &para.nodes[0];
+    assert_eq!(n.advance, 240.0, "object advance lost");
+    assert_eq!((n.ascent, n.descent), (100.0, 20.0), "object extents lost");
+    assert!(!n.is_text());
+    assert_eq!(plan.lines.len(), 1);
+}
+
+#[test]
+fn an_object_too_wide_for_the_measure_still_reports_a_line() {
+    let text = "\u{FFFC}";
+    let spacing = Spacing::for_size(SIZE);
+    let mut m = ObjectMeasure { object_at: Some(0), box_: (900.0, 100.0, 20.0) };
+    let (_, plan) = typeset(text, &spacing, StyleId(0), &[], &BreakOptions::new(480.0), &mut m);
+    assert_eq!(plan.lines.len(), 1, "an oversized figure must not vanish");
+}
+
+#[test]
+fn text_nodes_still_report_zero_extent() {
+    // The line box for ordinary prose comes from the fonts; a non-zero default here
+    // would silently override it.
+    let spacing = Spacing::for_size(SIZE);
+    let mut m = MonospaceMeasure { size: SIZE, factor: 0.5 };
+    let (para, _) = typeset("plain words", &spacing, StyleId(0), &[], &BreakOptions::new(480.0), &mut m);
+    assert!(para.nodes.iter().all(|n| n.is_text()), "{:?}", para.nodes);
+}

@@ -39,6 +39,9 @@ impl InlineStyle {
     pub const CODE: InlineStyle = InlineStyle(1 << 2);
     pub const LINK: InlineStyle = InlineStyle(1 << 3);
     pub const STRIKETHROUGH: InlineStyle = InlineStyle(1 << 4);
+    /// Marks an inline object placeholder rather than a decoration. The character
+    /// in the span is U+FFFC; what it stands for lives in [`Block::objects`].
+    pub const OBJECT: InlineStyle = InlineStyle(1 << 5);
 
     #[inline]
     pub const fn bits(self) -> u8 {
@@ -96,6 +99,27 @@ pub struct Block {
     pub list: Option<ListInfo>,
     /// A list item carrying a checkbox, with its state.
     pub task: Option<bool>,
+    /// Inline objects: the span they occupy in [`Block::text`], and their target.
+    ///
+    /// An image is set as a single object-replacement character so the layout
+    /// engine treats it as one atomic box with an intrinsic size, which is what lets
+    /// a tall figure sit inside running prose without special-casing the line model.
+    pub objects: Vec<ObjectSpan>,
+}
+
+/// An inline non-text box.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ObjectSpan {
+    pub range: std::ops::Range<usize>,
+    pub kind: ObjectKind,
+}
+
+/// What a placeholder stands for.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ObjectKind {
+    /// `src` is as written in the document; resolving it against the document's
+    /// directory is the caller's job, since only the caller knows that directory.
+    Image { src: String, alt: String },
 }
 
 impl Block {
@@ -138,6 +162,8 @@ struct Builder {
     quote_depth: u8,
     /// One entry per open list, holding its info and the next item number.
     lists: Vec<(ListInfo, u64)>,
+    /// Accumulated while inside `Tag::Image`; its alt text is captured, not set.
+    image: Option<(String, String)>,
 }
 
 impl Builder {
@@ -145,7 +171,10 @@ impl Builder {
         match ev {
             Event::Start(tag) => self.start(tag),
             Event::End(tag) => self.end(tag),
-            Event::Text(t) => self.push(&t, self.inline),
+            Event::Text(t) => match self.image.as_mut() {
+                Some((_, alt)) => alt.push_str(&t),
+                None => self.push(&t, self.inline),
+            },
             Event::Code(t) => self.push(&t, {
                 let mut s = self.inline;
                 s.insert(InlineStyle::CODE);
@@ -220,7 +249,9 @@ impl Builder {
             Tag::Strong => self.inline.insert(InlineStyle::STRONG),
             Tag::Strikethrough => self.inline.insert(InlineStyle::STRIKETHROUGH),
             Tag::Link { .. } => self.inline.insert(InlineStyle::LINK),
-            Tag::Image { .. } => {}
+            Tag::Image { dest_url, .. } => {
+                self.image = Some((dest_url.to_string(), String::new()));
+            }
             _ => {}
         }
     }
@@ -239,7 +270,11 @@ impl Builder {
             TagEnd::Strong => self.inline.remove(InlineStyle::STRONG),
             TagEnd::Strikethrough => self.inline.remove(InlineStyle::STRIKETHROUGH),
             TagEnd::Link => self.inline.remove(InlineStyle::LINK),
-            TagEnd::Image => {}
+            TagEnd::Image => {
+                if let Some((src, alt)) = self.image.take() {
+                    self.push_object(ObjectKind::Image { src, alt });
+                }
+            }
             _ => {}
         }
     }
@@ -255,6 +290,7 @@ impl Builder {
             quote_depth: self.quote_depth,
             list: None,
             task: None,
+            objects: Vec::new(),
         });
     }
 
@@ -275,6 +311,19 @@ impl Builder {
             Some(prev) if prev.style == style && prev.range.end == start => prev.range.end = end,
             _ => b.spans.push(Span { range: start..end, style }),
         }
+    }
+
+    /// Append an object-replacement character and register what it stands for.
+    fn push_object(&mut self, kind: ObjectKind) {
+        if self.cur.is_none() {
+            self.open(BlockKind::Paragraph);
+        }
+        let b = self.cur.as_mut().unwrap();
+        let start = b.text.len();
+        b.text.push('\u{FFFC}');
+        let end = b.text.len();
+        b.objects.push(ObjectSpan { range: start..end, kind });
+        b.spans.push(Span { range: start..end, style: InlineStyle::OBJECT });
     }
 
     fn close(&mut self) {

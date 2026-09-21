@@ -6,6 +6,7 @@
 //! glyph advances to come from the same place.
 
 mod font;
+mod images;
 mod report;
 mod sample;
 mod theme;

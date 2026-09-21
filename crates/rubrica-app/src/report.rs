@@ -30,7 +30,13 @@ pub fn report(source: &str, path: Option<&str>, width: f32, dpi: f32) -> Result<
     }
     let theme = Theme::default();
     let doc = rubrica_doc::Document::parse(source);
-    let (ops, height, column_pt, _left) = build_ops(&mut font, &theme, &doc, width, dpi);
+    // No render target exists here, so figures are measured from their files
+    // through WIC but not decoded to bitmaps -- enough to lay out and report.
+    let _ = unsafe { windows::Win32::System::Com::CoInitializeEx(None, windows::Win32::System::Com::COINIT_MULTITHREADED) };
+    let store = crate::images::ImageStore::new().ok();
+    let base = path.map(std::path::Path::new).and_then(|p| p.parent());
+    let (ops, height, column_pt, _left) =
+        build_ops(&mut font, &theme, &doc, width, dpi, store.as_ref(), base);
     let k = dpi / 72.0;
 
     let mut lines: Vec<Line> = Vec::new();
