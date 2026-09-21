@@ -6,6 +6,7 @@
 //! glyph advances to come from the same place.
 
 mod font;
+mod hyphen;
 mod images;
 mod report;
 mod sample;
@@ -25,7 +26,8 @@ fn main() -> Result<()> {
         let file = positional(&argv);
         let (path, source) = load(file.as_deref())?;
         let shown = path.and_then(|p| p.to_str().map(str::to_string));
-        return report::report(&source, shown.as_deref(), width, dpi);
+        let hyphenate = !argv.iter().any(|a| a == "--no-hyphenate");
+        return report::report(&source, shown.as_deref(), width, dpi, hyphenate);
     }
     let arg = std::env::args_os().nth(1).map(PathBuf::from);
     let (path, source) = load(arg.as_ref().and_then(|p| p.to_str()))?;

@@ -386,3 +386,66 @@ fn text_nodes_still_report_zero_extent() {
     let (para, _) = typeset("plain words", &spacing, StyleId(0), &[], &BreakOptions::new(480.0), &mut m);
     assert!(para.nodes.iter().all(|n| n.is_text()), "{:?}", para.nodes);
 }
+
+#[test]
+fn a_dictionary_point_lets_a_line_break_inside_a_word() {
+    // "the unbreakable word" in a 96pt measure: no break between whole words fits
+    // (24pt alone is far too short, 117pt is too wide), so without a dictionary the
+    // paragraph has no legal set of breaks at all.
+    let text = "the unbreakable word";
+    let column = 96.0;
+    let (_, tight) = hyph_set(text, column, &[], false);
+    // With no dictionary the only legal sets of breaks leave a word stranded on its
+    // own line, which is what the third, tolerance-free pass exists to survive.
+    assert!(tight.lines.iter().all(|l| l.hyphen.is_none()));
+    assert!(
+        tight.pass == 3,
+        "expected the no-hyphenation case to need the tolerance-free pass, got pass {}",
+        tight.pass
+    );
+
+    // Splitting "unbreak|able" gives a line of 24 + space + 56 + hyphen = 89.33,
+    // whose 6.67pt shortfall the word space can absorb.
+    let (_, split) = hyph_set(text, column, &[11], true);
+    assert!(split.lines.len() >= 2, "hyphenation should allow a real break");
+    assert!(split.lines[0].badness < 10000, "first line should no longer be flagged");
+    assert!(split.lines[0].hyphen.is_some(), "the broken line must carry its hyphen");
+}
+
+#[test]
+fn a_hyphenated_line_pays_for_the_glyph_it_shows() {
+    let text = "the unbreakable word";
+    let (para, plan) = hyph_set(text, 96.0, &[11], true);
+    let l = plan.lines.iter().find(|l| l.hyphen.is_some()).expect("no hyphenated line");
+    let h = l.hyphen.unwrap();
+    let node = para.node(h);
+    assert_eq!(node.advance, 4.0, "hyphen advance not carried onto the node");
+    assert_eq!(node.kind, rubrica_type::paragraph::NodeKind::Hyphen);
+    assert!(node.text.is_empty(), "a hyphen is not source text");
+    // The placed line must end with the hyphen slot, or the glyph is never drawn.
+    let placed = place(&para, l);
+    assert_eq!(placed.last().and_then(|p| p.node), Some(h), "hyphen not placed at the line end");
+}
+
+#[test]
+fn hyphenation_is_refused_when_the_option_is_off() {
+    let text = "the unbreakable word";
+    let (_, off) = hyph_set(text, 96.0, &[11], false);
+    assert!(off.lines.iter().all(|l| l.hyphen.is_none()), "hyphenated despite being disabled");
+    let (_, on) = hyph_set(text, 96.0, &[11], true);
+    assert!(on.lines.iter().any(|l| l.hyphen.is_some()));
+}
+
+
+/// Measure that also reports a hyphen advance, so hyphenation is testable.
+fn hyph_set(text: &str, column: Pt, hyphens: &[usize], allow: bool) -> (Paragraph, Plan) {
+    let spacing = Spacing::for_size(SIZE);
+    let mut measure = MonospaceMeasure { size: SIZE, factor: 0.5 };
+    let mut opts = BreakOptions::new(column);
+    opts.hyphenate = allow;
+    let para = rubrica_type::paragraph::paragraph_from_text_hyphenated(
+        text, &spacing, StyleId(0), &[], hyphens, 4.0, &mut measure,
+    );
+    let plan = rubrica_type::breaking::break_paragraph(&para, &opts);
+    (para, plan)
+}

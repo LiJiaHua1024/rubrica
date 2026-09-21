@@ -27,3 +27,4 @@ windows = { version = "0.62", features = [
     "Win32_UI_HiDpi",
 ] }
 windows-numerics = "0.3"
+hyphenation = { version = "0.8", features = ["embed_en-us"] }

@@ -14,6 +14,17 @@ use crate::units::{INFINITY, Pt};
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
 pub struct StyleId(pub u16);
 
+/// What a node draws.
+///
+/// A hyphen node is the one case where the glyph is not the source text: it stands
+/// for the break character TeX takes from the font's `hyphenchar`, and it is drawn
+/// only when the line actually breaks there.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum NodeKind {
+    Text,
+    Hyphen,
+}
+
 /// An unbreakable horizontal unit: a word, a single ideograph, or an inline
 /// object. `advance` is its natural width, filled in by a [Measure].
 #[derive(Clone, Debug)]
@@ -28,12 +39,13 @@ pub struct Node {
     /// a displayed formula, which has a height the line must make room for.
     pub ascent: Pt,
     pub descent: Pt,
+    pub kind: NodeKind,
 }
 
 impl Node {
     #[inline]
     pub fn is_text(&self) -> bool {
-        self.ascent == 0.0 && self.descent == 0.0
+        self.kind == NodeKind::Text && self.ascent == 0.0 && self.descent == 0.0
     }
 }
 
@@ -99,8 +111,11 @@ pub enum Item {
         /// Line-break desirability; negative invites the break, `i32::MIN` forces it.
         penalty: i32,
         forced: bool,
-        /// Extra width contributed when the break is taken (a hyphen, say).
+        /// Extra width contributed when the break is taken.
         width: Pt,
+        /// Node to draw at the line's end when this break is taken, which is what
+        /// makes a discretionary hyphen show its glyph.
+        hyphen: Option<u32>,
     },
 }
 
@@ -116,6 +131,11 @@ impl Item {
 
     pub fn is_glue(&self) -> bool {
         matches!(self, Item::Glue { .. })
+    }
+
+    /// True for a discretionary hyphen, which the solver may refuse.
+    pub fn is_hyphen(&self) -> bool {
+        matches!(self, Item::Penalty { hyphen: Some(_), .. })
     }
 }
 
@@ -166,6 +186,15 @@ pub struct BuildOptions<'a> {
     /// Style for a given text range. Only consulted for segmentation-relevant
     /// decisions here; the renderer re-derives runs from these ids.
     pub style_of: StyleId,
+    /// Byte offsets inside Western words at which a discretionary hyphen break is
+    /// permitted, as produced by a Knuth-Liang dictionary. Offsets at a word edge or
+    /// on an existing cut are ignored.
+    pub hyphens: &'a [usize],
+    /// Demerit cost of taking a hyphenated break, TeX's `\hyphenpenalty`.
+    pub hyphen_penalty: i32,
+    /// Advance of the font's hyphen glyph, measured by the caller so this crate
+    /// stays free of any shaping dependency.
+    pub hyphen_width: Pt,
     /// Inline style ranges, byte offsets into the same string as `text`.
     ///
     /// Segments are cut at these boundaries as well as at UAX #14 opportunities, so
@@ -238,6 +267,26 @@ pub fn build(
             false
         }
     });
+    // A dictionary point splits a word that UAX #14 would keep whole. It joins the
+    // cut list but must not later be handed glue, which is what distinguishes it.
+    let hyphen_set: Vec<usize> = opts
+        .hyphens
+        .iter()
+        .copied()
+        .filter(|&at| at > 0 && at < text.len() && !text[..at].ends_with(char::is_whitespace))
+        .collect();
+    for at in &hyphen_set {
+        cuts.push((*at, false));
+    }
+    cuts.sort_by_key(|&(at, _)| at);
+    cuts.dedup_by(|a, b| {
+        if a.0 == b.0 {
+            b.1 |= a.1;
+            true
+        } else {
+            false
+        }
+    });
     cuts.push((text.len(), false));
 
     let mut segments: Vec<Range<usize>> = Vec::with_capacity(cuts.len());
@@ -282,12 +331,42 @@ pub fn build(
             let advance = measure.advance(text, range.clone(), style);
             let (ascent, descent) = measure.extent(text, range.clone(), style);
             let id = p.nodes.len() as u32;
-            p.nodes.push(Node { text: range, style, advance, role, ascent, descent });
+            p.nodes.push(Node {
+                text: range,
+                style,
+                advance,
+                role,
+                ascent,
+                descent,
+                kind: NodeKind::Text,
+            });
             p.items.push(Item::Box { node: id });
             prev_role = Some(role);
         }
 
-        if !trailing.is_empty() {
+        let split_here = hyphen_set.contains(&seg.end) && trailing.is_empty();
+        if split_here {
+            let style = StyleSpan::resolve(opts.spans, seg.end, opts.style_of);
+            let h = p.nodes.len() as u32;
+            p.nodes.push(Node {
+                text: seg.end..seg.end,
+                style,
+                advance: opts.hyphen_width,
+                role: Role::Western,
+                ascent: 0.0,
+                descent: 0.0,
+                kind: NodeKind::Hyphen,
+            });
+            p.items.push(Item::Penalty {
+                penalty: opts.hyphen_penalty,
+                forced: false,
+                width: opts.hyphen_width,
+                hyphen: Some(h),
+            });
+            // The penalty is itself the separator: leaving `prev_role` set would
+            // make the next segment insert a word space between the two halves.
+            prev_role = None;
+        } else if !trailing.is_empty() {
             emit_space(&mut p, &mut prev_role, trailing, opts);
         }
     }
@@ -301,7 +380,7 @@ pub fn build(
             shrink: 0.0,
             breakable: true,
         });
-        p.items.push(Item::Penalty { penalty: -10001, forced: true, width: 0.0 });
+        p.items.push(Item::Penalty { penalty: -10001, forced: true, width: 0.0, hyphen: None });
     }
     p
 }
@@ -310,7 +389,7 @@ pub fn build(
 /// box needs no script-recipe glue because this space already separates them.
 fn emit_space(p: &mut Paragraph, prev_role: &mut Option<Role>, ws: &str, opts: &BuildOptions) {
     if ws.contains('\n') {
-        p.items.push(Item::Penalty { penalty: i32::MIN, forced: true, width: 0.0 });
+        p.items.push(Item::Penalty { penalty: i32::MIN, forced: true, width: 0.0, hyphen: None });
     } else {
         p.items.push(Item::glue(&opts.spacing.latin_space));
     }
@@ -324,6 +403,37 @@ fn glue_recipe_for(a: Role, b: Role, s: &Spacing) -> &GlueRecipe {
         (Role::Cjk, Role::Other) | (Role::Other, Role::Cjk) => &s.mixed,
         _ => &s.latin_space,
     }
+}
+
+/// As [`paragraph_from_text`], but also splitting Western words at the given byte
+/// offsets, which is how a Knuth-Liang dictionary feeds discretionary breaks in.
+#[allow(clippy::too_many_arguments)]
+pub fn paragraph_from_text_hyphenated(
+    text: &str,
+    spacing: &Spacing,
+    style: StyleId,
+    spans: &[StyleSpan],
+    hyphens: &[usize],
+    hyphen_width: Pt,
+    measure: &mut dyn Measure,
+) -> Paragraph {
+    use unicode_linebreak::BreakOpportunity;
+    let breaks: Vec<(usize, bool)> = unicode_linebreak::linebreaks(text)
+        .map(|(at, kind)| (at, kind == BreakOpportunity::Mandatory))
+        .collect();
+    build(
+        text,
+        &breaks,
+        &BuildOptions {
+            spacing,
+            style_of: style,
+            spans,
+            hyphens,
+            hyphen_penalty: 200,
+            hyphen_width,
+        },
+        measure,
+    )
 }
 
 /// Convenience: segment with UAX #14 tables and measure in one call.
@@ -341,7 +451,14 @@ pub fn paragraph_from_text(
     build(
         text,
         &breaks,
-        &BuildOptions { spacing, style_of: style, spans },
+        &BuildOptions {
+            spacing,
+            style_of: style,
+            spans,
+            hyphens: &[],
+            hyphen_penalty: 200,
+            hyphen_width: 0.0,
+        },
         measure,
     )
 }

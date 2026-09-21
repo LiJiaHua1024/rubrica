@@ -36,7 +36,7 @@ pub fn place(para: &Paragraph, line: &Line) -> Vec<Placed> {
         }
     }
 
-    let mut out = Vec::with_capacity(line.items.len());
+    let mut out = Vec::with_capacity(line.items.len() + 1);
     let mut x = 0.0f64;
     for i in line.items.clone() {
         match items[i] {
@@ -64,12 +64,19 @@ pub fn place(para: &Paragraph, line: &Line) -> Vec<Placed> {
                 out.push(Placed { x: x as Pt, w: w as Pt, node: None });
                 x += w;
             }
-            Item::Penalty { width, .. } => {
-                let w = f64::from(width);
-                out.push(Placed { x: x as Pt, w: w as Pt, node: None });
-                x += w;
+            Item::Penalty { .. } => {
+                // An untaken discretionary break contributes nothing at all: the
+                // solver charged its width only to the line that actually broke on
+                // it, via `Line::hyphen`. Charging it here as well would make every
+                // unused dictionary point inflate its line by a hyphen width.
             }
         }
+    }
+    // A line that broke on a hyphen has already had its width charged for the
+    // glyph by the solver; here it is given a slot so the painter draws it.
+    if let Some(h) = line.hyphen {
+        let node = para.node(h);
+        out.push(Placed { x: x as Pt, w: f64::from(node.advance) as Pt, node: Some(h) });
     }
     out
 }

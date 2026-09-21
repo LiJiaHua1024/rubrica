@@ -27,7 +27,25 @@ pub fn typeset(
     opts: &BreakOptions,
     measure: &mut dyn paragraph::Measure,
 ) -> (Paragraph, Plan) {
-    let para = paragraph::paragraph_from_text(text, spacing, style, spans, measure);
+    typeset_hyphenated(text, spacing, style, spans, &[], 0.0, opts, measure)
+}
+
+/// As [`typeset`], additionally offering the given byte offsets as discretionary
+/// hyphen breaks. `hyphen_width` is the advance of the font's hyphen glyph, which
+/// only a shaping backend can supply.
+pub fn typeset_hyphenated(
+    text: &str,
+    spacing: &Spacing,
+    style: StyleId,
+    spans: &[paragraph::StyleSpan],
+    hyphens: &[usize],
+    hyphen_width: Pt,
+    opts: &BreakOptions,
+    measure: &mut dyn paragraph::Measure,
+) -> (Paragraph, Plan) {
+    let para = paragraph::paragraph_from_text_hyphenated(
+        text, spacing, style, spans, hyphens, hyphen_width, measure,
+    );
     let plan = breaking::break_paragraph(&para, opts);
     (para, plan)
 }

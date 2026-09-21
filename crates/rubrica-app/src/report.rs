@@ -23,7 +23,7 @@ struct Line {
     families: Vec<String>,
 }
 
-pub fn report(source: &str, path: Option<&str>, width: f32, dpi: f32) -> Result<()> {
+pub fn report(source: &str, path: Option<&str>, width: f32, dpi: f32, hyphenate: bool) -> Result<()> {
     let mut font = FontEngine::new().map_err(|e| -> Error { format!("DirectWrite: {e}").into() })?;
     if !font.probe() {
         return Err("no usable font face".into());
@@ -35,8 +35,17 @@ pub fn report(source: &str, path: Option<&str>, width: f32, dpi: f32) -> Result<
     let _ = unsafe { windows::Win32::System::Com::CoInitializeEx(None, windows::Win32::System::Com::COINIT_MULTITHREADED) };
     let store = crate::images::ImageStore::new().ok();
     let base = path.map(std::path::Path::new).and_then(|p| p.parent());
-    let (ops, height, column_pt, _left) =
-        build_ops(&mut font, &theme, &doc, width, dpi, store.as_ref(), base);
+    let hyphenator = if hyphenate { crate::hyphen::Hyphenator::english() } else { None };
+    let (ops, height, column_pt, _left) = build_ops(
+        &mut font,
+        &theme,
+        &doc,
+        width,
+        dpi,
+        store.as_ref(),
+        base,
+        hyphenator.as_ref(),
+    );
     let k = dpi / 72.0;
 
     let mut lines: Vec<Line> = Vec::new();

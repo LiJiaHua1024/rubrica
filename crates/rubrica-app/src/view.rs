@@ -13,7 +13,7 @@ use rubrica_doc::{Align, Block, BlockKind, Document, InlineStyle};
 use rubrica_type::justification::place;
 use rubrica_type::paragraph::{Item, Spacing, StyleId, StyleSpan};
 use rubrica_type::units::Pt;
-use rubrica_type::{BreakOptions, typeset};
+use rubrica_type::{BreakOptions, typeset, typeset_hyphenated};
 use windows::core::{w, Interface, PCWSTR};
 use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, RECT, WPARAM};
 use windows::Win32::Graphics::Direct2D::Common::{
@@ -60,9 +60,14 @@ use windows::Win32::UI::WindowsAndMessaging::{
 use windows_numerics::Vector2;
 
 use crate::font::{FaceRequest, FontEngine, ObjectBox, Style as RunStyle};
+use crate::hyphen::Hyphenator;
 use crate::images::ImageStore;
 use crate::theme::{ColorRole, Theme};
 use crate::{Error, Result};
+
+/// The character drawn at a discretionary break, and the range to shape it from.
+const HYPHEN: &str = "-";
+const HYPHEN_RANGE: std::ops::Range<usize> = 0..1;
 
 /// Page margin, in ems of the body size.
 const MARGIN_EM: Pt = 2.6;
@@ -191,6 +196,8 @@ pub struct View {
     dragging: bool,
     /// Built once a render target exists, since bitmaps need one.
     images: Option<ImageStore>,
+    /// English word breaks, when the embedded dictionary loaded.
+    hyphenator: Option<Hyphenator>,
 }
 
 /// Thumb geometry, in device independent pixels, or `None` when the document fits.
@@ -253,6 +260,7 @@ pub fn run(source: String, path: Option<PathBuf>) -> Result<()> {
         path,
         dragging: false,
         images: None,
+        hyphenator: Hyphenator::english(),
     });
 
     const CLASS: &str = "Rubrica.Main";
@@ -585,6 +593,7 @@ impl View {
                 self.dpi,
                 self.images.as_ref(),
                 self.path.as_deref().and_then(|p| p.parent()),
+                self.hyphenator.as_ref(),
             );
         self.content_h = h;
         self.ops = ops;
@@ -609,6 +618,10 @@ struct Blk<'a> {
     left: Pt,
     column: Pt,
     table: Option<&'a PreparedTable>,
+    /// Byte offsets inside this block's text where a word may split.
+    hyphens: &'a [usize],
+    /// Advance of the hyphen glyph at this block's body size.
+    hyphen_width: Pt,
 }
 
 /// A table cell with its styles already resolved to ids, so column sizing and
@@ -632,7 +645,7 @@ const CELL_MIN_EM: Pt = 3.0;
 /// Typeset one block into the display list and return the new document y.
 fn layout_block(font: &mut FontEngine, ctx: &Ctx<'_>, blk: &Blk<'_>, ops: &mut Vec<Op>, mut y: Pt) -> Pt {
     let Ctx { theme, styles, k } = *ctx;
-    let Blk { b, text, spans, base, left, column, .. } = *blk;
+    let Blk { b, text, spans, base, left, column, hyphens, hyphen_width, .. } = *blk;
     let mut images_out: Vec<(PathBuf, f32, f32, Pt, Pt)> = Vec::new();
     if b.kind == BlockKind::Rule {
         y += theme.base * 0.6;
@@ -661,7 +674,16 @@ fn layout_block(font: &mut FontEngine, ctx: &Ctx<'_>, blk: &Blk<'_>, ops: &mut V
     opts.ragged = b.ragged();
     opts.par_indent = theme.first_line_indent_em * size;
 
-    let (para, plan) = typeset(text, &spacing, StyleId(base as u16), spans, &opts, font);
+    let (para, plan) = typeset_hyphenated(
+        text,
+        &spacing,
+        StyleId(base as u16),
+        spans,
+        hyphens,
+        hyphen_width,
+        &opts,
+        font,
+    );
     if plan.lines.is_empty() {
         return y;
     }
@@ -934,7 +956,7 @@ fn layout_table(
     ops: &mut Vec<Op>,
     mut y: Pt,
 ) -> Pt {
-    let Ctx { theme, styles, k } = *ctx;
+    let Ctx { theme, styles, k, .. } = *ctx;
     let size = theme.base;
     let spacing = Spacing::for_size(size);
     let leading = theme.body_leading.for_mixed(true);
@@ -1158,6 +1180,7 @@ pub fn build_ops(
     dpi: f32,
     images: Option<&ImageStore>,
     base_dir: Option<&std::path::Path>,
+    hyphenator: Option<&Hyphenator>,
 ) -> (Vec<Op>, Pt, Pt, Pt) {
     let k = scale_of(dpi);
     let margin = theme.base * MARGIN_EM;
@@ -1273,6 +1296,21 @@ pub fn build_ops(
 
     for (b, (text, spans, base, table)) in doc.blocks.iter().zip(prepared) {
         let base_left = left;
+        // Offsets are computed against the block's own text, which already carries
+        // the list marker, so they need no shifting.
+        let hyphens: Vec<usize> = hyphenator
+            .map(|h| h.points(&text))
+            .filter(|v| !v.is_empty())
+            .unwrap_or_default();
+        let hyphen_width = if hyphens.is_empty() {
+            0.0
+        } else {
+            let st = &styles[base];
+            font.shape_runs(HYPHEN, HYPHEN_RANGE, &st.face, st.size, st.tracking)
+                .iter()
+                .map(|r| r.width())
+                .sum()
+        };
         let size = theme.body_size(b.kind);
         y += theme.space_before(b.kind, first);
         first = false;
@@ -1295,6 +1333,8 @@ pub fn build_ops(
                 left: body_left,
                 column: column - (body_left - left),
                 table: table.as_ref(),
+                hyphens: &hyphens,
+                hyphen_width,
             },
             &mut ops,
             y,

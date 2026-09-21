@@ -29,6 +29,10 @@ pub struct BreakOptions {
     /// Stretch granted to every line on the second pass, tried before conceding
     /// an overfull line (TeX's `\emergencystretch`).
     pub emergencystretch: Pt,
+    /// Whether discretionary hyphens may be broken at at all. The solver still
+    /// withholds them from its first pass, so a paragraph that can be set without
+    /// hyphens is set without hyphens; this only turns the facility off entirely.
+    pub hyphenate: bool,
     /// Penalties for jumping into a worse fitness class.
     pub lousy_demerits: i32,
     pub awful_demerits: i32,
@@ -46,6 +50,7 @@ impl BreakOptions {
             par_indent: 0.0,
             pretolerance: 100,
             tolerance: 200,
+            hyphenate: true,
             // TeX leaves this at zero because hyphenation keeps bad breaks rare; an
             // engine without them needs a real budget or every awkward paragraph
             // falls through to the tolerance-free pass and stops reporting badness.
@@ -74,6 +79,8 @@ pub struct Line {
     pub forced: bool,
     /// First line of the paragraph, which was indented.
     pub first: bool,
+    /// Hyphen node to draw at the end of this line, when it broke on one.
+    pub hyphen: Option<u32>,
     /// The block opted out of justification entirely.
     pub ragged: bool,
 }
@@ -269,16 +276,39 @@ pub fn break_paragraph(para: &Paragraph, opts: &BreakOptions) -> Plan {
         // hyphenation lands we cannot assume that window is ever hit, so a third
         // pass with the tolerance removed guarantees the solver always has a
         // solution instead of dropping the paragraph into `desperate`.
+        // TeX's ordering: the cheap pass may not hyphenate, so hyphenation is a
+        // remedy for a paragraph that cannot be set cleanly rather than the first
+        // thing tried. Without this, one overfull line is "legal" on pass 1 and the
+        // dictionary is never consulted.
         let attempts = [
-            (opts.pretolerance, 0.0f32),
-            (opts.tolerance, opts.emergencystretch),
-            (i32::MAX, opts.emergencystretch),
+            (opts.pretolerance, 0.0f32, false),
+            (opts.tolerance, opts.emergencystretch, opts.hyphenate),
+            (i32::MAX, opts.emergencystretch, opts.hyphenate),
         ];
         let mut result = None;
-        for (n, (tol, extra)) in attempts.into_iter().enumerate() {
-            if let Some(out) = solve(items, &sums, from, end, opts, tol, extra) {
+        for (n, (tol, extra, hyphenate)) in attempts.into_iter().enumerate() {
+            let mut o = *opts;
+            o.hyphenate = hyphenate;
+            if let Some(out) = solve(items, &sums, from, end, &o, tol, extra) {
+                // A pass that had to leave a line overfull is not a success: TeX
+                // keeps going and lets the next pass hyphenate. Accepting it here
+                // would mean the dictionary is never consulted for exactly the
+                // paragraphs that need it.
+                //
+                // Overfull means specifically too wide -- natural width past what
+                // the glue can absorb. Badness alone cannot be the test: a line with
+                // no stretchable glue at all, such as a one-line list item, also
+                // scores 10000, and treating that as overfull would push ordinary
+                // paragraphs all the way to the tolerance-free pass and pick worse
+                // breaks than pass 1 already had.
+                let overfull = out.0.iter().any(|l| {
+                    !l.is_ragged() && f64::from(l.natural) - f64::from(l.shrink) > f64::from(l.target) + f64::from(EPSILON)
+                });
+                let last = n == attempts.len() - 1;
                 result = Some((out, n as u8 + 1));
-                break;
+                if last || !overfull {
+                    break;
+                }
             }
         }
         let ((mut out, cost), p) = match result {
@@ -317,6 +347,7 @@ fn solve(
     for i in from + 1..=end {
         let legal = match items[i] {
             Item::Glue { breakable, stretch, .. } => breakable || stretch >= INFINITY / 2.0,
+            Item::Penalty { hyphen: Some(_), .. } => opts.hyphenate,
             Item::Penalty { .. } => true,
             Item::Box { .. } => false,
         };
@@ -448,6 +479,10 @@ fn solve(
             forced: matches!(items[ed.item], Item::Penalty { forced: true, .. }),
             first: n == 0 && first_line,
             ragged: opts.ragged,
+            hyphen: match items[ed.item] {
+                Item::Penalty { hyphen, .. } => hyphen,
+                _ => None,
+            },
         });
     }
     Some((lines, total))
@@ -519,6 +554,7 @@ fn desperate(
             forced: matches!(items[b], Item::Penalty { forced: true, .. }),
             first: first_line && out.is_empty(),
             ragged: true,
+            hyphen: None,
         });
         if b >= end {
             break;
