@@ -64,8 +64,10 @@ dependencies = [
 name = "rubrica-app"
 version = "0.1.0"
 dependencies = [
+ "rubrica-doc",
  "rubrica-type",
  "windows",
+ "windows-numerics",
 ]
 
 [[package]]
