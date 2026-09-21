@@ -632,7 +632,7 @@ const CELL_MIN_EM: Pt = 3.0;
 /// Typeset one block into the display list and return the new document y.
 fn layout_block(font: &mut FontEngine, ctx: &Ctx<'_>, blk: &Blk<'_>, ops: &mut Vec<Op>, mut y: Pt) -> Pt {
     let Ctx { theme, styles, k } = *ctx;
-    let Blk { b, text, spans, base, left, column, table } = *blk;
+    let Blk { b, text, spans, base, left, column, .. } = *blk;
     let mut images_out: Vec<(PathBuf, f32, f32, Pt, Pt)> = Vec::new();
     if b.kind == BlockKind::Rule {
         y += theme.base * 0.6;
@@ -647,7 +647,7 @@ fn layout_block(font: &mut FontEngine, ctx: &Ctx<'_>, blk: &Blk<'_>, ops: &mut V
         return y + theme.base * 0.6;
     }
     if let Some(t) = blk.table {
-        return layout_table(font, theme, styles, t, left, column, ops, y, k);
+        return layout_table(font, ctx, t, left, column, ops, y);
     }
     if text.trim().is_empty() {
         return y;
@@ -927,15 +927,14 @@ impl View {
 /// lines grows its row instead of overwriting the row below it.
 fn layout_table(
     font: &mut FontEngine,
-    theme: &Theme,
-    styles: &[AppStyle],
+    ctx: &Ctx<'_>,
     t: &PreparedTable,
     left: Pt,
     column: Pt,
     ops: &mut Vec<Op>,
     mut y: Pt,
-    k: f32,
 ) -> Pt {
+    let Ctx { theme, styles, k } = *ctx;
     let size = theme.base;
     let spacing = Spacing::for_size(size);
     let leading = theme.body_leading.for_mixed(true);
