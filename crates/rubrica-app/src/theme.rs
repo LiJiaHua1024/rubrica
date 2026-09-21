@@ -138,7 +138,7 @@ impl Theme {
                 self.base * self.heading_scale[i]
             }
             BlockKind::Code => self.base * 0.92,
-            BlockKind::Paragraph | BlockKind::Rule => self.base,
+            BlockKind::Paragraph | BlockKind::Rule | BlockKind::Table => self.base,
         }
     }
 
@@ -167,7 +167,7 @@ impl Theme {
             BlockKind::Heading(_) => 700,
             BlockKind::Rule => 400,
             BlockKind::Code => 400,
-            BlockKind::Paragraph => 400,
+            BlockKind::Paragraph | BlockKind::Table => 400,
         };
         if inline.contains(InlineStyle::STRONG) {
             weight = weight.max(700);
@@ -207,6 +207,7 @@ impl Theme {
             BlockKind::Code => self.space_before_code,
             BlockKind::Rule => 1.4,
             BlockKind::Paragraph => self.space_before_body,
+            BlockKind::Table => 1.2,
         };
         self.base * lines
     }

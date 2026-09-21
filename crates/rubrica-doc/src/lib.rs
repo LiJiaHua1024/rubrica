@@ -78,6 +78,9 @@ pub enum BlockKind {
     Code,
     /// `<hr>`: no text, drawn as a rule.
     Rule,
+    /// A GFM table. Its text lives in [`Block::table`], not in [`Block::text`],
+    /// because a cell is not a position in the document's reading order.
+    Table,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -99,6 +102,8 @@ pub struct Block {
     pub list: Option<ListInfo>,
     /// A list item carrying a checkbox, with its state.
     pub task: Option<bool>,
+    /// Set for [`BlockKind::Table`].
+    pub table: Option<Table>,
     /// Inline objects: the span they occupy in [`Block::text`], and their target.
     ///
     /// An image is set as a single object-replacement character so the layout
@@ -114,6 +119,41 @@ pub struct ObjectSpan {
     pub kind: ObjectKind,
 }
 
+/// A grid of cells with one header row and any number of body rows.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Table {
+    /// Per-column alignment, in column order.
+    pub aligns: Vec<Align>,
+    pub head: Vec<Cell>,
+    pub rows: Vec<Vec<Cell>>,
+}
+
+impl Table {
+    pub fn columns(&self) -> usize {
+        let mut n = self.head.len();
+        for r in &self.rows {
+            n = n.max(r.len());
+        }
+        n
+    }
+}
+
+/// One table cell and the inline styles its text carries.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Cell {
+    pub text: String,
+    pub spans: Vec<Span>,
+}
+
+/// Where a cell's content sits within its column.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Align {
+    #[default]
+    Left,
+    Center,
+    Right,
+}
+
 /// What a placeholder stands for.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ObjectKind {
@@ -124,8 +164,12 @@ pub enum ObjectKind {
 
 impl Block {
     /// Headings and code are set ragged-right; justifying them is a defect.
+    /// Headings and code are set ragged-right; a table is laid out per cell.
     pub fn ragged(&self) -> bool {
-        matches!(self.kind, BlockKind::Heading(_) | BlockKind::Code | BlockKind::Rule)
+        matches!(
+            self.kind,
+            BlockKind::Heading(_) | BlockKind::Code | BlockKind::Rule | BlockKind::Table
+        )
     }
 
     /// Spans covering the whole block, for callers that only need one style.
@@ -141,7 +185,9 @@ pub struct Document {
 
 impl Document {
     pub fn parse(source: &str) -> Document {
-        let mut opts = Options::ENABLE_STRIKETHROUGH | Options::ENABLE_TASKLISTS;
+        let mut opts = Options::ENABLE_STRIKETHROUGH
+            | Options::ENABLE_TASKLISTS
+            | Options::ENABLE_TABLES;
         // A footnote definition would become a block orphaned from the paragraph
         // that cites it, and citations are invisible without a reference UI. Keep
         // the syntax literal until it has one.
@@ -164,6 +210,11 @@ struct Builder {
     lists: Vec<(ListInfo, u64)>,
     /// Accumulated while inside `Tag::Image`; its alt text is captured, not set.
     image: Option<(String, String)>,
+    /// Accumulated while inside `Tag::Table`.
+    table: Option<Table>,
+    row: Vec<Cell>,
+    cell: Option<Cell>,
+    in_head: bool,
 }
 
 impl Builder {
@@ -171,15 +222,23 @@ impl Builder {
         match ev {
             Event::Start(tag) => self.start(tag),
             Event::End(tag) => self.end(tag),
-            Event::Text(t) => match self.image.as_mut() {
-                Some((_, alt)) => alt.push_str(&t),
-                None => self.push(&t, self.inline),
-            },
-            Event::Code(t) => self.push(&t, {
-                let mut s = self.inline;
-                s.insert(InlineStyle::CODE);
-                s
-            }),
+            Event::Text(t) => {
+                if let Some((_, alt)) = self.image.as_mut() {
+                    alt.push_str(&t);
+                } else if let Some(c) = self.cell.as_mut() {
+                    push_cell(c, &t, self.inline);
+                } else {
+                    self.push(&t, self.inline);
+                }
+            }
+            Event::Code(t) => {
+                let mut st = self.inline;
+                st.insert(InlineStyle::CODE);
+                match self.cell.as_mut() {
+                    Some(c) => push_cell(c, &t, st),
+                    None => self.push(&t, st),
+                }
+            }
             Event::SoftBreak => self.push(" ", InlineStyle::EMPTY),
             Event::HardBreak => self.push("\n", InlineStyle::EMPTY),
             Event::TaskListMarker(checked) => {
@@ -238,6 +297,23 @@ impl Builder {
                     b.list = Some(info);
                 }
             }
+            Tag::Table(aligns) => {
+                self.open(BlockKind::Table);
+                self.table = Some(Table {
+                    aligns: aligns.iter().map(|a| match a {
+                        pulldown_cmark::Alignment::Left => Align::Left,
+                        pulldown_cmark::Alignment::Center => Align::Center,
+                        pulldown_cmark::Alignment::Right => Align::Right,
+                        pulldown_cmark::Alignment::None => Align::Left,
+                    }).collect(),
+                    ..Default::default()
+                });
+                self.row.clear();
+                self.in_head = false;
+            }
+            Tag::TableHead => self.in_head = true,
+            Tag::TableRow => self.row.clear(),
+            Tag::TableCell => self.cell = Some(Cell::default()),
             Tag::CodeBlock(kind) => {
                 self.open(if matches!(kind, CodeBlockKind::Fenced(_) | CodeBlockKind::Indented) {
                     BlockKind::Code
@@ -259,6 +335,30 @@ impl Builder {
     fn end(&mut self, tag: TagEnd) {
         match tag {
             TagEnd::Paragraph | TagEnd::Heading(_) | TagEnd::CodeBlock => self.close(),
+            TagEnd::TableCell => {
+                if let Some(c) = self.cell.take() {
+                    self.row.push(c);
+                }
+            }
+            TagEnd::TableHead | TagEnd::TableRow => {
+                let row = std::mem::take(&mut self.row);
+                if let Some(t) = self.table.as_mut() {
+                    if self.in_head {
+                        t.head = row;
+                    } else {
+                        t.rows.push(row);
+                    }
+                }
+                self.in_head = false;
+            }
+            TagEnd::Table => {
+                if let Some(t) = self.table.take() {
+                    if let Some(b) = self.cur.as_mut() {
+                        b.table = Some(t);
+                    }
+                }
+                self.close();
+            }
             TagEnd::Item => {
                 self.close();
             }
@@ -291,6 +391,7 @@ impl Builder {
             list: None,
             task: None,
             objects: Vec::new(),
+            table: None,
         });
     }
 
@@ -340,7 +441,8 @@ impl Builder {
                 }
             }
             let empty = b.text.trim().is_empty();
-            if !empty || b.kind == BlockKind::Rule {
+            let has_table = b.table.as_ref().is_some_and(|t| !t.head.is_empty() || !t.rows.is_empty());
+            if !empty || b.kind == BlockKind::Rule || has_table {
                 self.blocks.push(b);
             }
         }
@@ -348,8 +450,28 @@ impl Builder {
 
     fn finish(mut self) -> Document {
         self.close();
-        self.blocks.retain(|b| !b.text.trim().is_empty() || b.kind == BlockKind::Rule);
+        // A table and a rule carry no block text of their own, so a test on
+        // `text` alone would drop them; this must agree with `close`.
+        self.blocks.retain(|b| {
+            !b.text.trim().is_empty()
+                || b.kind == BlockKind::Rule
+                || b.table.as_ref().is_some_and(|t| !t.head.is_empty() || !t.rows.is_empty())
+        });
         Document { blocks: self.blocks }
+    }
+}
+
+/// Append text to a cell, merging with the previous span when the style matches.
+fn push_cell(c: &mut Cell, t: &str, style: InlineStyle) {
+    if t.is_empty() {
+        return;
+    }
+    let start = c.text.len();
+    c.text.push_str(t);
+    let end = c.text.len();
+    match c.spans.last_mut() {
+        Some(prev) if prev.style == style && prev.range.end == start => prev.range.end = end,
+        _ => c.spans.push(Span { range: start..end, style }),
     }
 }
 

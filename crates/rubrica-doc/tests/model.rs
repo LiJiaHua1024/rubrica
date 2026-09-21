@@ -169,3 +169,32 @@ fn an_image_alone_forms_its_own_block() {
     assert_eq!(doc.blocks.len(), 1);
     assert_eq!(doc.blocks[0].objects.len(), 1);
 }
+
+#[test]
+fn a_gfm_table_becomes_a_grid_not_prose() {
+    let src = "| Name | Qty |\n|:-----|----:|\n| apple | 3 |\n| **pear** | 12 |\n";
+    let doc = Document::parse(src);
+    assert_eq!(doc.blocks.len(), 1, "{:?}", doc.blocks.iter().map(|b| (b.kind, &b.text)).collect::<Vec<_>>());
+    let b = &doc.blocks[0];
+    assert_eq!(b.kind, BlockKind::Table);
+    assert!(b.ragged(), "a table is laid out per cell, not justified");
+    let t = b.table.as_ref().expect("no table");
+    assert_eq!(t.columns(), 2);
+    assert_eq!(t.head.len(), 2);
+    assert_eq!(t.head[0].text, "Name");
+    assert_eq!(t.rows.len(), 2);
+    assert_eq!(t.rows[1][0].text, "pear");
+    assert_eq!(t.aligns, vec![rubrica_doc::Align::Left, rubrica_doc::Align::Right]);
+    // Inline formatting inside a cell survives as a span over the cell's own text.
+    let bold = t.rows[1][0].spans.iter().find(|s| s.style.contains(InlineStyle::STRONG));
+    assert!(bold.is_some(), "{:?}", t.rows[1][0]);
+    assert_eq!(&t.rows[1][0].text[bold.unwrap().range.clone()], "pear");
+}
+
+#[test]
+fn a_table_with_cjk_cells_keeps_its_grid() {
+    let doc = Document::parse("| 名称 | 数量 |\n|---|---|\n| 苹果 | 三 |\n");
+    let t = doc.blocks[0].table.as_ref().expect("no table");
+    assert_eq!(t.head[0].text, "名称");
+    assert_eq!(t.rows[0][1].text, "三");
+}

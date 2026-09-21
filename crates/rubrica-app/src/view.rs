@@ -9,9 +9,9 @@
 use std::collections::HashMap;
 use std::path::PathBuf;
 
-use rubrica_doc::{Block, BlockKind, Document, InlineStyle};
+use rubrica_doc::{Align, Block, BlockKind, Document, InlineStyle};
 use rubrica_type::justification::place;
-use rubrica_type::paragraph::{Spacing, StyleId, StyleSpan};
+use rubrica_type::paragraph::{Item, Spacing, StyleId, StyleSpan};
 use rubrica_type::units::Pt;
 use rubrica_type::{BreakOptions, typeset};
 use windows::core::{w, Interface, PCWSTR};
@@ -608,12 +608,31 @@ struct Blk<'a> {
     base: usize,
     left: Pt,
     column: Pt,
+    table: Option<&'a PreparedTable>,
 }
+
+/// A table cell with its styles already resolved to ids, so column sizing and
+/// word wrapping measure exactly what prose measures.
+pub struct PreparedCell {
+    pub text: String,
+    pub spans: Vec<StyleSpan>,
+    pub align: Align,
+}
+
+pub struct PreparedTable {
+    pub head: Vec<PreparedCell>,
+    pub rows: Vec<Vec<PreparedCell>>,
+}
+
+/// Horizontal padding inside a table cell, in ems of the body size.
+const CELL_PAD_EM: Pt = 0.6;
+/// The narrowest a column may be squeezed to before it is left to overflow.
+const CELL_MIN_EM: Pt = 3.0;
 
 /// Typeset one block into the display list and return the new document y.
 fn layout_block(font: &mut FontEngine, ctx: &Ctx<'_>, blk: &Blk<'_>, ops: &mut Vec<Op>, mut y: Pt) -> Pt {
     let Ctx { theme, styles, k } = *ctx;
-    let Blk { b, text, spans, base, left, column } = *blk;
+    let Blk { b, text, spans, base, left, column, table } = *blk;
     let mut images_out: Vec<(PathBuf, f32, f32, Pt, Pt)> = Vec::new();
     if b.kind == BlockKind::Rule {
         y += theme.base * 0.6;
@@ -626,6 +645,9 @@ fn layout_block(font: &mut FontEngine, ctx: &Ctx<'_>, blk: &Blk<'_>, ops: &mut V
             color: ColorRole::Muted,
         });
         return y + theme.base * 0.6;
+    }
+    if let Some(t) = blk.table {
+        return layout_table(font, theme, styles, t, left, column, ops, y, k);
     }
     if text.trim().is_empty() {
         return y;
@@ -895,6 +917,181 @@ impl View {
 }
 
 /// Intern a style for an inline object, which has no font properties at all.
+/// Lay out a grid.
+///
+/// Columns size to their widest cell, which is what makes a short table look
+/// deliberate rather than striped; the grid only gets squeezed when it genuinely
+/// will not fit the measure, and then it is squeezed in proportion to how far each
+/// column is above a floor that can still hold a short word. Cell heights are
+/// measured from the wrapped result, never assumed, so a cell that wraps to four
+/// lines grows its row instead of overwriting the row below it.
+fn layout_table(
+    font: &mut FontEngine,
+    theme: &Theme,
+    styles: &[AppStyle],
+    t: &PreparedTable,
+    left: Pt,
+    column: Pt,
+    ops: &mut Vec<Op>,
+    mut y: Pt,
+    k: f32,
+) -> Pt {
+    let size = theme.base;
+    let spacing = Spacing::for_size(size);
+    let leading = theme.body_leading.for_mixed(true);
+    let pad = size * CELL_PAD_EM;
+    let cols = t.head.len().max(t.rows.iter().map(|r| r.len()).max().unwrap_or(0));
+    if cols == 0 {
+        return y;
+    }
+
+    /// The style a cell's text should be measured at when it carries no spans.
+    fn base_of(c: &PreparedCell) -> StyleId {
+        c.spans.first().map_or(StyleId(0), |s| s.style)
+    }
+
+    /// Set a cell inside `inner` points of width.
+    fn set_cell(
+        font: &mut FontEngine,
+        c: &PreparedCell,
+        spacing: &Spacing,
+        inner: Pt,
+    ) -> (rubrica_type::Paragraph, rubrica_type::Plan) {
+        let mut opts = BreakOptions::new(inner);
+        // A cell is never justified: stretching a short label to fill a wide column
+        // would tear its words apart.
+        opts.ragged = true;
+        typeset(&c.text, spacing, base_of(c), &c.spans, &opts, font)
+    }
+
+    let inner_of = |w: Pt| (w - pad * 2.0).max(size * 1.5);
+
+    // Pass 1: natural width of each column, measured with no break opportunities.
+    let mut widths = vec![0.0f32; cols];
+    let mut measure = |widths: &mut Vec<f32>, cells: &[PreparedCell]| {
+        for (i, c) in cells.iter().enumerate().take(cols) {
+            let (para, _) = typeset(
+                &c.text,
+                &spacing,
+                base_of(c),
+                &c.spans,
+                &BreakOptions::new(Pt::MAX / 4.0),
+                font,
+            );
+            let w: Pt = para
+                .items
+                .iter()
+                .map(|it| match *it {
+                    Item::Box { node } => para.node(node).advance,
+                    Item::Glue { base, .. } => base,
+                    Item::Penalty { width, .. } => width,
+                })
+                .sum::<Pt>()
+                + pad * 2.0;
+            widths[i] = widths[i].max(w);
+        }
+    };
+    measure(&mut widths, &t.head);
+    for r in &t.rows {
+        measure(&mut widths, r);
+    }
+
+    let mut total: Pt = widths.iter().sum();
+    if total > column {
+        let floor = size * CELL_MIN_EM + pad * 2.0;
+        let excess: Pt = widths.iter().map(|w| (w - floor).max(0.0)).sum();
+        if excess > 0.0 {
+            let take = (total - column).min(excess);
+            for w in widths.iter_mut() {
+                let e = (*w - floor).max(0.0);
+                *w -= take * (e / excess);
+            }
+            total = widths.iter().sum();
+        }
+    }
+
+    let mut paint_row = |cells: &[PreparedCell], top: Pt, ops: &mut Vec<Op>| -> Pt {
+        // Measure every cell first: the row is as tall as its tallest cell.
+        let mut heights = vec![0.0f32; cols];
+        for (i, c) in cells.iter().enumerate().take(cols) {
+            let (_, plan) = set_cell(font, c, &spacing, inner_of(widths[i]));
+            heights[i] = plan.lines.len().max(1) as Pt * size * leading;
+        }
+        let row_h = heights.iter().copied().fold(pad, f32::max) + pad;
+
+        let mut x = left;
+        for (i, c) in cells.iter().enumerate().take(cols) {
+            let inner = inner_of(widths[i]);
+            let (para, plan) = set_cell(font, c, &spacing, inner);
+            let mut ly = top + pad * 0.5;
+            for line in &plan.lines {
+                let placed = place(&para, line);
+                let w = placed.last().map(|p| p.x + p.w).unwrap_or(0.0);
+                let shift = match c.align {
+                    Align::Left => 0.0,
+                    Align::Center => (inner - w) * 0.5,
+                    Align::Right => (inner - w).max(0.0),
+                };
+                let mut runs: Vec<PaintRun> = Vec::new();
+                let mut ascent = 0.0f32;
+                for slot in placed {
+                    let Some(node_id) = slot.node else { continue };
+                    let node = para.node(node_id);
+                    let st = &styles[node.style.0 as usize];
+                    for r in font.shape_runs(&c.text, node.text.clone(), &st.face, st.size, st.tracking) {
+                        ascent = ascent.max(r.ascent);
+                        let Some(face) = font.font_face(r.face) else { continue };
+                        runs.push(PaintRun {
+                            family: font.face_family(r.face),
+                            face,
+                            em: r.size * k,
+                            glyphs: r.glyphs,
+                            advances: r.advances.iter().map(|a| a * k).collect(),
+                            offsets: r.offsets,
+                            x: (x + pad + shift + slot.x) * k,
+                            baseline: 0.0,
+                            color: st.color,
+                        });
+                    }
+                }
+                for run in runs.iter_mut() {
+                    run.baseline = (ly + ascent) * k;
+                }
+                if !runs.is_empty() {
+                    ops.push(Op::Runs(runs));
+                }
+                ly += size * leading;
+            }
+            x += widths[i];
+        }
+        row_h
+    };
+
+    let grid_w = total.min(column);
+    ops.push(Op::Rect { x: left * k, y: y * k, w: grid_w * k, h: 0.0, color: ColorRole::Surface });
+    let panel = ops.len() - 1;
+
+    let head_h = paint_row(&t.head, y, ops);
+    y += head_h;
+    ops.push(Op::Line {
+        x0: left * k,
+        y0: y * k,
+        x1: (left + grid_w) * k,
+        y1: y * k,
+        thickness: size * 0.05 * k,
+        color: ColorRole::Muted,
+    });
+    for r in &t.rows {
+        y += paint_row(r, y, ops);
+    }
+    // The header panel is drawn before its text, so its height can only be filled
+    // in once the first row has been measured.
+    if let Some(Op::Rect { h, .. }) = ops.get_mut(panel) {
+        *h = head_h * k;
+    }
+    y
+}
+
 fn intern_object(styles: &mut Vec<AppStyle>, path: PathBuf, object: ObjectBox) -> StyleId {
     let app = AppStyle {
         face: FaceRequest {
@@ -980,7 +1177,7 @@ pub fn build_ops(
 
     // Interning has to finish before measuring, because the engine resolves a
     // StyleId through the installed table.
-    let mut prepared: Vec<(String, Vec<StyleSpan>, usize)> = Vec::new();
+    let mut prepared: Vec<(String, Vec<StyleSpan>, usize, Option<PreparedTable>)> = Vec::new();
     for b in &doc.blocks {
         let marker = marker_for(b);
         let shift = marker.len();
@@ -1040,7 +1237,32 @@ pub fn build_ops(
             };
             spans.push(StyleSpan { range: s.range.start + shift..s.range.end + shift, style: id });
         }
-        prepared.push((text, spans, base.0 as usize));
+        let table = b.table.as_ref().map(|t| {
+            let mut prep = |cells: &[rubrica_doc::Cell]| -> Vec<PreparedCell> {
+                cells
+                    .iter()
+                    .enumerate()
+                    .map(|(i, c)| PreparedCell {
+                        text: c.text.clone(),
+                        spans: c
+                            .spans
+                            .iter()
+                            .map(|sp| StyleSpan {
+                                range: sp.range.clone(),
+                                style: intern(
+                                    &mut styles,
+                                    &theme.fonts.fallback,
+                                    theme.resolve(b.kind, sp.style),
+                                ),
+                            })
+                            .collect(),
+                        align: t.aligns.get(i).copied().unwrap_or_default(),
+                    })
+                    .collect()
+            };
+            PreparedTable { head: prep(&t.head), rows: t.rows.iter().map(|r| prep(r)).collect() }
+        });
+        prepared.push((text, spans, base.0 as usize, table));
     }
 
     font.begin_layout(
@@ -1050,7 +1272,7 @@ pub fn build_ops(
             .collect(),
     );
 
-    for (b, (text, spans, base)) in doc.blocks.iter().zip(prepared) {
+    for (b, (text, spans, base, table)) in doc.blocks.iter().zip(prepared) {
         let base_left = left;
         let size = theme.body_size(b.kind);
         y += theme.space_before(b.kind, first);
@@ -1073,6 +1295,7 @@ pub fn build_ops(
                 base,
                 left: body_left,
                 column: column - (body_left - left),
+                table: table.as_ref(),
             },
             &mut ops,
             y,
