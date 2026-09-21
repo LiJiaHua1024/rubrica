@@ -37,15 +37,22 @@ use windows::Win32::System::Registry::{RRF_RT_DWORD, RegGetValueW, HKEY_CURRENT_
 use windows::Win32::UI::HiDpi::{
     DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2, GetDpiForWindow, SetProcessDpiAwarenessContext,
 };
-use windows::Win32::UI::Input::KeyboardAndMouse::VK_UP;
+use windows::Win32::UI::Input::KeyboardAndMouse::{
+    GetKeyState, ReleaseCapture, SetCapture, VK_CONTROL, VK_O, VK_UP,
+};
 use windows::Win32::UI::Input::KeyboardAndMouse::{VK_DOWN, VK_ESCAPE, VK_NEXT, VK_PRIOR};
+use windows::Win32::UI::Controls::Dialogs::{
+    GetOpenFileNameW, OPENFILENAMEW, OFN_FILEMUSTEXIST, OFN_HIDEREADONLY, OFN_PATHMUSTEXIST,
+};
+use windows::Win32::UI::Shell::{DragAcceptFiles, DragFinish, DragQueryFileW, HDROP};
 use windows::Win32::UI::WindowsAndMessaging::{
     CS_HREDRAW, CS_VREDRAW, CREATESTRUCTW, CreateWindowExW, DefWindowProcW, DispatchMessageW,
     GWLP_USERDATA, GetClientRect, GetWindowLongPtrW, GetMessageW, HWND_TOP, IDC_ARROW, KillTimer,
     LoadCursorW, MSG, PostQuitMessage, RegisterClassExW, SW_SHOWNORMAL, SetTimer,
     SetWindowLongPtrW, SetWindowPos, ShowWindow, TranslateMessage, WNDCLASSEXW, WM_DESTROY,
     WM_DPICHANGED, WM_ERASEBKGND, WM_KEYDOWN, WM_MOUSEWHEEL, WM_NCCREATE, WM_PAINT, WM_SIZE,
-    WM_TIMER, WS_EX_APPWINDOW, WS_OVERLAPPEDWINDOW, SWP_NOACTIVATE, SWP_NOZORDER,
+    WM_TIMER, WS_EX_APPWINDOW, WS_OVERLAPPEDWINDOW, SWP_NOACTIVATE, SWP_NOZORDER, WM_DROPFILES,
+    WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEMOVE,
 };
 use windows_numerics::Vector2;
 
@@ -170,6 +177,27 @@ pub struct View {
     client_h: f32,
     dpi: f32,
     path: Option<PathBuf>,
+    /// Set while the pointer is dragging the scroll thumb.
+    dragging: bool,
+}
+
+/// Thumb geometry, in device independent pixels, or `None` when the document fits.
+///
+/// Kept free of `View` so the arithmetic -- thumb height as the viewport fraction,
+/// and the scroll-to-position mapping that must stay consistent with it -- can be
+/// tested without a render target or a window.
+fn thumb_rect(content_h: Pt, client_w: f32, client_h: f32, scroll: Pt, dpi: f32) -> Option<(f32, f32, f32, f32)> {
+    let k = scale_of(dpi);
+    let doc = content_h * k;
+    if doc <= client_h + 1.0 {
+        return None;
+    }
+    let track = 10.0;
+    let x = client_w - track - 3.0;
+    let h = (client_h * client_h / doc).max(28.0);
+    let max_scroll = (content_h - client_h / k).max(0.0);
+    let frac = if max_scroll > 0.0 { (scroll / max_scroll).clamp(0.0, 1.0) } else { 0.0 };
+    Some((x, frac * (client_h - h).max(0.0), track, h))
 }
 
 /// Points to device independent pixels at the target's DPI.
@@ -208,6 +236,7 @@ pub fn run(source: String, path: Option<PathBuf>) -> Result<()> {
         client_h: 1.0,
         dpi: 96.0,
         path,
+        dragging: false,
     });
 
     const CLASS: &str = "Rubrica.Main";
@@ -350,6 +379,7 @@ impl View {
             }
             Err(e) => eprintln!("render target: {e}"),
         }
+        DragAcceptFiles(hwnd, true);
         self.apply_dark_titlebar(hwnd);
         self.relayout();
     }
@@ -451,8 +481,13 @@ impl View {
                     k if k == VK_DOWN.0 as u32 => self.scroll_by(step),
                     k if k == VK_PRIOR.0 as u32 => self.scroll_by(-page),
                     k if k == VK_NEXT.0 as u32 => self.scroll_by(page),
-                    k if k == VK_ESCAPE.0 as u32 => {
-                        PostQuitMessage(0);
+                    k if k == VK_ESCAPE.0 as u32 => PostQuitMessage(0),
+                    k if k == VK_O.0 as u32
+                        && (GetKeyState(VK_CONTROL.0 as i32) as u16 & 0x8000) != 0 =>
+                    {
+                        if let Some(path) = self.prompt_for_file(hwnd) {
+                            self.load_document(&path);
+                        }
                     }
                     _ => {}
                 }
@@ -468,6 +503,40 @@ impl View {
                     self.relayout();
                 }
                 let _ = InvalidateRect(Some(hwnd), None, false);
+                LRESULT(0)
+            }
+            WM_DROPFILES => {
+                self.open_from_drop(hwnd, wp.0);
+                LRESULT(0)
+            }
+            WM_LBUTTONDOWN => {
+                // A press inside the thumb starts a drag; anywhere else pages down.
+                let x = ((lp.0 & 0xFFFF) as i16) as f32;
+                let y = ((lp.0 >> 16) as i16) as f32;
+                if self.thumb_hit(x, y) {
+                    self.dragging = true;
+                    self.scroll_to_thumb(y);
+                } else if y > self.client_h * 0.5 {
+                    self.scroll_by(self.page());
+                } else {
+                    self.scroll_by(-self.page());
+                }
+                let _ = SetCapture(hwnd);
+                let _ = InvalidateRect(Some(hwnd), None, false);
+                LRESULT(0)
+            }
+            WM_MOUSEMOVE => {
+                if self.dragging {
+                    self.scroll_to_thumb(((lp.0 >> 16) as i16) as f32);
+                    let _ = InvalidateRect(Some(hwnd), None, false);
+                }
+                LRESULT(0)
+            }
+            WM_LBUTTONUP => {
+                if self.dragging {
+                    self.dragging = false;
+                    let _ = ReleaseCapture();
+                }
                 LRESULT(0)
             }
             WM_PAINT => {
@@ -615,6 +684,81 @@ fn layout_block(font: &mut FontEngine, ctx: &Ctx<'_>, blk: &Blk<'_>, ops: &mut V
 }
 
 impl View {
+    /// Client-space height of one text page, in points.
+    fn page(&self) -> Pt {
+        self.client_h / scale_of(self.dpi) * 0.85
+    }
+
+    fn thumb_rect(&self) -> Option<(f32, f32, f32, f32)> {
+        thumb_rect(self.content_h, self.client_w, self.client_h, self.scroll, self.dpi)
+    }
+
+    fn thumb_hit(&self, x: f32, y: f32) -> bool {
+        match self.thumb_rect() {
+            Some((tx, ty, _tw, th)) => x >= tx - 8.0 && y >= ty - 8.0 && y <= ty + th + 8.0,
+            None => false,
+        }
+    }
+
+    fn scroll_to_thumb(&mut self, pointer_y: f32) {
+        let Some((_, _, _, th)) = self.thumb_rect() else { return };
+        let view = self.client_h;
+        let max_scroll = (self.content_h - view / scale_of(self.dpi)).max(0.0);
+        let room = (view - th).max(1.0);
+        let centre = (pointer_y - th * 0.5).clamp(0.0, room);
+        self.scroll = centre / room * max_scroll;
+    }
+
+    /// Open the first dropped file; a reader shows one document at a time.
+    unsafe fn open_from_drop(&mut self, hwnd: HWND, hdrop: usize) {
+        let h = HDROP(hdrop as *mut _);
+        if DragQueryFileW(h, u32::MAX, None) < 1 {
+            DragFinish(h);
+            return;
+        }
+        let mut buf = [0u16; 1024];
+        let written = DragQueryFileW(h, 0, Some(&mut buf)) as usize;
+        DragFinish(h);
+        let path = String::from_utf16_lossy(&buf[..written]);
+        let path = path.trim_end_matches(char::from(0)).to_string();
+        self.load_document(std::path::Path::new(&path));
+        let _ = InvalidateRect(Some(hwnd), None, false);
+    }
+
+    /// Replace the open document, resetting the view to its top.
+    fn load_document(&mut self, path: &std::path::Path) {
+        match std::fs::read_to_string(path) {
+            Ok(src) => {
+                self.doc = rubrica_doc::Document::parse(&src);
+                self.path = Some(path.to_path_buf());
+                self.scroll = 0.0;
+                self.relayout();
+            }
+            Err(e) => eprintln!("cannot open {}: {e}", path.display()),
+        }
+    }
+
+    /// The common dialog. Returns the chosen path, if the user did not cancel.
+    unsafe fn prompt_for_file(&self, hwnd: HWND) -> Option<PathBuf> {
+        let mut buf = [0u16; 1024];
+        let filter = utf16("Markdown\0*.md;*.markdown;*.txt\0All files\0*.*\0\0");
+        let mut ofn = OPENFILENAMEW {
+            lStructSize: std::mem::size_of::<OPENFILENAMEW>() as u32,
+            hwndOwner: hwnd,
+            lpstrFilter: PCWSTR(filter.as_ptr()),
+            lpstrFile: windows::core::PWSTR(buf.as_mut_ptr()),
+            nMaxFile: buf.len() as u32,
+            Flags: OFN_FILEMUSTEXIST | OFN_HIDEREADONLY | OFN_PATHMUSTEXIST,
+            ..Default::default()
+        };
+        if GetOpenFileNameW(&mut ofn).as_bool() {
+            let end = buf.iter().position(|&c| c == 0).unwrap_or(buf.len());
+            Some(PathBuf::from(String::from_utf16_lossy(&buf[..end])))
+        } else {
+            None
+        }
+    }
+
     fn paint(&mut self) {
         let Some(target) = self.target.clone() else { return };
         unsafe {
@@ -805,4 +949,52 @@ pub fn build_ops(
     }
 
 (ops, y + theme.base * 2.0, column, left)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const DPI: f32 = 96.0;
+
+    #[test]
+    fn no_thumb_when_the_document_fits() {
+        // 800 DIP of viewport at 96 dpi is 600pt of page.
+        assert!(thumb_rect(500.0, 1000.0, 800.0, 0.0, DPI).is_none());
+        assert!(thumb_rect(600.0, 1000.0, 800.0, 0.0, DPI).is_none());
+    }
+
+    #[test]
+    fn thumb_height_is_the_viewport_fraction_of_the_document() {
+        let (_, _, _, h) = thumb_rect(2400.0, 1000.0, 800.0, 0.0, DPI).unwrap();
+        // doc = 2400pt * 1.3333 = 3200dip; 800*800/3200 = 200
+        assert!((h - 200.0).abs() < 0.5, "thumb {h}");
+    }
+
+    #[test]
+    fn thumb_travel_maps_onto_the_scrollable_range() {
+        let content = 2400.0;
+        let view = 800.0;
+        let (_, y0, _, h) = thumb_rect(content, 1000.0, view, 0.0, DPI).unwrap();
+        assert!(y0.abs() < 0.01, "at the top the thumb must sit at 0, got {y0}");
+        let max_scroll = content - view / scale_of(DPI);
+        let (_, y_end, _, _) = thumb_rect(content, 1000.0, view, max_scroll, DPI).unwrap();
+        assert!((y_end - (view - h)).abs() < 0.5, "at the bottom the thumb must reach the track end: {y_end} vs {}", view - h);
+        // Midway in the scroll range is midway along the track.
+        let (_, y_mid, _, _) = thumb_rect(content, 1000.0, view, max_scroll * 0.5, DPI).unwrap();
+        assert!((y_mid - (view - h) * 0.5).abs() < 1.0, "mid scroll -> {y_mid}");
+    }
+
+    #[test]
+    fn thumb_stays_inside_the_client_width() {
+        let (x, _, track, _) = thumb_rect(2400.0, 400.0, 800.0, 0.0, DPI).unwrap();
+        assert!(x + track <= 400.0, "thumb overhangs the window: {x}+{track}");
+        assert!(x > 0.0);
+    }
+
+    #[test]
+    fn scrolling_past_the_end_clamps_instead_of_leaving_the_track() {
+        let (_, y_over, _, h) = thumb_rect(2400.0, 1000.0, 800.0, 99_000.0, DPI).unwrap();
+        assert!(y_over + h <= 800.0 + 0.5, "thumb left the viewport: {y_over}+{h}");
+    }
 }
