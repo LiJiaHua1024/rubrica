@@ -23,10 +23,11 @@ pub fn typeset(
     text: &str,
     spacing: &Spacing,
     style: StyleId,
+    spans: &[paragraph::StyleSpan],
     opts: &BreakOptions,
     measure: &mut dyn paragraph::Measure,
 ) -> (Paragraph, Plan) {
-    let para = paragraph::paragraph_from_text(text, spacing, style, measure);
+    let para = paragraph::paragraph_from_text(text, spacing, style, spans, measure);
     let plan = breaking::break_paragraph(&para, opts);
     (para, plan)
 }

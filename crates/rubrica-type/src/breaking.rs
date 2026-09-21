@@ -33,6 +33,10 @@ pub struct BreakOptions {
     pub lousy_demerits: i32,
     pub awful_demerits: i32,
     pub nasty_demerits: i32,
+    /// Set the whole block ragged-right instead of justified. Headings and code
+    /// must never be stretched to the measure -- doing so is a typographic error --
+    /// and over at TeX this is `\raggedright`'s infinite `\rightskip`.
+    pub ragged: bool,
 }
 
 impl BreakOptions {
@@ -49,6 +53,7 @@ impl BreakOptions {
             lousy_demerits: 100,
             awful_demerits: 1000,
             nasty_demerits: 1000,
+            ragged: false,
         }
     }
 }
@@ -69,13 +74,16 @@ pub struct Line {
     pub forced: bool,
     /// First line of the paragraph, which was indented.
     pub first: bool,
+    /// The block opted out of justification entirely.
+    pub ragged: bool,
 }
 
 impl Line {
-    /// The final line carries `\parfillskip`'s infinite stretch and stays ragged.
+    /// The final line carries `\parfillskip`'s infinite stretch and stays ragged,
+    /// as does every line of an explicitly ragged block.
     #[inline]
     pub fn is_ragged(&self) -> bool {
-        self.stretch >= INFINITY / 2.0
+        self.ragged || self.stretch >= INFINITY / 2.0
     }
 }
 
@@ -208,8 +216,9 @@ fn score(
 
     // Overfull (shrink-starved) lines are legal but cost enormously -- that is how
     // TeX reports them instead of dropping text. Underfull ones beyond tolerance
-    // are simply not allowed.
-    if delta > 0.0 && bad > tolerance {
+    // are simply not allowed, except in a ragged block, where leftover space is
+    // free and the widest-edge-wins tie-break fills lines greedily.
+    if delta > 0.0 && bad > tolerance && !(opts.ragged && bad < 10000) {
         return None;
     }
     let fit = fitness(ratio);
@@ -438,6 +447,7 @@ fn solve(
             fitness: ed.fitness,
             forced: matches!(items[ed.item], Item::Penalty { forced: true, .. }),
             first: n == 0 && first_line,
+            ragged: opts.ragged,
         });
     }
     Some((lines, total))
@@ -508,6 +518,7 @@ fn desperate(
             fitness: 3,
             forced: matches!(items[b], Item::Penalty { forced: true, .. }),
             first: first_line && out.is_empty(),
+            ragged: true,
         });
         if b >= end {
             break;

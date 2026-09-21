@@ -147,6 +147,40 @@ pub struct BuildOptions<'a> {
     /// Style for a given text range. Only consulted for segmentation-relevant
     /// decisions here; the renderer re-derives runs from these ids.
     pub style_of: StyleId,
+    /// Inline style ranges, byte offsets into the same string as `text`.
+    ///
+    /// Segments are cut at these boundaries as well as at UAX #14 opportunities, so
+    /// the invariant "one node, one style" holds and both measurement and painting
+    /// can treat a node as atomic.
+    pub spans: &'a [StyleSpan],
+}
+
+/// A run of source carrying one style.
+#[derive(Clone, Debug)]
+pub struct StyleSpan {
+    pub range: Range<usize>,
+    pub style: StyleId,
+}
+
+impl StyleSpan {
+    /// Resolve the style covering `at`, falling back to `default`.
+    pub fn resolve(spans: &[StyleSpan], at: usize, default: StyleId) -> StyleId {
+        // Sorted by start; find the last span that begins at or before `at`.
+        let i = match spans.binary_search_by(|s| s.range.start.cmp(&at)) {
+            Ok(i) => i,
+            Err(0) => return default,
+            Err(i) => i - 1,
+        };
+        let s = &spans[i];
+        if at < s.range.end {
+            s.style
+        } else {
+            spans[i + 1..]
+                .iter()
+                .find(|s| s.range.contains(&at))
+                .map_or(default, |s| s.style)
+        }
+    }
 }
 
 /// Segment `text` into nodes and interleave glue.
@@ -167,6 +201,24 @@ pub fn build(
             cuts.push((at, required));
         }
     }
+    // Style changes are breaks too, so a node never straddles two styles.
+    for s in opts.spans {
+        for &at in [&s.range.start, &s.range.end] {
+            if at > 0 && at < text.len() {
+                cuts.push((at, false));
+            }
+        }
+    }
+    cuts.sort_by_key(|&(at, _)| at);
+    // Merging duplicates must not lose a mandatory flag hiding behind a style cut.
+    cuts.dedup_by(|a, b| {
+        if a.0 == b.0 {
+            b.1 |= a.1;
+            true
+        } else {
+            false
+        }
+    });
     cuts.push((text.len(), false));
 
     let mut segments: Vec<Range<usize>> = Vec::with_capacity(cuts.len());
@@ -203,13 +255,14 @@ pub fn build(
         if !core.is_empty() {
             let range = seg.start + lead..seg.start + lead + core.len();
             let role = Role::of(core.chars().next().unwrap());
+            let style = StyleSpan::resolve(opts.spans, range.start, opts.style_of);
             if let Some(prev) = prev_role {
                 let recipe = glue_recipe_for(prev, role, opts.spacing);
                 p.items.push(Item::glue(recipe));
             }
-            let advance = measure.advance(text, range.clone(), opts.style_of);
+            let advance = measure.advance(text, range.clone(), style);
             let id = p.nodes.len() as u32;
-            p.nodes.push(Node { text: range, style: opts.style_of, advance, role });
+            p.nodes.push(Node { text: range, style, advance, role });
             p.items.push(Item::Box { node: id });
             prev_role = Some(role);
         }
@@ -258,6 +311,7 @@ pub fn paragraph_from_text(
     text: &str,
     spacing: &Spacing,
     style: StyleId,
+    spans: &[StyleSpan],
     measure: &mut dyn Measure,
 ) -> Paragraph {
     use unicode_linebreak::BreakOpportunity;
@@ -267,7 +321,7 @@ pub fn paragraph_from_text(
     build(
         text,
         &breaks,
-        &BuildOptions { spacing, style_of: style },
+        &BuildOptions { spacing, style_of: style, spans },
         measure,
     )
 }

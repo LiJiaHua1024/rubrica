@@ -1,0 +1,143 @@
+use rubrica_doc::{BlockKind, Document, InlineStyle};
+
+fn kinds(src: &str) -> Vec<BlockKind> {
+    Document::parse(src).blocks.iter().map(|b| b.kind).collect()
+}
+
+#[test]
+fn headings_paragraphs_and_code_keep_their_order_and_identity() {
+    let src = "# Title\n\nA paragraph.\n\n```rust\nfn main() {}\n```\n\n## Second\n";
+    let doc = Document::parse(src);
+    assert_eq!(
+        kinds(src),
+        vec![
+            BlockKind::Heading(1),
+            BlockKind::Paragraph,
+            BlockKind::Code,
+            BlockKind::Heading(2),
+        ]
+    );
+    assert_eq!(doc.blocks[0].text, "Title");
+    assert_eq!(doc.blocks[2].text, "fn main() {}");
+    assert!(doc.blocks[2].ragged(), "code must never be justified");
+    assert!(doc.blocks[0].ragged(), "a heading must never be justified");
+    assert!(!doc.blocks[1].ragged());
+}
+
+#[test]
+fn a_soft_break_continues_the_paragraph_rather_than_breaking_the_line() {
+    // The whole point of owning Block::text: slicing the source verbatim would
+    // hand the engine a newline per wrapped line and every paragraph would set
+    // ragged on its own column widths.
+    let src = "first line of prose\nsecond line of prose\n\nnew paragraph\n";
+    let doc = Document::parse(src);
+    assert_eq!(doc.blocks.len(), 2);
+    assert_eq!(doc.blocks[0].text, "first line of prose second line of prose");
+    assert!(!doc.blocks[0].text.contains('\n'));
+}
+
+#[test]
+fn a_hard_break_survives_as_a_forced_line_break() {
+    let doc = Document::parse("two lines\\\nclose together\n");
+    assert_eq!(doc.blocks[0].text, "two lines\nclose together");
+}
+
+#[test]
+fn inline_styles_become_spans_over_the_block_text() {
+    let src = "plain **bold** *it* `code` ~~gone~~ [link](https://example.com)";
+    let doc = Document::parse(src);
+    let b = &doc.blocks[0];
+    assert_eq!(b.text, "plain bold it code gone link");
+    let named: Vec<(&str, InlineStyle)> = b
+        .spans
+        .iter()
+        .map(|s| (&b.text[s.range.clone()], s.style))
+        .collect();
+    // pulldown hands back a word together with its trailing space, so compare the
+    // trimmed content: the space riding inside a span is harmless, because the
+    // layout engine peels whitespace off a node before resolving its style.
+    let has = |w: &str, f: InlineStyle| {
+        named.iter().any(|(t, s)| t.trim() == w && s.contains(f))
+    };
+    assert!(has("bold", InlineStyle::STRONG), "{named:?}");
+    assert!(has("it", InlineStyle::EMPHASIS), "{named:?}");
+    assert!(has("code", InlineStyle::CODE), "{named:?}");
+    assert!(has("gone", InlineStyle::STRIKETHROUGH), "{named:?}");
+    assert!(has("link", InlineStyle::LINK), "{named:?}");
+    assert!(has("plain", InlineStyle::EMPTY), "{named:?}");
+    // Spans must tile the text with no gaps, or a glyph goes unpainted.
+    let mut cursor = 0usize;
+    for s in &b.spans {
+        assert_eq!(s.range.start, cursor, "gap before {:?}", &b.text[s.range.clone()]);
+        cursor = s.range.end;
+    }
+    assert_eq!(cursor, b.text.len(), "text after the last span");
+}
+
+#[test]
+fn emphasis_nesting_combines_both_flags() {
+    let doc = Document::parse("_a **b** c_\n");
+    let b = &doc.blocks[0];
+    let bold = b.spans.iter().find(|s| b.text[s.range.clone()].trim() == "b").unwrap();
+    assert!(bold.style.contains(InlineStyle::STRONG | InlineStyle::EMPHASIS));
+    let plain = b.spans.iter().find(|s| b.text[s.range.clone()].trim() == "a").unwrap();
+    assert!(plain.style.contains(InlineStyle::EMPHASIS));
+    assert!(!plain.style.contains(InlineStyle::STRONG));
+}
+
+#[test]
+fn list_items_carry_markers_and_nesting_depth() {
+    // The nested bullet must sit *inside* an item: two spaces of indent after a
+    // blank line is a new top-level list to CommonMark, not a child.
+    let src = "- one\n  - nested\n- two\n\n1. first\n2. second\n";
+    let doc = Document::parse(src);
+    let items: Vec<_> = doc.blocks.iter().filter_map(|b| b.list).collect();
+    assert_eq!(items.len(), 5, "{items:?}");
+    assert_eq!(items[0].index, None, "bullet");
+    assert!(!items[0].ordered);
+    assert_eq!(items[1].depth, 1, "nested list must be one deeper, got {items:?}");
+    assert_eq!(items[3].index, Some(1));
+    assert_eq!(items[4].index, Some(2));
+    assert!(items[4].ordered);
+}
+
+#[test]
+fn task_list_items_record_their_checked_state() {
+    let doc = Document::parse("- [x] done\n- [ ] todo\n");
+    assert_eq!(doc.blocks[0].task, Some(true));
+    assert_eq!(doc.blocks[1].task, Some(false));
+}
+
+#[test]
+fn block_quote_depth_is_recorded_per_block() {
+    let src = "> quoted\n>\n> > deeper\n";
+    let doc = Document::parse(src);
+    assert_eq!(doc.blocks[0].quote_depth, 1);
+    assert_eq!(doc.blocks[1].quote_depth, 2);
+}
+
+#[test]
+fn thematic_breaks_become_rule_blocks() {
+    let doc = Document::parse("above\n\n---\n\nbelow\n");
+    assert_eq!(kinds("above\n\n---\n\nbelow\n"), vec![
+        BlockKind::Paragraph,
+        BlockKind::Rule,
+        BlockKind::Paragraph
+    ]);
+    assert!(doc.blocks[1].text.is_empty());
+}
+
+#[test]
+fn mixed_cjk_and_latin_survives_the_parser() {
+    let doc = Document::parse("使用Rust实现**排版**引擎\n");
+    let b = &doc.blocks[0];
+    assert_eq!(b.text, "使用Rust实现排版引擎");
+    assert!(b.spans.iter().any(|s| s.style.contains(InlineStyle::STRONG)));
+}
+
+#[test]
+fn empty_and_whitespace_only_input_produce_nothing() {
+    assert!(Document::parse("").blocks.is_empty());
+    assert!(Document::parse("\n\n   \n").blocks.is_empty());
+    assert!(Document::parse("<!-- only a comment -->\n").blocks.is_empty());
+}

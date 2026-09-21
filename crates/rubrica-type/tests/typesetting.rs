@@ -6,7 +6,7 @@
 use rubrica_type::breaking::BreakOptions;
 use rubrica_type::classify::Role;
 use rubrica_type::justification::{line_width, place};
-use rubrica_type::paragraph::{Item, MonospaceMeasure, Spacing, StyleId};
+use rubrica_type::paragraph::{Item, MonospaceMeasure, Spacing, StyleId, StyleSpan};
 use rubrica_type::units::Pt;
 use rubrica_type::{Paragraph, Plan, typeset};
 
@@ -26,7 +26,7 @@ fn set_indent(text: &str, column: Pt, indent: Pt) -> (Paragraph, Plan) {
     let mut measure = MonospaceMeasure { size: SIZE, factor: 0.5 };
     let mut opts = BreakOptions::new(column);
     opts.par_indent = indent;
-    typeset(text, &spacing, StyleId(0), &opts, &mut measure)
+    typeset(text, &spacing, StyleId(0), &[], &opts, &mut measure)
 }
 
 fn text_of(para: &Paragraph, src: &str, line: &rubrica_type::Line) -> String {
@@ -156,7 +156,7 @@ fn mixed_script_joins_get_the_quarter_em_glue() {
     // which is the case that actually distinguishes CJK-aware typesetting.
     let text = "使用Rust实现";
     let mut measure = MonospaceMeasure { size: SIZE, factor: 0.5 };
-    let (para, _) = typeset(text, &spacing, StyleId(0), &BreakOptions::new(500.0), &mut measure);
+    let (para, _) = typeset(text, &spacing, StyleId(0), &[], &BreakOptions::new(500.0), &mut measure);
 
     let near = |a: Pt, b: Pt| (a - b).abs() < 0.01;
     let mixed = para
@@ -185,7 +185,7 @@ fn ideograph_join_glue_is_compressible() {
     assert!(spacing.cjk_join.shrink > 0.0);
     let text = "中文中文中文";
     let mut measure = MonospaceMeasure { size: SIZE, factor: 0.5 };
-    let (para, _) = typeset(text, &spacing, StyleId(0), &BreakOptions::new(500.0), &mut measure);
+    let (para, _) = typeset(text, &spacing, StyleId(0), &[], &BreakOptions::new(500.0), &mut measure);
     let joins = para
         .items
         .iter()
@@ -258,6 +258,59 @@ fn breaking_is_deterministic() {
     for (x, y) in a.lines.iter().zip(&b.lines) {
         assert_eq!(x.items, y.items);
     }
+}
+
+#[test]
+fn a_node_never_straddles_two_styles() {
+    // Segments must be cut at style boundaries as well as at line-break
+    // opportunities, or the renderer cannot paint a node with one font.
+    let text = "plain **loud** tail";
+    let loud = text.find("loud").unwrap();
+    let tail = text.find("tail").unwrap();
+    let spans = vec![
+        StyleSpan { range: loud..loud + 4, style: StyleId(1) },
+        StyleSpan { range: tail..tail + 4, style: StyleId(2) },
+    ];
+    let spacing = Spacing::for_size(SIZE);
+    let mut measure = MonospaceMeasure { size: SIZE, factor: 0.5 };
+    let (para, _) = typeset(text, &spacing, StyleId(0), &spans, &BreakOptions::new(500.0), &mut measure);
+
+    let styles: Vec<u16> = para.nodes.iter().map(|n| n.style.0).collect();
+    assert!(styles.contains(&1) && styles.contains(&2) && styles.contains(&0), "{styles:?}");
+    for n in &para.nodes {
+        let covered = spans.iter().find(|s| s.range.contains(&n.text.start));
+        let want = covered.map_or(0, |s| s.style.0);
+        assert_eq!(n.style.0, want, "node {:?} has the wrong style", &text[n.text.clone()]);
+        assert!(
+            covered.is_none_or(|s| s.range.end >= n.text.end),
+            "node {:?} runs past its style span",
+            &text[n.text.clone()]
+        );
+    }
+}
+
+#[test]
+fn a_ragged_block_is_never_stretched_to_the_measure() {
+    // Headings and code must opt out of justification; stretching them is an error.
+    let text = "a heading that is quite long and would otherwise be justified across the measure";
+    let spacing = Spacing::for_size(SIZE);
+    let mut measure = MonospaceMeasure { size: SIZE, factor: 0.5 };
+    let column = 30.0 * SIZE;
+    let mut opts = BreakOptions::new(column);
+    opts.ragged = true;
+    let (para, plan) = typeset(text, &spacing, StyleId(0), &[], &opts, &mut measure);
+    assert!(plan.lines.len() >= 2, "expected the block to wrap");
+    for l in &plan.lines {
+        assert!(l.is_ragged(), "a ragged block produced a justified line");
+        let w = line_width(&place(&para, l));
+        assert!(
+            (w - l.natural).abs() < 0.5,
+            "ragged line was stretched: natural {} placed {w}",
+            l.natural
+        );
+    }
+    // Ragged fill should approximate the greedy result: lines are as full as legal.
+    assert!(plan.lines[0].natural > 0.85 * column, "ragged lines under-filled the measure");
 }
 
 #[test]

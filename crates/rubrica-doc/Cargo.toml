@@ -1,9 +1,8 @@
 [package]
-name = "rubrica-app"
+name = "rubrica-doc"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
 
 [dependencies]
-rubrica-type.workspace = true
-windows = "0.62.2"
+pulldown-cmark = "0.13.4"

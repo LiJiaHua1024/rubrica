@@ -36,7 +36,7 @@ fn main() {
     let mut measure = MonospaceMeasure { size: SIZE, factor: 0.5 };
     let mut opts = BreakOptions::new(column);
     opts.par_indent = indent;
-    let (para, plan) = typeset(text, &spacing, StyleId(0), &opts, &mut measure);
+    let (para, plan) = typeset(text, &spacing, StyleId(0), &[], &opts, &mut measure);
 
     println!(
         "measure {column:.0}pt ({ems:.1} em)  indent {indent:.0}   pass {}   demerits {:.1}",
