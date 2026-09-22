@@ -12,7 +12,7 @@
 use std::collections::BTreeMap;
 
 use crate::font::FontEngine;
-use crate::theme::Theme;
+use crate::theme::{ColorRole, Theme};
 use crate::view::build_ops;
 use crate::{Error, Result};
 
@@ -140,11 +140,11 @@ pub fn report(source: &str, path: Option<&str>, width: f32, dpi: f32, hyphenate:
         .filter(|o| matches!(o.kind, rubrica_doc::ObjectKind::Math { .. }))
         .count();
     if asked > 0 {
-        let (set, bars, mut families) = math.census();
+        let (set, bars, mut families, measured) = math.census();
         families.sort();
         families.dedup();
         println!(
-            "math         : {asked} formulae, {set} set from [{}], {bars} rules drawn",
+            "math         : {asked} formulae, {set} set from [{}], {bars} rules drawn, {measured} measured from a MATH table",
             families.join(", ")
         );
     }
@@ -171,6 +171,42 @@ pub fn report(source: &str, path: Option<&str>, width: f32, dpi: f32, hyphenate:
     if cited > 0 || defined > 0 {
         let blocks: usize = doc.footnotes.iter().map(|f| f.blocks.len()).sum();
         println!("footnotes    : {cited} cited, {defined} defined, {blocks} blocks set");
+    }
+    // Struck runs are the only faint ink a page carries, so a faint rule in the op
+    // list can only be a strike. Counted rather than trusted: a struck span that sets
+    // no rule has lost the whole point of the mark, and one that sets a rule per
+    // ideograph would be the same picture at a dozen times the ops.
+    let struck = doc
+        .blocks
+        .iter()
+        .flat_map(|b| b.spans.iter())
+        .filter(|s| s.style.contains(rubrica_doc::InlineStyle::STRIKETHROUGH))
+        .count();
+    if struck > 0 {
+        let rules: Vec<f32> = ops
+            .iter()
+            .filter_map(|op| match op {
+                crate::view::Op::Rect { color: ColorRole::Faint, h, .. } => Some(*h / k),
+                _ => None,
+            })
+            .collect();
+        let thinnest = rules.iter().cloned().fold(f32::INFINITY, f32::min);
+        println!(
+            "strike       : {struck} span(s) -> {} rule(s), thinnest {thinnest:.2}pt",
+            rules.len()
+        );
+        // Where each face on the page puts its own rule, in ems above the baseline:
+        // read from `OS/2`, so a page that says these are all the same height has a
+        // guessed number in it somewhere.
+        let heights = census
+            .keys()
+            .filter_map(|fam| {
+                let face = font.open_face(fam, 400, false)?;
+                let (pos, weight) = font.strike_rule(face, theme.base);
+                Some(format!("{fam} {:+.3}em/{:.2}pt", pos / theme.base, weight))
+            })
+            .collect::<Vec<_>>();
+        println!("  heights    : {}", heights.join(", "));
     }
     Ok(())
 }

@@ -159,6 +159,9 @@ struct AppStyle {
     object: Option<ObjectBox>,
     /// What an object style draws, once its box is known.
     source: Option<ObjectSource>,
+    /// Strike the run's own ink, per face: like `raise`, this is painting rather
+    /// than measuring, so it stays out of [`RunStyle`].
+    strike: bool,
 }
 
 /// The thing behind an object placeholder.
@@ -709,6 +712,50 @@ fn paint_run(font: &FontEngine, r: &GlyphRun, x: Pt, dy: Pt, k: f32, color: Colo
     })
 }
 
+/// A strike rule still being grown, with the style it belongs to.
+struct Rule {
+    style: StyleId,
+    x: Pt,
+    top: Pt,
+    w: Pt,
+    h: Pt,
+    color: ColorRole,
+}
+
+/// Lay down the rule grown so far, if there is one.
+fn end_rule(rule: &mut Option<Rule>, bars: &mut Vec<(Pt, Pt, Pt, Pt, ColorRole)>) {
+    if let Some(r) = rule.take() {
+        bars.push((r.x, r.top, r.w, r.h, r.color));
+    }
+}
+
+/// Start or extend the strike rule being accumulated across a line.
+///
+/// Extended by style, not by geometry: every ideograph and every word is its own
+/// node, while the glue between two of them is part of the same struck span and has
+/// to be covered too. A different style ends the run -- which is what separates an
+/// intervening unstruck word, and what gives a bilingual span one rule per face at
+/// that face's own height instead of one averaged over both.
+fn merge_rule(
+    pending: &mut Option<Rule>,
+    bars: &mut Vec<(Pt, Pt, Pt, Pt, ColorRole)>,
+    style: StyleId,
+    x: Pt,
+    w: Pt,
+    top: Pt,
+    h: Pt,
+    color: ColorRole,
+) {
+    if let Some(r) = pending.as_mut().filter(|r| r.style == style) {
+        if (r.top - top).abs() < 0.01 && (r.h - h).abs() < 0.01 {
+            r.w += w;
+            return;
+        }
+    }
+    end_rule(pending, bars);
+    *pending = Some(Rule { style, x, top, w, h, color });
+}
+
 /// Typeset one block into the display list and return the new document y.
 fn layout_block(font: &mut FontEngine, ctx: &Ctx<'_>, blk: &Blk<'_>, ops: &mut Vec<Op>, mut y: Pt) -> Pt {
     let Ctx { theme, styles, math, k } = *ctx;
@@ -765,10 +812,19 @@ fn layout_block(font: &mut FontEngine, ctx: &Ctx<'_>, blk: &Blk<'_>, ops: &mut V
         let mut bars: Vec<(Pt, Pt, Pt, Pt, ColorRole)> = Vec::new();
         let mut ascent = 0.0f32;
         let mut descent = 0.0f32;
+        // One strike rule per line rather than per node: the layout core makes every
+        // ideograph and every word its own node, so a struck Chinese phrase would
+        // otherwise draw a separate op per character.
+        let mut ruled: Option<Rule> = None;
         for slot in placed {
             let Some(node_id) = slot.node else { continue };
             let node = para.node(node_id);
             let st = &styles[node.style.0 as usize];
+            // A node of any other style -- unstruck, or struck in another face --
+            // closes the rule, so it never covers text the author did not mark.
+            if ruled.as_ref().is_some_and(|r| r.style != node.style) {
+                end_rule(&mut ruled, &mut bars);
+            }
             if let Some(o) = st.object {
                 // An object contributes its own box to the line and is drawn from
                 // its source, not from the placeholder character's glyphs.
@@ -818,9 +874,26 @@ fn layout_block(font: &mut FontEngine, ctx: &Ctx<'_>, blk: &Blk<'_>, ops: &mut V
                 if let Some(p) = paint_run(font, &r, at, dy, k, st.color) {
                     runs.push(p);
                 }
+                if st.strike && r.width() > 0.0 {
+                    // Read from the face carrying these glyphs, because that is where
+                    // the height comes from. `dy` takes a lifted mark's rule up with
+                    // it.
+                    let (pos, weight) = font.strike_rule(r.face, r.size);
+                    merge_rule(
+                        &mut ruled,
+                        &mut bars,
+                        node.style,
+                        at,
+                        r.width(),
+                        dy - pos - weight * 0.5,
+                        weight,
+                        st.color,
+                    );
+                }
                 at += r.width();
             }
         }
+        end_rule(&mut ruled, &mut bars);
         let natural = ascent + descent;
         let line_h = (size * leading.for_mixed(mixed)).max(natural * 1.02);
         let baseline = y + (line_h - natural) * 0.5 + ascent;
@@ -1235,6 +1308,7 @@ fn intern_object(styles: &mut Vec<AppStyle>, source: ObjectSource, color: ColorR
         raise: 0.0,
         object: Some(object),
         source: Some(source),
+        strike: false,
     };
     if let Some(i) = styles.iter().position(|s| *s == app) {
         return StyleId(i as u16);
@@ -1258,6 +1332,7 @@ fn intern(styles: &mut Vec<AppStyle>, fallback: &[String], r: crate::theme::Reso
         raise: r.raise,
         object: None,
         source: None,
+        strike: r.strike,
     };
     if let Some(i) = styles.iter().position(|s| *s == app) {
         return StyleId(i as u16);

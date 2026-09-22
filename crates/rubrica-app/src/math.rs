@@ -10,12 +10,9 @@
 //! A formula is laid out once per source, size and style and then cached, because
 //! two passes need it: line breaking wants its box, and painting wants its shapes.
 
-use std::ffi::c_void;
-
 use rubrica_math::layout::{Extents, MathMeasure, Shape, Stacked};
-use rubrica_math::table::{assemble, MathTable, MATH_TAG};
+use rubrica_math::table::{assemble, MathTable};
 use rubrica_type::units::Pt;
-use windows::core::BOOL;
 use windows::Win32::Graphics::DirectWrite::{
     DWRITE_FONT_METRICS, DWRITE_GLYPH_OFFSET, IDWriteFontFace,
 };
@@ -27,6 +24,9 @@ use crate::font::{FaceRequest, FontEngine, GlyphRun, ObjectBox};
 pub struct Entry {
     key: (String, i32, bool),
     pub object: ObjectBox,
+    /// Whether this formula was measured from the face's `MATH` table rather than from
+    /// the layout's fallback constants.
+    from_table: bool,
     /// Glyph runs with their x from the origin and their y *below* the baseline, in
     /// points.
     pub parts: Vec<(GlyphRun, Pt, Pt)>,
@@ -66,9 +66,13 @@ impl MathStore {
             return Some(i);
         }
         let face = font.open_face(&req.family, req.weight, req.italic);
-        let formula = {
+        let (formula, from_table) = {
             let mut adapter = Adapter::open(font, req, face);
-            rubrica_math::typeset(source, size, display, &mut adapter)
+            // Recorded here rather than inferred later, because it is the one fact the
+            // report cannot get from the picture: a formula drawn from the face's own
+            // `MATH` table and one drawn from fallback constants both look plausible.
+            let read = adapter.table().is_some();
+            (rubrica_math::typeset(source, size, display, &mut adapter), read)
         };
         let mut parts = Vec::new();
         let mut rules = Vec::new();
@@ -138,6 +142,7 @@ impl MathStore {
                 ascent: formula.ascent,
                 descent: formula.descent,
             },
+            from_table,
             family: parts.first().map(|(r, _, _)| font.face_family(r.face)).unwrap_or_default(),
             parts,
             rules,
@@ -149,19 +154,20 @@ impl MathStore {
         self.entries.get(i)
     }
 
-    /// How many formulas are set, how much of them is shaped rather than drawn, and
-    /// which families carried them.
+    /// How many formulas are set, how much of them is shaped rather than drawn, which
+    /// families carried them, and how many were measured from a real `MATH` table.
     ///
     /// The headless report prints this, because a formula that silently fell back to
-    /// a face with no `MATH` table still draws -- at the wrong shape -- and a number
-    /// is the only way to see that from outside the window. Bars are counted
-    /// separately because they are rectangles, so nothing else in the display list
-    /// tells them apart from a table's header panel.
-    pub fn census(&self) -> (usize, usize, Vec<String>) {
+    /// a face with no `MATH` table still draws -- at the wrong shape, with TeX's own
+    /// constants -- and a number is the only way to see that from outside the window.
+    /// Bars are counted separately because they are rectangles, so nothing else in the
+    /// display list tells them apart from a table's header panel.
+    pub fn census(&self) -> (usize, usize, Vec<String>, usize) {
         (
             self.entries.len(),
             self.entries.iter().map(|e| e.rules.len()).sum(),
             self.entries.iter().map(|e| e.family.clone()).collect(),
+            self.entries.iter().filter(|e| e.from_table).count(),
         )
     }
 }
@@ -280,20 +286,12 @@ impl MathMeasure for Adapter<'_> {
 
 /// The raw `MATH` table of a face, or `None` when it has none -- which is how a face
 /// without math support is reported, and what makes the layout use its fallbacks.
+///
+/// Read from the file rather than from `TryGetFontTable`, which reports no tables at
+/// all for a face from the system collection: without this the whole formula layout
+/// silently runs on its fallback constants and looks, on screen, almost right.
 fn math_table_bytes(face: &IDWriteFontFace) -> Option<(Vec<u8>, u16)> {
     let mut metrics = DWRITE_FONT_METRICS::default();
-    let mut data: *mut c_void = std::ptr::null_mut();
-    let mut len = 0u32;
-    let mut ctx: *mut c_void = std::ptr::null_mut();
-    let mut exists = BOOL(0);
-    unsafe {
-        face.GetMetrics(&mut metrics);
-        face.TryGetFontTable(MATH_TAG, &mut data, &mut len, &mut ctx, &mut exists).ok()?;
-        if exists.0 == 0 || data.is_null() || len == 0 {
-            return None;
-        }
-        let bytes = std::slice::from_raw_parts(data as *const u8, len as usize).to_vec();
-        face.ReleaseFontTable(ctx);
-        Some((bytes, metrics.designUnitsPerEm))
-    }
+    unsafe { face.GetMetrics(&mut metrics) };
+    Some((crate::tables::table_bytes(face, b"MATH")?, metrics.designUnitsPerEm))
 }

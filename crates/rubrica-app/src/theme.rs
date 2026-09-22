@@ -73,6 +73,11 @@ pub struct ResolvedStyle {
     /// line loop counts it into the ascent so a raised run cannot be clipped by the
     /// line above. Zero for prose.
     pub raise: Pt,
+    /// Draw a rule through the run. Kept as a flag rather than a position because
+    /// where the rule goes is the face's business: it comes from that font's `OS/2`
+    /// table at paint time, so a struck Han span and a struck Latin span each sit at
+    /// the height their own designer chose.
+    pub strike: bool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -247,6 +252,7 @@ impl Theme {
             color,
             mono: role == Role::Mono,
             raise,
+            strike: inline.contains(InlineStyle::STRIKETHROUGH),
         }
     }
 

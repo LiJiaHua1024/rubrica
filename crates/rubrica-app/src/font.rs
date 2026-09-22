@@ -107,6 +107,9 @@ pub struct FontEngine {
     faces: RefCell<Vec<Face>>,
     resolved: RefCell<HashMap<(String, u16, bool), Option<usize>>>,
     shaped: RefCell<HashMap<ShapeKey, Vec<GlyphRun>>>,
+    /// `(position, thickness)` of this face's strikeout rule, in design units, read
+    /// from its file: a face is asked once, however many struck runs it carries.
+    strikeout: RefCell<HashMap<usize, Option<(f32, f32)>>>,
     styles: RefCell<Vec<Style>>,
 }
 
@@ -137,6 +140,7 @@ impl FontEngine {
                 faces: RefCell::new(Vec::new()),
                 resolved: RefCell::new(HashMap::new()),
                 shaped: RefCell::new(HashMap::new()),
+                strikeout: RefCell::new(HashMap::new()),
                 styles: RefCell::new(Vec::new()),
             })
         }
@@ -442,6 +446,39 @@ impl FontEngine {
         self.faces.borrow().get(idx).map(|f| f.family.clone()).unwrap_or_default()
     }
 
+    /// Where a strike through this face's text belongs: `(height above the baseline,
+    /// thickness)`, in points at `size`.
+    ///
+    /// Read from the face's own `OS/2` rather than guessed from an average cap height,
+    /// for the same reason the math engine reads `MATH`: a font that draws its hyphen
+    /// low and a font that draws it high are struck through at different heights, and
+    /// a rule that ignores that is a rule drawn on top of the glyphs rather than
+    /// through them.
+    pub fn strike_rule(&self, face: usize, size: Pt) -> (Pt, Pt) {
+        let Some((face_obj, metrics)) =
+            self.faces.borrow().get(face).map(|f| (f.face.clone(), f.metrics))
+        else {
+            return (size * STRIKE_FALLBACK_POS, size * STRIKE_FALLBACK_WEIGHT);
+        };
+        let upm = metrics.designUnitsPerEm.max(1) as f32;
+        let s = size / upm;
+        let cached = self.strikeout.borrow().get(&face).copied();
+        let design = match cached {
+            Some(hit) => hit,
+            None => {
+                let read = crate::tables::table_bytes(&face_obj, b"OS/2")
+                    .as_deref()
+                    .and_then(os2_strikeout);
+                self.strikeout.borrow_mut().insert(face, read);
+                read
+            }
+        };
+        match design {
+            Some((pos, weight)) => (pos * s, weight * s),
+            None => (size * STRIKE_FALLBACK_POS, size * STRIKE_FALLBACK_WEIGHT),
+        }
+    }
+
     /// Resolve a family by name to a face index, for a backend that needs the face
     /// itself rather than shaped text -- the math engine reads its `MATH` table.
     pub(crate) fn open_face(&self, family: &str, weight: u16, italic: bool) -> Option<usize> {
@@ -529,4 +566,53 @@ fn cjk_char(c: char) -> bool {
 
 fn utf16(s: &str) -> Vec<u16> {
     s.encode_utf16().chain(std::iter::once(0)).collect()
+}
+
+/// A face that does not say where its strike goes -- no file, no `OS/2`, or a size of
+/// zero -- gets one at a little under half the em, thin enough to read as a line drawn
+/// through the word rather than as a word sitting on a rule: high enough to clear
+/// lowercase, low enough to stay off the ascenders.
+const STRIKE_FALLBACK_POS: f32 = 0.28;
+const STRIKE_FALLBACK_WEIGHT: f32 = 0.06;
+
+/// A face's own strikeout rule, read from its `OS/2` table: `(position, thickness)` in
+/// design units.
+///
+/// The two fields are the INT16s at bytes 26 and 28 of every version of the table --
+/// size first, then position, which is the order the spec gives and not the order the
+/// names suggest. A size of zero is the font declining to answer, which is a `None`
+/// rather than a rule drawn on the baseline.
+fn os2_strikeout(bytes: &[u8]) -> Option<(f32, f32)> {
+    let fields = bytes.get(26..30)?;
+    let weight = i16::from_be_bytes([fields[0], fields[1]]) as f32;
+    let pos = i16::from_be_bytes([fields[2], fields[3]]) as f32;
+    (weight > 0.0).then_some((pos, weight))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A minimal `OS/2` version-4 table with only the two strikeout fields set.
+    fn table(size: i16, position: i16) -> Vec<u8> {
+        let mut b = vec![0u8; 96];
+        b[0..2].copy_from_slice(&4u16.to_be_bytes());
+        b[26..28].copy_from_slice(&size.to_be_bytes());
+        b[28..30].copy_from_slice(&position.to_be_bytes());
+        b
+    }
+
+    #[test]
+    fn reads_the_strikeout_fields_where_the_spec_puts_them() {
+        // Size at byte 26, position at 28 -- and the pair comes back the other way
+        // round, because a caller wants height and then weight.
+        assert_eq!(os2_strikeout(&table(50, 275)), Some((275.0, 50.0)));
+    }
+
+    #[test]
+    fn a_font_that_declines_no_rule_gets_the_fallback() {
+        assert_eq!(os2_strikeout(&table(0, 275)), None);
+        // A table too short to hold the fields is the same answer: nothing to read.
+        assert_eq!(os2_strikeout(&[0u8; 12]), None);
+    }
 }
