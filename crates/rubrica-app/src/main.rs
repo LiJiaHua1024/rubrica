@@ -12,6 +12,7 @@ mod images;
 mod math;
 mod report;
 mod sample;
+mod settings;
 mod tables;
 mod theme;
 mod view;

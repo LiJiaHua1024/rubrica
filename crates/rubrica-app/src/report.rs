@@ -96,11 +96,8 @@ pub fn report(
     // -- so a face that came back as somebody else's substitute is visible here rather
     // than only on a screen.
     let f = &TextFace::ALL[theme.face];
-    let installed: Vec<&str> = TextFace::ALL
-        .iter()
-        .filter(|t| font.has_family(t.body) && font.has_family(t.heading))
-        .map(|t| t.label)
-        .collect();
+    let installed: Vec<&str> =
+        TextFace::ALL.iter().filter(|t| crate::view::face_drawable(&font, t)).map(|t| t.label).collect();
     println!("face       : {}  ({} + {})", f.label, f.body, f.heading);
     println!("             installed: {}", installed.join(", "));
     println!("blocks     : {}   lines: {}   height {:.0}pt", doc.blocks.len(), lines.len(), height);

@@ -926,16 +926,36 @@ pub fn run(source: String, path: Option<PathBuf>) -> Result<()> {
     // without the hand cursor rather than refusing to start.
     let hand = unsafe { LoadCursorW(None, IDC_HAND).unwrap_or(arrow) };
 
+    // The reader's own appearance, from the last window, applied before the first layout
+    // so a start-up never shows one page and then changes its face.
+    //
+    // A remembered family that has since left the machine is dropped rather than set:
+    // DirectWrite would answer it with a substitute, and a preference that quietly becomes
+    // a different font is worse than no preference at all. The size and the palette are
+    // kept regardless, since neither depends on anything installed.
+    let saved = crate::settings::load();
+    let mut theme = Theme::default();
+    if let Some(zoom) = saved.zoom {
+        theme.set_zoom(zoom);
+    }
+    let remembered = saved.face.filter(|i| {
+        TextFace::ALL.get(*i).is_some_and(|f| face_drawable(&font, f))
+    });
+    if let Some(face) = remembered {
+        theme.set_face(face);
+    }
+    let dark = saved.dark.unwrap_or_else(system_prefers_dark);
+
     let mut view = Box::new(View {
         d2d,
         target: None,
         hwnd_target: None,
         font,
-        theme: Theme::default(),
+        theme,
         doc: Document::parse(&source),
         ops: Vec::new(),
-        palette: Palette::of(system_prefers_dark()),
-        dark_override: None,
+        palette: Palette::of(dark),
+        dark_override: saved.dark,
         brushes: HashMap::new(),
         hotspots: Vec::new(),
         note_tops: Vec::new(),
@@ -1020,8 +1040,17 @@ fn window_title(path: Option<&std::path::Path>) -> String {
 }
 
 /// Null-terminated UTF-16, the shape every `PCWSTR` window-name parameter wants.
-fn utf16(s: &str) -> Vec<u16> {
+pub(crate) fn utf16(s: &str) -> Vec<u16> {
     s.encode_utf16().chain(std::iter::once(0)).collect()
+}
+
+/// Whether this machine can draw both halves of a face pairing.
+///
+/// Asked of the font engine rather than of the theme, because the answer is a fact about
+/// the machine: it decides which rows of the menu are live and whether a remembered face
+/// is worth setting, neither of which is anything the page has a say in.
+pub(crate) fn face_drawable(font: &FontEngine, f: &TextFace) -> bool {
+    font.has_family(f.body) && font.has_family(f.heading)
 }
 
 /// Reads the same registry value the Settings app writes. There is no window
@@ -1289,8 +1318,7 @@ impl View {
                     // same claim on the dark one as anyone whose OS says so.
                     k if ctrl && k == VK_D.0 as u32 => {
                         let dark = !self.palette.dark;
-                        self.dark_override = Some(dark);
-                        self.set_dark(dark, hwnd);
+                        self.apply_command(Command::Palette(dark), hwnd);
                     }
                     // A copy with nothing selected leaves the clipboard alone. Clearing
                     // it would throw away what the reader put there from somewhere else,
@@ -1574,7 +1602,7 @@ impl View {
             from_file: self.path.is_some(),
             text: !self.sel_index.is_empty(),
             face: self.theme.face,
-            offered: TextFace::ALL.iter().map(|f| self.face_available(f)).collect(),
+            offered: TextFace::ALL.iter().map(|f| face_drawable(&self.font, f)).collect(),
         };
         let menu = match unsafe { CreatePopupMenu() } {
             Ok(m) => m,
@@ -1638,10 +1666,12 @@ impl View {
             Command::Face(i) => self.set_face(i, hwnd),
             Command::Palette(dark) => {
                 self.dark_override = Some(dark);
+                self.remember();
                 self.set_dark(dark, hwnd);
             }
             Command::FollowSystem => {
                 self.dark_override = None;
+                self.remember();
                 let dark = system_prefers_dark();
                 self.set_dark(dark, hwnd);
             }
@@ -1659,9 +1689,9 @@ impl View {
         let _ = unsafe { InvalidateRect(Some(hwnd), None, false) };
     }
 
-    /// Whether this machine can draw both halves of a pairing.
-    fn face_available(&self, f: &TextFace) -> bool {
-        self.font.has_family(f.body) && self.font.has_family(f.heading)
+    /// Write down the appearance the reader is looking at, for the next window.
+    fn remember(&self) {
+        crate::settings::record(self.theme.zoom, self.dark_override, self.theme.face);
     }
 
     /// Set the page in another face pairing.
@@ -1672,10 +1702,11 @@ impl View {
     /// for them.
     fn set_face(&mut self, face: usize, hwnd: HWND) {
         let Some(f) = TextFace::ALL.get(face) else { return };
-        if face == self.theme.face || !self.face_available(f) {
+        if face == self.theme.face || !face_drawable(&self.font, f) {
             return;
         }
         self.theme.set_face(face);
+        self.remember();
         self.relayout();
         self.clamp_scroll();
         let _ = unsafe { InvalidateRect(Some(hwnd), None, false) };
@@ -1712,6 +1743,7 @@ impl View {
             return;
         }
         self.scroll *= self.theme.base / before;
+        self.remember();
         self.relayout();
         self.clamp_scroll();
         let _ = unsafe { InvalidateRect(Some(hwnd), None, false) };
