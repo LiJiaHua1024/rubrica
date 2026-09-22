@@ -92,6 +92,18 @@ impl Line {
     pub fn is_ragged(&self) -> bool {
         self.ragged || self.stretch >= INFINITY / 2.0
     }
+
+    /// Ink that no amount of shrinking can pull back inside the measure.
+    ///
+    /// Deliberately a different question from [Self::is_ragged]: infinite stretch
+    /// absorbs leftover space and never surplus ink, so a paragraph's final line can
+    /// be both -- ragged, and the worst line on the page. Only this one says the
+    /// solver has to try again at a looser tolerance.
+    #[inline]
+    pub fn is_overfull(&self) -> bool {
+        f64::from(self.natural) - f64::from(self.shrink)
+            > f64::from(self.target) + f64::from(EPSILON)
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -301,9 +313,15 @@ pub fn break_paragraph(para: &Paragraph, opts: &BreakOptions) -> Plan {
                 // scores 10000, and treating that as overfull would push ordinary
                 // paragraphs all the way to the tolerance-free pass and pick worse
                 // breaks than pass 1 already had.
-                let overfull = out.0.iter().any(|l| {
-                    !l.is_ragged() && f64::from(l.natural) - f64::from(l.shrink) > f64::from(l.target) + f64::from(EPSILON)
-                });
+                //
+                // `is_ragged` is not the gate here: the final line's infinite
+                // `\parfillskip` stretch makes it exempt from being *short*, and a
+                // paragraph whose last line cannot be made to fit is exactly the one
+                // that needs the looser pass -- and the hyphenation the looser pass
+                // unlocks. A block that opted out of justification is overfull by
+                // request, so it never escalates.
+                let overfull =
+                    !opts.ragged && out.0.iter().any(|l| l.is_overfull());
                 let last = n == attempts.len() - 1;
                 result = Some((out, n as u8 + 1));
                 if last || !overfull {
@@ -319,7 +337,10 @@ pub fn break_paragraph(para: &Paragraph, opts: &BreakOptions) -> Plan {
         demerits += cost;
         lines.append(&mut out);
     }
-    if pass < 3 && lines.iter().any(|l| l.badness >= 10000 && !l.is_ragged()) {
+    if pass < 3
+        && !opts.ragged
+        && lines.iter().any(|l| l.is_overfull() || (l.badness >= 10000 && !l.is_ragged()))
+    {
         pass = 3;
     }
     Plan { lines, demerits, pass }

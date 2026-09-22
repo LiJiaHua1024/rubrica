@@ -8,7 +8,7 @@
 
 use crate::breaking::Line;
 use crate::paragraph::{Item, Paragraph};
-use crate::units::{EPSILON, Pt};
+use crate::units::{EPSILON, INFINITY, Pt};
 
 /// A positioned slot: a box at `x` with width `w`, or glue (`node == None`).
 #[derive(Clone, Copy, Debug)]
@@ -18,10 +18,23 @@ pub struct Placed {
     pub node: Option<u32>,
 }
 
-/// Lay out one line at its target width. Ragged lines get natural widths.
+/// Lay out one line at its target width. Ragged lines get natural widths -- unless
+/// their natural width is already past the measure, which no amount of stretch
+/// licence covers.
 pub fn place(para: &Paragraph, line: &Line) -> Vec<Placed> {
     let items = &para.items;
-    let slack: f64 = if line.is_ragged() { 0.0 } else { (line.target - line.natural).into() };
+    let delta = f64::from(line.target) - f64::from(line.natural);
+    // Infinite stretch makes *leftover* space free -- that is what keeps a final line
+    // ragged -- but it absorbs no ink. A line whose own width already passes the
+    // measure has to be pulled back by shrinking, `\parfillskip` included: TeX
+    // excuses the last line from being underfull, never from being overfull.
+    let slack = if line.ragged {
+        0.0
+    } else if line.stretch >= INFINITY / 2.0 {
+        delta.min(0.0)
+    } else {
+        delta
+    };
     let eps = f64::from(EPSILON);
 
     let mut total_stretch = 0.0;
