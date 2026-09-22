@@ -46,7 +46,7 @@ use windows::Win32::UI::Input::KeyboardAndMouse::{
 use windows::Win32::UI::Input::KeyboardAndMouse::{VK_DOWN, VK_ESCAPE, VK_NEXT, VK_PRIOR};
 use windows::Win32::UI::Input::KeyboardAndMouse::{
     VK_0, VK_A, VK_ADD, VK_C, VK_D, VK_END, VK_HOME, VK_LEFT, VK_NUMPAD0, VK_OEM_4,
-    VK_OEM_6, VK_OEM_MINUS, VK_OEM_PLUS, VK_RIGHT, VK_SHIFT, VK_SUBTRACT, VIRTUAL_KEY,
+    VK_OEM_6, VK_OEM_MINUS, VK_OEM_PLUS, VK_R, VK_RIGHT, VK_SHIFT, VK_SUBTRACT, VIRTUAL_KEY,
 };
 use windows::Win32::UI::Controls::Dialogs::{
     GetOpenFileNameW, OPENFILENAMEW, OFN_FILEMUSTEXIST, OFN_HIDEREADONLY, OFN_PATHMUSTEXIST,
@@ -792,9 +792,14 @@ struct MenuState {
 fn menu_items(s: &MenuState) -> Vec<MenuRow> {
     let row = |cmd: Command, label, enabled| MenuRow::Row { cmd, label, enabled, checked: false };
     let check = |cmd: Command, label, on| MenuRow::Row { cmd, label, enabled: true, checked: on };
+    // A tab in a menu string starts the accelerator column, which Windows sets
+    // right-aligned on its own. Only the rows where the key does exactly what the row
+    // says print one: `Ctrl`+`D` picks whichever palette is not on rather than the one it
+    // is standing next to, and the bracket keys step the measure rather than settling on
+    // a rung, so a hint on either would promise a different thing from the one it keeps.
     let mut v = vec![
-        row(Command::Copy, "Copy", s.selected),
-        row(Command::SelectAll, "Select All", s.text),
+        row(Command::Copy, "Copy\tCtrl+C", s.selected),
+        row(Command::SelectAll, "Select All\tCtrl+A", s.text),
     ];
     if let Some(url) = &s.link {
         v.push(MenuRow::Gap);
@@ -803,9 +808,9 @@ fn menu_items(s: &MenuState) -> Vec<MenuRow> {
     }
     v.push(MenuRow::Gap);
     v.extend([
-        row(Command::ZoomIn, "Increase Text", true),
-        row(Command::ZoomOut, "Decrease Text", true),
-        row(Command::ZoomReset, "Actual Size", true),
+        row(Command::ZoomIn, "Increase Text\tCtrl++", true),
+        row(Command::ZoomOut, "Decrease Text\tCtrl+-", true),
+        row(Command::ZoomReset, "Actual Size\tCtrl+0", true),
     ]);
     v.push(MenuRow::Gap);
     for (i, f) in TextFace::ALL.iter().enumerate() {
@@ -827,8 +832,8 @@ fn menu_items(s: &MenuState) -> Vec<MenuRow> {
     ]);
     v.push(MenuRow::Gap);
     v.extend([
-        row(Command::OpenFile, "Open\u{2026}", true),
-        row(Command::Reload, "Reload", s.from_file),
+        row(Command::OpenFile, "Open\u{2026}\tCtrl+O", true),
+        row(Command::Reload, "Reload\tCtrl+R", s.from_file),
     ]);
     v
 }
@@ -1356,11 +1361,13 @@ impl View {
                             PostQuitMessage(0);
                         }
                     }
-                    k if k == VK_O.0 as u32 && ctrl => {
-                        if let Some(path) = self.prompt_for_file(hwnd) {
-                            self.load_document(&path);
-                        }
-                    }
+                    // Both of these go through the menu's own command, so the key and the
+                    // row it repeats cannot drift apart -- one of them is written in terms
+                    // of the other.
+                    k if k == VK_O.0 as u32 && ctrl => self.apply_command(Command::OpenFile, hwnd),
+                    // A document with no file behind it has nothing to read again, which is
+                    // the same condition that dims the row.
+                    k if k == VK_R.0 as u32 && ctrl => self.apply_command(Command::Reload, hwnd),
                     // The virtual-key codes name physical keys, so both the shifted and
                     // unshifted form of the same key (`+` and `=`) arrive as one of
                     // these, and the numpad's own `+`/`-` mean the same thing to a
@@ -4087,6 +4094,36 @@ mod tests {
         let got = rows(&s);
         assert_eq!(row(&got, 2), (Command::Measure(2), true, true));
         assert_eq!(row(&got, 1), (Command::Measure(1), true, false), "the design's own width stays a choice");
+    }
+
+    #[test]
+    fn a_row_that_a_key_also_repeats_prints_the_key() {
+        let rows = |s: &MenuState| {
+            menu_items(s)
+                .into_iter()
+                .filter_map(|r| match r {
+                    MenuRow::Row { cmd, label, .. } => Some((cmd, label)),
+                    MenuRow::Gap => None,
+                })
+                .collect::<Vec<_>>()
+        };
+        let got = rows(&state(true, None, None, true, true));
+        for (cmd, key) in [
+            (&Command::Copy, "Copy\tCtrl+C"),
+            (&Command::SelectAll, "Select All\tCtrl+A"),
+            (&Command::ZoomIn, "Increase Text\tCtrl++"),
+            (&Command::ZoomOut, "Decrease Text\tCtrl+-"),
+            (&Command::ZoomReset, "Actual Size\tCtrl+0"),
+            (&Command::OpenFile, "Open\u{2026}\tCtrl+O"),
+            (&Command::Reload, "Reload\tCtrl+R"),
+        ] {
+            let (_, label) = got.iter().find(|(c, _)| c == cmd).expect("the row the key answers");
+            assert_eq!(*label, key, "a hint that is not the key is worse than none");
+        }
+        // Nothing else may claim one. `Ctrl`+`D` picks whichever palette is not on the
+        // screen rather than the row it would be printed on, and the bracket keys step
+        // the measure instead of settling on the rung they are next to.
+        assert_eq!(got.iter().filter(|(_, l)| l.contains('\t')).count(), 7);
     }
 
     #[test]
