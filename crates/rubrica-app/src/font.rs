@@ -314,7 +314,16 @@ impl FontEngine {
             text: units.clone().into_boxed_slice(),
         };
         if let Some(hit) = self.shaped.borrow().get(&key) {
-            return hit.clone();
+            // A cached run's `text` is an address in whichever string the first pass was
+            // handed, not a fact about the shaping: the glyphs, clusters and advances
+            // are all offset-free, so the hit is good and only its range needs moving.
+            return hit
+                .iter()
+                .map(|r| GlyphRun {
+                    text: text_start..text_start + (r.text.end - r.text.start),
+                    ..r.clone()
+                })
+                .collect();
         }
         if units.is_empty() {
             return Vec::new();
@@ -558,7 +567,10 @@ fn first_char_len(s: &str) -> usize {
     s.chars().next().map_or(1, |c| c.len_utf8())
 }
 
-fn cjk_char(c: char) -> bool {
+/// Whether a character belongs to a script that writes words without spaces between
+/// them, which is what decides both the face it is shaped in and how a double-click
+/// finds its extent.
+pub fn cjk_char(c: char) -> bool {
     matches!(c as u32,
         0x2E80..=0x2EFF | 0x3000..=0x303F | 0x3040..=0x30FF | 0x3400..=0x4DBF
         | 0x4E00..=0x9FFF | 0xF900..=0xFAFF | 0xFF00..=0xFFEF | 0x20000..=0x2FA1F)
