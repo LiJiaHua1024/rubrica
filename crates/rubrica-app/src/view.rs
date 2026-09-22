@@ -45,8 +45,8 @@ use windows::Win32::UI::Input::KeyboardAndMouse::{
 };
 use windows::Win32::UI::Input::KeyboardAndMouse::{VK_DOWN, VK_ESCAPE, VK_NEXT, VK_PRIOR};
 use windows::Win32::UI::Input::KeyboardAndMouse::{
-    VK_0, VK_A, VK_ADD, VK_C, VK_D, VK_NUMPAD0, VK_OEM_MINUS, VK_OEM_PLUS, VK_SUBTRACT,
-    VIRTUAL_KEY,
+    VK_0, VK_A, VK_ADD, VK_C, VK_D, VK_END, VK_HOME, VK_LEFT, VK_NUMPAD0, VK_OEM_MINUS,
+    VK_OEM_PLUS, VK_RIGHT, VK_SHIFT, VK_SUBTRACT, VIRTUAL_KEY,
 };
 use windows::Win32::UI::Controls::Dialogs::{
     GetOpenFileNameW, OPENFILENAMEW, OFN_FILEMUSTEXIST, OFN_HIDEREADONLY, OFN_PATHMUSTEXIST,
@@ -461,6 +461,150 @@ pub fn word_at(sel: &[SelLine], c: Caret) -> Selection {
     Selection { from: Caret { line: c.line, ch: lo }, to: Caret { line: c.line, ch: hi } }
 }
 
+/// Where an arrow key takes the caret. `Ctrl` turns the sideways motions into word
+/// motions and the rest into the ends of the document, which is what every other text
+/// surface on this system means by them.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Motion {
+    Left,
+    Right,
+    Up,
+    Down,
+    Home,
+    End,
+    WordLeft,
+    WordRight,
+    DocStart,
+    DocEnd,
+}
+
+impl Motion {
+    /// Whether the motion reads backwards through the text, which is what decides which
+    /// edge of a selection an arrow without `Shift` leaves the caret on.
+    fn backward(self) -> bool {
+        matches!(self, Motion::Left | Motion::WordLeft | Motion::Up | Motion::Home | Motion::DocStart)
+    }
+}
+
+/// The key a reader pressed, as a motion -- or `None` when it is not one of the arrows.
+fn motion_of(key: u32, ctrl: bool) -> Option<Motion> {
+    Some(match key {
+        k if k == VK_LEFT.0 as u32 => if ctrl { Motion::WordLeft } else { Motion::Left },
+        k if k == VK_RIGHT.0 as u32 => if ctrl { Motion::WordRight } else { Motion::Right },
+        k if k == VK_UP.0 as u32 => if ctrl { Motion::DocStart } else { Motion::Up },
+        k if k == VK_DOWN.0 as u32 => if ctrl { Motion::DocEnd } else { Motion::Down },
+        k if k == VK_HOME.0 as u32 => if ctrl { Motion::DocStart } else { Motion::Home },
+        k if k == VK_END.0 as u32 => if ctrl { Motion::DocEnd } else { Motion::End },
+        _ => return None,
+    })
+}
+
+/// A place in the index that cannot fall off the page.
+fn clamp_caret(sel: &[SelLine], c: Caret) -> Caret {
+    if sel.is_empty() {
+        return Caret { line: 0, ch: 0 };
+    }
+    let line = c.line.min(sel.len() - 1);
+    Caret { line, ch: c.ch.min(sel[line].chars.len()) }
+}
+
+/// The kind of the character a motion is standing on: the one ahead of it reading
+/// forwards, the one behind it reading backwards.
+fn kind_ahead(sel: &[SelLine], c: Caret, forward: bool) -> Option<WordKind> {
+    let i = if forward { c.ch } else { c.ch.checked_sub(1)? };
+    sel.get(c.line)?.chars.get(i).copied().map(word_kind)
+}
+
+/// The caret one motion away, clamped to the page: an arrow at either end of a document
+/// stays where it is rather than falling out of the index and taking the selection with
+/// it.
+pub fn next_caret(sel: &[SelLine], from: Caret, m: Motion) -> Caret {
+    if sel.is_empty() {
+        return Caret { line: 0, ch: 0 };
+    }
+    let at = clamp_caret(sel, from);
+    let last = sel.len() - 1;
+    let end_of = |line: usize| sel[line].chars.len();
+    let moved = match m {
+        // A line break is one position to cross, not two: coming down at the end of a
+        // line lands the caret at the start of the next, the way a drag would.
+        Motion::Left => match at.ch {
+            0 => match at.line {
+                0 => at,
+                l => Caret { line: l - 1, ch: end_of(l - 1) },
+            },
+            n => Caret { line: at.line, ch: n - 1 },
+        },
+        Motion::Right => {
+            if at.ch < end_of(at.line) {
+                Caret { line: at.line, ch: at.ch + 1 }
+            } else if at.line < last {
+                Caret { line: at.line + 1, ch: 0 }
+            } else {
+                at
+            }
+        }
+        // The same column where the line has one, and the end of it where it does not:
+        // an index that has only drawn lines cannot know which character a reader's eye
+        // was following down a paragraph.
+        Motion::Up => Caret { line: at.line.saturating_sub(1), ch: at.ch },
+        Motion::Down => Caret { line: (at.line + 1).min(last), ch: at.ch },
+        Motion::Home => Caret { line: at.line, ch: 0 },
+        Motion::End => Caret { line: at.line, ch: end_of(at.line) },
+        Motion::DocStart => Caret { line: 0, ch: 0 },
+        Motion::DocEnd => Caret { line: last, ch: end_of(last) },
+        Motion::WordRight => {
+            let mut c = at;
+            // A word motion does not stop to admire the space in front of the word.
+            while kind_ahead(sel, c, true) == Some(WordKind::Space) {
+                let n = clamp_caret(sel, Caret { line: c.line, ch: c.ch + 1 });
+                if n == c {
+                    break;
+                }
+                c = n;
+            }
+            let w = word_at(sel, c);
+            if w.to.ch > c.ch {
+                Caret { line: c.line, ch: w.to.ch }
+            } else {
+                // Past this line's last word: over the break, where the next motion
+                // picks up the next line's first.
+                next_caret(sel, c, Motion::Right)
+            }
+        }
+        Motion::WordLeft => {
+            let mut c = at;
+            while kind_ahead(sel, c, false) == Some(WordKind::Space) {
+                let p = clamp_caret(sel, Caret { line: c.line, ch: c.ch.saturating_sub(1) });
+                if p == c {
+                    break;
+                }
+                c = p;
+            }
+            // Onto the word's last character, so that the extent below reads the word
+            // rather than whatever the caret was standing after.
+            c = next_caret(sel, c, Motion::Left);
+            let w = word_at(sel, c);
+            if w.from.ch < c.ch {
+                Caret { line: c.line, ch: w.from.ch }
+            } else {
+                c
+            }
+        }
+    };
+    clamp_caret(sel, moved)
+}
+
+/// Where the caret bar stands: the character edge it names, as tall as its line.
+/// A caret past the end of a line that has since been rewound reads as the line's own
+/// right edge rather than as no caret at all, because that is where the text it was
+/// standing after now ends.
+pub fn caret_rect(sel: &[SelLine], c: Caret) -> Option<(f32, f32, f32, f32)> {
+    let l = sel.get(c.line)?;
+    let x = *l.xs.get(c.ch.min(l.chars.len()))?;
+    Some((x, l.y, 1.0, l.h))
+}
+
 /// Everything one typesetting pass produced.
 pub struct Page {
     pub ops: Vec<Op>,
@@ -508,6 +652,10 @@ pub struct View {
     /// Where the button went down in the text, which is the end of a selection that
     /// has not been dragged yet and the point a double click expands from.
     press_caret: Option<Caret>,
+    /// Where the reader has put the caret, by a click or an arrow. While it is set the
+    /// arrow keys belong to it rather than to the scroll, which is what every text
+    /// surface on this system does and the reason `Escape` has to give it back.
+    caret: Option<Caret>,
     /// The ink laid over selected text. A highlight drawn *under* the ink cannot
     /// work: a code block paints its own opaque panel after it.
     sel_brush: Option<ID2D1SolidColorBrush>,
@@ -689,6 +837,7 @@ pub fn run(source: String, path: Option<PathBuf>) -> Result<()> {
         sel_index: Vec::new(),
         selection: None,
         press_caret: None,
+        caret: None,
         sel_brush: None,
         arrow,
         hand,
@@ -977,12 +1126,38 @@ impl View {
                 let step = self.theme.base * self.theme.body_leading.latin;
                 let page = self.page_height();
                 let ctrl = held(VK_CONTROL);
+                let shift = held(VK_SHIFT);
+                // Once the reader has put a caret on the page -- by a click or by an
+                // arrow -- the arrows belong to it, up and down included, because that
+                // is what they mean on every text surface they have ever used. Before
+                // then the same two keys are the page's scroll, which is what a reader
+                // who has only used the wheel has no reason to give up.
+                let caretless = self.caret.is_none() && self.selection.is_none();
+                if let Some(m) = motion_of(wp.0 as u32, ctrl) {
+                    let scrolls = caretless && !shift && matches!(m, Motion::Up | Motion::Down);
+                    if !scrolls {
+                        self.move_caret(m, shift);
+                        let _ = InvalidateRect(Some(hwnd), None, false);
+                        return LRESULT(0);
+                    }
+                }
                 match wp.0 as u32 {
                     k if k == VK_UP.0 as u32 => self.scroll_by(-step),
                     k if k == VK_DOWN.0 as u32 => self.scroll_by(step),
                     k if k == VK_PRIOR.0 as u32 => self.scroll_by(-page),
                     k if k == VK_NEXT.0 as u32 => self.scroll_by(page),
-                    k if k == VK_ESCAPE.0 as u32 => PostQuitMessage(0),
+                    // The way back out of a caret the reader has clicked into: while the
+                    // page carries a marking, `Escape` gives it up -- and with it the
+                    // arrows, which go back to being the scroll. Only an unmarked page
+                    // takes the key as a request to close.
+                    k if k == VK_ESCAPE.0 as u32 => {
+                        if self.caret.is_some() || self.selection.is_some() {
+                            self.caret = None;
+                            self.selection = None;
+                        } else {
+                            PostQuitMessage(0);
+                        }
+                    }
                     k if k == VK_O.0 as u32 && ctrl => {
                         if let Some(path) = self.prompt_for_file(hwnd) {
                             self.load_document(&path);
@@ -1065,6 +1240,10 @@ impl View {
                         None
                     };
                     self.press_caret = Some(c);
+                    // Wherever the pointer lands is where the arrows go on from, so a
+                    // reader can click into a paragraph and finish the selection with the
+                    // keyboard without the caret starting at the top of the page.
+                    self.caret = Some(c);
                 }
                 self.press_at = Some((x, y));
                 let _ = SetCapture(hwnd);
@@ -1187,6 +1366,46 @@ impl View {
         self.press_caret = None;
     }
 
+    /// Take the caret one motion away, holding or dropping the selection as `Shift` says.
+    ///
+    /// With it, the end the reader started from stays where it is and the far end walks
+    /// away, which is what makes a selection out of repeated presses. Without it the
+    /// marking is finished: the caret collapses to whichever edge the motion heads away
+    /// from, because an arrow pressed at the end of a selection means "on from here", and
+    /// `here` is the end it was read to.
+    fn move_caret(&mut self, m: Motion, extend: bool) {
+        let (anchor, focus) = match self.selection {
+            Some(s) if extend => (s.from, s.to),
+            Some(s) => {
+                let o = s.ordered();
+                let c = if m.backward() { o.from } else { o.to };
+                (c, c)
+            }
+            None => {
+                let c = self.caret.unwrap_or(Caret { line: 0, ch: 0 });
+                (c, c)
+            }
+        };
+        let to = next_caret(&self.sel_index, focus, m);
+        self.caret = Some(to);
+        self.selection = (to != anchor).then_some(Selection { from: anchor, to });
+        self.scroll_to_caret(to);
+    }
+
+    /// Bring the line the caret is on into the window, by the least movement that does.
+    fn scroll_to_caret(&mut self, c: Caret) {
+        let Some(l) = self.sel_index.get(c.line) else { return };
+        let k = scale_of(self.dpi);
+        let (top, bottom) = (l.y / k, (l.y + l.h) / k);
+        let view = self.client_h / k;
+        if top < self.scroll {
+            self.scroll = top;
+        } else if bottom > self.scroll + view {
+            self.scroll = bottom - view;
+        }
+        self.clamp_scroll();
+    }
+
     /// Act on the target at this index in [`View::hotspots`].
     fn activate(&mut self, i: usize, hwnd: HWND) {
         let Some(kind) = self.hotspots.get(i).map(|h| h.kind.clone()) else { return };
@@ -1277,6 +1496,7 @@ impl View {
         // the reader ink they never dragged over.
         self.selection = None;
         self.press_caret = None;
+        self.caret = None;
         self.sel_index = page.sel;
     }
 
@@ -1994,6 +2214,22 @@ impl View {
                         }
                         let r = D2D_RECT_F { left: x, top: y, right: x + w, bottom: y + h };
                         target.FillRectangle(&r, &brush);
+                    }
+                }
+            }
+            // The caret, when the reader has one and is not marking anything with it. An
+            // arrow that moves an invisible bar is an arrow the reader cannot aim, and a
+            // steady one rather than a blinking one because nothing here ticks at the
+            // half-second a blink would need -- the page has no reason to repaint that
+            // often, and a blink that misses its beats is worse than no blink.
+            if self.selection.is_none() {
+                if let (Some(c), Some(brush)) = (self.caret, self.brushes.get(&ColorRole::Text).cloned())
+                {
+                    if let Some((x, y, w, h)) = caret_rect(&self.sel_index, c) {
+                        if y + h >= top && y <= bottom {
+                            let r = D2D_RECT_F { left: x, top: y, right: x + w, bottom: y + h };
+                            target.FillRectangle(&r, &brush);
+                        }
                     }
                 }
             }
@@ -3176,5 +3412,77 @@ mod tests {
             hot_kind(&url("https://example.com"), &ctx),
             Some(HotKind::Url("https://example.com".into()))
         );
+    }
+
+    #[test]
+    fn the_arrows_walk_the_caret_over_the_page() {
+        let sel = [sel_line("one", 0.0, Join::None), sel_line("two", 20.0, Join::Newline)];
+        let at = |line, ch| Caret { line, ch };
+        assert_eq!(next_caret(&sel, at(0, 0), Motion::Right), at(0, 1));
+        // The break is one position to cross, not two, so a walk right reads through the
+        // page without a beat at either edge.
+        assert_eq!(next_caret(&sel, at(0, 3), Motion::Right), at(1, 0));
+        assert_eq!(next_caret(&sel, at(1, 0), Motion::Left), at(0, 3));
+        assert_eq!(next_caret(&sel, at(0, 2), Motion::Down), at(1, 2));
+        assert_eq!(next_caret(&sel, at(0, 1), Motion::End), at(0, 3));
+        assert_eq!(next_caret(&sel, at(1, 2), Motion::Home), at(1, 0));
+        // Past either end of the index the caret stays, rather than pointing at a line
+        // that was never drawn.
+        assert_eq!(next_caret(&sel, at(0, 0), Motion::Left), at(0, 0));
+        assert_eq!(next_caret(&sel, at(1, 3), Motion::Right), at(1, 3));
+        assert_eq!(next_caret(&sel, at(1, 3), Motion::Down), at(1, 3));
+        assert_eq!(next_caret(&sel, at(1, 1), Motion::DocStart), at(0, 0));
+        assert_eq!(next_caret(&sel, at(0, 0), Motion::DocEnd), at(1, 3));
+        // A column the shorter line never had is clamped to the end of the one reached,
+        // so a run of `Down` cannot leave the caret past the text it can be seen in.
+        let short = [sel_line("one", 0.0, Join::None), sel_line("t", 20.0, Join::Newline)];
+        assert_eq!(next_caret(&short, at(0, 3), Motion::Down), at(1, 1));
+    }
+
+    #[test]
+    fn a_word_motion_takes_the_whole_word_and_the_space_ahead_of_it() {
+        let sel = [sel_line("hello world  again", 0.0, Join::None)];
+        let at = |ch| Caret { line: 0, ch };
+        assert_eq!(next_caret(&sel, at(0), Motion::WordRight), at(5));
+        // From inside the space between two words the next motion lands on the end of
+        // the word after it, not on the start -- one press, one word.
+        assert_eq!(next_caret(&sel, at(5), Motion::WordRight), at(11));
+        assert_eq!(next_caret(&sel, at(16), Motion::WordRight), at(18), "the last word's own end");
+        assert_eq!(next_caret(&sel, at(18), Motion::WordRight), at(18), "and no further");
+        assert_eq!(next_caret(&sel, at(18), Motion::WordLeft), at(13));
+        assert_eq!(next_caret(&sel, at(13), Motion::WordLeft), at(6));
+        assert_eq!(next_caret(&sel, at(6), Motion::WordLeft), at(0));
+        assert_eq!(next_caret(&sel, at(0), Motion::WordLeft), at(0));
+        // Ideographs are words of one, so a `Ctrl`+arrow steps them a character at a
+        // time -- the same extent a double-click gives.
+        let han = [sel_line("排版引擎", 0.0, Join::None)];
+        assert_eq!(next_caret(&han, Caret { line: 0, ch: 1 }, Motion::WordRight), Caret { line: 0, ch: 2 });
+    }
+
+    #[test]
+    fn a_marking_grown_from_the_caret_reads_back_the_same() {
+        // What `Shift`+arrows leave behind is an ordinary selection, so it has to copy
+        // exactly what the same range dragged out would.
+        let sel = [sel_line("one", 0.0, Join::None), sel_line("two", 20.0, Join::Newline)];
+        let from = Caret { line: 0, ch: 1 };
+        let mut to = from;
+        for m in [Motion::Right, Motion::Right, Motion::Right, Motion::Down, Motion::Right, Motion::Right] {
+            to = next_caret(&sel, to, m);
+        }
+        assert_eq!((to.line, to.ch), (1, 2));
+        assert_eq!(selection_text(&sel, Selection { from, to }), "ne\ntw");
+        // And drawn, which is the reader's half of the same agreement.
+        assert_eq!(selection_rects(&sel, Selection { from, to }).len(), 2);
+    }
+
+    #[test]
+    fn the_caret_bar_stands_on_a_character_edge() {
+        let sel = [sel_line("abc", 10.0, Join::None)];
+        let (x, y, w, h) = caret_rect(&sel, Caret { line: 0, ch: 1 }).unwrap();
+        assert_eq!((x, y, w, h), (CHAR, 10.0, 1.0, sel[0].h));
+        // Past the last character the bar stands at the line's right edge, where the text
+        // it was following ends; off the page there is no bar at all.
+        assert_eq!(caret_rect(&sel, Caret { line: 0, ch: 9 }).map(|r| r.0), Some(3.0 * CHAR));
+        assert_eq!(caret_rect(&sel, Caret { line: 1, ch: 0 }), None);
     }
 }
