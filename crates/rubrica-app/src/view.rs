@@ -98,6 +98,12 @@ const WHEEL_STEP: Pt = 72.0;
 /// Appearance is polled, not pushed; see `WM_TIMER` below.
 const APPEARANCE_TIMER: usize = 0x5140;
 const APPEARANCE_TICK_MS: u32 = 400;
+/// The page on disk is polled for the same reason: there is no message for a file being
+/// written. `ReadDirectoryChangesW` would answer the question as it is asked, at the cost
+/// of a thread and a wait handle wired into the message loop, to learn something a
+/// `GetFileTime` gives in a microsecond.
+const DOCUMENT_TIMER: usize = 0x5141;
+const DOCUMENT_TICK_MS: u32 = 700;
 /// How far the pointer has to travel, in device pixels, before a held left button stops
 /// meaning "here" and starts meaning "from here to there".
 const DRAG_SLOP: f32 = 3.0;
@@ -722,6 +728,9 @@ pub struct View {
     client_h: f32,
     dpi: f32,
     path: Option<PathBuf>,
+    /// What the file behind the page looked like when this text was read out of it: how
+    /// long it was, and when it was last written. See [`Stamp`] and `WM_TIMER`.
+    stamp: Option<Stamp>,
     /// The pages the reader has left behind, and the ones they have stepped away from.
     /// Filled by any change of page -- a link, a dropped file, a second document out of
     /// the dialog -- so that the last thing they were reading is never more than one key
@@ -1357,6 +1366,12 @@ pub fn run(source: String, path: Option<PathBuf>) -> Result<()> {
         .filter(|(left, _)| Some(left.as_path()) == path.as_deref())
         .map(|(_, anchor)| anchor);
 
+    // The file the text above came out of, as it stands at this moment. `main` has already
+    // read it, so this is the stamp of the page on the screen rather than of some text that
+    // arrived afterwards -- and if a save did land in between, the first poll finds it a
+    // fraction of a second later.
+    let stamp = path.as_deref().and_then(stamp_of);
+
     let mut view = Box::new(View {
         d2d,
         target: None,
@@ -1385,6 +1400,7 @@ pub fn run(source: String, path: Option<PathBuf>) -> Result<()> {
         client_h: 1.0,
         dpi: 96.0,
         path,
+        stamp,
         history: History::default(),
         dragging: false,
         press_at: None,
@@ -1444,6 +1460,10 @@ pub fn run(source: String, path: Option<PathBuf>) -> Result<()> {
         }
         let _ = ShowWindow(hwnd, SW_SHOWNORMAL);
         let _ = SetTimer(Some(hwnd), APPEARANCE_TIMER, APPEARANCE_TICK_MS, None);
+        // Armed even for a page with no file behind it: the sample has no path to poll, and
+        // the tick costs a branch, while a document opened later by the dialog or a drop has
+        // to find the timer already running.
+        let _ = SetTimer(Some(hwnd), DOCUMENT_TIMER, DOCUMENT_TICK_MS, None);
 
         let mut msg = MSG::default();
         while GetMessageW(&mut msg, None, 0, 0).as_bool() {
@@ -1451,6 +1471,7 @@ pub fn run(source: String, path: Option<PathBuf>) -> Result<()> {
             DispatchMessageW(&msg);
         }
         let _ = KillTimer(Some(hwnd), APPEARANCE_TIMER);
+        let _ = KillTimer(Some(hwnd), DOCUMENT_TIMER);
         // `view` is dropped here; the pointer stored in GWLP_USERDATA dies with it.
     }
     Ok(())
@@ -1536,6 +1557,37 @@ fn system_prefers_dark() -> bool {
         )
     };
     r.is_ok() && value == 0
+}
+
+/// The two facts about a file that say whether the page on the screen came out of this
+/// one of it.
+///
+/// Length and age rather than a hash, because the question is asked two or three times a
+/// second and a hash reads the whole document to answer it. A save that left the file both
+/// exactly as long and exactly as old as it was is the one case this can miss, and it is a
+/// save that changed nothing.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct Stamp {
+    len: u64,
+    /// `None` when the drive will not say, which some network shares will not. The length
+    /// is then the only thing that can notice a rewrite, and it usually still can.
+    written: Option<std::time::SystemTime>,
+}
+
+fn stamp_of(path: &std::path::Path) -> Option<Stamp> {
+    let m = std::fs::metadata(path).ok()?;
+    Some(Stamp { len: m.len(), written: m.modified().ok() })
+}
+
+/// Whether the page on the screen is now a page the file has stopped being.
+///
+/// A file that is not there to be asked answers `false`, on purpose: the text last read
+/// out of it is still true about the document the reader was reading, and a page that
+/// blanks itself because an editor renamed a temporary file over the top of it would be
+/// three screens of prose lost for a few milliseconds. The next tick finds the new file,
+/// and this one keeps the reader where they were standing until it does.
+fn is_written(seen: Option<Stamp>, now: Option<Stamp>) -> bool {
+    now.is_some() && now != seen
 }
 
 unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRESULT {
@@ -1965,12 +2017,17 @@ impl View {
                 LRESULT(0)
             }
             WM_TIMER => {
-                // A poll, not a push: there is no message for this setting. The reader's
-                // own choice outranks it, and `set_dark` does nothing when the answer it
-                // gets is already on screen.
-                let dark = self.dark_override.unwrap_or_else(system_prefers_dark);
-                self.set_dark(dark, hwnd);
-                let _ = InvalidateRect(Some(hwnd), None, false);
+                match wp.0 {
+                    DOCUMENT_TIMER => self.reload_if_written(hwnd),
+                    _ => {
+                        // A poll, not a push: there is no message for this setting. The
+                        // reader's own choice outranks it, and `set_dark` does nothing when
+                        // the answer it gets is already on screen.
+                        let dark = self.dark_override.unwrap_or_else(system_prefers_dark);
+                        self.set_dark(dark, hwnd);
+                        let _ = InvalidateRect(Some(hwnd), None, false);
+                    }
+                }
                 LRESULT(0)
             }
             WM_DROPFILES => {
@@ -3418,6 +3475,40 @@ impl View {
         }
     }
 
+    /// Read the page again if the file behind it has been written since the text on screen
+    /// came out of it.
+    ///
+    /// The reader keeps their place, because that is what a save is: somebody has changed
+    /// a paragraph, not the paragraph being looked at. `relayout_in_place` is the same
+    /// arithmetic a resize or a change of face already uses, and the place it keeps is a
+    /// character of the prose rather than a distance down the page, so a document that has
+    /// grown around the reader carries them along with it. What cannot survive a re-wrap is
+    /// a selection -- a pair of places in lines that no longer exist -- and a search's
+    /// hits, which `relayout` re-asks of the new page for itself.
+    fn reload_if_written(&mut self, hwnd: HWND) {
+        // Held rather than borrowed: the page is replaced through the same `self` the path
+        // is a part of, and a borrow of one field is a borrow of the whole struct as far as
+        // the compiler is concerned. One path per three-quarters of a second is not a
+        // copy worth an unsafe for.
+        let Some(path) = self.path.clone() else { return };
+        let now = stamp_of(&path);
+        if !is_written(self.stamp, now) {
+            return;
+        }
+        let Ok(source) = std::fs::read_to_string(&path) else {
+            // Half way through being written, or locked by whatever is writing it. The
+            // stamp is left as it was, so the next tick asks again rather than assuming
+            // this file has already been read.
+            return;
+        };
+        self.doc = rubrica_doc::Document::parse(&source);
+        // The age polled *before* the read, not the one taken after it: if the file was
+        // written again in between, the older stamp makes the next tick notice, where the
+        // newer one would let a change go unread until the save after it.
+        self.stamp = now;
+        self.relayout_in_place(hwnd);
+    }
+
     /// Make this text the page, from its top, and name it on the title bar. The title is
     /// part of the page rather than of the call that got here, because this is the one
     /// place every route to a new document passes through -- and a reader who has just
@@ -3426,6 +3517,10 @@ impl View {
     fn set_page(&mut self, source: String, path: Option<PathBuf>, hwnd: HWND) {
         self.doc = rubrica_doc::Document::parse(&source);
         self.path = path;
+        // Filed at the same moment as the text that came out of it, so that the next tick
+        // of the poll compares the page on screen against the file it was read from rather
+        // than against whatever the last page's file was.
+        self.stamp = self.path.as_deref().and_then(stamp_of);
         self.scroll = 0.0;
         self.relayout();
         let title = utf16(&window_title(self.path.as_deref()));
@@ -4572,6 +4667,71 @@ mod tests {
     use super::*;
 
     const DPI: f32 = 96.0;
+
+    /// The page poll's whole decision, taken without a file in the way.
+    #[test]
+    fn a_page_is_only_reread_when_the_file_behind_it_has_changed() {
+        let aged = |secs: u64| {
+            Stamp { len: 10, written: Some(std::time::UNIX_EPOCH + std::time::Duration::from_secs(secs)) }
+        };
+        // Same length, same age: the screen is showing the file that is there.
+        assert!(!is_written(Some(aged(1)), Some(aged(1))), "an unchanged file is not a save");
+        // Either number moving is a write, and a write is a page to take again.
+        assert!(is_written(Some(aged(1)), Some(aged(2))));
+        assert!(is_written(Some(Stamp { len: 11, ..aged(1) }), Some(Stamp { len: 12, ..aged(1) })));
+        // A file that has gone away is not a page to throw at the reader.
+        assert!(!is_written(Some(aged(1)), None), "a missing file keeps the last page read");
+        // Nothing filed against a page yet -- the start-up read that could not ask, or the
+        // sample -- is not the same as a page already up to date.
+        assert!(is_written(None, Some(aged(1))), "a page of unknown origin is a page to read");
+        assert!(!is_written(None, None), "and there is nothing to do about a page with no file");
+        // A share that tells nobody an age still tells a length.
+        let blind = |len: u64| Stamp { len, written: None };
+        assert!(is_written(Some(blind(10)), Some(blind(11))));
+        assert!(!is_written(Some(blind(10)), Some(blind(10))));
+    }
+
+    /// The same decision with a real file behind it, which is the only way to check that
+    /// what is asked of the drive is answered in the units the comparison uses.
+    #[test]
+    fn a_file_says_how_long_it_is_and_when_it_was_written() {
+        let dir = std::env::temp_dir().join(format!("rubrica-stamp-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("a directory to write a page into");
+        let file = dir.join("chapter.md");
+
+        assert_eq!(stamp_of(&file), None, "a page not written yet has nothing to say");
+        std::fs::write(&file, "one two").expect("a page to ask about");
+        let first = stamp_of(&file).expect("a page that has been written");
+        // Bytes, not characters -- which matters the first time a document is written in
+        // Chinese and a length in characters would say two lines are the same size.
+        assert_eq!(first.len, 7);
+        assert!(first.written.is_some(), "a local drive gives an age");
+
+        // Rewritten to exactly the same length. The age is then put there by hand rather
+        // than left to the clock: a filesystem with a coarse timestamp makes two writes a
+        // microsecond apart the same age, and the test would be about this machine's drive
+        // rather than about the comparison.
+        std::fs::write(&file, "two one").expect("the same length, the other way round");
+        aged_to(&file, 3_600);
+        let second = stamp_of(&file).expect("the page again");
+        assert_eq!(second.len, first.len, "the length gives no hint of the change");
+        assert_ne!(second, first, "and so only the age can say it");
+        assert!(is_written(Some(first), Some(second)));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Set a file's age to a stated number of seconds after the epoch, and say nothing if
+    /// that could not be done: the assertion above is the thing under test, and a drive
+    /// that will not be told an age fails there rather than here.
+    fn aged_to(path: &std::path::Path, secs: u64) {
+        let times = std::fs::FileTimes::new()
+            .set_modified(std::time::UNIX_EPOCH + std::time::Duration::from_secs(secs));
+        if let Ok(h) = std::fs::OpenOptions::new().write(true).open(path) {
+            let _ = h.set_times(times);
+        }
+    }
 
     #[test]
     fn no_thumb_when_the_document_fits() {
