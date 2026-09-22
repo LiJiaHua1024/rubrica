@@ -29,6 +29,16 @@ fn set_indent(text: &str, column: Pt, indent: Pt) -> (Paragraph, Plan) {
     typeset(text, &spacing, StyleId(0), &[], &opts, &mut measure)
 }
 
+/// As [`set_indent`], but for a marker hanging out of the left margin: the width the
+/// lines under it give up.
+fn set_hang(text: &str, column: Pt, hang: Pt) -> (Paragraph, Plan) {
+    let spacing = Spacing::for_size(SIZE);
+    let mut measure = MonospaceMeasure { size: SIZE, factor: 0.5 };
+    let mut opts = BreakOptions::new(column);
+    opts.hang_indent = hang;
+    typeset(text, &spacing, StyleId(0), &[], &opts, &mut measure)
+}
+
 fn text_of(para: &Paragraph, src: &str, line: &rubrica_type::Line) -> String {
     let mut s = String::new();
     for i in line.items.clone() {
@@ -312,6 +322,60 @@ fn par_indent_shortens_only_the_first_line() {
     assert!(
         (second - column).abs() < 0.5,
         "second line must flush to the full measure: wanted {column}, got {second:.3}"
+    );
+}
+
+#[test]
+fn hang_indent_narrows_every_line_but_the_markers_own() {
+    let column = 34.0 * SIZE;
+    let hang = 40.0;
+    let (para, plan) = set_hang(PROSE, column, hang);
+    assert!(plan.lines.len() >= 3, "need two hung lines to compare against");
+
+    // The line the marker sits on keeps the whole measure; the marker hangs out of it
+    // rather than eating into the text beside it.
+    assert!(plan.lines[0].first);
+    assert!(
+        (plan.lines[0].target - column).abs() < 0.5,
+        "first line target should be the full measure {column}, got {}",
+        plan.lines[0].target
+    );
+    for (i, l) in plan.lines.iter().enumerate().skip(1) {
+        assert!(!l.first, "only one line may be the first");
+        assert!(
+            (l.target - (column - hang)).abs() < 0.5,
+            "line {i} should be set to {}, got {}",
+            column - hang,
+            l.target
+        );
+    }
+    // A target is a promise the solver has to keep: every hung line that is not the
+    // ragged last one has to be justified out to its own, narrower measure.
+    for i in 1..plan.lines.len() - 1 {
+        let w = line_width(&place(&para, &plan.lines[i]));
+        assert!(
+            (w - (column - hang)).abs() < 0.5,
+            "line {i} flushed to {w:.3} instead of {}",
+            column - hang
+        );
+    }
+    // And the narrowing has to change where the text breaks, not only what it is
+    // reported as: set the same prose without the marker and the second line reaches
+    // further into the source than the hung one does.
+    let ends_at = |para: &Paragraph, l: &rubrica_type::Line| -> usize {
+        l.items
+            .clone()
+            .rev()
+            .find_map(|i| match para.items[i] {
+                Item::Box { node } => Some(para.node(node).text.end),
+                _ => None,
+            })
+            .unwrap_or(0)
+    };
+    let (plain_para, plain) = set(PROSE, column);
+    assert!(
+        ends_at(&para, &plan.lines[1]) < ends_at(&plain_para, &plain.lines[1]),
+        "a hung second line must break earlier than a flush one"
     );
 }
 

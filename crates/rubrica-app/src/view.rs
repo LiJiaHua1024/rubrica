@@ -661,6 +661,10 @@ struct Blk<'a> {
     /// Markdown has no footnote block kind, only a definition the reader collects.
     size: Pt,
     leading: Leading,
+    /// Width of the marker leading this block, which is how far every line under it
+    /// stands back from the measure so the marker can hang in that space. Zero for a
+    /// block with no marker, which is every block but a list item and a footnote.
+    hang: Pt,
 }
 
 /// A block readied for layout: its text with the marker already in front of it, and
@@ -670,6 +674,10 @@ struct Prepared {
     spans: Vec<StyleSpan>,
     /// The id of the block's own prose style, which is also what a marker is set in.
     base: usize,
+    /// The marker's own advance, which the lines below it give up. Measured rather than
+    /// assumed from ems, because a bullet and the number `10` are not the same width and
+    /// body text that lines up with neither is not hung.
+    hang: Pt,
     table: Option<PreparedTable>,
 }
 
@@ -739,27 +747,22 @@ fn end_rule(rule: &mut Option<Rule>, bars: &mut Vec<(Pt, Pt, Pt, Pt, ColorRole)>
 fn merge_rule(
     pending: &mut Option<Rule>,
     bars: &mut Vec<(Pt, Pt, Pt, Pt, ColorRole)>,
-    style: StyleId,
-    x: Pt,
-    w: Pt,
-    top: Pt,
-    h: Pt,
-    color: ColorRole,
+    next: Rule,
 ) {
-    if let Some(r) = pending.as_mut().filter(|r| r.style == style) {
-        if (r.top - top).abs() < 0.01 && (r.h - h).abs() < 0.01 {
-            r.w += w;
+    if let Some(r) = pending.as_mut().filter(|r| r.style == next.style) {
+        if (r.top - next.top).abs() < 0.01 && (r.h - next.h).abs() < 0.01 {
+            r.w += next.w;
             return;
         }
     }
     end_rule(pending, bars);
-    *pending = Some(Rule { style, x, top, w, h, color });
+    *pending = Some(next);
 }
 
 /// Typeset one block into the display list and return the new document y.
 fn layout_block(font: &mut FontEngine, ctx: &Ctx<'_>, blk: &Blk<'_>, ops: &mut Vec<Op>, mut y: Pt) -> Pt {
     let Ctx { theme, styles, math, k } = *ctx;
-    let Blk { b, text, spans, base, left, column, hyphenation, size, .. } = *blk;
+    let Blk { b, text, spans, base, left, column, hyphenation, size, hang, .. } = *blk;
     let leading = &blk.leading;
     let mut images_out: Vec<(PathBuf, f32, f32, Pt, Pt)> = Vec::new();
     if b.kind == BlockKind::Rule {
@@ -786,6 +789,9 @@ fn layout_block(font: &mut FontEngine, ctx: &Ctx<'_>, blk: &Blk<'_>, ops: &mut V
     let mut opts = BreakOptions::new(column);
     opts.ragged = b.ragged();
     opts.par_indent = theme.first_line_indent_em * size;
+    // Every line but the first stands back by the marker's own width, so the marker
+    // hangs in the margin it clears instead of shoving the body along.
+    opts.hang_indent = hang;
 
     let (para, plan) = typeset_hyphenated(
         text,
@@ -806,6 +812,10 @@ fn layout_block(font: &mut FontEngine, ctx: &Ctx<'_>, blk: &Blk<'_>, ops: &mut V
 
     for line in &plan.lines {
         let placed = place(&para, line);
+        // Where this line starts. A line under a hanging marker begins at the marker's
+        // right edge, which is the space [`Blk::hang`] bought it; the first line begins
+        // at the block's own left, where the marker sits.
+        let line_left = left + if line.first { opts.par_indent } else { hang };
         let mut runs: Vec<PaintRun> = Vec::new();
         // Bars of a formula, as x, top edge, width, thickness and ink, all still
         // relative to this line's baseline because the line has no position yet.
@@ -834,7 +844,7 @@ fn layout_block(font: &mut FontEngine, ctx: &Ctx<'_>, blk: &Blk<'_>, ops: &mut V
                     Some(ObjectSource::Image(file)) => {
                         images_out.push((
                             file.clone(),
-                            (left + slot.x) * k,
+                            (line_left + slot.x) * k,
                             o.advance * k,
                             o.ascent,
                             o.descent,
@@ -845,12 +855,12 @@ fn layout_block(font: &mut FontEngine, ctx: &Ctx<'_>, blk: &Blk<'_>, ops: &mut V
                         // box, so nothing here accumulates an advance.
                         if let Some(entry) = math.get(*index) {
                             for (r, dx, dy) in &entry.parts {
-                                if let Some(p) = paint_run(font, r, left + slot.x + dx, *dy, k, st.color) {
+                                if let Some(p) = paint_run(font, r, line_left + slot.x + dx, *dy, k, st.color) {
                                     runs.push(p);
                                 }
                             }
                             bars.extend(entry.rules.iter().map(|(x, top, w, h)| {
-                                (left + slot.x + x, *top, *w, *h, st.color)
+                                (line_left + slot.x + x, *top, *w, *h, st.color)
                             }));
                         }
                     }
@@ -867,7 +877,7 @@ fn layout_block(font: &mut FontEngine, ctx: &Ctx<'_>, blk: &Blk<'_>, ops: &mut V
             // One span can need several faces -- Latin and Han in one sentence, or a
             // run that falls back for a symbol -- and each takes up where the last
             // stopped, since only the whole span's width is what the line broke on.
-            let mut at = left + slot.x;
+            let mut at = line_left + slot.x;
             for r in shaped {
                 ascent = ascent.max(r.ascent - dy);
                 descent = descent.max((r.descent + dy).max(0.0));
@@ -882,12 +892,14 @@ fn layout_block(font: &mut FontEngine, ctx: &Ctx<'_>, blk: &Blk<'_>, ops: &mut V
                     merge_rule(
                         &mut ruled,
                         &mut bars,
-                        node.style,
-                        at,
-                        r.width(),
-                        dy - pos - weight * 0.5,
-                        weight,
-                        st.color,
+                        Rule {
+                            style: node.style,
+                            x: at,
+                            top: dy - pos - weight * 0.5,
+                            w: r.width(),
+                            h: weight,
+                            color: st.color,
+                        },
                     );
                 }
                 at += r.width();
@@ -1475,9 +1487,19 @@ fn prepare_block(
     let mut text = set.marker.clone();
     text.push_str(&b.text);
     let mut spans: Vec<StyleSpan> = Vec::with_capacity(b.spans.len() + 1);
+    let mut hang = 0.0;
     if shift > 0 {
         let id = intern(styles, &theme.fonts.fallback, r(BlockKind::Paragraph, InlineStyle::EMPTY));
         spans.push(StyleSpan { range: 0..shift, style: id });
+        // Shaped through the same entry point the body is shaped by, so the measure the
+        // lines below give up is exactly the width the marker takes up here -- which is
+        // what makes a `☐` and a `10.` each clear their own space rather than a guess.
+        let st = &styles[id.0 as usize];
+        hang = font
+            .shape_runs(&text, 0..shift, &st.face, st.size, st.tracking)
+            .iter()
+            .map(|r| r.width())
+            .sum();
     }
     let base = intern(styles, &theme.fonts.fallback, r(b.kind, InlineStyle::EMPTY));
     for s in &b.spans {
@@ -1521,7 +1543,7 @@ fn prepare_block(
         };
         PreparedTable { head: prep(&t.head), rows: t.rows.iter().map(|r| prep(r)).collect() }
     });
-    Prepared { text, spans, base: base.0 as usize, table }
+    Prepared { text, spans, base: base.0 as usize, hang, table }
 }
 
 /// Where the words of `text` may split, and the advance of the hyphen glyph at the
@@ -1606,6 +1628,24 @@ pub fn build_ops(
         })
         .collect();
 
+    // One hanging indent per list level rather than one per item: an ordered list that
+    // runs from `9.` to `10.` still sets every body at the same x, the way a table's
+    // second column would. The same for the apparatus, where the numbers `9` and `10`
+    // sit in one column of notes. Digits are tabular in the faces in use, so the widest
+    // marker of a level is also the measure every narrower one is set against.
+    let mut level_hang: Vec<Pt> = Vec::new();
+    for (b, p) in doc.blocks.iter().zip(&prepared) {
+        if let Some(l) = b.list {
+            let d = l.depth as usize;
+            level_hang.resize(d + 1, 0.0);
+            level_hang[d] = level_hang[d].max(p.hang);
+        }
+    }
+    let note_hang = note_units
+        .iter()
+        .map(|u| u.first().map_or(0.0, |p| p.hang))
+        .fold(0.0f32, Pt::max);
+
     font.begin_layout(
         styles
             .iter()
@@ -1626,6 +1666,10 @@ pub fn build_ops(
         let mut left = base_left
             + b.quote_depth as Pt * theme.quote_indent_em * theme.base
             + b.list.map_or(0.0, |l| l.depth as Pt * theme.list_indent_em * size);
+        // Every point a block is run in from the margin is a point it has to give back
+        // at the right: a nested list or a quotation that kept the page's whole measure
+        // would end its lines out past the text standing beside it.
+        let inner = (column - (left - base_left)).max(size * 4.0);
         // A displayed equation is the only thing on its line, and an equation on its
         // own is centred rather than run in to the margin: the prose around it is
         // justified, so a short line starting at the left edge reads as a line that
@@ -1635,16 +1679,13 @@ pub fn build_ops(
         {
             if let Some(s) = p.spans.last() {
                 if let Some(o) = styles[s.style.0 as usize].object {
-                    let inner = column - (left - base_left);
                     left += ((inner - o.advance) * 0.5).max(0.0);
                 }
             }
         }
-        let body_left = if b.list.is_some() {
-            left + theme.list_indent_em * size * 0.9
-        } else {
-            left
-        };
+        // The block starts at its own left and the marker hangs out of it: no extra
+        // indent is added here for a list, because the lines under the marker give that
+        // width back themselves, at the width the marker actually has.
         y = layout_block(
             font,
             &ctx,
@@ -1653,12 +1694,15 @@ pub fn build_ops(
                 text: &p.text,
                 spans: &p.spans,
                 base: p.base,
-                left: body_left,
-                column: column - (body_left - left),
+                left,
+                column: inner,
                 table: p.table.as_ref(),
                 hyphenation: Hyphenation { points: &hyphens, width: hyphen_width },
                 size,
                 leading: theme.line_spacing(b.kind),
+                hang: b.list.map_or(p.hang, |l| {
+                    level_hang.get(l.depth as usize).copied().unwrap_or(p.hang)
+                }),
             },
             &mut ops,
             y,
@@ -1706,6 +1750,7 @@ pub fn build_ops(
                         hyphenation: Hyphenation { points: &hyphens, width: hyphen_width },
                         size,
                         leading: theme.note_leading(),
+                        hang: note_hang,
                     },
                     &mut ops,
                     y,

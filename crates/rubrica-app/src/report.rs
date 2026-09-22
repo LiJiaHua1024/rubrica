@@ -38,7 +38,7 @@ pub fn report(source: &str, path: Option<&str>, width: f32, dpi: f32, hyphenate:
     let mut math = crate::math::MathStore::new();
     let mut objects = crate::view::Objects::new(store.as_ref(), base, &mut math);
     let hyphenator = if hyphenate { crate::hyphen::Hyphenator::english() } else { None };
-    let (ops, height, column_pt, _left) = build_ops(
+    let (ops, height, column_pt, left_pt) = build_ops(
         &mut font,
         &theme,
         &doc,
@@ -75,6 +75,9 @@ pub fn report(source: &str, path: Option<&str>, width: f32, dpi: f32, hyphenate:
     }
 
     let col_dip = column_pt * k;
+    // The measure's right edge in device pixels: where every justified line ends,
+    // whatever its own left happens to be.
+    let edge = (left_pt + column_pt) * k;
     println!("document   : {}", path.unwrap_or("(built-in sample)"));
     println!("blocks     : {}   lines: {}   height {:.0}pt", doc.blocks.len(), lines.len(), height);
     println!("measure    : {:.1}pt ({:.1} em)  = {col_dip:.1}dip at {dpi}dpi", column_pt, column_pt / theme.base);
@@ -86,11 +89,13 @@ pub fn report(source: &str, path: Option<&str>, width: f32, dpi: f32, hyphenate:
     let mut fills: Vec<f32> = Vec::new();
     let mut off_measure = 0usize;
     for (i, l) in lines.iter().enumerate() {
-        let fill = (l.right - l.left) / col_dip;
+        // Measure an edge, not a width: a line under a hanging marker or a first-line
+        // indent starts further in, so its width is legitimately short while its right
+        // edge sits exactly on the measure. Judging the width would report every hung
+        // line as a ragged one.
+        let fill = l.right / edge;
         let short = fill < 0.985;
-        // Compare a width against a width: the right edge is absolute, so
-        // subtracting the measure from it silently flags every centred line.
-        let over = (l.right - l.left - col_dip) / k;
+        let over = (l.right - edge) / k;
         if !short {
             fills.push(fill);
         }
@@ -122,6 +127,25 @@ pub fn report(source: &str, path: Option<&str>, width: f32, dpi: f32, hyphenate:
     }
     if off_measure > 0 {
         println!("!! {off_measure} line(s) hang past the measure (overfull)");
+    }
+    // Which lines stand back from the margin, and by how much -- the work of a hanging
+    // marker. A document whose list items wrap should never report none of these: that
+    // the marker stopped being measured is a layout change too subtle to spot in a
+    // glyph census.
+    let mut offsets: BTreeMap<i32, usize> = BTreeMap::new();
+    for l in &lines {
+        let back = l.left / k - left_pt;
+        if back > 1.0 {
+            *offsets.entry((back * 10.0).round() as i32).or_default() += 1;
+        }
+    }
+    if !offsets.is_empty() {
+        let n: usize = offsets.values().sum();
+        let steps: Vec<String> = offsets
+            .iter()
+            .map(|(t, c)| format!("{:.1}pt x{c}", *t as f32 / 10.0))
+            .collect();
+        println!("hang         : {n} line(s) stand back from the margin at {}", steps.join(", "));
     }
     println!("glyph census:");
     for (fam, n) in &census {

@@ -22,6 +22,11 @@ pub struct BreakOptions {
     pub column_width: Pt,
     /// First-line indent; later lines flush to `column_width`.
     pub par_indent: Pt,
+    /// TeX's `\hangindent`: what every line but the first gives up, so that the first
+    /// line runs out to the left of the rest. A bullet or a footnote's number sits in
+    /// the space the other lines leave, which is the only way a marker can hang in the
+    /// margin and still have the lines under it break at their own, narrower measure.
+    pub hang_indent: Pt,
     /// Max badness on the first pass (TeX's `\pretolerance`).
     pub pretolerance: i32,
     /// Max badness on the second pass (TeX's `\tolerance`).
@@ -48,6 +53,7 @@ impl BreakOptions {
         Self {
             column_width,
             par_indent: 0.0,
+            hang_indent: 0.0,
             pretolerance: 100,
             tolerance: 200,
             hyphenate: true,
@@ -61,6 +67,14 @@ impl BreakOptions {
             ragged: false,
         }
     }
+
+    /// The measure a line is set to. The paragraph's first line pays its own indent and
+    /// nothing else; the lines under a hanging marker pay the hang instead, so the two
+    /// never compound on the same line.
+    #[inline]
+    pub fn target(&self, first: bool) -> Pt {
+        self.column_width - if first { self.par_indent } else { self.hang_indent }
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -71,7 +85,9 @@ pub struct Line {
     pub natural: Pt,
     pub stretch: Pt,
     pub shrink: Pt,
-    /// Width this line is set to; `column_width` unless it is first or last.
+    /// Width this line is set to; [`BreakOptions::target`]'s, so it differs from
+    /// `column_width` on an indented first line, on a line under a hanging marker, and
+    /// on the last.
     pub target: Pt,
     pub badness: i32,
     pub fitness: u8,
@@ -400,7 +416,7 @@ fn solve(
                 Item::Penalty { width, .. } => width,
                 _ => 0.0,
             };
-            let line_target = opts.column_width - if at_start[e] { opts.par_indent } else { 0.0 };
+            let line_target = opts.target(at_start[e]);
             let (range, natural, stretch, shrink) = trim(items, sums, ed.start, k, pw);
             if range.is_empty() {
                 next_active.push(e);
@@ -445,7 +461,7 @@ fn solve(
             Item::Penalty { width, .. } => width,
             _ => 0.0,
         };
-        let line_target = opts.column_width - if at_start[prev] { opts.par_indent } else { 0.0 };
+        let line_target = opts.target(at_start[prev]);
         let (range, natural, stretch, shrink) = trim(items, sums, ed.start, k, pw);
         let (bad, fit, _) = score(
             natural,
@@ -494,7 +510,7 @@ fn solve(
             natural: ed.width,
             stretch: ed.stretch,
             shrink: ed.shrink,
-            target: opts.column_width - if n == 0 && first_line { opts.par_indent } else { 0.0 },
+            target: opts.target(n == 0 && first_line),
             badness: ed.badness,
             fitness: ed.fitness,
             forced: matches!(items[ed.item], Item::Penalty { forced: true, .. }),
@@ -540,7 +556,7 @@ fn desperate(
             if legal {
                 first_legal = first_legal.or(Some(i));
                 let (_, natural, _, shrink) = trim(items, sums, start, i, 0.0);
-                if f64::from(natural) - f64::from(shrink) > f64::from(opts.column_width) + f64::from(EPSILON) {
+                if f64::from(natural) - f64::from(shrink) > f64::from(opts.target(first_line && out.is_empty())) + f64::from(EPSILON) {
                     break;
                 }
                 take = Some(i);
@@ -569,7 +585,7 @@ fn desperate(
             natural,
             stretch,
             shrink,
-            target: opts.column_width - if first_line && out.is_empty() { opts.par_indent } else { 0.0 },
+            target: opts.target(first_line && out.is_empty()),
             badness: 10000,
             fitness: 3,
             forced: matches!(items[b], Item::Penalty { forced: true, .. }),
