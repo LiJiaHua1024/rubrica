@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-members = ["crates/rubrica-type", "crates/rubrica-app", "crates/rubrica-doc"]
+members = ["crates/rubrica-type", "crates/rubrica-app", "crates/rubrica-doc", "crates/rubrica-math"]
 
 [workspace.package]
 version = "0.1.0"
@@ -10,6 +10,7 @@ license = "MIT OR Apache-2.0"
 [workspace.dependencies]
 rubrica-type = { path = "crates/rubrica-type" }
 rubrica-doc = { path = "crates/rubrica-doc" }
+rubrica-math = { path = "crates/rubrica-math" }
 unicode-linebreak = "0.1"
 unicode-script = "0.5"
 

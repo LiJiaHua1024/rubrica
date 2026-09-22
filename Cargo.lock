@@ -123,6 +123,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "rubrica-math"
+version = "0.1.0"
+
+[[package]]
 name = "rubrica-type"
 version = "0.1.0"
 dependencies = [

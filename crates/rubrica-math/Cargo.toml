@@ -1,0 +1,8 @@
+[package]
+name = "rubrica-math"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "OpenType MATH table parsing, a LaTeX subset, and MATH-driven box layout"
+
+[dependencies]
