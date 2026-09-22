@@ -203,6 +203,29 @@ mod tests {
         }
     }
 
+    #[test]
+    fn a_text_fraction_is_set_one_script_step_down() {
+        let run_size = |src: &str| {
+            typeset(src, 10.0, false, &mut Mock::mathy())
+                .shapes
+                .iter()
+                .map(|s| match s {
+                    Shape::Run { size, .. } => *size,
+                    _ => 0.0,
+                })
+                .fold(0.0f32, f32::max)
+        };
+        assert_eq!(run_size("\\frac{1}{2}"), 10.0);
+        assert_eq!(
+            run_size("\\tfrac{1}{2}"),
+            7.5,
+            "the face's own script ratio, not a size this engine invented"
+        );
+        // `\dfrac` keeps its size and changes only its proportions, which the mock
+        // declines to report -- so what separates it from `\frac` is the parse.
+        assert_eq!(run_size("\\dfrac{1}{2}"), 10.0);
+    }
+
     trait RemoveOne {
         fn remove_one(self) -> (f32, f32, f32);
     }

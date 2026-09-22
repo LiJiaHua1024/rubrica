@@ -2,9 +2,9 @@
 //!
 //! Deliberately a subset, not a TeX implementation: the goal is the math people
 //! actually write in Markdown, so fractions, scripts, radicals, stretchy delimiters,
-//! big operators with limits, accents, multi-row environments and the common symbol
-//! names are handled, and anything else degrades to its literal characters rather than
-//! disappearing.
+//! big operators with limits, accents, lettering switches (`\mathbb`, `\mathbf`),
+//! multi-row environments and the common symbol names are handled, and anything else
+//! degrades to its literal characters rather than disappearing.
 //!
 //! Unbalanced braces or an unknown command never fail the parse. A reader that
 //! refuses to show a document because one formula is malformed is worse than one
@@ -21,6 +21,8 @@ pub enum Node {
         den: Box<Node>,
         /// `\binom` renders the same stack with no rule.
         has_bar: bool,
+        /// Whether the fraction takes its proportions from the formula around it.
+        style: FracStyle,
     },
     Sup {
         base: Box<Node>,
@@ -79,6 +81,22 @@ pub enum Node {
         kind: ArrayKind,
         delimiters: Option<(char, char)>,
     },
+}
+
+/// Whether a fraction is set by the formula around it or by its own name.
+///
+/// `\dfrac` and `\tfrac` are the same stack read at two sizes: one keeps a displayed
+/// formula's proportions wherever it is written, the other is put small enough to sit in
+/// a line of prose without pushing that line apart.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum FracStyle {
+    /// Take the surrounding style, which is plain `\frac`.
+    #[default]
+    Auto,
+    /// Display proportions, whatever the formula around it is doing.
+    Display,
+    /// Text proportions, at one script step down.
+    Text,
 }
 
 /// Where a big operator's limits go: above/below in display style, as scripts
@@ -270,18 +288,20 @@ impl<'a> Parser<'a> {
                 Some(b' ') => {
                     self.bump();
                 }
-                Some(b) => {
-                    self.bump();
-                    let ch = (b as char).to_string();
+                Some(_) => {
+                    // Decoded a character at a time, so a Greek letter or a Han
+                    // ideograph typed straight into the formula arrives as itself
+                    // rather than as its two or three UTF-8 bytes.
+                    let Some(ch) = self.take_char() else { break };
                     match out.last_mut() {
                         // Letters run together into one atom; digits and operators
                         // each stand alone, because their spacing differs.
                         Some(Node::Atom(s))
-                            if letter_run(s) && (b as char).is_alphabetic() =>
+                            if letter_run(s) && ch.is_alphabetic() =>
                         {
-                            s.push_str(&ch)
+                            s.push(ch)
                         }
-                        _ => out.push(Node::Atom(ch)),
+                        _ => out.push(Node::Atom(ch.to_string())),
                     }
                 }
             }
@@ -353,10 +373,13 @@ impl<'a> Parser<'a> {
                 Node::Row(self.list(Ctx::Group))
             }
             Some(b'\\') => self.command().unwrap_or(Node::Atom(String::new())),
-            Some(_) => {
-                let c = self.bump().unwrap() as char;
-                Node::Atom(c.to_string())
-            }
+            Some(b) => match self.take_char() {
+                Some(c) => Node::Atom(c.to_string()),
+                None => {
+                    self.bump();
+                    Node::Atom((b as char).to_string())
+                }
+            },
             None => Node::Atom(String::new()),
         }
     }
@@ -376,6 +399,7 @@ impl<'a> Parser<'a> {
                 b'%' => Node::Atom("%".into()),
                 b'$' => Node::Atom("$".into()),
                 b'&' => Node::Atom("&".into()),
+                b'|' => Node::Atom("\u{2016}".into()),
                 b'\\' => Node::Space(0),
                 _ => Node::Atom((first as char).to_string()),
             });
@@ -401,10 +425,21 @@ impl<'a> Parser<'a> {
                 let name = self.braced_text().unwrap_or_default();
                 Node::Atom(format!("\\end{{{name}}}"))
             }
-            "frac" | "dfrac" | "tfrac" => {
+            "frac" => Node::Frac {
+                num: Box::new(self.argument()),
+                den: Box::new(self.argument()),
+                has_bar: true,
+                style: FracStyle::Auto,
+            },
+            "dfrac" | "tfrac" => {
                 let a = self.argument();
                 let b = self.argument();
-                Node::Frac { num: Box::new(a), den: Box::new(b), has_bar: true }
+                Node::Frac {
+                    num: Box::new(a),
+                    den: Box::new(b),
+                    has_bar: true,
+                    style: if name == "dfrac" { FracStyle::Display } else { FracStyle::Text },
+                }
             }
             "binom" => {
                 let a = self.argument();
@@ -416,6 +451,7 @@ impl<'a> Parser<'a> {
                         num: Box::new(a),
                         den: Box::new(b),
                         has_bar: false,
+                        style: FracStyle::Auto,
                     }),
                 }
             }
@@ -464,10 +500,25 @@ impl<'a> Parser<'a> {
                 let r = self.delim();
                 Node::Atom(r.to_string())
             }
-            "text" | "mathrm" | "operatorname" => {
-                // Upright text: kept as atoms, since style is not modelled here.
-                self.argument()
-            }
+            // Upright words: read as written, spaces and all, because a formula's
+            // `\text{as } x` loses a word when the space is treated as a separator.
+            "text" | "textrm" | "mbox" => Node::Atom(self.text_argument()),
+            "mathrm" | "operatorname" => Node::Atom(self.text_argument()),
+            "textbf" => Node::Atom(alphabetize(Alphabet::Bold, &self.text_argument())),
+            "textit" => Node::Atom(alphabetize(Alphabet::Italic, &self.text_argument())),
+            "textsf" => Node::Atom(alphabetize(Alphabet::Sans, &self.text_argument())),
+            "texttt" => Node::Atom(alphabetize(Alphabet::Monospace, &self.text_argument())),
+            // A change of alphabet in math: the argument's letters become the codepoints
+            // of that alphabet, which is how TeX itself spells it. See [`Alphabet`].
+            "mathbb" => self.alphabetized(Alphabet::DoubleStruck),
+            "mathbf" | "bf" => self.alphabetized(Alphabet::Bold),
+            "mathit" | "mathnormal" | "it" => self.alphabetized(Alphabet::Italic),
+            "boldsymbol" => self.alphabetized(Alphabet::BoldItalic),
+            "mathsf" | "sf" => self.alphabetized(Alphabet::Sans),
+            "mathtt" | "tt" => self.alphabetized(Alphabet::Monospace),
+            "mathfrak" | "frak" => self.alphabetized(Alphabet::Fraktur),
+            "mathcal" | "cal" => self.alphabetized(Alphabet::Script),
+            "mathscr" => self.alphabetized(Alphabet::Script),
             "overline" => Node::Bar { body: Box::new(self.argument()), side: BarSide::Over },
             "underline" => Node::Bar { body: Box::new(self.argument()), side: BarSide::Under },
             "hat" => self.accent(AccentKind::Hat),
@@ -485,6 +536,67 @@ impl<'a> Parser<'a> {
 
     fn accent(&mut self, kind: AccentKind) -> Node {
         Node::Accent { base: Box::new(self.argument()), accent: kind }
+    }
+
+    /// The argument of an alphabet-switching command, with its letters moved into that
+    /// alphabet's codepoints. Nested switches keep the inner one: the outer has nothing
+    /// left to retarget once the inner has spent the letter's ASCII codepoint.
+    fn alphabetized(&mut self, alphabet: Alphabet) -> Node {
+        retarget(alphabet, self.argument())
+    }
+
+    /// A brace group read as *words* rather than as tokens: its spaces are the author's
+    /// and not separators, so `\text{as } x` keeps the gap the sentence needs. Only the
+    /// escapes that stand for a character are resolved; braces around an inner group
+    /// vanish and everything else is kept exactly as written.
+    fn text_argument(&mut self) -> String {
+        if self.peek() != Some(b'{') {
+            return self.take_char().map(|c| c.to_string()).unwrap_or_default();
+        }
+        self.at += 1;
+        let mut out = String::new();
+        let mut depth = 1usize;
+        while depth > 0 && self.at < self.src.len() {
+            match self.src[self.at] {
+                b'{' => {
+                    depth += 1;
+                    self.at += 1;
+                }
+                b'}' => {
+                    depth -= 1;
+                    self.at += 1;
+                }
+                b'\\' => {
+                    self.at += 1;
+                    match self.take_char() {
+                        Some(c) if !c.is_ascii_alphabetic() => out.push(c),
+                        Some(c) => {
+                            out.push('\\');
+                            out.push(c);
+                        }
+                        None => {}
+                    }
+                }
+                _ => match self.take_char() {
+                    Some(c) => out.push(c),
+                    // Not a UTF-8 boundary, which only a malformed input can leave the
+                    // reader at: keep the byte rather than spin on it.
+                    None => {
+                        out.push(self.src[self.at] as char);
+                        self.at += 1;
+                    }
+                },
+            }
+        }
+        out
+    }
+
+    /// The next character, whole: a multibyte one arrives as the letter it is rather
+    /// than as the bytes of its UTF-8 encoding.
+    fn take_char(&mut self) -> Option<char> {
+        let c = std::str::from_utf8(self.rest()).ok()?.chars().next()?;
+        self.at += c.len_utf8();
+        Some(c)
     }
 
     /// `\begin{X} ... \end{X}`: a grid of cells. The name decides the kind, and with
@@ -671,6 +783,9 @@ impl<'a> Parser<'a> {
             b"rbrack" => ']',
             b"vert" | b"lvert" | b"rvert" | b"mid" => '|',
             b"Vert" | b"lVert" | b"rVert" => '\u{2016}',
+            // `\|` is the shorthand for `\Vert`, and the escaped bar is how a norm
+            // reaches the page -- a delimiter nothing else would draw.
+            b"|" => '\u{2016}',
             _ => '\0',
         }
     }
@@ -682,6 +797,153 @@ impl<'a> Parser<'a> {
 /// after it.
 fn letter_run(s: &str) -> bool {
     s.chars().next().is_some_and(|c| c.is_alphabetic())
+}
+
+/// A lettering style in math, spelled the way TeX and Unicode spell it: as a different
+/// codepoint rather than as a different face. That is what lets a blackboard-bold `ℝ`
+/// travel through the layout as one ordinary atom -- measured by the same shaper, drawn
+/// by the same run path -- with the face itself chosen by the platform's font fallback.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Alphabet {
+    Bold,
+    Italic,
+    BoldItalic,
+    Sans,
+    SansBold,
+    /// `\mathsf{\mathit{...}}`, which no command of ours reaches on its own.
+    Fraktur,
+    BoldFraktur,
+    /// `\mathcal`, and `\mathscr` as well: a script face is one alphabet to a font,
+    /// and the two names differ only in which designer's curves they ask for.
+    Script,
+    BoldScript,
+    /// `\mathbb`: the double-struck numerals `\N \Z \Q \R \C`.
+    DoubleStruck,
+    Monospace,
+}
+
+impl Alphabet {
+    /// The codepoint each block starts at, for `A`, `a` and `0`. `None` for the digits
+    /// means the alphabet has no numerals encoded, which is most of them.
+    fn bases(self) -> (u32, u32, Option<u32>) {
+        use Alphabet::*;
+        match self {
+            Bold => (0x1D400, 0x1D41A, Some(0x1D7CE)),
+            Italic => (0x1D434, 0x1D44E, None),
+            BoldItalic => (0x1D468, 0x1D482, None),
+            Sans => (0x1D5A0, 0x1D5BA, Some(0x1D7E2)),
+            SansBold => (0x1D5D4, 0x1D5EE, Some(0x1D7EC)),
+            Fraktur => (0x1D504, 0x1D51E, None),
+            BoldFraktur => (0x1D56C, 0x1D586, None),
+            Script => (0x1D49C, 0x1D4B6, None),
+            BoldScript => (0x1D4D0, 0x1D4EA, None),
+            DoubleStruck => (0x1D538, 0x1D552, Some(0x1D7D8)),
+            Monospace => (0x1D670, 0x1D68A, Some(0x1D7F6)),
+        }
+    }
+
+    /// A letter encoded outside its block because it predates it: `\R` is `ℝ` at
+    /// U+211D, not the twenty-third slot of the double-struck row.
+    fn exception(self, c: char) -> Option<char> {
+        use Alphabet::*;
+        let cp = match (self, c) {
+            (Italic, 'h') => '\u{210E}',
+            (DoubleStruck, 'C') => '\u{2102}',
+            (DoubleStruck, 'H') => '\u{210D}',
+            (DoubleStruck, 'N') => '\u{2115}',
+            (DoubleStruck, 'P') => '\u{2119}',
+            (DoubleStruck, 'Q') => '\u{211A}',
+            (DoubleStruck, 'R') => '\u{211D}',
+            (DoubleStruck, 'Z') => '\u{2124}',
+            (Fraktur, 'C') => '\u{212D}',
+            (Fraktur, 'H') => '\u{210C}',
+            (Fraktur, 'I') => '\u{2110}',
+            (Fraktur, 'R') => '\u{211C}',
+            (Fraktur, 'Z') => '\u{2128}',
+            (Script, 'B') => '\u{212C}',
+            (Script, 'E') => '\u{2130}',
+            (Script, 'F') => '\u{2131}',
+            (Script, 'H') => '\u{210B}',
+            (Script, 'I') => '\u{2110}',
+            (Script, 'L') => '\u{2112}',
+            (Script, 'M') => '\u{2133}',
+            (Script, 'R') => '\u{211B}',
+            (Script, 'e') => '\u{212F}',
+            (Script, 'i') => '\u{210A}',
+            _ => return None,
+        };
+        Some(cp)
+    }
+
+    /// One character in this alphabet, or `None` when it has no lettering of its own and
+    /// stays as written -- punctuation, operators, and a letter already spent on the
+    /// alphabet of an inner switch.
+    fn of(self, c: char) -> Option<char> {
+        if let Some(e) = self.exception(c) {
+            return Some(e);
+        }
+        let (cap, lower, digits) = self.bases();
+        let (base, value) = match c {
+            'A'..='Z' => (cap, c as u32 - 'A' as u32),
+            'a'..='z' => (lower, c as u32 - 'a' as u32),
+            '0'..='9' => (digits?, c as u32 - '0' as u32),
+            _ => return None,
+        };
+        char::from_u32(base + value)
+    }
+}
+
+/// Retarget every letter in `s`, leaving anything else alone.
+pub fn alphabetize(alphabet: Alphabet, s: &str) -> String {
+    s.chars().map(|c| alphabet.of(c).unwrap_or(c)).collect()
+}
+
+/// Retarget the letters of a parsed argument, however deep they sit in it: a switch
+/// covers its whole argument, which is why `\mathbb{R^n}` doubles the `n` as well while
+/// `\mathbb{R}^n` leaves it in the plain alphabet.
+pub fn retarget(alphabet: Alphabet, node: Node) -> Node {
+    let go = |n: Node| retarget(alphabet, n);
+    let boxed = |n: Node| Box::new(go(n));
+    match node {
+        Node::Atom(s) => Node::Atom(alphabetize(alphabet, &s)),
+        Node::Row(v) => Node::Row(v.into_iter().map(go).collect()),
+        Node::Frac { num, den, has_bar, style } => Node::Frac {
+            num: boxed(*num),
+            den: boxed(*den),
+            has_bar,
+            style,
+        },
+        Node::Sup { base, sup } => Node::Sup { base: boxed(*base), sup: boxed(*sup) },
+        Node::Sub { base, sub } => Node::Sub { base: boxed(*base), sub: boxed(*sub) },
+        Node::SubSup { base, sub, sup } => Node::SubSup {
+            base: boxed(*base),
+            sub: boxed(*sub),
+            sup: boxed(*sup),
+        },
+        Node::Sqrt { body, degree } => Node::Sqrt {
+            body: boxed(*body),
+            degree: degree.map(|d| boxed(*d)),
+        },
+        Node::Fence { left, right, body } =>
+            Node::Fence { left, right, body: boxed(*body) },
+        Node::BigOp { op, limits, sub, sup } => Node::BigOp {
+            // The operator's own name is not lettered: a bold `\sum` is still the
+            // `\sum` glyph, and `\lim` is a word rather than a product of letters.
+            op,
+            limits,
+            sub: sub.map(|n| boxed(*n)),
+            sup: sup.map(|n| boxed(*n)),
+        },
+        Node::Accent { base, accent } => Node::Accent { base: boxed(*base), accent },
+        Node::Bar { body, side } => Node::Bar { body: boxed(*body), side },
+        Node::Array { rows, columns, kind, delimiters } => Node::Array {
+            rows: rows.into_iter().map(|r| r.into_iter().map(go).collect()).collect(),
+            columns,
+            kind,
+            delimiters,
+        },
+        s @ Node::Space(_) => s,
+    }
 }
 
 /// LaTeX command name to the text it denotes. Greek, the usual operators and
@@ -817,8 +1079,10 @@ fn symbol(name: &str) -> Option<&'static str> {
         "Pr" => "Pr",
         "cdots" => "⋯",
         "ldots" => "…",
-        "vdots" => "⋮",
+        "dots" => "…",
         "ddots" => "⋱",
+        "vdots" => "⋮",
+        "colon" => ":",
         "dotsc" => "⋯",
         "angle" => "∠",
         "perp" => "⊥",
@@ -835,6 +1099,10 @@ fn symbol(name: &str) -> Option<&'static str> {
         "rfloor" => "⌋",
         "langle" => "⟨",
         "rangle" => "⟩",
+        // The `\left`-only spellings are also written on their own -- `\lVert x \rVert`
+        // for a norm -- where they reach the symbol table instead of a delimiter pair.
+        "vert" | "lvert" | "rvert" => "|",
+        "Vert" | "lVert" | "rVert" => "\u{2016}",
         "surd" => "√",
         "checkmark" => "✓",
         "dagger" => "†",
@@ -927,9 +1195,14 @@ mod tests {
             // A row of one is just that one: `{x}` and `x` must not look different.
             Node::Row(v) if v.len() == 1 => sexp(&v[0]),
             Node::Row(v) => format!("({})", v.iter().map(sexp).collect::<Vec<_>>().join(" ")),
-            Node::Frac { num, den, has_bar } => format!(
+            Node::Frac { num, den, has_bar, style } => format!(
                 "({} {} {})",
-                if *has_bar { "frac" } else { "nob" },
+                match (*has_bar, *style) {
+                    (true, FracStyle::Auto) => "frac",
+                    (true, FracStyle::Display) => "dfrac",
+                    (true, FracStyle::Text) => "tfrac",
+                    (false, _) => "nob",
+                },
                 sexp(num),
                 sexp(den)
             ),
@@ -1023,6 +1296,10 @@ mod tests {
         // is the bug this guards: `argument` must not eat the backslash twice.
         assert_eq!(of("\\frac12"), "(frac 1 2)");
         assert_eq!(of("\\hat x"), "(accent Hat x)");
+        // The three spellings are one construct with three proportions.
+        assert_eq!(of("\\frac12"), "(frac 1 2)");
+        assert_eq!(of("\\dfrac12"), "(dfrac 1 2)");
+        assert_eq!(of("\\tfrac12"), "(tfrac 1 2)");
     }
 
     #[test]
@@ -1201,8 +1478,7 @@ mod tests {
     }
 
     #[test]
-    fn a_broken_environment_degrades_to_its_own_text() {
-        // Unknown name: the markers show as written and the content survives.
+    fn a_broken_environment_degrades_to_its_own_text() {        // Unknown name: the markers show as written and the content survives.
         assert_eq!(
             of("\\begin{psst} a & b \\end{psst}"),
             "(\\begin{psst} a b \\end{psst})"
@@ -1223,5 +1499,53 @@ mod tests {
             of("\\begin{psst}a\\end{psst}\\frac{1}{2}"),
             "((\\begin{psst} a \\end{psst}) (frac 1 2))"
         );
+    }
+
+    #[test]
+    fn an_alphabet_switch_moves_the_letter_to_its_own_codepoint() {
+        assert_eq!(of("\\mathbb{R}"), "\u{211D}");
+        assert_eq!(of("\\mathbb{N}\\cap\\mathbb{Z}"), "(\u{2115} \u{2229} \u{2124})");
+        assert_eq!(of("\\mathbf{x}"), "\u{1D431}");
+        assert_eq!(of("\\mathcal{L}"), "\u{2112}");
+        assert_eq!(of("\\mathfrak{g}"), "\u{1D524}");
+        assert_eq!(of("\\boldsymbol{v}"), "\u{1D497}");
+        // The switch covers the argument it was given, so a whole word is lettered; a
+        // script written after the closer is outside it, which is what TeX does too.
+        assert_eq!(of("\\mathbb{AB}^{n}"), "(sup \u{1D538}\u{1D539} n)");
+        // A block with no numerals of its own leaves the digit as written: a lettered
+        // glyph that does not exist would come back as tofu, and 2 is not a substitute
+        // for a nonexistent double-struck 2.
+        assert_eq!(of("\\mathcal{L}^2"), "(sup \u{2112} 2)");
+        // Punctuation and operators have no lettered spelling at all.
+        assert_eq!(of("\\mathbb{+}"), "+");
+        // Two switches on one letter: the inner one spent the ASCII codepoint, and the
+        // outer leaves what it cannot retarget alone rather than mangling it.
+        assert_eq!(of("\\mathbb{\\mathbf{R}}"), "\u{1D411}");
+    }
+
+    #[test]
+    fn text_keeps_the_spaces_inside_its_own_braces() {
+        // The space is the author's: `list` treats one between atoms as a separator, so
+        // a word group read through the ordinary path arrives missing its own gaps.
+        assert_eq!(of("\\text{hello world}"), "hello world");
+        assert_eq!(of("\\text{as }x"), "as x");
+        assert_eq!(of("\\mathrm{d}x"), "dx");
+        assert_eq!(of("\\operatorname{arg min}"), "arg min");
+        // Only the escapes that stand for a character are resolved; an inner group
+        // contributes its words without the braces that set it off.
+        assert_eq!(of("\\text{50\\% off}"), "50% off");
+        assert_eq!(of("\\text{a{bc}d}"), "abcd");
+        // An unbraced text argument is the one token after it, spaces and all.
+        assert_eq!(of("\\text x"), "x");
+        assert_eq!(of("\\text{unclosed"), "unclosed", "an unclosed group still gives its words");
+    }
+
+    #[test]
+    fn a_non_ascii_letter_survives_as_one_character() {
+        // Byte-at-a-time reading turned a typed `π` into two latin-1 marks and a Han
+        // ideograph into three, which no font can render as the letter it is.
+        assert_eq!(of("\u{3C0}+1"), "(\u{3C0} + 1)");
+        assert_eq!(of("\u{3C0}\u{3C1}"), "\u{3C0}\u{3C1}", "letters still run together");
+        assert_eq!(of("\\text{\u{4E2D}\u{6587}}"), "\u{4E2D}\u{6587}");
     }
 }

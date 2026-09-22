@@ -24,7 +24,7 @@
 //! stands in, so a formula still sets acceptably in a font like Consolas instead of
 //! collapsing.
 
-use crate::parse::{AccentKind, ArrayKind, BarSide, ColAlign, Limits, Node};
+use crate::parse::{AccentKind, ArrayKind, BarSide, ColAlign, FracStyle, Limits, Node};
 use crate::table::constant;
 
 pub type Pt = f32;
@@ -207,7 +207,8 @@ impl Engine<'_> {
         match n {
             Node::Atom(s) => self.atom(s, st),
             Node::Row(v) => self.row(v, st),
-            Node::Frac { num, den, has_bar } => self.frac(num, den, *has_bar, st),
+            Node::Frac { num, den, has_bar, style } =>
+                self.frac(num, den, *has_bar, *style, st),
             Node::Sup { base, sup } => self.scripts(base, None, Some(sup), st),
             Node::Sub { base, sub } => self.scripts(base, Some(sub), None, st),
             Node::SubSup { base, sub, sup } => self.scripts(base, Some(sub), Some(sup), st),
@@ -262,7 +263,30 @@ impl Engine<'_> {
 
     /// Fractions and a big operator's limit stack are the same arrangement: two boxes
     /// about the axis with a minimum ink gap between them.
-    fn frac(&mut self, num: &Node, den: &Node, has_bar: bool, st: Style) -> (Vec<Shape>, Mb) {
+    fn frac(
+        &mut self,
+        num: &Node,
+        den: &Node,
+        has_bar: bool,
+        forced: FracStyle,
+        st: Style,
+    ) -> (Vec<Shape>, Mb) {
+        // `\tfrac` is the whole construct one script step down, the way `smallmatrix`
+        // is; `\dfrac` keeps its size and only asks for a displayed formula's
+        // proportions. Everything below reads `st`, so restating the style here is all
+        // a forced one changes.
+        let mut base = st;
+        if forced == FracStyle::Text {
+            base.size = self.script_size(st, 1);
+        }
+        let st = Style {
+            display: match forced {
+                FracStyle::Auto => st.display,
+                FracStyle::Display => true,
+                FracStyle::Text => false,
+            },
+            ..base
+        };
         // Both halves lose the display style and are cramped: a numerator is set in
         // text style even inside a display formula.
         let inner = Style { display: false, cramped: true, ..st };

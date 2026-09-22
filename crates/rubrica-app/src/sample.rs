@@ -115,6 +115,10 @@ $$\begin{pmatrix} a & b \\ c & d \end{pmatrix} \begin{pmatrix} x \\ y \end{pmatr
 
 上面每一个数字都取自字体自带的 MATH 表：分数线落在 axisHeight 上，分子按 numShift 上移，根号与括号由 glyph assembly 拼出需要的高度，而不是把一个字形纵向拉长。多行的公式也一样——行距取 mathLeading，整块以 axisHeight 为轴居中，所以矩阵和它旁边的分数线同高。
 
+公式里的字母也可以换一套字形：$\mathbb{R}^n$、$\mathbf{x}$、$\mathcal{L}$、$\mathfrak{g}$、$\boldsymbol{v}$。这里换的是码位而不是字体，与 TeX 和 Word 的做法相同——黑板粗体的 `ℝ` 仍然是一个普通的原子，量它与画它走的还是上面那条路径，找不到这个字形时才由逐字回退去别的面里取。词组要的是另一件事：$\text{其中 } n > 1$ 里的空格是作者写下的，不是两个记号之间的分隔，所以花括号里的内容整段照原样读出。
+
+$$\int_{\mathbb{R}^n} e^{-\lVert \mathbf{x} \rVert^2}\,\mathrm{d}\mathbf{x} = \pi^{n/2} \quad \text{其中 } \mathbf{x} \in \mathbb{R}^n$$
+
 ## 脚注
 
 引用标记只把数字抬高，让它坐在它所属的那个词上方，而不是成为句子里的一个词：全局断行的代价函数[^dy]决定了每一行的富余量，重复引用同一个脚注得到的是同一个数字[^dy]。
