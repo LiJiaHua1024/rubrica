@@ -726,6 +726,18 @@ fn scale_of(dpi: f32) -> f32 {
     dpi / 72.0
 }
 
+/// How far the document's top sits above the window's, in device independent pixels,
+/// when the reader has scrolled down by `scroll` points.
+///
+/// One function for one number, because it is used from both ends of the same
+/// arithmetic: paint lifts the display list by it, and a pointer's y is pushed down by it
+/// to be asked of that list. Agree on nothing else and the page paints one paragraph while
+/// a click marks the next.
+#[inline]
+fn scroll_dip(scroll: Pt, dpi: f32) -> Pt {
+    scroll * scale_of(dpi)
+}
+
 /// One rung of the measure ladder either way, stopping at both ends rather than
 /// wrapping: a key pressed past the widest column the page can be set to should do
 /// nothing, not silently teleport the reader to the narrow one.
@@ -1813,7 +1825,7 @@ impl View {
     /// window's client origin. The rectangles are stored against the top of the
     /// document, so the only translation the test needs is the scroll.
     fn hot_at(&self, x: f32, y: f32) -> Option<usize> {
-        let y = y + self.scroll * scale_of(self.dpi);
+        let y = y + scroll_dip(self.scroll, self.dpi);
         self.hotspots
             .iter()
             .position(|h| x >= h.x && x <= h.x + h.w && y >= h.y && y <= h.y + h.h)
@@ -1822,7 +1834,7 @@ impl View {
     /// The place in the page's text under a pointer position given in client pixels,
     /// translated into document pixels the same way [`View::hot_at`] translates.
     fn caret_under(&self, x: f32, y: f32) -> Caret {
-        caret_at(&self.sel_index, x, y + self.scroll * scale_of(self.dpi))
+        caret_at(&self.sel_index, x, y + scroll_dip(self.scroll, self.dpi))
     }
 
     /// Scroll the page when a drag is held against its top or bottom edge, so a
@@ -2981,9 +2993,14 @@ impl View {
             target.BeginDraw();
             let bg = d2d(self.palette.bg);
             target.Clear(Some(&bg));
-            let scroll_dip = self.scroll * scale_of(self.dpi);
-            let top = -scroll_dip;
-            let bottom = self.client_h - scroll_dip;
+            // The display list is measured from the top of the document, so the whole of
+            // it is lifted by the scroll here and nowhere else: a wheel tick costs one
+            // subtraction at paint time rather than a relayout of the page, which is the
+            // difference between scrolling at the frame rate and building the page again.
+            let up = scroll_dip(self.scroll, self.dpi);
+            // The document's two edges that the window is over.
+            let top = up;
+            let bottom = up + self.client_h;
             for op in self.ops.iter() {
                 match op {
                     Op::Rect { x, y, w, h, color } => {
@@ -2994,9 +3011,9 @@ impl View {
                         if let Some(brush) = self.brushes.get(&role).cloned() {
                             let r = D2D_RECT_F {
                                 left: *x,
-                                top: *y,
+                                top: *y - up,
                                 right: x + w,
-                                bottom: y + h,
+                                bottom: y + h - up,
                             };
                             target.FillRectangle(&r, &brush);
                         }
@@ -3008,8 +3025,8 @@ impl View {
                         let role = *color;
                         if let Some(brush) = self.brushes.get(&role).cloned() {
                             target.DrawLine(
-                                Vector2::new(*x0, *y0),
-                                Vector2::new(*x1, *y1),
+                                Vector2::new(*x0, y0 - up),
+                                Vector2::new(*x1, y1 - up),
                                 &brush,
                                 *thickness,
                                 None,
@@ -3024,7 +3041,12 @@ impl View {
                             continue;
                         };
                         if let Some(bmp) = store.bitmap(&t, path) {
-                            let r = D2D_RECT_F { left: *x, top: *y, right: x + w, bottom: y + h };
+                            let r = D2D_RECT_F {
+                                left: *x,
+                                top: y - up,
+                                right: x + w,
+                                bottom: y + h - up,
+                            };
                             target.DrawBitmap(
                                 &bmp,
                                 Some(&r),
@@ -3052,7 +3074,7 @@ impl View {
                                 bidiLevel: 0,
                             };
                             target.DrawGlyphRun(
-                                Vector2::new(run.x, run.baseline),
+                                Vector2::new(run.x, run.baseline - up),
                                 &gr,
                                 &brush,
                                 DWRITE_MEASURING_MODE_NATURAL,
@@ -3071,7 +3093,8 @@ impl View {
                         if y + h < top || y > bottom {
                             continue;
                         }
-                        let r = D2D_RECT_F { left: x, top: y, right: x + w, bottom: y + h };
+                        let r =
+                            D2D_RECT_F { left: x, top: y - up, right: x + w, bottom: y + h - up };
                         target.FillRectangle(&r, &brush);
                     }
                 }
@@ -3086,7 +3109,12 @@ impl View {
                 {
                     if let Some((x, y, w, h)) = caret_rect(&self.sel_index, c) {
                         if y + h >= top && y <= bottom {
-                            let r = D2D_RECT_F { left: x, top: y, right: x + w, bottom: y + h };
+                            let r = D2D_RECT_F {
+                                left: x,
+                                top: y - up,
+                                right: x + w,
+                                bottom: y + h - up,
+                            };
                             target.FillRectangle(&r, &brush);
                         }
                     }
@@ -3996,6 +4024,21 @@ mod tests {
     fn scrolling_past_the_end_clamps_instead_of_leaving_the_track() {
         let (_, y_over, _, h) = thumb_rect(2400.0, 1000.0, 800.0, 99_000.0, DPI).unwrap();
         assert!(y_over + h <= 800.0 + 0.5, "thumb left the viewport: {y_over}+{h}");
+    }
+
+    #[test]
+    fn a_line_is_painted_where_a_click_is_asked_of_it() {
+        // Two ends of one subtraction: paint lifts the display list by `scroll_dip`, and a
+        // pointer's own y is pushed down by the same number to be asked of that list. A
+        // sign flipped on either end is a page that shows one paragraph and marks the one
+        // above it -- and nothing outside a window would notice, so the round trip is the
+        // check.
+        let sel = vec![sel_line("first", 0.0, Join::None), sel_line("second", 32.0, Join::None)];
+        let up = scroll_dip(20.0, DPI);
+        let painted = sel[1].y - up;
+        assert!(painted > 0.0 && painted < 800.0, "the scrolled line is still on screen: {painted}");
+        let c = caret_at(&sel, 0.0, painted + up + 1.0);
+        assert_eq!(c.line, 1, "a pointer at the painted place reaches the painted line");
     }
 
     fn url(target: &str, range: std::ops::Range<usize>) -> Action {
