@@ -71,6 +71,10 @@ pub fn report(source: &str, path: Option<&str>, o: &Options) -> Result<()> {
 
     let mut lines: Vec<Line> = Vec::new();
     let mut census: BTreeMap<String, usize> = BTreeMap::new();
+    // Glyphs no face on this machine owns: a zero id is `.notdef`, which paints as an
+    // empty box and is otherwise invisible from outside the window. Math is where it
+    // bites first, because a change of lettering style there is a change of codepoint.
+    let mut notdef: BTreeMap<String, usize> = BTreeMap::new();
     for op in ops {
         let crate::view::Op::Runs(runs) = op else { continue };
         if runs.is_empty() {
@@ -87,6 +91,10 @@ pub fn report(source: &str, path: Option<&str>, o: &Options) -> Result<()> {
             l.right = l.right.max(r.x + w);
             let fam = r.family.clone();
             *census.entry(fam.clone()).or_default() += r.glyphs.len();
+            let holes = r.glyphs.iter().filter(|g| **g == 0).count();
+            if holes > 0 {
+                *notdef.entry(fam.clone()).or_default() += holes;
+            }
             if !l.families.contains(&fam) {
                 l.families.push(fam);
             }
@@ -184,6 +192,11 @@ pub fn report(source: &str, path: Option<&str>, o: &Options) -> Result<()> {
     println!("glyph census:");
     for (fam, n) in &census {
         println!("  {fam:<24} {n:>6} glyphs");
+    }
+    if !notdef.is_empty() {
+        let n: usize = notdef.values().sum();
+        let who = notdef.iter().map(|(f, c)| format!("{f} x{c}")).collect::<Vec<_>>().join(", ");
+        println!("notdef       : {n} drawn glyph(s) no face here has -- {who}");
     }
     let han: usize = source.chars().filter(|c| matches!(*c as u32, 0x4E00..=0x9FFF)).count();
     let latin: usize = source.chars().filter(|c| c.is_ascii_alphabetic()).count();

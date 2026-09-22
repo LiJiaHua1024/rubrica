@@ -296,7 +296,18 @@ impl FontEngine {
         let mut at = 0usize;
         while at < slice.len() {
             let rest = &slice[at..];
-            let Some(face) = self.resolve_face(req, rest) else { break };
+            // Nothing on the request's list has the next character. Draw it from the
+            // requested face anyway: `.notdef` is a box a reader can see and a report can
+            // count, while stopping here turns the rest of the run into invisible text.
+            let face = match self.resolve_face(req, rest) {
+                Some(f) => f,
+                None => match self.face_for(&req.family, req.weight, req.italic) {
+                    Some(f) => f,
+                    // No face at all -- a machine with no fonts, or a family that was
+                    // uninstalled mid-run. There is nothing left to draw with.
+                    None => break,
+                },
+            };
             let taken = self.covered_prefix(face, rest).max(first_char_len(rest));
             let chunk = &rest[..taken];
             let mut runs = self.shape_with_face(chunk, range.start + at, face, size, tracking);
