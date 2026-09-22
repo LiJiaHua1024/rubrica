@@ -71,7 +71,7 @@ use crate::font::{FaceRequest, FontEngine, GlyphRun, ObjectBox, Style as RunStyl
 use crate::hyphen::Hyphenator;
 use crate::images::ImageStore;
 use crate::math::MathStore;
-use crate::theme::{ColorRole, Leading, Theme, Zoom};
+use crate::theme::{ColorRole, Leading, TextFace, Theme, Zoom};
 use crate::{Error, Result};
 
 /// The character drawn at a discretionary break, and the range to shape it from.
@@ -733,6 +733,8 @@ enum Command {
     ZoomIn,
     ZoomOut,
     ZoomReset,
+    /// Set the page in one of the faces [`TextFace::ALL`] offers, by index.
+    Face(usize),
     /// Set the palette and keep it set, against whatever the system says next.
     Palette(bool),
     /// Let the system's own setting decide again, which is the only way back out of a
@@ -766,6 +768,13 @@ struct MenuState {
     /// Whether the page has any text at all, which is the difference between an empty
     /// document and a document nothing has been marked in.
     text: bool,
+    /// Which entry of [`TextFace::ALL`] the page is set in right now.
+    face: usize,
+    /// Which of those faces this machine can actually draw, index for index with
+    /// [`TextFace::ALL`]. A face that is not installed is shown and left dim: it is the
+    /// reader's own machine, and hiding the choice they cannot have says less about it
+    /// than naming it and refusing to do anything when asked.
+    offered: Vec<bool>,
 }
 
 /// The menu, in the order it appears and with the groups it is divided into.
@@ -787,6 +796,14 @@ fn menu_items(s: &MenuState) -> Vec<MenuRow> {
         row(Command::ZoomOut, "Decrease Text", true),
         row(Command::ZoomReset, "Actual Size", true),
     ]);
+    v.push(MenuRow::Gap);
+    for (i, f) in TextFace::ALL.iter().enumerate() {
+        let on = i == s.face;
+        let ok = s.offered.get(i).copied().unwrap_or(false);
+        // The face in use is always clickable: a machine that has lost a family since it
+        // was chosen still has to be able to choose away from it.
+        v.push(if on { check(Command::Face(i), f.label, true) } else { row(Command::Face(i), f.label, ok) });
+    }
     v.push(MenuRow::Gap);
     v.extend([
         check(Command::Palette(false), "Light", s.dark == Some(false)),
@@ -1556,6 +1573,8 @@ impl View {
             dark: self.dark_override,
             from_file: self.path.is_some(),
             text: !self.sel_index.is_empty(),
+            face: self.theme.face,
+            offered: TextFace::ALL.iter().map(|f| self.face_available(f)).collect(),
         };
         let menu = match unsafe { CreatePopupMenu() } {
             Ok(m) => m,
@@ -1616,6 +1635,7 @@ impl View {
                 self.zoom_to(z, hwnd);
             }
             Command::ZoomReset => self.zoom_to(Zoom::DESIGN, hwnd),
+            Command::Face(i) => self.set_face(i, hwnd),
             Command::Palette(dark) => {
                 self.dark_override = Some(dark);
                 self.set_dark(dark, hwnd);
@@ -1636,6 +1656,28 @@ impl View {
                 }
             }
         }
+        let _ = unsafe { InvalidateRect(Some(hwnd), None, false) };
+    }
+
+    /// Whether this machine can draw both halves of a pairing.
+    fn face_available(&self, f: &TextFace) -> bool {
+        self.font.has_family(f.body) && self.font.has_family(f.heading)
+    }
+
+    /// Set the page in another face pairing.
+    ///
+    /// A face that is not installed is refused rather than answered by whatever
+    /// DirectWrite would substitute in its place: a reader who asks for Candara on a
+    /// machine without it should go on reading the face they had, not a stranger chosen
+    /// for them.
+    fn set_face(&mut self, face: usize, hwnd: HWND) {
+        let Some(f) = TextFace::ALL.get(face) else { return };
+        if face == self.theme.face || !self.face_available(f) {
+            return;
+        }
+        self.theme.set_face(face);
+        self.relayout();
+        self.clamp_scroll();
         let _ = unsafe { InvalidateRect(Some(hwnd), None, false) };
     }
 
@@ -3812,7 +3854,15 @@ mod tests {
     /// asks: is anything marked, is there an address here, who is deciding the palette,
     /// did this page come off a disk, is there any text at all.
     fn state(selected: bool, link: Option<&str>, dark: Option<bool>, from_file: bool, text: bool) -> MenuState {
-        MenuState { link: link.map(str::to_string), selected, dark, from_file, text }
+        MenuState {
+            link: link.map(str::to_string),
+            selected,
+            dark,
+            from_file,
+            text,
+            face: 0,
+            offered: vec![true; TextFace::ALL.len()],
+        }
     }
 
     #[test]
@@ -3829,8 +3879,13 @@ mod tests {
         );
         // The document came from nowhere, so there is nothing on disk to read again.
         assert_eq!(got.last().map(|(c, e, _)| (c.clone(), *e)), Some((Command::Reload, false)));
-        assert_eq!(got.iter().filter(|(_, _, c)| *c).count(), 1, "exactly one palette row is on");
+        assert_eq!(
+            got.iter().filter(|(_, _, c)| *c).count(),
+            2,
+            "exactly one palette row and one face row are on"
+        );
         assert!(got.iter().any(|(c, _, c2)| *c2 && c == &Command::FollowSystem));
+        assert!(got.iter().any(|(c, _, c2)| *c2 && c == &Command::Face(0)));
 
         assert_eq!(rows(&state(true, None, None, false, true))[0], (Command::Copy, true, false));
 
@@ -3843,6 +3898,26 @@ mod tests {
     }
 
     #[test]
+    fn a_face_this_machine_cannot_draw_is_named_and_dimmed() {
+        let mut s = state(false, None, None, false, true);
+        s.offered = vec![true, false, false, true];
+        let at = |got: &[(Command, bool, bool)], i| {
+            got.iter().find(|(c, _, _)| c == &Command::Face(i)).cloned().expect("face row")
+        };
+        let got = rows(&s);
+        assert_eq!(at(&got, 0), (Command::Face(0), true, true));
+        assert_eq!(at(&got, 1), (Command::Face(1), false, false), "not installed, so not offered");
+        assert_eq!(at(&got, 3), (Command::Face(3), true, false));
+
+        // A face can go missing after the page has been set in it -- a font uninstalled
+        // while the reader was away. The row that says where they are stays true, and
+        // stays clickable, because leaving is the one thing that must still work.
+        s.face = 1;
+        let got = rows(&s);
+        assert_eq!(at(&got, 1), (Command::Face(1), true, true));
+    }
+
+    #[test]
     fn a_menu_opened_over_a_link_carries_its_address() {
         let s = MenuState {
             link: Some("https://example.com/x".into()),
@@ -3850,6 +3925,8 @@ mod tests {
             dark: None,
             from_file: false,
             text: true,
+            face: 0,
+            offered: vec![true; TextFace::ALL.len()],
         };
         let got = rows(&s);
         // Two items, in this order: follow it, and take only the address. Both enabled,

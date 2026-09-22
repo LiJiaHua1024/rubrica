@@ -185,6 +185,14 @@ impl FontEngine {
         (exists.0 != 0).then_some(index)
     }
 
+    /// Whether this machine can actually set body-weight text in this family, which is
+    /// what decides whether a face the reader is being offered is offered or greyed out.
+    /// Asking for a face rather than for a name: a family registered with no readable
+    /// file behind it is a name nothing can be drawn from.
+    pub fn has_family(&self, family: &str) -> bool {
+        self.face_for(family, 400, false).is_some()
+    }
+
     /// Resolve (family, weight, slant) to a cached face.
     fn face_for(&self, family: &str, weight: u16, italic: bool) -> Option<usize> {
         let key = (family.to_string(), weight, italic);

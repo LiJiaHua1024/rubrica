@@ -4,9 +4,10 @@
 //! someone else's font files is not on the table, and a reader that cannot render
 //! without them is more fragile than one that picks good system faces.
 //!
-//! Body serif with sans headings is a deliberate, conventional pairing: the serif
-//! carries long-form reading at small sizes while the sans gives headings a change
-//! of voice without a change of weight alone.
+//! Sans body with serif headings is the default pairing, and a deliberate one: the
+//! screen face carries long-form reading at small sizes, where a serif's fine strokes
+//! go muddy on a low-DPI panel, while the serif gives headings a change of voice rather
+//! than a change of weight alone. [`TextFace`] offers the alternatives.
 
 use rubrica_doc::{BlockKind, InlineStyle};
 use rubrica_type::units::Pt;
@@ -37,9 +38,11 @@ pub struct Fonts {
 
 impl Default for Fonts {
     fn default() -> Self {
-        let at = |i: usize| ["Segoe UI", "Georgia", "Consolas"][i].to_string();
+        // The two Latin reading faces are the first entry of the list the reader chooses
+        // from, so the default cannot drift away from what the menu calls the default.
+        let pair = TextFace::ALL[0];
         Self {
-            latin: [at(0), at(1), at(2)],
+            latin: [pair.body.to_string(), pair.heading.to_string(), "Consolas".into()],
             cjk: ["Microsoft YaHei".into(), "Microsoft YaHei".into(), "Consolas".into()],
             fallback: vec!["Segoe UI".into(), "Microsoft YaHei".into(), "Segoe UI Symbol".into()],
             math: ["Cambria Math".into(), "Segoe UI Symbol".into()],
@@ -166,6 +169,31 @@ impl Leading {
     }
 }
 
+/// A face pairing the reader can ask for, and the name it is asked for by.
+///
+/// Body and heading are chosen as one pair rather than as two settings, because the
+/// pairing is the thing that has been judged: a body face swapped on its own leaves the
+/// headings in whatever face they had, and two serifs that were never picked to sit
+/// together read as a mistake rather than as a choice.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct TextFace {
+    pub label: &'static str,
+    pub body: &'static str,
+    pub heading: &'static str,
+}
+
+impl TextFace {
+    /// Everything the reader is offered, in the order they see it. The first entry is
+    /// what a reader who never opens the menu gets, and [`Theme::set_face`] indexes
+    /// these.
+    pub const ALL: [TextFace; 4] = [
+        TextFace { label: "Default", body: "Segoe UI", heading: "Georgia" },
+        TextFace { label: "Serif", body: "Georgia", heading: "Georgia" },
+        TextFace { label: "Humanist", body: "Candara", heading: "Candara" },
+        TextFace { label: "Monospace", body: "Consolas", heading: "Consolas" },
+    ];
+}
+
 #[derive(Clone, Debug)]
 pub struct Theme {
     pub fonts: Fonts,
@@ -194,6 +222,10 @@ pub struct Theme {
     /// The reader's size preference, applied to [`Theme::base`] by [`Theme::set_zoom`].
     /// Carried by the theme so a relayout needs only the theme it is already handed.
     pub zoom: Zoom,
+    /// Which of [`TextFace::ALL`] the Latin faces were taken from. Kept as an index
+    /// rather than read back off [`Theme::fonts`], because the menu has to check the row
+    /// that is really on the page and two pairings could share a body face.
+    pub face: usize,
 }
 
 impl Default for Theme {
@@ -215,6 +247,7 @@ impl Default for Theme {
             quote_indent_em: 1.2,
             list_indent_em: 1.6,
             zoom: Zoom::DESIGN,
+            face: 0,
         }
     }
 }
@@ -235,6 +268,18 @@ impl Theme {
     pub fn set_zoom(&mut self, zoom: Zoom) {
         self.zoom = zoom;
         self.base = Self::DESIGN_BASE * zoom.factor();
+    }
+
+    /// Set the page in one of the offered pairings, by its index in [`TextFace::ALL`].
+    ///
+    /// Only the Latin roles move. The Han faces stay as they are because no pairing here
+    /// is a Han face: a reader asking for serif Latin prose still gets a Chinese
+    /// paragraph in the one family that draws it properly.
+    pub fn set_face(&mut self, face: usize) {
+        let Some(f) = TextFace::ALL.get(face) else { return };
+        self.face = face;
+        self.fonts.latin[Role::Body as usize] = f.body.to_string();
+        self.fonts.latin[Role::Heading as usize] = f.heading.to_string();
     }
 }
 
@@ -374,6 +419,28 @@ mod tests {
         assert_eq!(h1.weight, 700);
         assert_eq!(body.weight, 400);
         assert!(t.body_size(BlockKind::Heading(1)) > t.body_size(BlockKind::Heading(6)));
+    }
+
+    #[test]
+    fn a_chosen_face_moves_the_running_text_and_leaves_the_rest_alone() {
+        let mut t = Theme::default();
+        // What the reader gets without asking is the first thing the menu offers, read
+        // from the same table the menu reads.
+        assert_eq!(t.face, 0);
+        assert_eq!(t.fonts.family(Role::Body, false), TextFace::ALL[0].body);
+        assert_eq!(t.fonts.family(Role::Heading, false), TextFace::ALL[0].heading);
+
+        t.set_face(3);
+        assert_eq!(t.fonts.family(Role::Body, false), "Consolas");
+        assert_eq!(t.fonts.family(Role::Heading, false), "Consolas");
+        // A code span, a formula and a Chinese paragraph are set by their own rules, and
+        // no Latin pairing has any business rewriting them.
+        assert_eq!(t.fonts.family(Role::Mono, false), "Consolas");
+        assert_eq!(t.fonts.family(Role::Body, true), "Microsoft YaHei");
+        assert_eq!(t.fonts.math[0], "Cambria Math");
+        // A face that is not on the list asks for nothing.
+        t.set_face(TextFace::ALL.len() + 1);
+        assert_eq!(t.face, 3);
     }
 
     #[test]

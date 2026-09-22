@@ -27,11 +27,12 @@ fn main() -> Result<()> {
         let width = flag(&argv, "--width").unwrap_or(1080.0);
         let dpi = flag(&argv, "--dpi").unwrap_or(96.0);
         let zoom = theme::Zoom::nearest_percent(flag(&argv, "--zoom").unwrap_or(100.0));
+        let face = flag(&argv, "--face").unwrap_or(0.0) as usize;
         let file = positional(&argv);
         let (path, source) = load(file.as_deref())?;
         let shown = path.and_then(|p| p.to_str().map(str::to_string));
         let hyphenate = !argv.iter().any(|a| a == "--no-hyphenate");
-        return report::report(&source, shown.as_deref(), width, dpi, hyphenate, zoom);
+        return report::report(&source, shown.as_deref(), width, dpi, hyphenate, zoom, face);
     }
     let arg = std::env::args_os().nth(1).map(PathBuf::from);
     let (path, source) = load(arg.as_ref().and_then(|p| p.to_str()))?;
@@ -51,7 +52,7 @@ fn load(file: Option<&str>) -> Result<(Option<PathBuf>, String)> {
 
 /// The document path, skipping the values that belong to `--width` and friends.
 fn positional(argv: &[String]) -> Option<String> {
-    const TAKES_VALUE: [&str; 3] = ["--width", "--dpi", "--zoom"];
+    const TAKES_VALUE: [&str; 4] = ["--width", "--dpi", "--zoom", "--face"];
     let mut skip_next = false;
     for a in argv.iter().skip(1) {
         if skip_next {

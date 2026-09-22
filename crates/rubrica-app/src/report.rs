@@ -7,12 +7,12 @@
 //! what is actually painted rather than what a second implementation would have
 //! produced -- and it never touches the desktop.
 //!
-//! Run: `rubrica-app --report [file.md] [--width 1080] [--dpi 96] [--zoom 120]`
+//! Run: `rubrica-app --report [file.md] [--width 1080] [--dpi 96] [--zoom 120] [--face 1]`
 
 use std::collections::BTreeMap;
 
 use crate::font::FontEngine;
-use crate::theme::{ColorRole, Theme, Zoom};
+use crate::theme::{ColorRole, TextFace, Theme, Zoom};
 use crate::view::build_ops;
 use crate::{Error, Result};
 
@@ -23,13 +23,22 @@ struct Line {
     families: Vec<String>,
 }
 
-pub fn report(source: &str, path: Option<&str>, width: f32, dpi: f32, hyphenate: bool, zoom: Zoom) -> Result<()> {
+pub fn report(
+    source: &str,
+    path: Option<&str>,
+    width: f32,
+    dpi: f32,
+    hyphenate: bool,
+    zoom: Zoom,
+    face: usize,
+) -> Result<()> {
     let mut font = FontEngine::new().map_err(|e| -> Error { format!("DirectWrite: {e}").into() })?;
     if !font.probe() {
         return Err("no usable font face".into());
     }
     let mut theme = Theme::default();
     theme.set_zoom(zoom);
+    theme.set_face(face);
     let doc = rubrica_doc::Document::parse(source);
     // No render target exists here, so figures are measured from their files
     // through WIC but not decoded to bitmaps -- enough to lay out and report.
@@ -83,6 +92,17 @@ pub fn report(source: &str, path: Option<&str>, width: f32, dpi: f32, hyphenate:
     let edge = (left_pt + column_pt) * k;
     println!("document   : {}", path.unwrap_or("(built-in sample)"));
     println!("size       : {:.2}pt body  ({}% of the design's)", theme.base, zoom.percent());
+    // Which pairing the page is set in, and which ones this machine could have set it in
+    // -- so a face that came back as somebody else's substitute is visible here rather
+    // than only on a screen.
+    let f = &TextFace::ALL[theme.face];
+    let installed: Vec<&str> = TextFace::ALL
+        .iter()
+        .filter(|t| font.has_family(t.body) && font.has_family(t.heading))
+        .map(|t| t.label)
+        .collect();
+    println!("face       : {}  ({} + {})", f.label, f.body, f.heading);
+    println!("             installed: {}", installed.join(", "));
     println!("blocks     : {}   lines: {}   height {:.0}pt", doc.blocks.len(), lines.len(), height);
     println!("measure    : {:.1}pt ({:.1} em)  = {col_dip:.1}dip at {dpi}dpi", column_pt, column_pt / theme.base);
     println!();
