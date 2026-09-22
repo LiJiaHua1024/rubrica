@@ -574,7 +574,8 @@ mod tests {
     }
 
     #[test]
-    fn notes_are_smaller_and_tighter_than_the_prose_they_annotate() {        let t = Theme::default();
+    fn notes_are_smaller_and_tighter_than_the_prose_they_annotate() {
+        let t = Theme::default();
         let body = t.body_size(BlockKind::Paragraph);
         let note = t.note_body_size(BlockKind::Paragraph);
         assert!(note < body, "a note at {note} should sit under body prose at {body}");

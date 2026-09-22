@@ -1478,7 +1478,8 @@ mod tests {
     }
 
     #[test]
-    fn a_broken_environment_degrades_to_its_own_text() {        // Unknown name: the markers show as written and the content survives.
+    fn a_broken_environment_degrades_to_its_own_text() {
+        // Unknown name: the markers show as written and the content survives.
         assert_eq!(
             of("\\begin{psst} a & b \\end{psst}"),
             "(\\begin{psst} a b \\end{psst})"

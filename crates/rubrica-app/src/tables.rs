@@ -206,7 +206,8 @@ mod tests {
     }
 
     #[test]
-    fn a_header_cut_off_mid_directory_yields_nothing() {        // The reader only maps the file's first few kilobytes, so a truncated buffer
+    fn a_header_cut_off_mid_directory_yields_nothing() {
+        // The reader only maps the file's first few kilobytes, so a truncated buffer
         // has to fail rather than read past it.
         let f = sfnt(&[&record(b"OS/2", 1000, 96)]);
         assert_eq!(table_range(&f[..f.len() - 4], 0, b"OS/2"), None);
