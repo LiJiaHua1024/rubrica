@@ -7,7 +7,7 @@ use rubrica_type::breaking::BreakOptions;
 use rubrica_type::classify::Role;
 use rubrica_type::justification::{line_width, place};
 use rubrica_type::paragraph::{Item, MonospaceMeasure, Spacing, StyleId, StyleSpan};
-use rubrica_type::units::Pt;
+use rubrica_type::units::{INFINITY, Pt};
 use rubrica_type::{Hyphenation, Paragraph, Plan, typeset};
 
 const SIZE: Pt = 16.0;
@@ -54,6 +54,57 @@ fn raggedness(plan: &Plan) -> f64 {
 }
 
 const PROSE: &str = "Typography is the art of arranging type so that written language stays legible and pleasant to read at a comfortable measure for long sessions";
+
+#[test]
+fn a_style_cut_inside_an_unbreakable_word_joins_instead_of_spacing() {
+    let spacing = Spacing::for_size(SIZE);
+    // "word" and a raised citation digit with nothing between them, which is what a
+    // footnote reference does to the text it sits on. UAX #14 offers no break inside
+    // `word1`, so the cut is a change of style only.
+    let text = "word1 next";
+    let spans = [
+        StyleSpan { range: 0..4, style: StyleId(0) },
+        StyleSpan { range: 4..5, style: StyleId(1) },
+        StyleSpan { range: 5..10, style: StyleId(0) },
+    ];
+    let mut measure = MonospaceMeasure { size: SIZE, factor: 0.5 };
+    let (para, _) = typeset(text, &spacing, StyleId(0), &spans, &BreakOptions::new(500.0), &mut measure);
+    assert!(para.nodes.iter().any(|n| n.style == StyleId(1)), "the cut did not make its own node");
+
+    let joins = para
+        .items
+        .iter()
+        .filter(|it| matches!(**it, Item::Glue { base, stretch, shrink, breakable }
+            if base == 0.0 && stretch == 0.0 && shrink == 0.0 && !breakable))
+        .count();
+    assert_eq!(joins, 1, "the cut needs a zero-width, unbreakable join");
+    // The one real space is the only place a word space belongs.
+    let word_spaces = para
+        .items
+        .iter()
+        .filter(|it| matches!(**it, Item::Glue { base, .. } if base == spacing.latin_space.base))
+        .count();
+    assert_eq!(word_spaces, 1, "a space appeared inside the word: {:?}", para.items);
+}
+
+#[test]
+fn a_break_the_source_offers_still_gets_the_scripts_glue() {
+    // The join above must not swallow the gap the mixed-script rule exists to put
+    // there: these two boundaries really are break opportunities.
+    let spacing = Spacing::for_size(SIZE);
+    let text = "中文Rust";
+    let spans = [
+        StyleSpan { range: 0..6, style: StyleId(0) },
+        StyleSpan { range: 6..10, style: StyleId(1) },
+    ];
+    let mut measure = MonospaceMeasure { size: SIZE, factor: 0.5 };
+    let (para, _) = typeset(text, &spacing, StyleId(0), &spans, &BreakOptions::new(500.0), &mut measure);
+    assert!(
+        para.items.iter().any(|it| matches!(*it, Item::Glue { base, breakable, .. }
+            if base == spacing.mixed.base && breakable)),
+        "quarter-em glue disappeared at the Han/Latin break opportunity"
+    );
+}
 
 #[test]
 fn western_paragraph_is_flushed_to_the_measure() {
@@ -448,4 +499,69 @@ fn hyph_set(text: &str, column: Pt, hyphens: &[usize], allow: bool) -> (Paragrap
     );
     let plan = rubrica_type::breaking::break_paragraph(&para, &opts);
     (para, plan)
+}
+
+#[test]
+fn a_final_line_too_wide_for_the_measure_shrinks() {
+    // `\parfillskip`'s infinite stretch excuses the last line from being *short*. It
+    // has never excused it from being wide -- and the solver calls a wide line legal
+    // as long as its glue can shrink, so somebody has to do that shrinking.
+    let text = "中文排版是一件需要认真对待的事情，行首与行尾都要对齐才能形成稳定的版面节奏。";
+    let column = 12.0 * SIZE;
+    let (para, plan) = set(text, column);
+    let last = plan.lines.last().unwrap();
+    assert!(last.is_ragged() && last.stretch >= INFINITY / 2.0, "the final line must hold \\parfillskip");
+
+    let base = line_width(&place(&para, last));
+    assert!(last.shrink > 24.0, "the line needs glue to shrink: {}", last.shrink);
+
+    // Too wide for the measure by 24pt: the glue has to take all of it back. The
+    // line's own ink is untouched -- only its joins tighten.
+    let mut over = last.clone();
+    over.natural = column + 24.0;
+    let w = line_width(&place(&para, &over));
+    assert!(
+        (w - (base - 24.0)).abs() < 0.5,
+        "an overfull final line was not shrunk: placed {w}, natural-width sum {base}"
+    );
+
+    // Two exemptions the shrink must not swallow: a final line that merely has room
+    // left over stays ragged, and a block that opted out of justification hangs past
+    // the measure rather than being squeezed -- squeezing a heading or a code line
+    // is the typographic error, not the fix.
+    let mut short = last.clone();
+    short.natural = column - 40.0;
+    let w = line_width(&place(&para, &short));
+    assert!((w - base).abs() < 0.5, "a short final line was justified: {w} vs {base}");
+
+    let mut block = last.clone();
+    block.ragged = true;
+    block.stretch = 0.0;
+    block.natural = column + 24.0;
+    let w = line_width(&place(&para, &block));
+    assert!((w - base).abs() < 0.5, "a ragged block was squeezed to fit: {w} vs {base}");
+}
+
+#[test]
+fn no_line_hangs_past_the_measure() {
+    // The ideograph join shrinks, so a line wider than the column is not "overfull"
+    // to the solver -- but the painter still has to take that ink back, or the page
+    // hangs into the margin. The final line used to be exempt from both checks.
+    let text = "引擎在 Han 与 Latin 的边界自动插入约四分之一 em 的可调间距，作者不需要手动加空格：使用Rust编写、Direct2D绘制、以及Microsoft YaHei渲染中文。";
+    let column = 13.0 * SIZE;
+    let (para, plan) = set(text, column);
+    assert!(plan.lines.len() >= 3, "need a paragraph that wraps, got {}", plan.lines.len());
+    for l in &plan.lines {
+        let w = line_width(&place(&para, l));
+        assert!(
+            w <= column + 0.5,
+            "line hangs {:.1}pt past the {column}pt measure: natural {} stretch {} shrink {} badness {} pass {}",
+            w - column,
+            l.natural,
+            l.stretch,
+            l.shrink,
+            l.badness,
+            plan.pass
+        );
+    }
 }

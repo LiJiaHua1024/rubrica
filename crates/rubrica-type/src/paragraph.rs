@@ -129,6 +129,16 @@ impl Item {
         }
     }
 
+    /// A join that holds two nodes together without moving them apart.
+    ///
+    /// Emitted where a style changes inside a stretch of text the source offers no
+    /// break at, which makes the two nodes one word: a footnote's raised digit after
+    /// its word, an image between letters. Giving those the script's glue would set
+    /// `word ¹` and let justification widen the gap in the middle of a word.
+    pub fn join() -> Item {
+        Item::Glue { base: 0.0, stretch: 0.0, shrink: 0.0, breakable: false }
+    }
+
     pub fn is_glue(&self) -> bool {
         matches!(self, Item::Glue { .. })
     }
@@ -306,6 +316,16 @@ pub fn build(
     });
     cuts.push((text.len(), false));
 
+    // Where the *source* permits a break, as opposed to where a cut exists only
+    // because the style changes. `breaks` arrives sorted from UAX #14.
+    let mut allowed: Vec<usize> = breaks
+        .iter()
+        .filter(|&&(at, _)| at > 0 && at < text.len())
+        .map(|&(at, _)| at)
+        .collect();
+    allowed.sort_unstable();
+    allowed.dedup();
+
     let mut segments: Vec<Range<usize>> = Vec::with_capacity(cuts.len());
     let mut start = 0usize;
     for (end, _) in &cuts {
@@ -342,8 +362,16 @@ pub fn build(
             let role = Role::of(core.chars().next().unwrap());
             let style = StyleSpan::resolve(opts.spans, range.start, opts.style_of);
             if let Some(prev) = prev_role {
-                let recipe = glue_recipe_for(prev, role, opts.spacing);
-                p.items.push(Item::glue(recipe));
+                // Getting here means no whitespace separates the two boxes, because
+                // any leading or trailing run of it has already been emitted as a
+                // space, which clears `prev_role`. So the boundary is a cut: use the
+                // script's glue only where the source really does allow a break, and
+                // otherwise join the two halves of the same word tightly.
+                if allowed.binary_search(&seg.start).is_ok() {
+                    p.items.push(Item::glue(glue_recipe_for(prev, role, opts.spacing)));
+                } else {
+                    p.items.push(Item::join());
+                }
             }
             let advance = measure.advance(text, range.clone(), style);
             let (ascent, descent) = measure.extent(text, range.clone(), style);
