@@ -46,6 +46,16 @@ pub struct BreakOptions {
     /// must never be stretched to the measure -- doing so is a typographic error --
     /// and over at TeX this is `\raggedright`'s infinite `\rightskip`.
     pub ragged: bool,
+    /// Break rather than hang, whatever the glue could give back.
+    ///
+    /// A ragged line wider than its measure is normally accepted on the theory that
+    /// its shrinkable glue will pull it back -- but [crate::place] only shrinks a
+    /// line it is stretching anyway, because squeezing a heading or a code line is
+    /// the error rather than the fix. Where the ink has a neighbour to its right --
+    /// a table cell inside its column -- an accepted-here, refused-there overfull
+    /// line overwrites that neighbour, so this option makes the line unbreakable by
+    /// shrinking and lets the solver do the only remaining thing: break it.
+    pub tight_box: bool,
 }
 
 impl BreakOptions {
@@ -65,6 +75,7 @@ impl BreakOptions {
             awful_demerits: 1000,
             nasty_demerits: 1000,
             ragged: false,
+            tight_box: false,
         }
     }
 
@@ -233,7 +244,9 @@ fn score(
 ) -> Option<(i32, u8, f64)> {
     let delta = f64::from(target) - f64::from(natural);
     let st = f64::from(stretch);
-    let sh = f64::from(shrink);
+    // In a tight box shrinking is not a way out of an overfull line, so the solver
+    // scores the line as if it had no shrinkable glue at all and reaches for a break.
+    let sh = if opts.tight_box { 0.0 } else { f64::from(shrink) };
     let eps = f64::from(EPSILON);
     let (ratio, bad) = if delta > eps {
         if st <= eps {

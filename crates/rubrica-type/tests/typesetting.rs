@@ -655,3 +655,46 @@ fn no_line_hangs_past_the_measure() {
         );
     }
 }
+
+/// As [`set_indent`], but for a block that opted out of justification -- a heading,
+/// a code line, a table cell -- optionally with the shrink taken away from the
+/// solver as well.
+fn set_box(text: &str, column: Pt, tight: bool) -> (Paragraph, Plan) {
+    let spacing = Spacing::for_size(SIZE);
+    let mut measure = MonospaceMeasure { size: SIZE, factor: 0.5 };
+    let mut opts = BreakOptions::new(column);
+    opts.ragged = true;
+    opts.tight_box = tight;
+    typeset(text, &spacing, StyleId(0), &[], &opts, &mut measure)
+}
+
+#[test]
+fn a_tight_box_breaks_where_a_loose_ragged_block_hangs() {
+    // A ragged block is never shrunk by `place`, yet the solver has been counting its
+    // shrinkable joins as room -- so it happily accepts one line wider than the
+    // measure and the painter leaves it hanging there. In prose that only trespasses
+    // into the margin. A table cell has a neighbour at that exact spot, and the two
+    // overwrite each other. Withdrawing the shrink leaves the solver one answer: break.
+    let text = "一格里的汉字排满了以后应当";
+    let column = 6.0 * SIZE;
+    assert_eq!(text.chars().count(), 13);
+
+    let (para, loose) = set_box(text, column, false);
+    assert_eq!(loose.lines.len(), 1, "a loose box was already forced to break");
+    let line = &loose.lines[0];
+    let w = line_width(&place(&para, line));
+    assert!(w > column + 0.5, "the case needs a line that hangs: {w} vs {column}");
+    assert!(
+        line.shrink >= w - column,
+        "the hang must be the glue's doing: shrink {} for {:.1} of excess",
+        line.shrink,
+        w - column
+    );
+
+    let (tpara, tight) = set_box(text, column, true);
+    assert!(tight.lines.len() >= 2, "a tight box hung instead of breaking");
+    for l in &tight.lines {
+        let w = line_width(&place(&tpara, l));
+        assert!(w <= column + 0.5, "a tight line hangs {w} in a {column} box");
+    }
+}

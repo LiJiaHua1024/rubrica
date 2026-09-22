@@ -180,6 +180,9 @@ impl Table {
 pub struct Cell {
     pub text: String,
     pub spans: Vec<Span>,
+    /// What a click on this cell's text would do. A cell is laid out by the grid rather
+    /// than as prose, so its targets are recorded here and not on the block.
+    pub actions: Vec<Action>,
 }
 
 /// Where a cell's content sits within its column.
@@ -311,27 +314,17 @@ impl Builder {
             Event::Text(t) => {
                 if let Some((_, alt)) = self.image.as_mut() {
                     alt.push_str(&t);
-                } else if let Some(c) = self.cell.as_mut() {
-                    push_cell(c, &t, self.inline);
                 } else {
-                    self.push(&t, self.inline);
+                    self.put(&t, self.inline);
                 }
             }
             Event::Code(t) => {
                 let mut st = self.inline;
                 st.insert(InlineStyle::CODE);
-                if let Some(c) = self.cell.as_mut() {
-                    push_cell(c, &t, st);
-                } else {
-                    self.push(&t, st);
-                }
+                self.put(&t, st);
             }
-            Event::SoftBreak => {
-                self.push(" ", InlineStyle::EMPTY);
-            }
-            Event::HardBreak => {
-                self.push("\n", InlineStyle::EMPTY);
-            }
+            Event::SoftBreak => self.put(" ", InlineStyle::EMPTY),
+            Event::HardBreak => self.put("\n", InlineStyle::EMPTY),
             Event::TaskListMarker(checked) => {
                 if let Some(b) = self.cur.as_mut() {
                     b.task = Some(checked);
@@ -344,7 +337,7 @@ impl Builder {
             // but printing the tags would be a lie too.
             Event::InlineHtml(h) => {
                 if is_line_break(&h) {
-                    self.push("\n", InlineStyle::EMPTY);
+                    self.put("\n", InlineStyle::EMPTY);
                 }
             }
             Event::Html(_) => {}
@@ -368,9 +361,19 @@ impl Builder {
                 // `SUPERSCRIPT` is what separates them from the word they belong to,
                 // so the citation reads as a mark on the text rather than as text.
                 let n = self.cite(label.as_ref());
-                let range = self.push(&n.to_string(), self.inline | InlineStyle::SUPERSCRIPT);
-                if let Some(b) = self.cur.as_mut() {
-                    push_action(b, range, ActionKind::Cite(label.to_string()));
+                let style = self.inline | InlineStyle::SUPERSCRIPT;
+                let cite = ActionKind::Cite(label.to_string());
+                let digits = n.to_string();
+                if let Some(c) = self.cell.as_mut() {
+                    // A cell has no paragraph to append to -- the block being built is the
+                    // table's, and text landing there is never drawn -- so the number goes
+                    // into the cell, where it at least gets its column's width.
+                    push_cell(c, &digits, style, Some(cite));
+                } else {
+                    let range = self.push(&digits, style);
+                    if let Some(b) = self.cur.as_mut() {
+                        push_action(&mut b.actions, range, cite);
+                    }
                 }
             }
         }
@@ -578,6 +581,21 @@ impl Builder {
         });
     }
 
+    /// Append a piece of inline text where it belongs: into the cell being read, or
+    /// into the block. The two are not interchangeable -- a table block's own text is
+    /// never drawn -- so every inline event comes through here rather than choosing a
+    /// sink of its own. A `<br>` in a cell is the only way an author can break a line
+    /// there, and it is a real break only if it reaches the cell.
+    fn put(&mut self, s: &str, style: InlineStyle) {
+        let link = self.link.clone().map(ActionKind::Url);
+        match self.cell.as_mut() {
+            Some(c) => push_cell(c, s, style, link),
+            None => {
+                self.push(s, style);
+            }
+        }
+    }
+
     /// Append text to the current block and return the range of it that was written,
     /// which is what an action needs to point at.
     fn push(&mut self, s: &str, style: InlineStyle) -> std::ops::Range<usize> {
@@ -601,7 +619,7 @@ impl Builder {
             _ => b.spans.push(Span { range: start..end, style }),
         }
         if let Some(url) = linked {
-            push_action(b, start..end, ActionKind::Url(url));
+            push_action(&mut b.actions, start..end, ActionKind::Url(url));
         }
         start..end
     }
@@ -619,7 +637,7 @@ impl Builder {
         b.spans.push(Span { range: start..end, style: InlineStyle::OBJECT });
         // A figure inside a link is the link's whole text, so it is what gets clicked.
         if let Some(url) = self.link.clone() {
-            push_action(b, start..end, ActionKind::Url(url));
+            push_action(&mut b.actions, start..end, ActionKind::Url(url));
         }
     }
 
@@ -686,18 +704,18 @@ fn worth_setting(b: &Block) -> bool {
 /// Append an actionable range, merging with the previous one when it is the same
 /// target and abuts it. A link whose text carries emphasis is pushed in pieces, and
 /// one link is one thing to click.
-fn push_action(b: &mut Block, range: std::ops::Range<usize>, kind: ActionKind) {
+fn push_action(actions: &mut Vec<Action>, range: std::ops::Range<usize>, kind: ActionKind) {
     if range.is_empty() {
         return;
     }
-    match b.actions.last_mut() {
+    match actions.last_mut() {
         Some(prev) if prev.kind == kind && prev.range.end == range.start => prev.range.end = range.end,
-        _ => b.actions.push(Action { range, kind }),
+        _ => actions.push(Action { range, kind }),
     }
 }
 
 /// Append text to a cell, merging with the previous span when the style matches.
-fn push_cell(c: &mut Cell, t: &str, style: InlineStyle) {
+fn push_cell(c: &mut Cell, t: &str, style: InlineStyle, action: Option<ActionKind>) {
     if t.is_empty() {
         return;
     }
@@ -707,6 +725,9 @@ fn push_cell(c: &mut Cell, t: &str, style: InlineStyle) {
     match c.spans.last_mut() {
         Some(prev) if prev.style == style && prev.range.end == start => prev.range.end = end,
         _ => c.spans.push(Span { range: start..end, style }),
+    }
+    if let Some(kind) = action {
+        push_action(&mut c.actions, start..end, kind);
     }
 }
 

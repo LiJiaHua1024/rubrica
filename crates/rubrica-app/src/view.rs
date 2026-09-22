@@ -947,6 +947,9 @@ pub struct PreparedCell {
     pub text: String,
     pub spans: Vec<StyleSpan>,
     pub align: Align,
+    /// What a click on this cell's ink would do. A cell is laid out by the grid, so
+    /// its targets ride along with the cell rather than with the block's prose.
+    pub actions: Vec<Action>,
 }
 
 pub struct PreparedTable {
@@ -1036,6 +1039,36 @@ fn merge_hot(hit: &mut [Option<(Pt, Pt)>], actions: &[Action], node: &std::ops::
     }
 }
 
+/// Turn this line's merged target rectangles into clickable hotspots, one per target
+/// that leads somewhere. A target whose ink is unopenable -- a relative path, a
+/// citation of a label no note answers -- is not marked at all, so a pointer that
+/// stays an arrow is the reader's answer to "nowhere".
+fn emit_hots(
+    hots: &mut Vec<Hot>,
+    actions: &[Action],
+    hit: &[Option<(Pt, Pt)>],
+    notes: &HashMap<String, usize>,
+    top: Pt,
+    line_h: Pt,
+    k: f32,
+) {
+    for (i, h) in hit.iter().enumerate() {
+        let Some((x0, x1)) = *h else { continue };
+        let Some(kind) = hot_kind(&actions[i].kind, notes) else { continue };
+        hots.push(Hot { x: x0 * k, y: top * k, w: (x1 - x0) * k, h: line_h * k, kind });
+    }
+}
+
+/// The jump an action offers, or `None` when its destination is not on the page or
+/// not openable.
+fn hot_kind(kind: &ActionKind, notes: &HashMap<String, usize>) -> Option<HotKind> {
+    match kind {
+        ActionKind::Url(u) if openable(u) => Some(HotKind::Url(u.clone())),
+        ActionKind::Cite(label) => notes.get(label.as_str()).copied().map(HotKind::Cite),
+        _ => None,
+    }
+}
+
 /// Typeset one block into the display list and return the new document y.
 fn layout_block(
     font: &mut FontEngine,
@@ -1062,7 +1095,7 @@ fn layout_block(
         return y + theme.base * 0.6;
     }
     if let Some(t) = blk.table {
-        return layout_table(font, ctx, t, left, column, ops, y);
+        return layout_table(font, ctx, blk, t, ops, hots, y);
     }
     if text.trim().is_empty() {
         return y;
@@ -1210,20 +1243,7 @@ fn layout_block(
         for (file, x, w, a, d) in images_out.drain(..) {
             ops.push(Op::Image { path: file, x, y: (baseline - a) * k, w, h: (a + d) * k });
         }
-        for (i, h) in hit.iter().enumerate() {
-            let Some((x0, x1)) = *h else { continue };
-            let kind = match &actions[i].kind {
-                // Ink that cannot be followed is not marked as a target at all: a
-                // pointer that stays an arrow is the reader's answer to "nowhere".
-                ActionKind::Url(u) if openable(u) => HotKind::Url(u.clone()),
-                ActionKind::Cite(label) => match notes.get(label.as_str()) {
-                    Some(n) => HotKind::Cite(*n),
-                    None => continue,
-                },
-                _ => continue,
-            };
-            hots.push(Hot { x: x0 * k, y: top * k, w: (x1 - x0) * k, h: line_h * k, kind });
-        }
+        emit_hots(hots, actions, &hit, notes, top, line_h, k);
         panel_bottom = y + line_h;
         y += line_h;
     }
@@ -1435,13 +1455,14 @@ impl View {
 fn layout_table(
     font: &mut FontEngine,
     ctx: &Ctx<'_>,
+    blk: &Blk<'_>,
     t: &PreparedTable,
-    left: Pt,
-    column: Pt,
     ops: &mut Vec<Op>,
+    hots: &mut Vec<Hot>,
     mut y: Pt,
 ) -> Pt {
     let Ctx { theme, styles, k, .. } = *ctx;
+    let Blk { left, column, .. } = *blk;
     let size = theme.base;
     let spacing = Spacing::for_size(size);
     let leading = theme.body_leading.for_mixed(true);
@@ -1467,6 +1488,10 @@ fn layout_table(
         // A cell is never justified: stretching a short label to fill a wide column
         // would tear its words apart.
         opts.ragged = true;
+        // And a cell that is too wide for its column cannot be allowed to shrink its
+        // way out of the problem either -- the painter leaves a ragged line alone,
+        // so the ink would land on the neighbour to the right. Break instead.
+        opts.tight_box = true;
         typeset(&c.text, spacing, base_of(c), &c.spans, &opts, font)
     }
 
@@ -1484,17 +1509,26 @@ fn layout_table(
                 &BreakOptions::new(Pt::MAX / 4.0),
                 font,
             );
-            let w: Pt = para
-                .items
-                .iter()
-                .map(|it| match *it {
-                    Item::Box { node } => para.node(node).advance,
-                    Item::Glue { base, .. } => base,
-                    Item::Penalty { width, .. } => width,
-                })
-                .sum::<Pt>()
-                + pad * 2.0;
-            widths[i] = widths[i].max(w);
+            // The widest line the cell can be made to have, not the sum of its content:
+            // a `<br>` is the author asking for two lines here, and a column wide enough
+            // for both of them on one line would be a column no cell needed.
+            let mut widest: Pt = 0.0;
+            let mut run: Pt = 0.0;
+            for it in &para.items {
+                match *it {
+                    Item::Box { node } => run += para.node(node).advance,
+                    Item::Glue { base, .. } => run += base,
+                    Item::Penalty { width, forced, .. } => {
+                        if forced {
+                            widest = widest.max(run);
+                            run = 0.0;
+                        } else {
+                            run += width;
+                        }
+                    }
+                }
+            }
+            widths[i] = widths[i].max(widest.max(run) + pad * 2.0);
         }
     };
     measure(&mut widths, &t.head);
@@ -1516,7 +1550,7 @@ fn layout_table(
         }
     }
 
-    let mut paint_row = |cells: &[PreparedCell], top: Pt, ops: &mut Vec<Op>| -> Pt {
+    let mut paint_row = |cells: &[PreparedCell], top: Pt, ops: &mut Vec<Op>, hots: &mut Vec<Hot>| -> Pt {
         // Measure every cell first: the row is as tall as its tallest cell.
         let mut heights = vec![0.0f32; cols];
         for (i, c) in cells.iter().enumerate().take(cols) {
@@ -1540,16 +1574,38 @@ fn layout_table(
                 };
                 let mut runs: Vec<PaintRun> = Vec::new();
                 let mut ascent = 0.0f32;
+                let mut hit: Vec<Option<(Pt, Pt)>> = vec![None; c.actions.len()];
+                let mut bars: Vec<(Pt, Pt, Pt, Pt, ColorRole)> = Vec::new();
+                let mut ruled: Option<Rule> = None;
                 for slot in placed {
                     let Some(node_id) = slot.node else { continue };
                     let node = para.node(node_id);
                     let st = &styles[node.style.0 as usize];
+                    if ruled.as_ref().is_some_and(|r| r.style != node.style) {
+                        end_rule(&mut ruled, &mut bars);
+                    }
                     let mut at = x + pad + shift + slot.x;
                     for r in font.shape_runs(&c.text, node.text.clone(), &st.face, st.size, st.tracking) {
                         // A citation inside a cell is raised like one inside prose.
                         ascent = ascent.max(r.ascent + st.raise);
                         let Some(face) = font.font_face(r.face) else { continue };
                         let width = r.width();
+                        if st.strike && width > 0.0 {
+                            let (pos, weight) = font.strike_rule(r.face, r.size);
+                            merge_rule(
+                                &mut ruled,
+                                &mut bars,
+                                Rule {
+                                    style: node.style,
+                                    x: at,
+                                    // Same offset as the raised mark it may strike through.
+                                    top: -st.raise - pos - weight * 0.5,
+                                    w: width,
+                                    h: weight,
+                                    color: st.color,
+                                },
+                            );
+                        }
                         runs.push(PaintRun {
                             family: font.face_family(r.face),
                             face,
@@ -1564,13 +1620,25 @@ fn layout_table(
                         });
                         at += width;
                     }
+                    merge_hot(&mut hit, &c.actions, &node.text, x + pad + shift + slot.x, at);
                 }
+                end_rule(&mut ruled, &mut bars);
                 for run in runs.iter_mut() {
                     run.baseline = (ly + ascent) * k;
                 }
                 if !runs.is_empty() {
                     ops.push(Op::Runs(runs));
                 }
+                for (bx, top, w, h, color) in bars {
+                    ops.push(Op::Rect {
+                        x: bx * k,
+                        y: (ly + ascent + top) * k,
+                        w: w * k,
+                        h: h * k,
+                        color,
+                    });
+                }
+                emit_hots(hots, &c.actions, &hit, ctx.notes, ly, size * leading, k);
                 ly += size * leading;
             }
             x += widths[i];
@@ -1582,7 +1650,7 @@ fn layout_table(
     ops.push(Op::Rect { x: left * k, y: y * k, w: grid_w * k, h: 0.0, color: ColorRole::Surface });
     let panel = ops.len() - 1;
 
-    let head_h = paint_row(&t.head, y, ops);
+    let head_h = paint_row(&t.head, y, ops, hots);
     y += head_h;
     ops.push(Op::Line {
         x0: left * k,
@@ -1593,7 +1661,7 @@ fn layout_table(
         color: ColorRole::Muted,
     });
     for r in &t.rows {
-        y += paint_row(r, y, ops);
+        y += paint_row(r, y, ops, hots);
     }
     // The header panel is drawn before its text, so its height can only be filled
     // in once the first row has been measured.
@@ -1845,12 +1913,21 @@ fn prepare_block(
                     spans: c
                         .spans
                         .iter()
-                        .map(|sp| StyleSpan {
-                            range: sp.range.clone(),
-                            style: intern(styles, &theme.fonts.fallback, r(b.kind, sp.style)),
+                        .map(|sp| {
+                            // Same rule as prose: ink is coloured as a link only where
+                            // the link leads somewhere the reader can go.
+                            let mut style = sp.style;
+                            if style.contains(InlineStyle::LINK) && !reaches(&c.actions, &sp.range) {
+                                style.remove(InlineStyle::LINK);
+                            }
+                            StyleSpan {
+                                range: sp.range.clone(),
+                                style: intern(styles, &theme.fonts.fallback, r(b.kind, style)),
+                            }
                         })
                         .collect(),
                     align: t.aligns.get(i).copied().unwrap_or_default(),
+                    actions: c.actions.clone(),
                 })
                 .collect()
         };

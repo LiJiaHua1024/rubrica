@@ -279,6 +279,34 @@ fn a_table_with_cjk_cells_keeps_its_grid() {
     assert_eq!(t.rows[0][1].text, "三");
 }
 
+#[test]
+fn a_cells_own_text_holds_its_link_its_citation_and_its_break() {
+    // A table block's own text is never drawn, so anything landing there instead of in
+    // the cell is text the reader never sees.
+    let src = "| a | [b](https://e/x)<br>c[^k] |\n|---|---|\n| d | e |\n\n[^k]: the note\n";
+    let b = &Document::parse(src).blocks[0];
+    let t = b.table.as_ref().expect("no table");
+    assert!(b.text.is_empty(), "the grid keeps its cells: block text is {:?}", b.text);
+    assert!(b.actions.is_empty(), "a cell's target is recorded on the cell");
+
+    let cell = &t.head[1];
+    assert_eq!(cell.text, "b\nc1", "`<br>` reaches the cell");
+    assert_eq!(
+        cell.actions.iter().map(|a| (a.range.clone(), a.kind.clone())).collect::<Vec<_>>(),
+        vec![
+            (0..1, rubrica_doc::ActionKind::Url("https://e/x".into())),
+            (3..4, rubrica_doc::ActionKind::Cite("k".into())),
+        ]
+    );
+    let raised: Vec<&str> = cell
+        .spans
+        .iter()
+        .filter(|s| s.style.contains(InlineStyle::SUPERSCRIPT))
+        .map(|s| &cell.text[s.range.clone()])
+        .collect();
+    assert_eq!(raised, vec!["1"]);
+}
+
 // --- footnotes -------------------------------------------------------------
 
 /// The spans over a block that carry a given flag, with the text they cover.

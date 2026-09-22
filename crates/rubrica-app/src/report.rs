@@ -182,13 +182,11 @@ pub fn report(source: &str, path: Option<&str>, width: f32, dpi: f32, hyphenate:
     // to be set, and a citation with no note behind it has nothing to show.
     let cited = {
         let mut numbers: Vec<usize> = Vec::new();
-        for b in &doc.blocks {
-            for s in &b.spans {
-                if s.style.contains(rubrica_doc::InlineStyle::SUPERSCRIPT) {
-                    if let Ok(n) = b.text[s.range.clone()].parse::<usize>() {
-                        if !numbers.contains(&n) {
-                            numbers.push(n);
-                        }
+        for (text, s) in all_spans(&doc) {
+            if s.style.contains(rubrica_doc::InlineStyle::SUPERSCRIPT) {
+                if let Ok(n) = text[s.range.clone()].parse::<usize>() {
+                    if !numbers.contains(&n) {
+                        numbers.push(n);
                     }
                 }
             }
@@ -204,18 +202,9 @@ pub fn report(source: &str, path: Option<&str>, width: f32, dpi: f32, hyphenate:
     // that wraps makes one rectangle per line, and a target the reader cannot follow
     // makes none at all -- so `rects` behind `ranges` by more than the wraps is a layout
     // that has lost a link, and `refused` climbing is a document full of `file:`.
-    let ranges: usize = doc
-        .blocks
-        .iter()
-        .chain(doc.footnotes.iter().flat_map(|f| &f.blocks))
-        .map(|b| b.actions.len())
-        .sum();
+    let ranges = all_actions(&doc).count();
     if ranges > 0 {
-        let refused = doc
-            .blocks
-            .iter()
-            .chain(doc.footnotes.iter().flat_map(|f| &f.blocks))
-            .flat_map(|b| b.actions.iter())
+        let refused = all_actions(&doc)
             .filter(|a| matches!(&a.kind, rubrica_doc::ActionKind::Url(u) if !crate::view::openable(u)))
             .count();
         let links = page.hotspots.iter().filter(|h| matches!(h.kind, crate::view::HotKind::Url(_))).count();
@@ -230,11 +219,8 @@ pub fn report(source: &str, path: Option<&str>, width: f32, dpi: f32, hyphenate:
     // list can only be a strike. Counted rather than trusted: a struck span that sets
     // no rule has lost the whole point of the mark, and one that sets a rule per
     // ideograph would be the same picture at a dozen times the ops.
-    let struck = doc
-        .blocks
-        .iter()
-        .flat_map(|b| b.spans.iter())
-        .filter(|s| s.style.contains(rubrica_doc::InlineStyle::STRIKETHROUGH))
+    let struck = all_spans(&doc)
+        .filter(|(_, s)| s.style.contains(rubrica_doc::InlineStyle::STRIKETHROUGH))
         .count();
     if struck > 0 {
         let rules: Vec<f32> = ops
@@ -263,4 +249,41 @@ pub fn report(source: &str, path: Option<&str>, width: f32, dpi: f32, hyphenate:
         println!("  heights    : {}", heights.join(", "));
     }
     Ok(())
+}
+
+/// Every clickable range the source asks for, prose and grid alike. A table's targets
+/// are recorded on its cells, so counting only the blocks' would report a document
+/// whose clickable text vanishes as soon as it is put in a table.
+fn all_actions(doc: &rubrica_doc::Document) -> impl Iterator<Item = &rubrica_doc::Action> {
+    all_blocks(doc).flat_map(|b| {
+        let cells = b
+            .table
+            .iter()
+            .flat_map(|t| t.head.iter().chain(t.rows.iter().flatten()))
+            .flat_map(|c| &c.actions);
+        b.actions.iter().chain(cells)
+    })
+}
+
+/// Every styled run, with the text its range indexes: a cell's spans count into its
+/// own cell's text, not into the block's.
+fn all_spans(doc: &rubrica_doc::Document) -> impl Iterator<Item = (&str, &rubrica_doc::Span)> {
+    all_blocks(doc).flat_map(|b| {
+        let cells = b
+            .table
+            .iter()
+            .flat_map(|t| t.head.iter().chain(t.rows.iter().flatten()))
+            .map(|c| (c.text.as_str(), &c.spans));
+        std::iter::once((b.text.as_str(), &b.spans))
+            .chain(cells)
+            .flat_map(|(text, spans)| spans.iter().map(move |s| (text, s)))
+    })
+}
+
+/// The page's blocks plus the blocks of its notes: a footnote is set by the same
+/// layout, so a census that stops at `blocks` cannot see what it does.
+fn all_blocks(doc: &rubrica_doc::Document) -> impl Iterator<Item = &rubrica_doc::Block> {
+    doc.blocks
+        .iter()
+        .chain(doc.footnotes.iter().flat_map(|f| &f.blocks))
 }
