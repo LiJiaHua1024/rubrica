@@ -45,23 +45,25 @@ use windows::Win32::UI::Input::KeyboardAndMouse::{
 };
 use windows::Win32::UI::Input::KeyboardAndMouse::{VK_DOWN, VK_ESCAPE, VK_NEXT, VK_PRIOR};
 use windows::Win32::UI::Input::KeyboardAndMouse::{
-    VK_0, VK_ADD, VK_D, VK_NUMPAD0, VK_OEM_MINUS, VK_OEM_PLUS, VK_SUBTRACT, VIRTUAL_KEY,
+    VK_0, VK_A, VK_ADD, VK_C, VK_D, VK_NUMPAD0, VK_OEM_MINUS, VK_OEM_PLUS, VK_SUBTRACT,
+    VIRTUAL_KEY,
 };
 use windows::Win32::UI::Controls::Dialogs::{
     GetOpenFileNameW, OPENFILENAMEW, OFN_FILEMUSTEXIST, OFN_HIDEREADONLY, OFN_PATHMUSTEXIST,
 };
 use windows::Win32::UI::Shell::{DragAcceptFiles, DragFinish, DragQueryFileW, ShellExecuteW, HDROP};
 use windows::Win32::UI::WindowsAndMessaging::{
-    CS_HREDRAW, CS_VREDRAW, CREATESTRUCTW, CreateWindowExW, DefWindowProcW, DispatchMessageW,
+    CS_DBLCLKS, CS_HREDRAW, CS_VREDRAW, CREATESTRUCTW, CreateWindowExW, DefWindowProcW, DispatchMessageW,
     GWLP_USERDATA, GetClientRect, GetCursorPos, GetWindowLongPtrW, GetMessageW, HCURSOR, HWND_TOP,
     HTCLIENT, IDC_ARROW, IDC_HAND, KillTimer, LoadCursorW, MSG, PostQuitMessage, RegisterClassExW,
     SetCursor, SW_SHOWNORMAL, SetTimer, SetWindowLongPtrW, SetWindowPos, ShowWindow, TranslateMessage,
     WNDCLASSEXW, WM_DESTROY, WM_DPICHANGED, WM_ERASEBKGND, WM_KEYDOWN, WM_MOUSEWHEEL, WM_NCCREATE,
     WM_PAINT, WM_SETCURSOR, WM_SIZE, WM_TIMER, WS_EX_APPWINDOW, WS_OVERLAPPEDWINDOW, SWP_NOACTIVATE,
-    SWP_NOZORDER, WM_DROPFILES, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEMOVE,
+    SWP_NOZORDER, WM_DROPFILES, WM_LBUTTONDOWN, WM_LBUTTONDBLCLK, WM_LBUTTONUP, WM_MOUSEMOVE,
 };
 use windows_numerics::Vector2;
 
+use crate::clipboard;
 use crate::font::{FaceRequest, FontEngine, GlyphRun, ObjectBox, Style as RunStyle};
 use crate::hyphen::Hyphenator;
 use crate::images::ImageStore;
@@ -80,6 +82,9 @@ const WHEEL_STEP: Pt = 72.0;
 /// Appearance is polled, not pushed; see `WM_TIMER` below.
 const APPEARANCE_TIMER: usize = 0x5140;
 const APPEARANCE_TICK_MS: u32 = 400;
+/// How far the pointer has to travel, in device pixels, before a held left button stops
+/// meaning "here" and starts meaning "from here to there".
+const DRAG_SLOP: f32 = 3.0;
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 struct Rgb {
@@ -228,6 +233,230 @@ pub struct Hot {
     pub kind: HotKind,
 }
 
+/// How a line's text is set off from the line before it when a selection is read back.
+/// The lines of a paragraph need nothing -- the space or the break the author wrote is
+/// already carried at the start of the next line -- but two table cells that meet on
+/// the page are columns, and two blocks are paragraphs.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Join {
+    None,
+    Tab,
+    Newline,
+    /// A blank line between, which is what separates one block of prose from the next.
+    Blank,
+}
+
+/// One drawn line, indexed by character so a drag can begin anywhere inside it and
+/// what comes back is what the author wrote rather than what the shaping kept.
+///
+/// Geometry is per character boundary rather than per run because a run is a
+/// shaping artefact: it splits where the script changes, so a word of one language
+/// can be drawn in two pieces while still being one word to select.
+pub struct SelLine {
+    /// Top edge and height, in the same device independent pixels as [`Hot`] and
+    /// measured from the top of the document.
+    pub y: f32,
+    pub h: f32,
+    /// What separates this line from the one before it in the text a copy hands back.
+    pub join: Join,
+    pub chars: Vec<char>,
+    /// The left edge of every boundary: `xs.len() == chars.len() + 1`, non-decreasing.
+    /// A step of no width is a character the source has and this line does not paint,
+    /// which is what a wrapped line's space between two of its words looks like.
+    pub xs: Vec<f32>,
+}
+
+/// A place in the page's text: a character index in a [`SelLine`], where `ch` equal to
+/// the line's length means after its last character.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Caret {
+    pub line: usize,
+    pub ch: usize,
+}
+
+/// The two ends of a drag, in whatever order the pointer made them.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Selection {
+    pub from: Caret,
+    pub to: Caret,
+}
+
+impl Selection {
+    /// Low end first, so neither the rectangles nor the text has to care which way
+    /// the reader dragged.
+    fn ordered(&self) -> Selection {
+        let (a, b) = (self.from, self.to);
+        if (a.line, a.ch) <= (b.line, b.ch) {
+            Selection { from: a, to: b }
+        } else {
+            Selection { from: b, to: a }
+        }
+    }
+}
+
+/// Where a pointer at `x`, `y` (device independent pixels from the top of the document)
+/// lands in the page's text. Above the first line and below the last both clamp rather
+/// than miss: a drag thrown past the top of the page means all of it from the start.
+pub fn caret_at(sel: &[SelLine], x: f32, y: f32) -> Caret {
+    let Some(_) = sel.first() else {
+        return Caret { line: 0, ch: 0 };
+    };
+    let mut line = sel.len() - 1;
+    for (i, l) in sel.iter().enumerate() {
+        if y < l.y + l.h {
+            line = i;
+            break;
+        }
+    }
+    let l = &sel[line];
+    // The nearest boundary, because a character's own ink starts a point or two to the
+    // right of the slot it was allocated, and a click that means the next character
+    // must not keep selecting the one before it.
+    let mut ch = l.xs.len().saturating_sub(1);
+    for (i, &edge) in l.xs.iter().enumerate() {
+        if edge > x {
+            ch = if i > 0 && (x - l.xs[i - 1]) < (edge - x) { i - 1 } else { i };
+            break;
+        }
+    }
+    Caret { line, ch }
+}
+
+/// The rectangles to lay under a selection, one per line it touches.
+pub fn selection_rects(sel: &[SelLine], s: Selection) -> Vec<(f32, f32, f32, f32)> {
+    let mut out = Vec::new();
+    for (line, lo, hi) in pieces(sel, s) {
+        let l = &sel[line];
+        let (x0, x1) = (l.xs[lo], l.xs[hi]);
+        if x1 - x0 > 0.0 {
+            out.push((x0, l.y, x1 - x0, l.h));
+        }
+    }
+    out
+}
+
+/// Which characters of each line a selection takes, as `(line, from, to)` in page order.
+///
+/// Both readings of a selection start here, because the two must agree exactly: a band
+/// the reader can see that copies nothing, or a character that copies without ever being
+/// highlighted, is the same bug told from the other side.
+fn pieces(sel: &[SelLine], s: Selection) -> Vec<(usize, usize, usize)> {
+    let s = s.ordered();
+    if s.from == s.to {
+        return Vec::new();
+    }
+    let mut out = Vec::new();
+    let last = s.to.line.min(sel.len().saturating_sub(1));
+    for (line, l) in sel.iter().enumerate().take(last + 1).skip(s.from.line) {
+        let lo = if line == s.from.line { s.from.ch } else { 0 };
+        let hi = if line == s.to.line { s.to.ch } else { l.chars.len() };
+        let (lo, hi) = (lo.min(l.chars.len()), hi.min(l.chars.len()));
+        if hi > lo {
+            out.push((line, lo, hi));
+        }
+    }
+    out
+}
+
+/// Read a selection back as text, with the separators [`Join`] records between the
+/// pieces that need them.
+///
+/// A selection with no character in it copies nothing rather than the whole page: an
+/// empty `to` would otherwise read every line below it, since a line the drag never
+/// reached is by this arithmetic "wholly inside".
+pub fn selection_text(sel: &[SelLine], s: Selection) -> String {
+    let mut out = String::new();
+    for (n, (line, lo, hi)) in pieces(sel, s).into_iter().enumerate() {
+        let l = &sel[line];
+        // A line that opens with the break the author wrote -- a `<br>` inside a cell,
+        // carried into the text by the gap the index fills in -- already says where it
+        // begins. Adding the row's own separator on top of it would copy a blank line
+        // where the page shows a single break.
+        if n > 0 && !matches!(l.chars.first(), Some('\n')) {
+            match l.join {
+                Join::None => {}
+                Join::Tab => out.push('\t'),
+                Join::Newline => out.push('\n'),
+                Join::Blank => out.push_str("\n\n"),
+            }
+        }
+        out.extend(l.chars[lo..hi].iter().copied());
+    }
+    out
+}
+
+/// What a double-click treats as one unit.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum WordKind {
+    /// A space, or the gap a wrapped line leaves where its source space used to be.
+    Space,
+    /// A letter, a digit, and the marks inside a word: `-` in `well-formed`, `_` in a
+    /// key name.
+    Word,
+    /// A Han, kana or fullwidth character. Selected one at a time: a line of them has
+    /// no boundary for a click to land on, so a run that stopped at one character is
+    /// the honest answer rather than a guess at the author's vocabulary.
+    Ideograph,
+    /// A brace, a quote, a comma. Its own unit, since it belongs to neither neighbour.
+    Mark,
+}
+
+fn word_kind(c: char) -> WordKind {
+    if c.is_whitespace() {
+        WordKind::Space
+    } else if crate::font::cjk_char(c) {
+        WordKind::Ideograph
+    } else if c.is_alphanumeric() {
+        WordKind::Word
+    } else if c == '_' || c == '-' || c == '’' {
+        // The apostrophe that joins contractions is inside the word, not after it.
+        WordKind::Word
+    } else {
+        WordKind::Mark
+    }
+}
+
+/// The word a double-click selects: the run of like characters around the caret, on the
+/// caret's own line.
+///
+/// A word never spans a line break here, because the index has no record of which lines
+/// were one paragraph -- only of which lines were drawn -- and guessing from `Join`
+/// would let a click on the last word of a heading reach into the paragraph under it.
+pub fn word_at(sel: &[SelLine], c: Caret) -> Selection {
+    let nothing = Selection { from: c, to: c };
+    let Some(line) = sel.get(c.line) else { return nothing };
+    let n = line.chars.len();
+    if n == 0 {
+        return nothing;
+    }
+    // The character the click fell inside. A caret at index `i` sits *before* character
+    // `i`, so unless the click was at the very start the character to the left is the
+    // one it was on.
+    let mut at = c.ch.min(n).saturating_sub(1);
+    if word_kind(line.chars[at]) == WordKind::Space {
+        // Between two words: the one on the right, since that is the one a reader
+        // aiming at a space means. Failing that, the one on the left. Marks are skipped
+        // on this search -- a click in the gap after `end."` wants the word, not the
+        // punctuation hanging off it -- while still selecting a mark it lands on.
+        let word = |i: usize| matches!(word_kind(line.chars[i]), WordKind::Word | WordKind::Ideograph);
+        match (at + 1..n).find(|&i| word(i)).or_else(|| (0..=at).rev().find(|&i| word(i))) {
+            Some(i) => at = i,
+            None => return nothing,
+        }
+    }
+    let kind = word_kind(line.chars[at]);
+    let (mut lo, mut hi) = (at, at + 1);
+    if kind != WordKind::Ideograph {
+        while lo > 0 && word_kind(line.chars[lo - 1]) == kind {
+            lo -= 1;
+        }
+        while hi < n && word_kind(line.chars[hi]) == kind {
+            hi += 1;
+        }
+    }
+    Selection { from: Caret { line: c.line, ch: lo }, to: Caret { line: c.line, ch: hi } }
+}
+
 /// Everything one typesetting pass produced.
 pub struct Page {
     pub ops: Vec<Op>,
@@ -240,6 +469,9 @@ pub struct Page {
     pub hotspots: Vec<Hot>,
     /// Where each footnote's first line begins, indexed like [`Document::footnotes`].
     pub note_tops: Vec<Pt>,
+    /// Every line of text the page drew, in the order a drag crosses them, which is
+    /// what makes the page selectable.
+    pub sel: Vec<SelLine>,
 }
 
 pub struct View {
@@ -259,6 +491,17 @@ pub struct View {
     /// The targets of the current layout, and where each note begins.
     hotspots: Vec<Hot>,
     note_tops: Vec<Pt>,
+    /// The page's text, character by character, as the current layout drew it.
+    sel_index: Vec<SelLine>,
+    /// What the reader has dragged out, if anything. Cleared by a relayout, whose
+    /// rewrapped lines would otherwise leave a selection pointing at other words.
+    selection: Option<Selection>,
+    /// Where the button went down in the text, which is the end of a selection that
+    /// has not been dragged yet and the point a double click expands from.
+    press_caret: Option<Caret>,
+    /// The ink laid over selected text. A highlight drawn *under* the ink cannot
+    /// work: a code block paints its own opaque panel after it.
+    sel_brush: Option<ID2D1SolidColorBrush>,
     /// The pointer over a clickable target. Both cursors are loaded once:
     /// `WM_SETCURSOR` is asked on every move, and a shared system cursor is not
     /// something to fetch afresh each time it answers.
@@ -275,6 +518,10 @@ pub struct View {
     path: Option<PathBuf>,
     /// Set while the pointer is dragging the scroll thumb.
     dragging: bool,
+    /// Where the left button went down, in client pixels. A press that has moved past
+    /// a few of them is a reader dragging out a selection rather than one aiming at a
+    /// link, and the difference has to be settled before the release.
+    press_at: Option<(f32, f32)>,
     /// Built once a render target exists, since bitmaps need one.
     images: Option<ImageStore>,
     /// Typeset formulas, kept across relayouts so a document's math is set once.
@@ -397,6 +644,10 @@ pub fn run(source: String, path: Option<PathBuf>) -> Result<()> {
         brushes: HashMap::new(),
         hotspots: Vec::new(),
         note_tops: Vec::new(),
+        sel_index: Vec::new(),
+        selection: None,
+        press_caret: None,
+        sel_brush: None,
         arrow,
         hand,
         pressed: None,
@@ -407,6 +658,7 @@ pub fn run(source: String, path: Option<PathBuf>) -> Result<()> {
         dpi: 96.0,
         path,
         dragging: false,
+        press_at: None,
         images: None,
         math: MathStore::new(),
         hyphenator: Hyphenator::english(),
@@ -418,7 +670,7 @@ pub fn run(source: String, path: Option<PathBuf>) -> Result<()> {
         let wide = utf16(CLASS);
         let wc = WNDCLASSEXW {
             cbSize: std::mem::size_of::<WNDCLASSEXW>() as u32,
-            style: CS_HREDRAW | CS_VREDRAW,
+            style: CS_HREDRAW | CS_VREDRAW | CS_DBLCLKS,
             lpfnWndProc: Some(wnd_proc),
             hInstance: hinst.into(),
             hCursor: arrow,
@@ -597,6 +849,13 @@ impl View {
                 Op::Image { .. } => {}
             }
         }
+        // The thumb is painted from its geometry rather than from an op, because an op
+        // would mean relaying out the document on every wheel tick. That leaves it
+        // asking for the one brush it needs by name: a document that has no muted text
+        // on the page but does overflow the window still has to be able to draw it.
+        if self.thumb_rect().is_some() && !roles.contains(&ColorRole::Muted) {
+            roles.push(ColorRole::Muted);
+        }
         for role in roles {
             if self.brushes.contains_key(&role) {
                 continue;
@@ -604,6 +863,17 @@ impl View {
             let c = d2d(self.palette.ink(role));
             if let Ok(b) = unsafe { rt.CreateSolidColorBrush(&c, None) } {
                 self.brushes.insert(role, b);
+            }
+        }
+        // The highlight is the accent with most of its opacity given back, because the
+        // ink has to stay readable under it. It goes *over* the text rather than under:
+        // a code block lays its own opaque panel down after any background would have
+        // been drawn, so a band underneath would simply disappear inside the panel.
+        if self.sel_brush.is_none() {
+            let mut c = d2d(self.palette.accent);
+            c.a = 0.28;
+            if let Ok(b) = unsafe { rt.CreateSolidColorBrush(&c, None) } {
+                self.sel_brush = Some(b);
             }
         }
     }
@@ -699,6 +969,18 @@ impl View {
                         self.dark_override = Some(dark);
                         self.set_dark(dark, hwnd);
                     }
+                    // A copy with nothing selected leaves the clipboard alone. Clearing
+                    // it would throw away what the reader put there from somewhere else,
+                    // to no purpose: an empty selection is not an edit.
+                    k if k == VK_C.0 as u32 && ctrl => {
+                        if let Some(s) = self.selection {
+                            let text = selection_text(&self.sel_index, s);
+                            if let Err(e) = clipboard::copy_text(hwnd, &text) {
+                                eprintln!("clipboard: {e}");
+                            }
+                        }
+                    }
+                    k if k == VK_A.0 as u32 && ctrl => self.select_all(),
                     _ => {}
                 }
                 let _ = InvalidateRect(Some(hwnd), None, false);
@@ -717,9 +999,9 @@ impl View {
                 self.open_from_drop(hwnd, wp.0);
                 LRESULT(0)
             }
-            WM_LBUTTONDOWN => {
+            WM_LBUTTONDOWN | WM_LBUTTONDBLCLK => {
                 // A press inside the thumb starts a drag; a press on a target waits for
-                // the release; anywhere else pages down.
+                // the release; a press anywhere else belongs to the text.
                 let x = ((lp.0 & 0xFFFF) as i16) as f32;
                 let y = ((lp.0 >> 16) as i16) as f32;
                 self.pressed = None;
@@ -728,11 +1010,21 @@ impl View {
                     self.scroll_to_thumb(y);
                 } else if let Some(i) = self.hot_at(x, y) {
                     self.pressed = Some(i);
-                } else if y > self.client_h * 0.5 {
-                    self.scroll_by(self.page_height());
                 } else {
-                    self.scroll_by(-self.page_height());
+                    let c = self.caret_under(x, y);
+                    // The second click of a pair expands the place the first one landed
+                    // on into a word. A press that pages the document instead would make
+                    // that pair scroll away halfway through, which is why the click in
+                    // empty prose is no longer a page turn.
+                    self.selection = if msg == WM_LBUTTONDBLCLK {
+                        let w = word_at(&self.sel_index, c);
+                        (w.from != w.to).then_some(w)
+                    } else {
+                        None
+                    };
+                    self.press_caret = Some(c);
                 }
+                self.press_at = Some((x, y));
                 let _ = SetCapture(hwnd);
                 let _ = InvalidateRect(Some(hwnd), None, false);
                 LRESULT(0)
@@ -753,9 +1045,25 @@ impl View {
                 }
             }
             WM_MOUSEMOVE => {
+                let x = ((lp.0 & 0xFFFF) as i16) as f32;
+                let y = ((lp.0 >> 16) as i16) as f32;
                 if self.dragging {
-                    self.scroll_to_thumb(((lp.0 >> 16) as i16) as f32);
+                    self.scroll_to_thumb(y);
                     let _ = InvalidateRect(Some(hwnd), None, false);
+                } else if let Some(from) = self.press_caret {
+                    // A button that has travelled since it went down in the text is no
+                    // longer aiming at a place: it is drawing a selection, and it goes on
+                    // drawing one until it comes up. The slop is what keeps a click on a
+                    // word from highlighting the word it landed inside of.
+                    let dragged = self
+                        .press_at
+                        .is_some_and(|(px, py)| (x - px).abs() > DRAG_SLOP || (y - py).abs() > DRAG_SLOP);
+                    if dragged {
+                        self.auto_scroll(y);
+                        let to = self.caret_under(x, y);
+                        self.selection = Some(Selection { from, to });
+                        let _ = InvalidateRect(Some(hwnd), None, false);
+                    }
                 }
                 LRESULT(0)
             }
@@ -765,6 +1073,10 @@ impl View {
                 // rest of the desktop, thumb drags being the only case it is meant for.
                 let _ = ReleaseCapture();
                 self.dragging = false;
+                // The drag is over, but what it drew stays selected: a reader lets go of
+                // the button to look at the selection, not to be quit out of it.
+                self.press_at = None;
+                self.press_caret = None;
                 if let Some(i) = self.pressed.take() {
                     let x = ((lp.0 & 0xFFFF) as i16) as f32;
                     let y = ((lp.0 >> 16) as i16) as f32;
@@ -797,6 +1109,40 @@ impl View {
         self.hotspots
             .iter()
             .position(|h| x >= h.x && x <= h.x + h.w && y >= h.y && y <= h.y + h.h)
+    }
+
+    /// The place in the page's text under a pointer position given in client pixels,
+    /// translated into document pixels the same way [`View::hot_at`] translates.
+    fn caret_under(&self, x: f32, y: f32) -> Caret {
+        caret_at(&self.sel_index, x, y + self.scroll * scale_of(self.dpi))
+    }
+
+    /// Scroll the page when a drag is held against its top or bottom edge, so a
+    /// selection longer than the viewport can be finished without letting go.
+    ///
+    /// The band is narrow and the step small because this runs on every pointer message
+    /// while the button is down near an edge, including the ones that do not move: too
+    /// fast reads as a page flipping under a stationary cursor.
+    fn auto_scroll(&mut self, y: f32) {
+        const EDGE: f32 = 20.0;
+        const STEP: Pt = 6.0;
+        if y < EDGE {
+            self.scroll_by(-STEP);
+        } else if y > self.client_h - EDGE {
+            self.scroll_by(STEP);
+        }
+    }
+
+    /// `Ctrl`+`A`: every line the page drew, from the first character of the first to
+    /// after the last of the last. A drag across a whole document has to be slow enough
+    /// for the edge auto-scroll to keep up; this does not.
+    fn select_all(&mut self) {
+        let Some(last) = self.sel_index.last() else { return };
+        self.selection = Some(Selection {
+            from: Caret { line: 0, ch: 0 },
+            to: Caret { line: self.sel_index.len() - 1, ch: last.chars.len() },
+        });
+        self.press_caret = None;
     }
 
     /// Act on the target at this index in [`View::hotspots`].
@@ -853,6 +1199,7 @@ impl View {
         // The brushes hold the old inks, keyed by role rather than by palette, so they
         // have to go; the layout is ink-independent and needs no work.
         self.brushes.clear();
+        self.sel_brush = None;
         unsafe { self.apply_dark_titlebar(hwnd) };
     }
 
@@ -878,6 +1225,12 @@ impl View {
         self.ops = page.ops;
         self.hotspots = page.hotspots;
         self.note_tops = page.note_tops;
+        // A selection is a pair of places in the old wrapping. Lines have moved, so
+        // the words they named are elsewhere, and holding on to the range would show
+        // the reader ink they never dragged over.
+        self.selection = None;
+        self.press_caret = None;
+        self.sel_index = page.sel;
     }
 
 }
@@ -922,6 +1275,15 @@ struct Blk<'a> {
     /// The block's clickable ranges, already shifted for the marker like [`Blk::spans`]
     /// is, so both index the same text.
     actions: &'a [Action],
+}
+
+/// What a layout pass writes into, bundled so that adding a third thing the page
+/// carries -- the character index, after the ink and the targets -- costs one argument
+/// to every layout function rather than two.
+struct Out<'a> {
+    ops: &'a mut Vec<Op>,
+    hots: &'a mut Vec<Hot>,
+    sel: &'a mut Vec<SelLine>,
 }
 
 /// A block readied for layout: its text with the marker already in front of it, and
@@ -1069,15 +1431,117 @@ fn hot_kind(kind: &ActionKind, notes: &HashMap<String, usize>) -> Option<HotKind
     }
 }
 
+/// Where each character of a shaped run begins, in points from the left of the page.
+///
+/// DirectWrite reports a cluster as a UTF-16 index into the run's own text, which is
+/// also its byte offset for anything in the Basic Multilingual Plane -- the walk below
+/// is exact for the rest. Shaping swallows a character into its neighbour's ligature
+/// without giving it an entry, and the caller reads that one off the gap.
+fn mark_run(text: &str, run: &GlyphRun, base: Pt, out: &mut Vec<(usize, Pt)>) {
+    let sub = &text[run.text.clone()];
+    let units = sub.encode_utf16().count();
+    let mut byte_of = vec![run.text.end; units + 1];
+    let mut u = 0usize;
+    for (b, c) in sub.char_indices() {
+        byte_of[u] = run.text.start + b;
+        u += c.len_utf16();
+    }
+    let mut acc: Pt = 0.0;
+    let mut prev = usize::MAX;
+    for (gi, cl) in run.clusters.iter().enumerate() {
+        let c = (*cl as usize).min(units);
+        if c != prev {
+            out.push((byte_of[c], base + acc));
+            prev = c;
+        }
+        acc += run.advances.get(gi).copied().unwrap_or(0.0);
+    }
+}
+
+/// Index one drawn line character by character, from the source rather than from the
+/// pieces it happened to be drawn in.
+///
+/// The gaps between the segments are the spaces and breaks a reader cannot see -- a
+/// justified line's word space, the newline a hard break turned into one -- and a copy
+/// has to keep them, so they get characters of their own spread over whatever width the
+/// layout left at that edge of the line.
+///
+/// `consumed` is how far the block's text has reached so far, and carries across a
+/// block's lines: a paragraph's wrapping space belongs to whichever line comes next.
+/// Where one drawn line sits, and what separates it from the line before: the four
+/// numbers `mark_line` otherwise takes as four more arguments.
+struct Band {
+    top: Pt,
+    h: Pt,
+    /// Points to device independent pixels.
+    k: f32,
+    join: Join,
+}
+
+fn mark_line(
+    text: &str,
+    band: Band,
+    segs: &[(std::ops::Range<usize>, Pt, Pt)],
+    marks: &[(usize, Pt)],
+    consumed: &mut usize,
+) -> Option<SelLine> {
+    let Band { top, h, k, join } = band;
+    let first = segs.first()?;
+    let mut l = SelLine {
+        y: top * k,
+        h: h * k,
+        join,
+        chars: Vec::new(),
+        xs: Vec::new(),
+    };
+    let mut mi = 0usize;
+    let mut at = first.1;
+    for (range, x0, x1) in segs {
+        // A line centred or right-aligned in a box too small for it can put its ink
+        // left of where the box starts; the index keeps to the box.
+        let (x0, x1) = (*x0, x1.max(*x0));
+        if range.start > *consumed {
+            let gap = &text[*consumed..range.start];
+            let n = gap.chars().count().max(1) as f64;
+            let (from, to) = (f64::from(at), f64::from(x0));
+            for (i, c) in gap.chars().enumerate() {
+                l.chars.push(c);
+                l.xs.push((from + (to - from) * (i as f64 / n)) as Pt);
+            }
+            at = x0;
+        }
+        for (b, c) in text[range.clone()].char_indices() {
+            let off = range.start + b;
+            while mi < marks.len() && marks[mi].0 < off {
+                mi += 1;
+            }
+            // A mark past this segment's right edge belongs to a later one, since a
+            // run that fell back to another face can be shaped out of order.
+            let x = marks
+                .get(mi)
+                .filter(|m| m.0 == off && m.1 <= x1)
+                .map_or(at, |m| m.1)
+                .max(x0)
+                .min(x1);
+            l.chars.push(c);
+            l.xs.push(x.max(l.xs.last().copied().unwrap_or(x)));
+        }
+        at = x1;
+        *consumed = range.end;
+    }
+    l.xs.push(at);
+    (!l.chars.is_empty()).then_some(l)
+}
+
 /// Typeset one block into the display list and return the new document y.
 fn layout_block(
     font: &mut FontEngine,
     ctx: &Ctx<'_>,
     blk: &Blk<'_>,
-    ops: &mut Vec<Op>,
-    hots: &mut Vec<Hot>,
+    out: &mut Out<'_>,
     mut y: Pt,
 ) -> Pt {
+    let Out { ops, hots, sel } = out;
     let Ctx { theme, styles, math, notes, k } = *ctx;
     let Blk { b, text, spans, base, left, column, hyphenation, size, hang, actions, .. } = *blk;
     let leading = &blk.leading;
@@ -1095,7 +1559,7 @@ fn layout_block(
         return y + theme.base * 0.6;
     }
     if let Some(t) = blk.table {
-        return layout_table(font, ctx, blk, t, ops, hots, y);
+        return layout_table(font, ctx, blk, t, &mut Out { ops, hots, sel }, y);
     }
     if text.trim().is_empty() {
         return y;
@@ -1126,6 +1590,9 @@ fn layout_block(
     let bg_role = if b.kind == BlockKind::Code { Some(ColorRole::Surface) } else { None };
     let panel_top = y;
     let mut panel_bottom = y;
+    // How far into this block's text the selection index has reached, which is shared
+    // by every line of it because the space between two of them is in neither.
+    let mut consumed = 0usize;
 
     for line in &plan.lines {
         let top = y;
@@ -1144,6 +1611,11 @@ fn layout_block(
         let mut bars: Vec<(Pt, Pt, Pt, Pt, ColorRole)> = Vec::new();
         let mut ascent = 0.0f32;
         let mut descent = 0.0f32;
+        // This line's ink, in the order it was drawn: the source range each segment
+        // paints and the two edges it sits between, plus the marks shaping left behind
+        // for the characters inside them.
+        let mut segs: Vec<(std::ops::Range<usize>, Pt, Pt)> = Vec::new();
+        let mut marks: Vec<(usize, Pt)> = Vec::new();
         // One strike rule per line rather than per node: the layout core makes every
         // ideograph and every word its own node, so a struck Chinese phrase would
         // otherwise draw a separate op per character.
@@ -1189,6 +1661,7 @@ fn layout_block(
                     None => {}
                 }
                 merge_hot(&mut hit, actions, &node.text, line_left + slot.x, line_left + slot.x + o.advance);
+                segs.push((node.text.clone(), line_left + slot.x, line_left + slot.x + o.advance));
                 continue;
             }
             let shaped = font.shape_runs(text, node.text.clone(), &st.face, st.size, st.tracking);
@@ -1202,6 +1675,7 @@ fn layout_block(
             // stopped, since only the whole span's width is what the line broke on.
             let mut at = line_left + slot.x;
             for r in shaped {
+                mark_run(text, &r, at, &mut marks);
                 ascent = ascent.max(r.ascent - dy);
                 descent = descent.max((r.descent + dy).max(0.0));
                 if let Some(p) = paint_run(font, &r, at, dy, k, st.color) {
@@ -1228,6 +1702,7 @@ fn layout_block(
                 at += r.width();
             }
             merge_hot(&mut hit, actions, &node.text, line_left + slot.x, at);
+            segs.push((node.text.clone(), line_left + slot.x, at));
         }
         end_rule(&mut ruled, &mut bars);
         let natural = ascent + descent;
@@ -1244,6 +1719,16 @@ fn layout_block(
             ops.push(Op::Image { path: file, x, y: (baseline - a) * k, w, h: (a + d) * k });
         }
         emit_hots(hots, actions, &hit, notes, top, line_h, k);
+        marks.sort_unstable_by_key(|m| m.0);
+        // The first character the block has indexed is the first character of the
+        // block, wherever on the page it ended up: that line takes the blank line the
+        // block before it left off with.
+        let join = if consumed == 0 { Join::Blank } else { Join::None };
+        if let Some(l) =
+            mark_line(text, Band { top, h: line_h, k, join }, &segs, &marks, &mut consumed)
+        {
+            sel.push(l);
+        }
         panel_bottom = y + line_h;
         y += line_h;
     }
@@ -1439,6 +1924,29 @@ impl View {
                     }
                 }
             }
+            // The bands of a selection, over the ink and under nothing: their geometry
+            // is the character index's, so a drag never costs a relayout, and drawing
+            // them last is what keeps them visible inside a code panel.
+            if let Some(s) = self.selection {
+                if let Some(brush) = self.sel_brush.clone() {
+                    for (x, y, w, h) in selection_rects(&self.sel_index, s) {
+                        if y + h < top || y > bottom {
+                            continue;
+                        }
+                        let r = D2D_RECT_F { left: x, top: y, right: x + w, bottom: y + h };
+                        target.FillRectangle(&r, &brush);
+                    }
+                }
+            }
+            // The thumb is drawn from its geometry rather than as an op, because an op
+            // would mean relaying out the document on every wheel tick. It is the only
+            // sign the reader has that the edge of the window can be gripped.
+            if let Some((tx, ty, tw, th)) = self.thumb_rect() {
+                if let Some(brush) = self.brushes.get(&ColorRole::Muted).cloned() {
+                    let r = D2D_RECT_F { left: tx, top: ty, right: tx + tw, bottom: ty + th };
+                    target.FillRectangle(&r, &brush);
+                }
+            }
             let _ = target.EndDraw(None, None);
         }
     }
@@ -1457,10 +1965,10 @@ fn layout_table(
     ctx: &Ctx<'_>,
     blk: &Blk<'_>,
     t: &PreparedTable,
-    ops: &mut Vec<Op>,
-    hots: &mut Vec<Hot>,
+    out: &mut Out<'_>,
     mut y: Pt,
 ) -> Pt {
+    let Out { ops, hots, sel } = out;
     let Ctx { theme, styles, k, .. } = *ctx;
     let Blk { left, column, .. } = *blk;
     let size = theme.base;
@@ -1550,12 +2058,23 @@ fn layout_table(
         }
     }
 
-    let mut paint_row = |cells: &[PreparedCell], top: Pt, ops: &mut Vec<Op>, hots: &mut Vec<Hot>| -> Pt {
+    let mut paint_row = |cells: &[PreparedCell], top: Pt, head: bool, ops: &mut Vec<Op>, hots: &mut Vec<Hot>, sel: &mut Vec<SelLine>| -> Pt {
         // Measure every cell first: the row is as tall as its tallest cell.
         let mut heights = vec![0.0f32; cols];
+        // Which column reaches each line of the row first. A cell that wraps down is
+        // not starting a new row, and the separator a copy uses has to answer to the
+        // row's shape -- one tab-separated line per line the reader sees -- rather than
+        // to the order the columns happened to be painted in.
+        let mut opens: Vec<usize> = Vec::new();
         for (i, c) in cells.iter().enumerate().take(cols) {
             let (_, plan) = set_cell(font, c, &spacing, inner_of(widths[i]));
-            heights[i] = plan.lines.len().max(1) as Pt * size * leading;
+            let n = plan.lines.len();
+            heights[i] = n.max(1) as Pt * size * leading;
+            for j in 0..n {
+                if j >= opens.len() {
+                    opens.push(i);
+                }
+            }
         }
         let row_h = heights.iter().copied().fold(pad, f32::max) + pad;
 
@@ -1563,6 +2082,10 @@ fn layout_table(
         for (i, c) in cells.iter().enumerate().take(cols) {
             let inner = inner_of(widths[i]);
             let (para, plan) = set_cell(font, c, &spacing, inner);
+            // A cell is its own piece of text to copy: two of them that sit side by
+            // side are columns, so the one on the right is a tab away from the last.
+            let mut consumed = 0usize;
+            let mut lines_out = 0usize;
             let mut ly = top + pad * 0.5;
             for line in &plan.lines {
                 let placed = place(&para, line);
@@ -1574,6 +2097,8 @@ fn layout_table(
                 };
                 let mut runs: Vec<PaintRun> = Vec::new();
                 let mut ascent = 0.0f32;
+                let mut segs: Vec<(std::ops::Range<usize>, Pt, Pt)> = Vec::new();
+                let mut marks: Vec<(usize, Pt)> = Vec::new();
                 let mut hit: Vec<Option<(Pt, Pt)>> = vec![None; c.actions.len()];
                 let mut bars: Vec<(Pt, Pt, Pt, Pt, ColorRole)> = Vec::new();
                 let mut ruled: Option<Rule> = None;
@@ -1586,6 +2111,7 @@ fn layout_table(
                     }
                     let mut at = x + pad + shift + slot.x;
                     for r in font.shape_runs(&c.text, node.text.clone(), &st.face, st.size, st.tracking) {
+                        mark_run(&c.text, &r, at, &mut marks);
                         // A citation inside a cell is raised like one inside prose.
                         ascent = ascent.max(r.ascent + st.raise);
                         let Some(face) = font.font_face(r.face) else { continue };
@@ -1621,6 +2147,7 @@ fn layout_table(
                         at += width;
                     }
                     merge_hot(&mut hit, &c.actions, &node.text, x + pad + shift + slot.x, at);
+                    segs.push((node.text.clone(), x + pad + shift + slot.x, at));
                 }
                 end_rule(&mut ruled, &mut bars);
                 for run in runs.iter_mut() {
@@ -1639,6 +2166,30 @@ fn layout_table(
                     });
                 }
                 emit_hots(hots, &c.actions, &hit, ctx.notes, ly, size * leading, k);
+                marks.sort_unstable_by_key(|m| m.0);
+                let join = if opens[lines_out] == i {
+                    // The first cell of a line the row has reached: a new line of the
+                    // grid. The header's own first line is a paragraph away from
+                    // whatever precedes the table.
+                    if head && lines_out == 0 {
+                        Join::Blank
+                    } else {
+                        Join::Newline
+                    }
+                } else {
+                    // Another cell on the same line: a column away from the last.
+                    Join::Tab
+                };
+                lines_out += 1;
+                if let Some(l) = mark_line(
+                    &c.text,
+                    Band { top: ly, h: size * leading, k, join },
+                    &segs,
+                    &marks,
+                    &mut consumed,
+                ) {
+                    sel.push(l);
+                }
                 ly += size * leading;
             }
             x += widths[i];
@@ -1650,7 +2201,7 @@ fn layout_table(
     ops.push(Op::Rect { x: left * k, y: y * k, w: grid_w * k, h: 0.0, color: ColorRole::Surface });
     let panel = ops.len() - 1;
 
-    let head_h = paint_row(&t.head, y, ops, hots);
+    let head_h = paint_row(&t.head, y, true, ops, hots, sel);
     y += head_h;
     ops.push(Op::Line {
         x0: left * k,
@@ -1661,7 +2212,7 @@ fn layout_table(
         color: ColorRole::Muted,
     });
     for r in &t.rows {
-        y += paint_row(r, y, ops, hots);
+        y += paint_row(r, y, false, ops, hots, sel);
     }
     // The header panel is drawn before its text, so its height can only be filled
     // in once the first row has been measured.
@@ -2008,6 +2559,7 @@ pub fn build_ops(
     let mut styles: Vec<AppStyle> = Vec::new();
     let mut ops = Vec::new();
     let mut hots = Vec::new();
+    let mut sel: Vec<SelLine> = Vec::new();
     let mut note_tops: Vec<Pt> = Vec::with_capacity(doc.footnotes.len());
     // A citation names its note by the author's own label, while the page knows notes
     // only by where they ended up. This is the bridge, and it is built before any
@@ -2132,8 +2684,7 @@ pub fn build_ops(
                 hang: if b.list.is_some() { level } else { 0.0 },
                 actions: &p.actions,
             },
-            &mut ops,
-            &mut hots,
+            &mut Out { ops: &mut ops, hots: &mut hots, sel: &mut sel },
             y,
         );
     }
@@ -2185,15 +2736,25 @@ pub fn build_ops(
                         hang: note_hang,
                         actions: &p.actions,
                     },
-                    &mut ops,
-                    &mut hots,
+                    &mut Out { ops: &mut ops, hots: &mut hots, sel: &mut sel },
                     y,
                 );
             }
         }
     }
 
-    Page { ops, height: y + theme.base * 2.0, column, left, hotspots: hots, note_tops }
+    // A grid paints one column at a time, so its lines reach the index column by
+    // column: the second line of a tall cell before the first line of the cell beside
+    // it. A drag crosses the page by line, and left to right within one, so the index
+    // is put back into the order the reader sees. The sort is stable, which is what
+    // keeps a row's cells in their column order.
+    sel.sort_by(|a, b| {
+        a.y.total_cmp(&b.y).then_with(|| {
+            a.xs.first().copied().unwrap_or(0.0).total_cmp(&b.xs.first().copied().unwrap_or(0.0))
+        })
+    });
+
+    Page { ops, height: y + theme.base * 2.0, column, left, hotspots: hots, note_tops, sel }
 }
 
 #[cfg(test)]
@@ -2321,5 +2882,155 @@ mod tests {
         assert!(!reaches(&actions, &(20..26)), "a target the reader cannot follow must not be coloured");
         // The object character inside a linked figure is the link's whole text.
         assert!(reaches(&actions, &(8..9)), "part of a target's ink is still its ink");
+    }
+
+    /// One character's advance in the lines the selection tests build.
+    const CHAR: f32 = 8.0;
+
+    /// A laid-out line to drag over: monospace, one `CHAR` wide per boundary, so the
+    /// arithmetic a test writes is the arithmetic it checks.
+    fn sel_line(text: &str, y: f32, join: Join) -> SelLine {
+        let chars: Vec<char> = text.chars().collect();
+        let xs = (0..=chars.len()).map(|i| i as f32 * CHAR).collect();
+        SelLine { y, h: CHAR * 1.5, join, chars, xs }
+    }
+
+    /// A line whose character at `squeezed_at` was given no width by the break that
+    /// swallowed it, which is what a wrapped line's own inter-word space looks like.
+    fn squeezed(text: &str, y: f32, squeezed_at: usize) -> SelLine {
+        let chars: Vec<char> = text.chars().collect();
+        let xs = (0..=chars.len())
+            .map(|i| (i - (i > squeezed_at) as usize) as f32 * CHAR)
+            .collect();
+        SelLine { y, h: CHAR * 1.5, join: Join::None, chars, xs }
+    }
+
+    #[test]
+    fn a_line_bringing_its_own_break_does_not_ask_for_another() {
+        // A `<br>` inside a cell: the break is part of that cell's own text, so the
+        // index already carries it, and the separator the row records on top would copy
+        // a blank line where the page shows a single one.
+        let mut carried = squeezed("\n中间再加一段", 35.0, 0);
+        carried.join = Join::Tab;
+        let sel = [sel_line("构件", 0.0, Join::Newline), carried, sel_line("混排", 70.0, Join::Tab)];
+        let all = Selection {
+            from: Caret { line: 0, ch: 0 },
+            to: Caret { line: 2, ch: 2 },
+        };
+        assert_eq!(selection_text(&sel, all), "构件\n中间再加一段\t混排");
+    }
+
+    #[test]
+    fn a_drag_picks_the_boundary_it_landed_nearest() {
+        let sel = [sel_line("abcdefgh", 0.0, Join::None)];
+        // The ink of a glyph starts a point or two inside its slot, so the middle of a
+        // character belongs to the character on its right.
+        assert_eq!(caret_at(&sel, 3.0 * CHAR + 2.0, 1.0).ch, 3);
+        assert_eq!(caret_at(&sel, 3.0 * CHAR + 6.0, 1.0).ch, 4);
+    }
+
+    #[test]
+    fn a_drag_thrown_past_the_page_clamps_to_its_ends() {
+        let sel = [sel_line("first", 0.0, Join::None), sel_line("second", 100.0, Join::Blank)];
+        let top = caret_at(&sel, -500.0, -500.0);
+        assert_eq!((top.line, top.ch), (0, 0), "a fling past the top means from the start");
+        let bottom = caret_at(&sel, 5000.0, 9000.0);
+        assert_eq!((bottom.line, bottom.ch), (1, 6), "…and past the bottom, to the end");
+        assert_eq!(caret_at(&[], 10.0, 10.0), Caret { line: 0, ch: 0 }, "an empty page has one place");
+    }
+
+    #[test]
+    fn a_selection_reads_back_the_separators_between_its_pieces() {
+        let sel = [
+            sel_line("one", 0.0, Join::None),
+            sel_line("two", 100.0, Join::Blank),
+            sel_line("three", 200.0, Join::Newline),
+            sel_line("four", 300.0, Join::Tab),
+        ];
+        let all = Selection {
+            from: Caret { line: 0, ch: 0 },
+            to: Caret { line: 3, ch: 4 },
+        };
+        assert_eq!(selection_text(&sel, all), "one\n\ntwo\nthree\tfour");
+    }
+
+    #[test]
+    fn dragging_upwards_copies_what_dragging_downwards_copies() {
+        let sel = [sel_line("alpha", 0.0, Join::None), sel_line("beta", 100.0, Join::Blank)];
+        let down = Selection { from: Caret { line: 0, ch: 1 }, to: Caret { line: 1, ch: 3 } };
+        let up = Selection { from: down.to, to: down.from };
+        assert_eq!(selection_text(&sel, up), selection_text(&sel, down));
+        assert_eq!(selection_rects(&sel, up), selection_rects(&sel, down));
+    }
+
+    #[test]
+    fn a_click_selects_nothing_and_copies_nothing() {
+        let sel = [sel_line("alpha", 0.0, Join::None)];
+        let here = Selection { from: Caret { line: 0, ch: 2 }, to: Caret { line: 0, ch: 2 } };
+        assert!(selection_rects(&sel, here).is_empty());
+        assert_eq!(selection_text(&sel, here), "");
+        // The same at either end of the page, where an empty `to` would otherwise read
+        // every line after the press.
+        let start = Selection { from: Caret { line: 0, ch: 0 }, to: Caret { line: 0, ch: 0 } };
+        assert_eq!(selection_text(&sel, start), "");
+    }
+
+    #[test]
+    fn a_squeezed_space_copies_but_never_shows() {
+        // `a b` with the space given no width by the line break: the character is in
+        // the source, so a copy has to keep it, and it is not on the page, so a
+        // highlight cannot draw it.
+        let sel = [squeezed("ab cd", 0.0, 2)];
+        assert_eq!(sel[0].xs[2], sel[0].xs[3], "the squeezed boundary must have no width");
+        let space = Selection { from: Caret { line: 0, ch: 2 }, to: Caret { line: 0, ch: 3 } };
+        assert!(selection_rects(&sel, space).is_empty(), "an invisible character has no ink to lie under");
+        assert_eq!(selection_text(&sel, space), " ");
+        let all = Selection { from: Caret { line: 0, ch: 0 }, to: Caret { line: 0, ch: 5 } };
+        assert_eq!(selection_text(&sel, all), "ab cd");
+    }
+
+    #[test]
+    fn a_double_click_takes_the_whole_word_and_the_hyphen_inside_it() {
+        let sel = [sel_line("well-formed text", 0.0, Join::None)];
+        let inside = word_at(&sel, Caret { line: 0, ch: 3 });
+        assert_eq!((inside.from.ch, inside.to.ch), (0, 11), "the hyphen is inside the word");
+        assert_eq!(selection_text(&sel, inside), "well-formed");
+    }
+
+    #[test]
+    fn a_double_click_in_a_gap_belongs_to_the_word_on_its_right() {
+        let sel = [sel_line("one  two", 0.0, Join::None)];
+        let w = word_at(&sel, Caret { line: 0, ch: 4 });
+        assert_eq!((w.from.ch, w.to.ch), (5, 8));
+        assert_eq!(selection_text(&sel, w), "two");
+        // …unless there is no word on the right, which is the end of a line.
+        let end = word_at(&sel, Caret { line: 0, ch: 8 });
+        assert_eq!((end.from.ch, end.to.ch), (5, 8));
+    }
+
+    #[test]
+    fn a_double_click_on_han_text_stops_at_one_character() {
+        let sel = [sel_line("排版引擎", 0.0, Join::None)];
+        let w = word_at(&sel, Caret { line: 0, ch: 2 });
+        assert_eq!((w.from.ch, w.to.ch), (1, 2), "no word boundary inside them is a click's to find");
+        assert_eq!(selection_text(&sel, w), "版");
+        // Mixed with Latin, each script keeps to its own extent.
+        let sel = [sel_line("版text版", 0.0, Join::None)];
+        let latin = word_at(&sel, Caret { line: 0, ch: 3 });
+        assert_eq!(selection_text(&sel, latin), "text");
+    }
+
+    #[test]
+    fn a_double_click_on_punctuation_takes_only_it() {
+        let sel = [sel_line("end. more", 0.0, Join::None)];
+        let w = word_at(&sel, Caret { line: 0, ch: 4 });
+        assert_eq!(selection_text(&sel, w), ".", "a mark belongs to neither neighbour");
+        // A click in the gap between two words goes to the word on its right...
+        let gap = word_at(&sel, Caret { line: 0, ch: 5 });
+        assert_eq!(selection_text(&sel, gap), "more");
+        // ...and to the one on its left when there is no word left to reach, skipping
+        // the punctuation trailing off the end rather than selecting it.
+        let sel = [sel_line("more. ", 0.0, Join::None)];
+        assert_eq!(selection_text(&sel, word_at(&sel, Caret { line: 0, ch: 6 })), "more");
     }
 }

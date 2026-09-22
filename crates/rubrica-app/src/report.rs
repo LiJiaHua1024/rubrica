@@ -248,6 +248,44 @@ pub fn report(source: &str, path: Option<&str>, width: f32, dpi: f32, hyphenate:
             .collect::<Vec<_>>();
         println!("  heights    : {}", heights.join(", "));
     }
+    // The selectable text of the page, counted against the ink it is meant to describe.
+    // A block that lays out without recording its lines is selectable everywhere except
+    // where it was just laid out, which is invisible in a screenshot and shows up here
+    // as a char count far behind the glyph count.
+    {
+        let chars: usize = page.sel.iter().map(|l| l.chars.len()).sum();
+        let glyphs: usize = census.values().sum();
+        let malformed = page
+            .sel
+            .iter()
+            .filter(|l| l.xs.len() != l.chars.len() + 1 || l.xs.windows(2).any(|w| w[1] < w[0]))
+            .count();
+        let unordered = page.sel.windows(2).filter(|w| w[1].y < w[0].y).count();
+        println!(
+            "select       : {} line(s), {chars} char(s) indexed against {glyphs} drawn, {malformed} malformed, {unordered} out of order",
+            page.sel.len()
+        );
+        // Read back the way `Ctrl`+`A` and a copy would: an index that satisfies its
+        // invariants but yields nothing when asked for everything is still no use.
+        let all = crate::view::Selection {
+            from: crate::view::Caret { line: 0, ch: 0 },
+            to: crate::view::Caret {
+                line: page.sel.len().saturating_sub(1),
+                ch: page.sel.last().map_or(0, |l| l.chars.len()),
+            },
+        };
+        let copied = crate::view::selection_text(&page.sel, all);
+        let bands = crate::view::selection_rects(&page.sel, all).len();
+        // The separators counted apart from the text: a page with a grid on it has to
+        // answer with tabs, and one whose blocks run together has lost the boundary
+        // between them -- neither of which is visible in a total character count.
+        let lines = copied.matches('\n').count();
+        let tabs = copied.matches('\t').count();
+        println!(
+            "  whole page : {} char(s) copied in {bands} band(s), {lines} line break(s), {tabs} tab(s)",
+            copied.chars().count()
+        );
+    }
     Ok(())
 }
 

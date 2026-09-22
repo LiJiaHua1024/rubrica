@@ -5,6 +5,7 @@
 //! architectural premise: fine typography requires the break decisions and the
 //! glyph advances to come from the same place.
 
+mod clipboard;
 mod font;
 mod hyphen;
 mod images;
