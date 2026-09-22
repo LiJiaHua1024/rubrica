@@ -113,9 +113,46 @@ fn list_items_carry_markers_and_nesting_depth() {
     assert!(items[4].ordered);
 }
 
+/// What a reader sees if it is not recorded: an item's second paragraph and its code
+/// fence standing out at the page margin, beside the marker instead of under the text
+/// they go on with. Only the block that opens an item carries a marker, so the level
+/// has to be said again for the ones that follow.
 #[test]
-fn task_list_items_record_their_checked_state() {
-    let doc = Document::parse("- [x] done\n- [ ] todo\n");
+fn a_loose_item_marks_the_blocks_that_continue_it() {
+    let src = "intro\n\n- one\n\n  two\n\n  ```sh\n  code\n  ```\n\n- next\n  - deep\n\n    deeper\n\nafter\n";
+    let doc = Document::parse(src);
+    let seen: Vec<(String, Option<u8>, Option<u8>)> = doc
+        .blocks
+        .iter()
+        .map(|b| {
+            (
+                b.text.clone(),
+                b.list.map(|l| l.depth),
+                b.item_depth,
+            )
+        })
+        .collect();
+    let at = |t: &str| {
+        seen.iter()
+            .find(|(text, _, _)| text.contains(t))
+            .unwrap_or_else(|| panic!("no block carrying {t:?} in {seen:?}"))
+    };
+    assert_eq!(at("intro").2, None, "prose outside any list");
+    let one = at("one");
+    assert_eq!((one.1, one.2), (Some(0), Some(0)), "the item's own block carries both");
+    let two = at("two");
+    assert_eq!((two.1, two.2), (None, Some(0)), "its second paragraph continues the item");
+    let code = at("code");
+    assert_eq!((code.1, code.2), (None, Some(0)), "and so does its fence");
+    assert_eq!(code.0, "code", "a fence is its own block, not the item's prose");
+    let deep = at("deep");
+    assert_eq!((deep.1, deep.2), (Some(1), Some(1)), "a nested item is one level deeper");
+    assert_eq!(at("deeper").2, Some(1), "and so is what continues it");
+    assert_eq!(at("after").2, None, "the count unwinds with the items");
+}
+
+#[test]
+fn task_list_items_record_their_checked_state() {    let doc = Document::parse("- [x] done\n- [ ] todo\n");
     assert_eq!(doc.blocks[0].task, Some(true));
     assert_eq!(doc.blocks[1].task, Some(false));
 }

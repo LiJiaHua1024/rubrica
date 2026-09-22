@@ -1745,9 +1745,19 @@ pub fn build_ops(
         let size = theme.body_size(b.kind);
         y += theme.space_before(b.kind, first);
         first = false;
+        // A list's geometry belongs to the list, not to whichever block happens to be
+        // standing at its level: an item's code fence set at its own, smaller size would
+        // start its text a little left of the prose above it.
+        let depth = b.item_depth.unwrap_or(0) as Pt;
+        let level = level_hang.get(depth as usize).copied().unwrap_or(0.0);
         let mut left = base_left
             + b.quote_depth as Pt * theme.quote_indent_em * theme.base
-            + b.list.map_or(0.0, |l| l.depth as Pt * theme.list_indent_em * size);
+            + depth * theme.list_indent_em * theme.base
+            // A block that only continues an item has no marker of its own to hang, so
+            // it starts where the item's text does rather than where its marker does.
+            // Ordinary prose is neither: it has no item to continue, and must not pay
+            // for one.
+            + if b.list.is_some() || b.item_depth.is_none() { 0.0 } else { level };
         // Every point a block is run in from the margin is a point it has to give back
         // at the right: a nested list or a quotation that kept the page's whole measure
         // would end its lines out past the text standing beside it.
@@ -1782,9 +1792,9 @@ pub fn build_ops(
                 hyphenation: Hyphenation { points: &hyphens, width: hyphen_width },
                 size,
                 leading: theme.line_spacing(b.kind),
-                hang: b.list.map_or(p.hang, |l| {
-                    level_hang.get(l.depth as usize).copied().unwrap_or(p.hang)
-                }),
+                // The level's marker width, shared by every item at that level so their
+                // bodies line up. A continuation block has already paid it at `left`.
+                hang: if b.list.is_some() { level } else { 0.0 },
             },
             &mut ops,
             y,

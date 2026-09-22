@@ -105,6 +105,14 @@ pub struct Block {
     /// How many block quotes contain this block.
     pub quote_depth: u8,
     pub list: Option<ListInfo>,
+    /// The depth of the list whose item contains this block, if any.
+    ///
+    /// A Markdown item can hold several blocks, and only the one that opens it carries
+    /// a marker: a loose item's second paragraph, its fenced code, its own nested list
+    /// all belong to the item's *text* column rather than to the page. A continuation
+    /// block has [`Block::list`] `None`, so without this it would sit out at the margin
+    /// beside the marker instead of under the text it goes on with.
+    pub item_depth: Option<u8>,
     /// A list item carrying a checkbox, with its state.
     pub task: Option<bool>,
     /// Set for [`BlockKind::Table`].
@@ -245,6 +253,11 @@ struct Builder {
     quote_depth: u8,
     /// One entry per open list, holding its info and the next item number.
     lists: Vec<(ListInfo, u64)>,
+    /// How many `Tag::Item`s are open. Non-zero while a block is being read inside a
+    /// list item, which is what makes it that item's continuation; see
+    /// [`Block::item_depth`]. Nested items nest the count, so an inner list's blocks
+    /// are still marked as belonging to a list.
+    in_item: u8,
     /// Definitions by label, in the order they were defined.
     notes: Vec<Draft>,
     /// How many labels have been cited, which is the next number to hand out:
@@ -378,6 +391,9 @@ impl Builder {
                     }
                     None => ListInfo { ordered: false, depth: 0, index: None },
                 };
+                // Opened before the block: the item's own first block is inside the
+                // item, and its continuation blocks are indented to match it.
+                self.in_item += 1;
                 self.open(BlockKind::Paragraph);
                 if let Some(b) = self.cur.as_mut() {
                     b.list = Some(info);
@@ -469,6 +485,7 @@ impl Builder {
             }
             TagEnd::Item => {
                 self.close();
+                self.in_item = self.in_item.saturating_sub(1);
             }
             TagEnd::FootnoteDefinition => {
                 self.close();
@@ -501,6 +518,13 @@ impl Builder {
             spans: Vec::new(),
             quote_depth: self.quote_depth,
             list: None,
+            // The innermost open list, if an item of it is open: the level a block
+            // joining now has to be indented to.
+            item_depth: if self.in_item > 0 {
+                self.lists.last().map(|(li, _)| li.depth)
+            } else {
+                None
+            },
             task: None,
             objects: Vec::new(),
             table: None,
