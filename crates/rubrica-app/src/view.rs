@@ -8,6 +8,7 @@
 
 use std::collections::HashMap;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use rubrica_doc::{Action, ActionKind, Align, Block, BlockKind, Document, InlineStyle};
 use rubrica_type::justification::place;
@@ -15,7 +16,7 @@ use rubrica_type::paragraph::{Item, Spacing, StyleId, StyleSpan};
 use rubrica_type::units::Pt;
 use rubrica_type::{BreakOptions, Hyphenation, typeset, typeset_hyphenated};
 use windows::core::{w, Interface, PCWSTR};
-use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, POINT, RECT, WPARAM};
+use windows::Win32::Foundation::{COLORREF, HWND, LPARAM, LRESULT, POINT, RECT, WPARAM};
 use windows::Win32::Graphics::Direct2D::Common::{
     D2D1_ALPHA_MODE_PREMULTIPLIED, D2D1_COLOR_F, D2D1_PIXEL_FORMAT, D2D_RECT_F, D2D_SIZE_U,
 };
@@ -31,7 +32,11 @@ use windows::Win32::Graphics::DirectWrite::{
 };
 use windows::Win32::Graphics::Dwm::{DwmSetWindowAttribute, DWMWA_USE_IMMERSIVE_DARK_MODE};
 use windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_B8G8R8A8_UNORM;
-use windows::Win32::Graphics::Gdi::{HBRUSH, InvalidateRect, ScreenToClient};
+use windows::Win32::Graphics::Gdi::{
+    CLIP_DEFAULT_PRECIS, CreateFontW, CreateSolidBrush, DEFAULT_CHARSET, DEFAULT_QUALITY,
+    DeleteObject, HBRUSH, HDC, HFONT, HGDIOBJ, InvalidateRect, OUT_DEFAULT_PRECIS, ScreenToClient,
+    SetBkColor, SetTextColor,
+};
 use windows::Win32::System::Com::{
     CoInitializeEx, COINIT_APARTMENTTHREADED, COINIT_DISABLE_OLE1DDE,
 };
@@ -41,13 +46,15 @@ use windows::Win32::UI::HiDpi::{
     DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2, GetDpiForWindow, SetProcessDpiAwarenessContext,
 };
 use windows::Win32::UI::Input::KeyboardAndMouse::{
-    GetKeyState, ReleaseCapture, SetCapture, VK_CONTROL, VK_O, VK_UP,
+    GetKeyState, ReleaseCapture, SetCapture, SetFocus, VK_CONTROL, VK_O, VK_UP,
 };
 use windows::Win32::UI::Input::KeyboardAndMouse::{VK_DOWN, VK_ESCAPE, VK_NEXT, VK_PRIOR};
 use windows::Win32::UI::Input::KeyboardAndMouse::{
-    VK_0, VK_A, VK_ADD, VK_C, VK_D, VK_END, VK_HOME, VK_LEFT, VK_MENU, VK_NUMPAD0, VK_OEM_4,
-    VK_OEM_6, VK_OEM_MINUS, VK_OEM_PLUS, VK_R, VK_RIGHT, VK_SHIFT, VK_SUBTRACT, VIRTUAL_KEY,
+    VK_0, VK_A, VK_ADD, VK_C, VK_D, VK_END, VK_F, VK_F3, VK_HOME, VK_LEFT, VK_MENU, VK_NUMPAD0,
+    VK_OEM_4, VK_OEM_6, VK_OEM_MINUS, VK_OEM_PLUS, VK_R, VK_RETURN, VK_RIGHT, VK_SHIFT,
+    VK_SUBTRACT, VIRTUAL_KEY,
 };
+use windows::Win32::UI::Controls::EM_SETCUEBANNER;
 use windows::Win32::UI::Controls::Dialogs::{
     GetOpenFileNameW, OPENFILENAMEW, OFN_FILEMUSTEXIST, OFN_HIDEREADONLY, OFN_PATHMUSTEXIST,
 };
@@ -64,16 +71,20 @@ use windows::Win32::UI::WindowsAndMessaging::{
     WM_DESTROY, WM_DPICHANGED, WM_ERASEBKGND, WM_KEYDOWN, WM_MOUSEWHEEL, WM_NCCREATE, WM_PAINT,
     WM_SETCURSOR, WM_SIZE, WM_TIMER, WS_EX_APPWINDOW, WS_OVERLAPPEDWINDOW, SWP_NOACTIVATE,
     SWP_NOZORDER, WM_DROPFILES, WM_LBUTTONDOWN, WM_LBUTTONDBLCLK, WM_LBUTTONUP, WM_MOUSEMOVE,
-    WM_SYSKEYDOWN,
+    WM_SYSKEYDOWN, CallWindowProcW, EN_CHANGE, ES_AUTOHSCROLL, GetParent, GetWindowTextW,
+    GWLP_WNDPROC, MoveWindow, SendMessageW, SW_HIDE, SW_SHOW, WM_CHAR, WM_COMMAND,
+    WM_CTLCOLOREDIT, WM_GETTEXTLENGTH, WM_SETFONT, WINDOW_STYLE, WNDPROC, WS_BORDER, WS_CHILD,
+    WS_VISIBLE,
 };
 use windows_numerics::Vector2;
 
 use crate::clipboard;
+use crate::find::Needle;
 use crate::font::{FaceRequest, FontEngine, GlyphRun, ObjectBox, Style as RunStyle};
 use crate::hyphen::Hyphenator;
 use crate::images::ImageStore;
 use crate::math::MathStore;
-use crate::theme::{ColorRole, Leading, Measure, TextFace, Theme, Zoom};
+use crate::theme::{ColorRole, Leading, Measure, Role, TextFace, Theme, Zoom};
 use crate::{Error, Result};
 
 /// The character drawn at a discretionary break, and the range to shape it from.
@@ -699,6 +710,21 @@ pub struct View {
     math: MathStore,
     /// English word breaks, when the embedded dictionary loaded.
     hyphenator: Option<Hyphenator>,
+    /// What the reader is looking for, and everywhere the page has it. `Some` while the
+    /// bar is on the window, whether or not anything has been typed into it yet.
+    find: Option<Find>,
+    /// The box the query is typed into: a window control of its own rather than ink this
+    /// view draws, because a reader searching for Chinese searches with an input method,
+    /// and an input method attaches to a real edit control and to nothing else.
+    edit: Option<HWND>,
+    edit_font: Option<HFONT>,
+    /// The box's background, which the painter has no say in: USER32 paints a child
+    /// window, and asks this window what colours to use.
+    edit_brush: Option<HBRUSH>,
+    /// How many there are, next to the box.
+    find_label: Vec<PaintRun>,
+    hit_brush: Option<ID2D1SolidColorBrush>,
+    focus_brush: Option<ID2D1SolidColorBrush>,
 }
 
 /// Thumb geometry, in device independent pixels, or `None` when the document fits.
@@ -832,6 +858,90 @@ impl History {
     }
 }
 
+/// What the reader is looking for, and everywhere the page has it.
+///
+/// The places are kept rather than recomputed per frame: a hit is a pair of caret
+/// positions in the current wrapping, so a wheel tick can repaint it for nothing, and
+/// only a relayout -- the one event that moves the words -- has to ask again.
+#[derive(Default)]
+struct Find {
+    /// What the box holds, mirrored out of it on every change. The box is a window that
+    /// may not exist yet, or any more, and the page has to be able to answer the same
+    /// question without one.
+    query: String,
+    marks: Vec<Selection>,
+    /// Which of them `Enter` last landed on, and the one drawn darker than the rest.
+    focus: usize,
+}
+
+/// The bar's size and station, in device independent pixels.
+///
+/// It hangs at the top right, over the page, rather than across the bottom of the window
+/// where nothing overlaps it: a bar the prose has to make room for is a page that reflows
+/// when a key is pressed, and a reader searching has already lost their place to look for.
+const FIND_W: f32 = 340.0;
+const FIND_H: f32 = 32.0;
+const FIND_TOP: f32 = 8.0;
+/// Kept from the window's right edge -- more than the thumb's track needs, so that the
+/// one thing the reader has to grip is never under the thing that appeared by accident.
+const FIND_EDGE: f32 = 16.0;
+/// Space at the bar's right for the count of what was found, which the box cannot have:
+/// a query is read from its start, and the number belongs out of the way of that.
+const FIND_COUNT: f32 = 96.0;
+const FIND_PAD: f32 = 6.0;
+/// The id the box's notifications come back with, since a child window has no other way
+/// to say which of its parent's children is speaking.
+const FIND_EDIT_ID: usize = 0x5141;
+
+/// The panel's rect, measured from the top of the *window* -- the bar is pinned to the
+/// glass, not to the page.
+fn find_panel(client_w: f32) -> (f32, f32, f32, f32) {
+    // A window narrower than the bar gives up width rather than hanging off the left edge,
+    // where a box with no words beside it is all that would be left of it.
+    let w = FIND_W.min((client_w - 2.0 * FIND_EDGE).max(0.0));
+    (client_w - FIND_EDGE - w, FIND_TOP, w, FIND_H)
+}
+
+/// The text box inside the panel, in the physical pixels `MoveWindow` wants: a child
+/// window is placed by the window manager, which knows nothing of this view's scale.
+fn find_edit(client_w: f32, dpi: f32) -> (i32, i32, i32, i32) {
+    let k = scale_of(dpi);
+    let (x, y, w, h) = find_panel(client_w);
+    let box_w = (w - 2.0 * FIND_PAD - FIND_COUNT).max(48.0);
+    let box_h = (h - 2.0 * FIND_PAD).max(12.0);
+    (
+        ((x + FIND_PAD) * k) as i32,
+        ((y + FIND_PAD) * k) as i32,
+        (box_w * k) as i32,
+        (box_h * k) as i32,
+    )
+}
+
+/// Whether a window point is on the bar's panel, which is this view's own paint and so
+/// hides whatever page is under it.
+fn in_find_panel(x: f32, y: f32, client_w: f32) -> bool {
+    let (px, py, pw, ph) = find_panel(client_w);
+    x >= px && x <= px + pw && y >= py && y <= py + ph
+}
+
+/// What the bar says about a search: how many hits there are, and which one the reader is
+/// on. One place rather than a format string in the painter, because the sentence is the
+/// only answer a reader gets to "is the word I meant even here", and it has to read as well
+/// at one hit as at nine hundred.
+fn find_count(focus: usize, hits: usize) -> String {
+    match hits {
+        0 => "no match".to_string(),
+        1 => "1 match".to_string(),
+        n => format!("{} of {}", focus + 1, n),
+    }
+}
+
+/// An 8-bit colour, the shape GDI wants for the one window this painter cannot reach.
+fn cref(c: Rgb) -> COLORREF {
+    let v = |x: f32| (x.clamp(0.0, 1.0) * 255.0).round() as u32;
+    COLORREF(v(c.r) | v(c.g) << 8 | v(c.b) << 16)
+}
+
 /// What the right-click menu can be asked to do.
 ///
 /// Every one of these is also reachable some other way -- a key, a click, the wheel --
@@ -846,6 +956,8 @@ enum Command {
     Heading(usize),
     Copy,
     SelectAll,
+    /// Put the bar on the window that a phrase is typed into.
+    Find,
     OpenUrl(String),
     CopyUrl(String),
     ZoomIn,
@@ -934,6 +1046,9 @@ fn menu_items(s: &MenuState) -> Vec<MenuRow> {
         MenuRow::Gap,
         row(Command::Copy, "Copy\tCtrl+C", s.selected),
         row(Command::SelectAll, "Select All\tCtrl+A", s.text),
+        // The one item on this menu a reader needs on a page too long to read at once,
+        // and lit by the same question as `Select All`: is there any text here at all.
+        row(Command::Find, "Find in Document\tCtrl+F", s.text),
     ];
     if let Some(url) = &s.link {
         v.push(MenuRow::Gap);
@@ -1247,6 +1362,13 @@ pub fn run(source: String, path: Option<PathBuf>) -> Result<()> {
         images: None,
         math: MathStore::new(),
         hyphenator: Hyphenator::english(),
+        find: None,
+        edit: None,
+        edit_font: None,
+        edit_brush: None,
+        find_label: Vec::new(),
+        hit_brush: None,
+        focus_brush: None,
     });
 
     const CLASS: &str = "Rubrica.Main";
@@ -1420,6 +1542,51 @@ unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM)
     }
 }
 
+/// The find box's own window procedure, kept when it was subclassed and answered through
+/// ever after. `SetWindowLongPtrW` speaks in numbers, and a function pointer is the same
+/// number in the other hand.
+static EDIT_PROC: AtomicUsize = AtomicUsize::new(0);
+
+/// The find box's procedure, with the keys the search owns lifted out of it.
+///
+/// A control gets the keyboard before its parent window does, so `Enter` and `Escape`
+/// cannot be answered upstairs. Everything else goes back to the procedure the control was
+/// made with: an edit box that has been taught to edit nothing is no bargain for three
+/// keys, and a reader who cannot correct a mistyped query has no search at all.
+unsafe extern "system" fn edit_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRESULT {
+    let previous: WNDPROC = core::mem::transmute_copy(&EDIT_PROC.load(Ordering::Relaxed));
+    if msg == WM_KEYDOWN {
+        if let Some(answer) = edit_find_key(hwnd, wp.0 as u32) {
+            return answer;
+        }
+    }
+    // `TranslateMessage` has already turned the key down above into this character by the
+    // time the procedure is asked about it, so a `Return` that means the search must also
+    // be a `Return` that never reaches the query.
+    if msg == WM_CHAR && matches!(wp.0 as u32, 0x0D | 0x1B) {
+        return LRESULT(0);
+    }
+    CallWindowProcW(previous, hwnd, msg, wp, lp)
+}
+
+/// `Enter` steps to the next hit and `Shift`+`Enter` to the last one; `Escape` closes the
+/// bar and hands the keyboard back to the page.
+unsafe fn edit_find_key(hwnd: HWND, vk: u32) -> Option<LRESULT> {
+    let parent = GetParent(hwnd).ok()?;
+    let raw = GetWindowLongPtrW(parent, GWLP_USERDATA);
+    if raw == 0 {
+        return None;
+    }
+    let view = &mut *(raw as *mut View);
+    let back = held(VK_SHIFT);
+    match vk {
+        k if k == VK_RETURN.0 as u32 || k == VK_F3.0 as u32 => view.step_find(back, parent),
+        k if k == VK_ESCAPE.0 as u32 => view.close_find(parent),
+        _ => return None,
+    }
+    Some(LRESULT(0))
+}
+
 impl View {
     unsafe fn attach(&mut self, hwnd: HWND) {
         let mut r = RECT::default();
@@ -1502,6 +1669,16 @@ impl View {
         if self.thumb_rect().is_some() && !roles.contains(&ColorRole::Muted) {
             roles.push(ColorRole::Muted);
         }
+        // The bar's panel and its count of matches are drawn from their geometry like the
+        // thumb, for the same reason, so the ink they fill with has to be asked for by
+        // name rather than found in a list of what the page happens to be made of.
+        if self.find.is_some() {
+            for role in [ColorRole::Surface, ColorRole::Muted] {
+                if !roles.contains(&role) {
+                    roles.push(role);
+                }
+            }
+        }
         for role in roles {
             if self.brushes.contains_key(&role) {
                 continue;
@@ -1522,6 +1699,20 @@ impl View {
                 self.sel_brush = Some(b);
             }
         }
+        // A hit is the same accent and less of it, because everything the search has found
+        // is a suggestion of where a word might be -- and the one the reader is on is more
+        // of it still, which is what tells a page with forty hits which of them the next
+        // `Enter` is about to move away from.
+        if self.hit_brush.is_none() {
+            let mut c = d2d(self.palette.accent);
+            c.a = 0.16;
+            self.hit_brush = unsafe { rt.CreateSolidColorBrush(&c, None).ok() };
+        }
+        if self.focus_brush.is_none() {
+            let mut c = d2d(self.palette.accent);
+            c.a = 0.45;
+            self.focus_brush = unsafe { rt.CreateSolidColorBrush(&c, None).ok() };
+        }
     }
 
     unsafe fn on_message(&mut self, hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRESULT {
@@ -1536,6 +1727,7 @@ impl View {
                 }
                 self.dpi = GetDpiForWindow(hwnd).max(96) as f32;
                 self.relayout();
+                self.layout_find();
                 let _ = InvalidateRect(Some(hwnd), None, false);
                 LRESULT(0)
             }
@@ -1559,7 +1751,11 @@ impl View {
                 if let Some(t) = &self.target {
                     t.SetDpi(self.dpi, self.dpi);
                 }
+                // The box's letters were made for the monitor it is leaving, and a font is
+                // sized in pixels, so it has to be made again rather than scaled up.
+                self.drop_edit_font();
                 self.relayout();
+                self.layout_find();
                 let _ = InvalidateRect(Some(hwnd), None, false);
                 LRESULT(0)
             }
@@ -1637,9 +1833,9 @@ impl View {
                         self.zoom_to(Zoom::DESIGN, hwnd);
                     }
                     // The bracket keys, which are the shape of the thing: two margins
-                    // moving apart or together. Nothing collides with them, because a
-                    // reader never types a bare bracket -- there is no text box in this
-                    // window.
+                    // moving apart or together. Nothing collides with them: a reader never
+                    // types a bare bracket, and the one text box this window grows has its
+                    // own procedure answering its keys before any of these is asked.
                     k if ctrl && k == VK_OEM_4.0 as u32 => {
                         let m = step_measure(self.theme.measure, -1);
                         self.set_measure(m, hwnd);
@@ -1660,6 +1856,18 @@ impl View {
                     // to no purpose: an empty selection is not an edit.
                     k if k == VK_C.0 as u32 && ctrl => self.copy_selection(hwnd),
                     k if k == VK_A.0 as u32 && ctrl => self.select_all(),
+                    k if k == VK_F.0 as u32 && ctrl => self.open_find(hwnd),
+                    // `F3` is the same key the box answers to while it has the keyboard, so
+                    // a reader who has closed the bar with `Escape` is one press from the
+                    // phrase they were looking at -- with the query still in the box.
+                    k if k == VK_F3.0 as u32 => {
+                        if self.find.is_some() {
+                            let back = held(VK_SHIFT);
+                            self.step_find(back, hwnd);
+                        } else {
+                            self.open_find(hwnd);
+                        }
+                    }
                     // A key this window has no use for goes back to the default handler,
                     // which is what turns the keyboard's menu key -- and `Shift`+`F10` --
                     // into the `WM_CONTEXTMENU` that opens the reader's menu. Answering
@@ -1686,6 +1894,31 @@ impl View {
                 } else {
                     DefWindowProcW(hwnd, msg, wp, lp)
                 }
+            }
+            // The find box has new words in it. Asked about on every keystroke rather than
+            // when `Enter` is pressed, because a search that waits is a reader pressing
+            // `Enter` to find out whether the word they meant is on the page at all.
+            WM_COMMAND => {
+                let (id, code) = (wp.0 & 0xFFFF, ((wp.0 >> 16) & 0xFFFF) as u32);
+                if id == FIND_EDIT_ID && code == EN_CHANGE {
+                    let query = self.edit_text();
+                    self.apply_find(&query, true);
+                    let _ = InvalidateRect(Some(hwnd), None, false);
+                    LRESULT(0)
+                } else {
+                    DefWindowProcW(hwnd, msg, wp, lp)
+                }
+            }
+            // The one piece of this window the painter cannot reach: a child control is
+            // erased by USER32, which asks here what ink to use for it.
+            WM_CTLCOLOREDIT => {
+                let dc = HDC(wp.0 as *mut core::ffi::c_void);
+                SetTextColor(dc, cref(self.palette.text));
+                SetBkColor(dc, cref(self.palette.bg));
+                if self.edit_brush.is_none() {
+                    self.edit_brush = Some(CreateSolidBrush(cref(self.palette.bg)));
+                }
+                LRESULT(self.edit_brush.map_or(0, |b| b.0 as isize))
             }
             WM_CONTEXTMENU => {
                 // `wParam` is the window and `lParam` the screen point the right button
@@ -1720,6 +1953,12 @@ impl View {
                 // the release; a press anywhere else belongs to the text.
                 let x = ((lp.0 & 0xFFFF) as i16) as f32;
                 let y = ((lp.0 >> 16) as i16) as f32;
+                // A press on the bar is not a press on the page. The box itself is a window
+                // and never reaches this handler; this is the strip of paint around it,
+                // under which the reader's own text is still lying.
+                if self.find.is_some() && in_find_panel(x, y, self.client_w) {
+                    return LRESULT(0);
+                }
                 self.pressed = None;
                 if self.thumb_hit(x, y) {
                     self.dragging = true;
@@ -2036,6 +2275,7 @@ impl View {
             Command::Heading(i) => self.jump_to(self.anchor_tops.get(i).copied(), hwnd),
             Command::Copy => self.copy_selection(hwnd),
             Command::SelectAll => self.select_all(),
+            Command::Find => unsafe { self.open_find(hwnd) },
             Command::OpenUrl(u) => open_url(&u),
             Command::CopyUrl(u) => {
                 if let Err(e) = clipboard::copy_text(hwnd, &u) {
@@ -2208,6 +2448,17 @@ impl View {
         // have to go; the layout is ink-independent and needs no work.
         self.brushes.clear();
         self.sel_brush = None;
+        self.hit_brush = None;
+        self.focus_brush = None;
+        // The find box is USER32's to erase, and it will ask this window what colour to
+        // use -- but only if it is asked to repaint, and only with the brush it is given
+        // now rather than the one it was given for the last palette.
+        if let Some(b) = self.edit_brush.take() {
+            unsafe { let _ = DeleteObject(HGDIOBJ(b.0)); }
+        }
+        if let Some(e) = self.edit {
+            unsafe { let _ = InvalidateRect(Some(e), None, true); }
+        }
         unsafe { self.apply_dark_titlebar(hwnd) };
     }
 
@@ -2241,8 +2492,232 @@ impl View {
         self.press_caret = None;
         self.caret = None;
         self.sel_index = page.sel;
+        // The hits are pairs of places in lines that have just been broken apart and
+        // joined up again, so the query has to be asked of the new page. Nothing is
+        // scrolled to: the reader did not ask for a reflow, and the least it can cost
+        // them is the paragraph they were already looking at.
+        if let Some(query) = self.find.as_ref().map(|f| f.query.clone()) {
+            self.apply_find(&query, false);
+        }
     }
 
+    /// Put the bar on the window, or bring back the one already there with the query it
+    /// still holds.
+    unsafe fn open_find(&mut self, hwnd: HWND) {
+        if self.edit.is_none() {
+            self.create_edit(hwnd);
+        }
+        let Some(edit) = self.edit else { return };
+        let _ = ShowWindow(edit, SW_SHOW);
+        self.find = Some(Find::default());
+        self.layout_find();
+        let query = self.edit_text();
+        self.apply_find(&query, false);
+        let _ = SetFocus(Some(edit));
+        let _ = InvalidateRect(Some(hwnd), None, false);
+    }
+
+    /// Make the box. Once, and its window kept: one that is destroyed and remade has lost
+    /// what the reader typed into it, which is the only thing worth keeping there.
+    unsafe fn create_edit(&mut self, parent: HWND) {
+        let Ok(module) = GetModuleHandleW(None) else { return };
+        let style = WS_CHILD | WS_VISIBLE | WINDOW_STYLE(ES_AUTOHSCROLL as u32) | WS_BORDER;
+        let Ok(edit) = CreateWindowExW(
+            Default::default(),
+            w!("EDIT"),
+            w!(""),
+            style,
+            0,
+            0,
+            10,
+            10,
+            Some(parent),
+            Some(HMENU(FIND_EDIT_ID as *mut core::ffi::c_void)),
+            Some(module.into()),
+            None,
+        ) else {
+            return;
+        };
+        // The words shown while the box is empty, drawn and erased by the control itself,
+        // and shown even while the box has the keyboard: this window has nothing else
+        // saying what the box is for.
+        let cue = utf16("Find in document");
+        let _ = SendMessageW(
+            edit,
+            EM_SETCUEBANNER,
+            Some(WPARAM(1)),
+            Some(LPARAM(cue.as_ptr() as isize)),
+        );
+        let previous = SetWindowLongPtrW(edit, GWLP_WNDPROC, edit_proc as *const () as isize);
+        EDIT_PROC.store(previous as usize, Ordering::Relaxed);
+        self.edit = Some(edit);
+    }
+
+    /// Where the box belongs now that the window has changed: moved, and its letters made
+    /// over if the monitor it is on has.
+    unsafe fn layout_find(&mut self) {
+        self.position_edit();
+        self.shape_find_label();
+    }
+
+    unsafe fn position_edit(&mut self) {
+        let Some(edit) = self.edit else { return };
+        self.ensure_edit_font();
+        if let Some(font) = self.edit_font {
+            let _ = SendMessageW(edit, WM_SETFONT, Some(WPARAM(font.0 as usize)), Some(LPARAM(1)));
+        }
+        let (x, y, w, h) = find_edit(self.client_w, self.dpi);
+        let _ = MoveWindow(edit, x, y, w, h, true);
+    }
+
+    /// The box's letters, made at the size this window is drawn at.
+    ///
+    /// Set by hand rather than left to the control, whose default is a fixed bitmap font
+    /// sized for the DPI the desktop started on: on a second monitor that is neither the
+    /// right face nor the right height, and a reader finds it out by typing.
+    unsafe fn ensure_edit_font(&mut self) {
+        if self.edit_font.is_some() {
+            return;
+        }
+        let face = utf16("Segoe UI");
+        // A negative height is the character height rather than the cell's, which is the
+        // only way to ask for a size that matches the text beside it. Weight 400 is
+        // regular; the character set is left to the system, so a reader whose locale is
+        // not Latin gets a face that can hold their own words.
+        let height = -((self.theme.base * 0.9 * scale_of(self.dpi)).round() as i32);
+        let font = CreateFontW(
+            height,
+            0,
+            0,
+            0,
+            400,
+            0,
+            0,
+            0,
+            DEFAULT_CHARSET,
+            OUT_DEFAULT_PRECIS,
+            CLIP_DEFAULT_PRECIS,
+            DEFAULT_QUALITY,
+            0,
+            PCWSTR(face.as_ptr()),
+        );
+        if !font.0.is_null() {
+            self.edit_font = Some(font);
+        }
+    }
+
+    unsafe fn drop_edit_font(&mut self) {
+        if let Some(font) = self.edit_font.take() {
+            let _ = DeleteObject(HGDIOBJ(font.0));
+        }
+    }
+
+    /// What is in the box.
+    unsafe fn edit_text(&self) -> String {
+        let Some(edit) = self.edit else { return String::new() };
+        let len = SendMessageW(edit, WM_GETTEXTLENGTH, None, None).0.max(0) as usize;
+        let mut buf = vec![0u16; len + 1];
+        let n = GetWindowTextW(edit, &mut buf).max(0) as usize;
+        buf.truncate(n.min(len));
+        String::from_utf16_lossy(&buf)
+    }
+
+    /// Ask the page where the query's characters are, and mark every place it found them.
+    fn apply_find(&mut self, query: &str, scroll: bool) {
+        if query.is_empty() {
+            self.find = Some(Find::default());
+            self.find_label.clear();
+            return;
+        }
+        let needle = Needle::of(&self.sel_index);
+        let marks: Vec<Selection> =
+            needle.hits(query).iter().filter_map(|h| needle.span(h)).collect();
+        // The first hit at or below the top edge of the window: a reader who has typed a
+        // word wants the page's answer to start where they were looking, not at the first
+        // line of the document three screens above.
+        let top = self.top_line();
+        let focus = marks.iter().position(|m| m.from.line >= top).unwrap_or(0);
+        if scroll {
+            if let Some(m) = marks.get(focus) {
+                self.scroll_to_caret(m.from);
+            }
+        }
+        self.find = Some(Find { query: query.to_string(), marks, focus });
+        self.shape_find_label();
+    }
+
+    /// The line the window is looking at, which is where a search begins.
+    fn top_line(&self) -> usize {
+        let top = scroll_dip(self.scroll, self.dpi);
+        self.sel_index.iter().position(|l| l.y + l.h > top).unwrap_or(0)
+    }
+
+    /// `Enter`, and `Shift`+`Enter`: walk the hits the search has already found, bringing
+    /// each one into the window as the reader comes to it.
+    fn step_find(&mut self, back: bool, hwnd: HWND) {
+        let Some(f) = self.find.as_ref() else { return };
+        let n = f.marks.len();
+        if n == 0 {
+            return;
+        }
+        let focus = if back { (f.focus + n - 1) % n } else { (f.focus + 1) % n };
+        let Some(m) = f.marks.get(focus) else { return };
+        let at = m.from;
+        if let Some(f) = self.find.as_mut() {
+            f.focus = focus;
+        }
+        self.scroll_to_caret(at);
+        self.shape_find_label();
+        let _ = unsafe { InvalidateRect(Some(hwnd), None, false) };
+    }
+
+    /// Take the bar away, and the keyboard with it. The page keeps its last place: a
+    /// reader who has finished looking is going on reading what they found.
+    unsafe fn close_find(&mut self, hwnd: HWND) {
+        self.find = None;
+        self.find_label.clear();
+        if let Some(edit) = self.edit {
+            let _ = ShowWindow(edit, SW_HIDE);
+        }
+        let _ = SetFocus(Some(hwnd));
+        let _ = InvalidateRect(Some(hwnd), None, false);
+    }
+
+    /// How many there are, and which one this is, set in the space kept at the bar's right.
+    fn shape_find_label(&mut self) {
+        self.find_label.clear();
+        let Some(f) = self.find.as_ref() else { return };
+        if f.query.is_empty() {
+            return;
+        }
+        let text = find_count(f.focus, f.marks.len());
+        let k = scale_of(self.dpi);
+        let size = self.theme.base * 0.85;
+        let req = FaceRequest {
+            family: self.theme.fonts.family(Role::Body, false).to_string(),
+            cjk_family: self.theme.fonts.family(Role::Body, true).to_string(),
+            fallback: self.theme.fonts.fallback.clone(),
+            weight: 400,
+            italic: false,
+        };
+        let runs = self.font.shape_runs(&text, 0..text.len(), &req, size, 0.02);
+        let width: f32 = runs.iter().map(|r| r.width() * k).sum();
+        let (px, py, pw, ph) = find_panel(self.client_w);
+        // End against the bar's own right edge, so a count that grows from two figures to
+        // five does not walk under the box.
+        let mut at = px + pw - FIND_PAD - width;
+        let baseline = py + ph / 2.0 + size * k * 0.35;
+        let mut label = Vec::new();
+        for r in &runs {
+            if let Some(mut p) = paint_run(&self.font, r, 0.0, 0.0, k, ColorRole::Muted) {
+                p.x = at;
+                p.baseline = baseline;
+                at += r.width() * k;
+                label.push(p);
+            }
+        }
+        self.find_label = label;
+    }
 }
 
 /// Inputs that are the same for every block in one layout pass.
@@ -3056,31 +3531,27 @@ impl View {
                             );
                         }
                     }
-                    Op::Runs(runs) => {
-                        for run in runs {
-                            if run.baseline < top || run.baseline > bottom + 40.0 {
-                                continue;
-                            }
-                            let role = run.color;
-                            let Some(brush) = self.brushes.get(&role).cloned() else { continue };
-                            let gr = DWRITE_GLYPH_RUN {
-                                fontFace: std::mem::ManuallyDrop::new(Some(run.face.clone())),
-                                fontEmSize: run.em,
-                                glyphCount: run.glyphs.len() as u32,
-                                glyphIndices: run.glyphs.as_ptr(),
-                                glyphAdvances: run.advances.as_ptr(),
-                                glyphOffsets: run.offsets.as_ptr(),
-                                isSideways: false.into(),
-                                bidiLevel: 0,
-                            };
-                            target.DrawGlyphRun(
-                                Vector2::new(run.x, run.baseline - up),
-                                &gr,
-                                &brush,
-                                DWRITE_MEASURING_MODE_NATURAL,
-                            );
-                            let _ = std::mem::ManuallyDrop::into_inner(gr.fontFace);
+                    Op::Runs(runs) => self.draw_runs(&target, runs, up),
+                }
+            }
+            // Every place the search found what the reader typed. Under their own
+            // selection and over the page's ink, because a hit is a suggestion and a drag
+            // is a decision.
+            if let Some(f) = self.find.as_ref() {
+                for (i, m) in f.marks.iter().enumerate() {
+                    let brush = if i == f.focus { &self.focus_brush } else { &self.hit_brush };
+                    let Some(brush) = brush.clone() else { continue };
+                    for (x, y, w, h) in selection_rects(&self.sel_index, *m) {
+                        if y + h < top || y > bottom {
+                            continue;
                         }
+                        let r = D2D_RECT_F {
+                            left: x,
+                            top: y - up,
+                            right: x + w,
+                            bottom: y + h - up,
+                        };
+                        target.FillRectangle(&r, &brush);
                     }
                 }
             }
@@ -3129,7 +3600,58 @@ impl View {
                     target.FillRectangle(&r, &brush);
                 }
             }
+            // The bar's panel last of all, and over the page: it is pinned to the glass, so
+            // what lies under it is whatever the reader has scrolled into place there, and
+            // must not be read as part of the answer. The box on the panel's left is USER32's
+            // to paint and sits over this ink by being a window.
+            if self.find.is_some() {
+                let (px, py, pw, ph) = find_panel(self.client_w);
+                if let Some(brush) = self.brushes.get(&ColorRole::Surface).cloned() {
+                    let r = D2D_RECT_F { left: px, top: py, right: px + pw, bottom: py + ph };
+                    target.FillRectangle(&r, &brush);
+                }
+                self.draw_runs(&target, &self.find_label, 0.0);
+            }
             let _ = target.EndDraw(None, None);
+        }
+    }
+
+    /// One face's positioned glyphs, lifted by `up` into window coordinates.
+    ///
+    /// Shared by the page's own runs and by the find bar's count, which is the only other
+    /// thing this window writes letters of. Both are measured in their own space against
+    /// the same `up`: the page's from the top of the document, the bar's from the top of
+    /// the window with nothing to take off.
+    unsafe fn draw_runs(
+        &self,
+        target: &ID2D1RenderTarget,
+        runs: &[PaintRun],
+        up: Pt,
+    ) {
+        let bottom = up + self.client_h;
+        for run in runs {
+            if run.baseline < up || run.baseline > bottom + 40.0 {
+                continue;
+            }
+            let role = run.color;
+            let Some(brush) = self.brushes.get(&role).cloned() else { continue };
+            let gr = DWRITE_GLYPH_RUN {
+                fontFace: std::mem::ManuallyDrop::new(Some(run.face.clone())),
+                fontEmSize: run.em,
+                glyphCount: run.glyphs.len() as u32,
+                glyphIndices: run.glyphs.as_ptr(),
+                glyphAdvances: run.advances.as_ptr(),
+                glyphOffsets: run.offsets.as_ptr(),
+                isSideways: false.into(),
+                bidiLevel: 0,
+            };
+            target.DrawGlyphRun(
+                Vector2::new(run.x, run.baseline - up),
+                &gr,
+                &brush,
+                DWRITE_MEASURING_MODE_NATURAL,
+            );
+            let _ = std::mem::ManuallyDrop::into_inner(gr.fontFace);
         }
     }
 }
@@ -4041,6 +4563,52 @@ mod tests {
         assert_eq!(c.line, 1, "a pointer at the painted place reaches the painted line");
     }
 
+    /// The bar's own arithmetic, which is the whole of what can be asked of it outside a
+    /// window: where it goes, and what it says when it is there.
+    #[test]
+    fn the_bar_leaves_the_thumb_outside_it_and_the_count_inside_it() {
+        let (px, py, pw, ph) = find_panel(1080.0);
+        // The reader has to be able to grip the scroll with the bar up -- it appeared
+        // because they pressed a key, not because they asked for something to lean on.
+        let (tx, _, track, _) = thumb_rect(2400.0, 1080.0, 800.0, 0.0, DPI).unwrap();
+        assert!(px + pw <= tx, "the bar is over the thumb's track: {} > {}", px + pw, tx);
+        assert!(!in_find_panel(tx + track / 2.0, py + ph / 2.0, 1080.0), "and the grip is still a press");
+        // The box sits inside the panel, with the count's room left at its right.
+        let k = scale_of(DPI);
+        let (ex, ey, ew, eh) = find_edit(1080.0, DPI);
+        assert!(ex as f32 >= px * k - 1.0, "the box left the bar: {ex}");
+        assert!((ex + ew) as f32 <= (px + pw - FIND_COUNT) * k + 1.0, "the box took the count's room");
+        assert!(ey as f32 >= py * k - 1.0 && (ey + eh) as f32 <= (py + ph) * k + 1.0);
+    }
+
+    #[test]
+    fn a_window_narrower_than_the_bar_narrows_it_rather_than_losing_it() {
+        for w in [180.0, 320.0, 1080.0] {
+            let (px, _, pw, _) = find_panel(w);
+            assert!(px >= 0.0 && px + pw <= w, "the bar left the window at {w}px: {px}+{pw}");
+            let (ex, _, ew, _) = find_edit(w, DPI);
+            assert!(ew > 40, "and left nothing to type into at {w}px");
+            assert!((ex + ew) as f32 <= w * scale_of(DPI) + 1.0, "the box went over the edge at {w}px");
+        }
+    }
+
+    #[test]
+    fn a_press_on_the_bar_does_not_mark_the_page_under_it() {
+        let (px, py, pw, ph) = find_panel(1080.0);
+        assert!(in_find_panel(px + 4.0, py + 2.0, 1080.0));
+        assert!(in_find_panel(px + pw - 4.0, py + ph - 2.0, 1080.0));
+        assert!(!in_find_panel(px + pw / 2.0, py + ph + 4.0, 1080.0), "a line below is the reader's own");
+        assert!(!in_find_panel(px - 4.0, py + 2.0, 1080.0));
+    }
+
+    #[test]
+    fn the_count_names_one_hit_without_a_place_and_many_with_one() {
+        assert_eq!(find_count(0, 0), "no match");
+        assert_eq!(find_count(0, 1), "1 match", "one hit has no position to be at");
+        assert_eq!(find_count(0, 9), "1 of 9");
+        assert_eq!(find_count(8, 9), "9 of 9");
+    }
+
     fn url(target: &str, range: std::ops::Range<usize>) -> Action {
         Action { range, kind: ActionKind::Url(target.to_string()) }
     }
@@ -4709,6 +5277,7 @@ mod tests {
             (&Command::GoForward, "Forward\tAlt+\u{2192}"),
             (&Command::Copy, "Copy\tCtrl+C"),
             (&Command::SelectAll, "Select All\tCtrl+A"),
+            (&Command::Find, "Find in Document\tCtrl+F"),
             (&Command::ZoomIn, "Increase Text\tCtrl++"),
             (&Command::ZoomOut, "Decrease Text\tCtrl+-"),
             (&Command::ZoomReset, "Actual Size\tCtrl+0"),
@@ -4721,7 +5290,7 @@ mod tests {
         // Nothing else may claim one. `Ctrl`+`D` picks whichever palette is not on the
         // screen rather than the row it would be printed on, and the bracket keys step
         // the measure instead of settling on the rung they are next to.
-        assert_eq!(got.iter().filter(|(_, l)| l.contains('\t')).count(), 9);
+        assert_eq!(got.iter().filter(|(_, l)| l.contains('\t')).count(), 10);
     }
 
     #[test]
