@@ -224,6 +224,10 @@ pub enum HotKind {
     /// [`Page::anchor_tops`]. A table of contents is only worth setting if clicking it
     /// goes somewhere.
     Heading(usize),
+    /// A link to another Markdown file beside this one, already resolved to a path that
+    /// exists. The reader is a document reader, so the answer to such a link is to read
+    /// that document rather than to hand the path to some other program.
+    Document(PathBuf),
 }
 
 /// A rectangle of the document a click can land on, in the same device independent
@@ -1506,6 +1510,10 @@ impl View {
             HotKind::Url(url) => open_url(&url),
             HotKind::Cite(note) => self.jump_to(self.note_tops.get(note).copied(), hwnd),
             HotKind::Heading(at) => self.jump_to(self.anchor_tops.get(at).copied(), hwnd),
+            HotKind::Document(path) => {
+                self.load_document(&path);
+                let _ = unsafe { InvalidateRect(Some(hwnd), None, false) };
+            }
         }
     }
 
@@ -1727,6 +1735,9 @@ struct Ctx<'a> {
     /// Which heading a fragment's slug names, indexed the same way -- the bridge from
     /// the address a table of contents writes to the line it is asking for.
     anchors: &'a HashMap<String, usize>,
+    /// Directory the open document's own relative links resolve against, which is the
+    /// directory its files are in. `None` for a document with no file behind it.
+    base: Option<&'a std::path::Path>,
     /// Points to device independent pixels.
     k: f32,
 }
@@ -1917,10 +1928,39 @@ fn hot_kind(kind: &ActionKind, ctx: &Ctx) -> Option<HotKind> {
             Some(fragment) => {
                 ctx.anchors.get(&slug(fragment)).copied().map(HotKind::Heading)
             }
-            None => None,
+            // A path is a request for another file, and this one reads them: it becomes
+            // a target only when the file is actually on disk beside the open document.
+            None => document_link(ctx.base, u).map(HotKind::Document),
         },
         ActionKind::Cite(label) => ctx.notes.get(label.as_str()).copied().map(HotKind::Cite),
     }
+}
+
+/// The document a relative link asks for, or `None` when its target is not a file this
+/// reader can take over: an address in another protocol, a name with no Markdown in it,
+/// or a file that is not there.
+///
+/// The `?` and `#` that can follow a destination are stripped before the name is
+/// considered, since they address a query or a place rather than part of the filename --
+/// and the `%` escapes inside what is left are what let an author name a file whose real
+/// name has a space in it.
+pub(crate) fn document_link(base: Option<&std::path::Path>, url: &str) -> Option<PathBuf> {
+    let target = url.trim().split(['?', '#']).next().filter(|t| !t.is_empty())?;
+    let path = std::path::Path::new(target);
+    // A colon before any separator is a scheme rather than a path. An absolute path is
+    // exempt: on this platform `C:/notes/x.md` puts its colon in exactly that place, and
+    // it does name a file.
+    if target.contains(':') && !path.is_absolute() {
+        return None;
+    }
+    let full = ImageStore::resolve(base, target);
+    if !matches!(
+        full.extension().and_then(|e| e.to_str()).map(|e| e.to_ascii_lowercase()).as_deref(),
+        Some("md") | Some("markdown") | Some("txt")
+    ) {
+        return None;
+    }
+    full.is_file().then_some(full)
 }
 
 /// Where each character of a shaped run begins, in points from the left of the page.
@@ -3147,7 +3187,15 @@ pub fn build_ops(
             .collect(),
     );
 
-    let ctx = Ctx { theme, styles: &styles, math: &*objects.math, notes: &notes, anchors: &anchors, k };
+    let ctx = Ctx {
+        theme,
+        styles: &styles,
+        math: &*objects.math,
+        notes: &notes,
+        anchors: &anchors,
+        base: objects.base_dir,
+        k,
+    };
 
     for (b, p) in doc.blocks.iter().zip(prepared) {
         let base_left = left;
@@ -3611,20 +3659,70 @@ mod tests {
             math: &math,
             notes: &empty,
             anchors: &anchors,
+            base: None,
             k: 1.0,
         };
         let url = |u: &str| ActionKind::Url(u.to_string());
         assert_eq!(hot_kind(&url("#global-breaking"), &ctx), Some(HotKind::Heading(0)));
         // The heading's own words in place of an address: the same rule reads them.
         assert_eq!(hot_kind(&url("#Global Breaking"), &ctx), Some(HotKind::Heading(0)));
-        // A page with no such heading gives no target to click, and a relative path is
-        // still a request for another file rather than a place in this one.
+        // A page with no such heading gives no target to click, and a path with no file
+        // behind it is nowhere the reader can go.
         assert_eq!(hot_kind(&url("#elsewhere"), &ctx), None);
         assert_eq!(hot_kind(&url("../other.md"), &ctx), None);
         assert_eq!(
             hot_kind(&url("https://example.com"), &ctx),
             Some(HotKind::Url("https://example.com".into()))
         );
+    }
+
+    #[test]
+    fn a_link_to_a_file_beside_the_document_opens_that_file() {
+        let dir = std::env::temp_dir().join(format!("rubrica-links-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        std::fs::write(dir.join("other.md"), "# Other\n").expect("other.md");
+        std::fs::write(dir.join("a chapter.markdown"), "# Chapter\n").expect("chapter");
+        std::fs::write(dir.join("data.csv"), "a,b\n").expect("data.csv");
+
+        let found = document_link(Some(&dir), "other.md");
+        let escaped = document_link(Some(&dir), "a%20chapter.markdown");
+        let with_fragment = document_link(Some(&dir), "other.md#somewhere");
+        let elsewhere = document_link(Some(&dir), "missing.md");
+        let pdf = document_link(Some(&dir), "data.csv");
+        let scheme = document_link(Some(&dir), "mailto:someone@example.com");
+        let web = document_link(Some(&dir), "https://example.com/x.md");
+        let nothing = document_link(Some(&dir), "#anchor");
+        // And the target a click acts on is the same answer, not one the layout pass
+        // reaches by a different road.
+        let theme = Theme::default();
+        let styles: Vec<AppStyle> = Vec::new();
+        let math = crate::math::MathStore::new();
+        let empty = HashMap::new();
+        let ctx = Ctx {
+            theme: &theme,
+            styles: &styles,
+            math: &math,
+            notes: &empty,
+            anchors: &empty,
+            base: Some(&dir),
+            k: 1.0,
+        };
+        let clicked = hot_kind(&ActionKind::Url("other.md".into()), &ctx);
+        let _ = std::fs::remove_dir_all(&dir);
+
+        assert_eq!(clicked, Some(HotKind::Document(dir.join("other.md"))));
+        assert_eq!(found, Some(dir.join("other.md")));
+        // An author names a space with `%20` because a link cannot carry the space
+        // itself; the file on disk has the space.
+        assert_eq!(escaped, Some(dir.join("a chapter.markdown")));
+        // A destination may ask for a place inside the other file as well. The file is
+        // still the half this reader can answer, and the reader lands at its top.
+        assert_eq!(with_fragment, Some(dir.join("other.md")));
+        assert_eq!(elsewhere, None, "a file that is not there is not a target");
+        assert_eq!(pdf, None, "not a document this reader reads");
+        assert_eq!(scheme, None, "an address in another protocol is not a path");
+        assert_eq!(web, None, "a page on the web is opened by the browser");
+        assert_eq!(nothing, None, "a bare fragment is this file's own address");
     }
 
     #[test]

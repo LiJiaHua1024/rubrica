@@ -128,11 +128,14 @@ impl ImageStore {
         unsafe { decoder.GetFrame(0).ok() }
     }
 
-    /// Resolve a Markdown image target against the document's own directory.
+    /// Resolve a Markdown target against the document's own directory.
     ///
     /// Absolute paths are taken as written; anything else is relative to the file
-    /// being read, which is what every other Markdown tool does.
+    /// being read, which is what every other Markdown tool does. A `%` followed by two
+    /// hex digits is read as the byte it escapes, because a path with a space in it can
+    /// only be written that way -- and a file named for a literal `%20` is rarer by far.
     pub fn resolve(base: Option<&Path>, src: &str) -> PathBuf {
+        let src = &percent_decode(src);
         let p = Path::new(src);
         if p.is_absolute() {
             return p.to_path_buf();
@@ -141,6 +144,45 @@ impl ImageStore {
             Some(dir) => dir.join(p),
             None => p.to_path_buf(),
         }
+    }
+}
+
+/// Undo the `%XX` escaping a Markdown target carries, leaving anything that is not an
+/// escape alone. A trailing `%` or a `%2` at the end of the string has no byte to name
+/// and is kept as written rather than dropped.
+pub fn percent_decode(src: &str) -> String {
+    let bytes = src.as_bytes();
+    if !bytes.contains(&b'%') {
+        return src.to_string();
+    }
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'%'
+                if i + 2 < bytes.len()
+                    && bytes[i + 1].is_ascii_hexdigit()
+                    && bytes[i + 2].is_ascii_hexdigit() =>
+            {
+                let v = hex_val(bytes[i + 1]) << 4 | hex_val(bytes[i + 2]);
+                out.push(v);
+                i += 3;
+            }
+            b => {
+                out.push(b);
+                i += 1;
+            }
+        }
+    }
+    // The escapes name bytes, not characters, so a percent-encoded UTF-8 name only comes
+    // back as the name if the bytes still spell one.
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+fn hex_val(b: u8) -> u8 {
+    match b {
+        b'0'..=b'9' => b - b'0',
+        _ => (b | 0x20) - b'a' + 10,
     }
 }
 
@@ -168,6 +210,21 @@ mod tests {
     #[test]
     fn without_a_document_directory_the_source_stays_relative_to_the_cwd() {
         assert_eq!(ImageStore::resolve(None, "a.png"), PathBuf::from("a.png"));
+    }
+
+    #[test]
+    fn an_escaped_space_names_the_space_it_escapes() {
+        let base = Path::new("C:/books");
+        assert_eq!(
+            ImageStore::resolve(Some(base), "my%20figure.png"),
+            PathBuf::from("C:/books/my figure.png")
+        );
+        // A percent that begins no escape is the author's own, and stays put: a file
+        // called `100%.png` is a real thing to have a figure named for.
+        assert_eq!(ImageStore::resolve(Some(base), "100%.png"), PathBuf::from("C:/books/100%.png"));
+        assert_eq!(ImageStore::resolve(Some(base), "end%2"), PathBuf::from("C:/books/end%2"));
+        // The bytes an escape names belong to one character split in two.
+        assert_eq!(percent_decode("%E4%B8%AD"), "中");
     }
 
     #[test]

@@ -219,6 +219,7 @@ pub fn report(source: &str, path: Option<&str>, width: f32, dpi: f32, hyphenate:
                         && !u
                             .strip_prefix('#')
                             .is_some_and(|f| slugs.contains(&crate::view::slug(f)))
+                        && crate::view::document_link(base, u).is_none()
                 }
                 _ => false,
             })
@@ -226,6 +227,7 @@ pub fn report(source: &str, path: Option<&str>, width: f32, dpi: f32, hyphenate:
         let links = page.hotspots.iter().filter(|h| matches!(h.kind, crate::view::HotKind::Url(_))).count();
         let jumps = page.hotspots.iter().filter(|h| matches!(h.kind, crate::view::HotKind::Cite(_))).count();
         let headings = page.hotspots.iter().filter(|h| matches!(h.kind, crate::view::HotKind::Heading(_))).count();
+        let files = page.hotspots.iter().filter(|h| matches!(h.kind, crate::view::HotKind::Document(_))).count();
         // A fragment that names no heading is the interesting kind of dead link: the
         // address was spelled out by hand from a heading's own words, and one of the two
         // has since changed. Nothing on the page says so, so this does.
@@ -239,7 +241,7 @@ pub fn report(source: &str, path: Option<&str>, width: f32, dpi: f32, hyphenate:
             .count();
         let on_page = slugs.len();
         println!(
-            "targets      : {ranges} range(s) -> {links} link rect(s), {jumps} citation rect(s), {headings}/{on_page} heading jump(s), {refused} refused"
+            "targets      : {ranges} range(s) -> {links} link rect(s), {jumps} citation rect(s), {headings}/{on_page} heading jump(s), {files} document jump(s), {refused} refused"
         );
         if dead > 0 {
             println!("!! {dead} fragment link(s) name no heading on the page");
