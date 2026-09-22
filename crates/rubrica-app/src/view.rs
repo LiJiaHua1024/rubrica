@@ -15,7 +15,7 @@ use rubrica_type::justification::place;
 use rubrica_type::paragraph::{Item, Spacing, StyleId, StyleSpan};
 use rubrica_type::units::Pt;
 use rubrica_type::{BreakOptions, Hyphenation, typeset, typeset_hyphenated};
-use windows::core::{w, Interface, PCWSTR};
+use windows::core::{w, BOOL, Interface, PCWSTR};
 use windows::Win32::Foundation::{COLORREF, HWND, LPARAM, LRESULT, POINT, RECT, WPARAM};
 use windows::Win32::Graphics::Direct2D::Common::{
     D2D1_ALPHA_MODE_PREMULTIPLIED, D2D1_COLOR_F, D2D1_PIXEL_FORMAT, D2D_RECT_F, D2D_SIZE_U,
@@ -34,8 +34,8 @@ use windows::Win32::Graphics::Dwm::{DwmSetWindowAttribute, DWMWA_USE_IMMERSIVE_D
 use windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_B8G8R8A8_UNORM;
 use windows::Win32::Graphics::Gdi::{
     CLIP_DEFAULT_PRECIS, CreateFontW, CreateSolidBrush, DEFAULT_CHARSET, DEFAULT_QUALITY,
-    DeleteObject, HBRUSH, HDC, HFONT, HGDIOBJ, InvalidateRect, OUT_DEFAULT_PRECIS, ScreenToClient,
-    SetBkColor, SetTextColor,
+    DeleteObject, EnumDisplayMonitors, GetMonitorInfoW, HBRUSH, HDC, HFONT, HGDIOBJ, HMONITOR,
+    InvalidateRect, MONITORINFO, OUT_DEFAULT_PRECIS, ScreenToClient, SetBkColor, SetTextColor,
 };
 use windows::Win32::System::Com::{
     CoInitializeEx, COINIT_APARTMENTTHREADED, COINIT_DISABLE_OLE1DDE,
@@ -62,19 +62,19 @@ use windows::Win32::UI::Shell::{DragAcceptFiles, DragFinish, DragQueryFileW, She
 use windows::Win32::UI::WindowsAndMessaging::{
     AppendMenuW, CS_DBLCLKS, CS_HREDRAW, CS_VREDRAW, CREATESTRUCTW, CreatePopupMenu,
     CreateWindowExW, DefWindowProcW, DestroyMenu, DispatchMessageW,
-    GWLP_USERDATA, GetClientRect, GetCursorPos, GetWindowLongPtrW, GetMessageW, HCURSOR, HMENU,
-    HWND_TOP, HTCLIENT, IDC_ARROW, IDC_HAND, KillTimer, LoadCursorW, MF_CHECKED, MF_GRAYED,
-    MF_POPUP, MF_SEPARATOR, MF_STRING, MSG, PostMessageW, PostQuitMessage, RegisterClassExW,
-    SetCursor, SetForegroundWindow, SetWindowTextW, SW_SHOWNORMAL, SetTimer, SetWindowLongPtrW,
-    SetWindowPos, ShowWindow, TPM_RETURNCMD,
+    GWLP_USERDATA, GetClientRect, GetCursorPos, GetWindowLongPtrW, GetMessageW, GetWindowPlacement,
+    HCURSOR, HMENU, HWND_TOP, HTCLIENT, IDC_ARROW, IDC_HAND, KillTimer, LoadCursorW, MF_CHECKED,
+    MF_GRAYED, MF_POPUP, MF_SEPARATOR, MF_STRING, MSG, PostMessageW, PostQuitMessage,
+    RegisterClassExW, SetCursor, SetForegroundWindow, SetWindowTextW, SW_SHOWNORMAL, SetTimer,
+    SetWindowLongPtrW, SetWindowPos, ShowWindow, SW_SHOWMAXIMIZED, TPM_RETURNCMD,
     TPM_RIGHTBUTTON, TrackPopupMenuEx, TranslateMessage, WM_CONTEXTMENU, WM_NULL, WNDCLASSEXW,
-    WM_DESTROY, WM_DPICHANGED, WM_ERASEBKGND, WM_KEYDOWN, WM_MOUSEWHEEL, WM_NCCREATE, WM_PAINT,
-    WM_SETCURSOR, WM_SIZE, WM_TIMER, WS_EX_APPWINDOW, WS_OVERLAPPEDWINDOW, SWP_NOACTIVATE,
-    SWP_NOZORDER, WM_DROPFILES, WM_LBUTTONDOWN, WM_LBUTTONDBLCLK, WM_LBUTTONUP, WM_MOUSEMOVE,
-    WM_SYSKEYDOWN, CallWindowProcW, EN_CHANGE, ES_AUTOHSCROLL, GetParent, GetWindowTextW,
-    GWLP_WNDPROC, MoveWindow, SendMessageW, SW_HIDE, SW_SHOW, WM_CHAR, WM_COMMAND,
-    WM_CTLCOLOREDIT, WM_GETTEXTLENGTH, WM_SETFONT, WINDOW_STYLE, WNDPROC, WS_BORDER, WS_CHILD,
-    WS_VISIBLE,
+    WM_DESTROY, WM_DPICHANGED, WM_ERASEBKGND, WM_EXITSIZEMOVE, WM_KEYDOWN, WM_MOUSEWHEEL,
+    WM_NCCREATE, WM_PAINT, WM_SETCURSOR, WM_SIZE, WM_TIMER, WS_EX_APPWINDOW, WS_OVERLAPPEDWINDOW,
+    SWP_NOACTIVATE, SWP_NOZORDER, WM_DROPFILES, WM_LBUTTONDOWN, WM_LBUTTONDBLCLK, WM_LBUTTONUP,
+    WM_MOUSEMOVE, WM_SYSKEYDOWN, CallWindowProcW, EN_CHANGE, ES_AUTOHSCROLL, GetParent,
+    GetWindowTextW, GWLP_WNDPROC, MoveWindow, SendMessageW, SW_HIDE, SW_SHOW, WM_CHAR, WM_COMMAND,
+    WM_CTLCOLOREDIT, WM_GETTEXTLENGTH, WM_SETFONT, WINDOWPLACEMENT, WINDOW_STYLE, WNDPROC,
+    WS_BORDER, WS_CHILD, WS_VISIBLE,
 };
 use windows_numerics::Vector2;
 
@@ -107,6 +107,14 @@ const DOCUMENT_TICK_MS: u32 = 700;
 /// How far the pointer has to travel, in device pixels, before a held left button stops
 /// meaning "here" and starts meaning "from here to there".
 const DRAG_SLOP: f32 = 3.0;
+/// The window a first run is given: a little way in from the top-left of the screen, wide
+/// enough for the design's measure plus a margin either side of it.
+///
+/// Not `CW_USEDEFAULT`, which is the system's answer and cascades off a position this
+/// program never knows: a window that moves when nobody moved it is a window the reader has
+/// to chase with `Alt`+`Tab` to find.
+const FIRST_FRAME: crate::settings::Frame =
+    crate::settings::Frame { left: 120, top: 100, width: 1080, height: 800, maximised: false };
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 struct Rgb {
@@ -1436,15 +1444,19 @@ pub fn run(source: String, path: Option<PathBuf>) -> Result<()> {
             return Err("RegisterClassExW failed".into());
         }
         let title = utf16(&window_title(view.path.as_deref()));
+        // Where the reader left the window, brought back onto the screens there are today.
+        let frame = crate::settings::window()
+            .map(|f| crate::settings::placed(f, &work_areas()))
+            .unwrap_or(FIRST_FRAME);
         let hwnd = CreateWindowExW(
             WS_EX_APPWINDOW,
             PCWSTR(wide.as_ptr()),
             PCWSTR(title.as_ptr()),
             WS_OVERLAPPEDWINDOW,
-            120,
-            100,
-            1080,
-            800,
+            frame.left,
+            frame.top,
+            frame.width,
+            frame.height,
             None,
             None,
             Some(hinst.into()),
@@ -1453,12 +1465,17 @@ pub fn run(source: String, path: Option<PathBuf>) -> Result<()> {
         .map_err(|e| -> Error { format!("CreateWindowExW: {e}").into() })?;
 
         view.attach(hwnd);
-        // After the first layout, since a place is a fact about it, and before the window
-        // is shown, so a reader never watches their page start at its top and move down.
+        // Straight to the maximised frame rather than to the normal one and then a state
+        // change, because the second way shows the reader the window they did not leave.
+        let _ = ShowWindow(hwnd, if frame.maximised { SW_SHOWMAXIMIZED } else { SW_SHOWNORMAL });
+        // After the show, because a window that is about to be maximised is resized by being
+        // shown -- and a place is a fact about the layout, which that resize has only just
+        // redone. Nothing has been drawn yet either way: `WM_PAINT` is a queued message and
+        // the first one is not reached until the loop below starts, so the reader still never
+        // watches their page begin at the top and move down.
         if let Some(anchor) = restore {
             view.restore_to(anchor);
         }
-        let _ = ShowWindow(hwnd, SW_SHOWNORMAL);
         let _ = SetTimer(Some(hwnd), APPEARANCE_TIMER, APPEARANCE_TICK_MS, None);
         // Armed even for a page with no file behind it: the sample has no path to poll, and
         // the tick costs a branch, while a document opened later by the dialog or a drop has
@@ -1559,6 +1576,62 @@ fn system_prefers_dark() -> bool {
     r.is_ok() && value == 0
 }
 
+/// The work area of every screen there is, in physical pixels.
+///
+/// The work area rather than the monitor's own extent, because the taskbar is not a place
+/// to put a title bar: a reader who docks theirs along the bottom should get their window
+/// back above it, not under it.
+unsafe fn work_areas() -> Vec<RECT> {
+    let mut areas: Vec<RECT> = Vec::new();
+    let list = &mut areas as *mut Vec<RECT>;
+    let _ = EnumDisplayMonitors(None, None, Some(keep_monitor), LPARAM(list as isize));
+    areas
+}
+
+/// One monitor, added to the list the caller left in the last parameter.
+unsafe extern "system" fn keep_monitor(
+    monitor: HMONITOR,
+    _dc: HDC,
+    _across: *mut RECT,
+    state: LPARAM,
+) -> BOOL {
+    let areas = &mut *(state.0 as *mut Vec<RECT>);
+    let mut info = MONITORINFO {
+        cbSize: std::mem::size_of::<MONITORINFO>() as u32,
+        ..Default::default()
+    };
+    if GetMonitorInfoW(monitor, &mut info).as_bool() {
+        areas.push(info.rcWork);
+    }
+    // `true` to be asked for the next one. There is no way to stop this walk early and no
+    // reason to want to: the answer is a handful of rectangles, taken once per start-up.
+    true.into()
+}
+
+/// Write down where the window is standing, and whether it is maximised at the time.
+///
+/// `GetWindowPlacement` rather than `GetWindowRect`, because the reader is allowed to close
+/// a maximised window and what has to come back is the frame they would have gone back to --
+/// which is not the screen with its edges off the display, and only means anything at all
+/// alongside the flag saying which of the two this window was.
+unsafe fn record_geometry(hwnd: HWND) {
+    let mut p = WINDOWPLACEMENT {
+        length: std::mem::size_of::<WINDOWPLACEMENT>() as u32,
+        ..Default::default()
+    };
+    if GetWindowPlacement(hwnd, &mut p).is_err() {
+        return;
+    }
+    let r = p.rcNormalPosition;
+    crate::settings::record_window(crate::settings::Frame {
+        left: r.left,
+        top: r.top,
+        width: r.right - r.left,
+        height: r.bottom - r.top,
+        maximised: p.showCmd == SW_SHOWMAXIMIZED.0 as u32,
+    });
+}
+
 /// The two facts about a file that say whether the page on the screen came out of this
 /// one of it.
 ///
@@ -1609,6 +1682,9 @@ unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM)
             if let Some(v) = view {
                 v.remember_reading();
             }
+            // The frame goes with the place for the same reason: the usual way to close a
+            // window is its own `X`, which asks nothing of the process on the way out.
+            record_geometry(hwnd);
             PostQuitMessage(0);
             LRESULT(0)
         }
@@ -1812,6 +1888,14 @@ impl View {
                 let _ = InvalidateRect(Some(hwnd), None, false);
                 LRESULT(0)
             }
+            WM_EXITSIZEMOVE => {
+                // The one message that means the reader has finished putting the window
+                // somewhere: it closes a drag and a resize alike. Written as it happens
+                // rather than on the way out, because a reader who moves the window and then
+                // loses the machine to a power cut has still moved it.
+                record_geometry(hwnd);
+                DefWindowProcW(hwnd, msg, wp, lp)
+            }
             WM_DPICHANGED => {
                 let r = &*(lp.0 as *const RECT);
                 if let Some(t) = &self.hwnd_target {
@@ -1829,6 +1913,11 @@ impl View {
                     SWP_NOZORDER | SWP_NOACTIVATE,
                 );
                 self.dpi = GetDpiForWindow(hwnd).max(96) as f32;
+                // Filed again straight away: a window that has just crossed into another
+                // scale is standing at a frame in the new monitor's pixels, and the number
+                // remembered before the crossing is one that cannot be restored to anywhere
+                // useful.
+                record_geometry(hwnd);
                 if let Some(t) = &self.target {
                     t.SetDpi(self.dpi, self.dpi);
                 }
