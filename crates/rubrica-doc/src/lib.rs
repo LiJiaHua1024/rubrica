@@ -57,11 +57,11 @@ impl InlineStyle {
         self.0 & other.0 == other.0
     }
     #[inline]
-    fn insert(&mut self, other: InlineStyle) {
+    pub fn insert(&mut self, other: InlineStyle) {
         self.0 |= other.0;
     }
     #[inline]
-    fn remove(&mut self, other: InlineStyle) {
+    pub fn remove(&mut self, other: InlineStyle) {
         self.0 &= !other.0;
     }
 }
@@ -123,6 +123,9 @@ pub struct Block {
     /// engine treats it as one atomic box with an intrinsic size, which is what lets
     /// a tall figure sit inside running prose without special-casing the line model.
     pub objects: Vec<ObjectSpan>,
+    /// What the reader can click: the ranges of [`Block::text`] that are a link or a
+    /// citation, in text order and never overlapping.
+    pub actions: Vec<Action>,
 }
 
 /// An inline non-text box.
@@ -130,6 +133,27 @@ pub struct Block {
 pub struct ObjectSpan {
     pub range: std::ops::Range<usize>,
     pub kind: ObjectKind,
+}
+
+/// A range of [`Block::text`] the reader can act on, and what acting on it means.
+///
+/// Kept beside the text rather than folded into [`Span`]'s style flags because a
+/// target is a string and not a bit: the style says this ink is a link, and only the
+/// action says where it goes.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Action {
+    pub range: std::ops::Range<usize>,
+    pub kind: ActionKind,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ActionKind {
+    /// A link's destination, kept exactly as the author wrote it. Whether it is
+    /// worth opening is the reader's judgement, not the parser's.
+    Url(String),
+    /// A citation of the footnote carrying this label. The note is already on the
+    /// page, below, so a citation is jumped to rather than opened somewhere else.
+    Cite(String),
 }
 
 /// A grid of cells with one header row and any number of body rows.
@@ -269,6 +293,9 @@ struct Builder {
     note: Option<usize>,
     /// Accumulated while inside `Tag::Image`; its alt text is captured, not set.
     image: Option<(String, String)>,
+    /// The destination of the `Tag::Link` being read, if one is open: every run of
+    /// text pushed while it is set belongs to it.
+    link: Option<String>,
     /// Accumulated while inside `Tag::Table`.
     table: Option<Table>,
     row: Vec<Cell>,
@@ -293,13 +320,18 @@ impl Builder {
             Event::Code(t) => {
                 let mut st = self.inline;
                 st.insert(InlineStyle::CODE);
-                match self.cell.as_mut() {
-                    Some(c) => push_cell(c, &t, st),
-                    None => self.push(&t, st),
+                if let Some(c) = self.cell.as_mut() {
+                    push_cell(c, &t, st);
+                } else {
+                    self.push(&t, st);
                 }
             }
-            Event::SoftBreak => self.push(" ", InlineStyle::EMPTY),
-            Event::HardBreak => self.push("\n", InlineStyle::EMPTY),
+            Event::SoftBreak => {
+                self.push(" ", InlineStyle::EMPTY);
+            }
+            Event::HardBreak => {
+                self.push("\n", InlineStyle::EMPTY);
+            }
             Event::TaskListMarker(checked) => {
                 if let Some(b) = self.cur.as_mut() {
                     b.task = Some(checked);
@@ -336,7 +368,10 @@ impl Builder {
                 // `SUPERSCRIPT` is what separates them from the word they belong to,
                 // so the citation reads as a mark on the text rather than as text.
                 let n = self.cite(label.as_ref());
-                self.push(&n.to_string(), self.inline | InlineStyle::SUPERSCRIPT);
+                let range = self.push(&n.to_string(), self.inline | InlineStyle::SUPERSCRIPT);
+                if let Some(b) = self.cur.as_mut() {
+                    push_action(b, range, ActionKind::Cite(label.to_string()));
+                }
             }
         }
     }
@@ -426,7 +461,15 @@ impl Builder {
             Tag::Emphasis => self.inline.insert(InlineStyle::EMPHASIS),
             Tag::Strong => self.inline.insert(InlineStyle::STRONG),
             Tag::Strikethrough => self.inline.insert(InlineStyle::STRIKETHROUGH),
-            Tag::Link { .. } => self.inline.insert(InlineStyle::LINK),
+            Tag::Link { dest_url, .. } => {
+                self.inline.insert(InlineStyle::LINK);
+                // The first destination wins: CommonMark cannot nest anchors, but a
+                // malformed document can reach here with a link inside a link, and one
+                // run of text can only be clicked into one place.
+                if self.link.is_none() {
+                    self.link = Some(dest_url.to_string());
+                }
+            }
             Tag::Image { dest_url, .. } => {
                 self.image = Some((dest_url.to_string(), String::new()));
             }
@@ -498,7 +541,10 @@ impl Builder {
             TagEnd::Emphasis => self.inline.remove(InlineStyle::EMPHASIS),
             TagEnd::Strong => self.inline.remove(InlineStyle::STRONG),
             TagEnd::Strikethrough => self.inline.remove(InlineStyle::STRIKETHROUGH),
-            TagEnd::Link => self.inline.remove(InlineStyle::LINK),
+            TagEnd::Link => {
+                self.inline.remove(InlineStyle::LINK);
+                self.link = None;
+            }
             TagEnd::Image => {
                 if let Some((src, alt)) = self.image.take() {
                     self.push_object(ObjectKind::Image { src, alt });
@@ -527,17 +573,23 @@ impl Builder {
             },
             task: None,
             objects: Vec::new(),
+            actions: Vec::new(),
             table: None,
         });
     }
 
-    fn push(&mut self, s: &str, style: InlineStyle) {
+    /// Append text to the current block and return the range of it that was written,
+    /// which is what an action needs to point at.
+    fn push(&mut self, s: &str, style: InlineStyle) -> std::ops::Range<usize> {
         if s.is_empty() {
-            return;
+            return 0..0;
         }
         if self.cur.is_none() {
             self.open(BlockKind::Paragraph);
         }
+        // Taken before `cur` is borrowed: the link and the block are both fields of
+        // the builder, and a run of text belongs to both.
+        let linked = self.link.clone();
         let b = self.cur.as_mut().unwrap();
         let start = b.text.len();
         b.text.push_str(s);
@@ -548,6 +600,10 @@ impl Builder {
             Some(prev) if prev.style == style && prev.range.end == start => prev.range.end = end,
             _ => b.spans.push(Span { range: start..end, style }),
         }
+        if let Some(url) = linked {
+            push_action(b, start..end, ActionKind::Url(url));
+        }
+        start..end
     }
 
     /// Append an object-replacement character and register what it stands for.
@@ -561,6 +617,10 @@ impl Builder {
         let end = b.text.len();
         b.objects.push(ObjectSpan { range: start..end, kind });
         b.spans.push(Span { range: start..end, style: InlineStyle::OBJECT });
+        // A figure inside a link is the link's whole text, so it is what gets clicked.
+        if let Some(url) = self.link.clone() {
+            push_action(b, start..end, ActionKind::Url(url));
+        }
     }
 
     fn close(&mut self) {
@@ -621,6 +681,19 @@ fn worth_setting(b: &Block) -> bool {
     !b.text.trim().is_empty()
         || b.kind == BlockKind::Rule
         || b.table.as_ref().is_some_and(|t| !t.head.is_empty() || !t.rows.is_empty())
+}
+
+/// Append an actionable range, merging with the previous one when it is the same
+/// target and abuts it. A link whose text carries emphasis is pushed in pieces, and
+/// one link is one thing to click.
+fn push_action(b: &mut Block, range: std::ops::Range<usize>, kind: ActionKind) {
+    if range.is_empty() {
+        return;
+    }
+    match b.actions.last_mut() {
+        Some(prev) if prev.kind == kind && prev.range.end == range.start => prev.range.end = range.end,
+        _ => b.actions.push(Action { range, kind }),
+    }
 }
 
 /// Append text to a cell, merging with the previous span when the style matches.

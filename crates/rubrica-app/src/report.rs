@@ -39,7 +39,7 @@ pub fn report(source: &str, path: Option<&str>, width: f32, dpi: f32, hyphenate:
     let mut math = crate::math::MathStore::new();
     let mut objects = crate::view::Objects::new(store.as_ref(), base, &mut math);
     let hyphenator = if hyphenate { crate::hyphen::Hyphenator::english() } else { None };
-    let (ops, height, column_pt, left_pt) = build_ops(
+    let page = build_ops(
         &mut font,
         &theme,
         &doc,
@@ -48,11 +48,13 @@ pub fn report(source: &str, path: Option<&str>, width: f32, dpi: f32, hyphenate:
         &mut objects,
         hyphenator.as_ref(),
     );
+    let ops = &page.ops;
+    let (height, column_pt, left_pt) = (page.height, page.column, page.left);
     let k = dpi / 72.0;
 
     let mut lines: Vec<Line> = Vec::new();
     let mut census: BTreeMap<String, usize> = BTreeMap::new();
-    for op in &ops {
+    for op in ops {
         let crate::view::Op::Runs(runs) = op else { continue };
         if runs.is_empty() {
             continue;
@@ -197,6 +199,32 @@ pub fn report(source: &str, path: Option<&str>, width: f32, dpi: f32, hyphenate:
     if cited > 0 || defined > 0 {
         let blocks: usize = doc.footnotes.iter().map(|f| f.blocks.len()).sum();
         println!("footnotes    : {cited} cited, {defined} defined, {blocks} blocks set");
+    }
+    // What a click can reach, counted on the page rather than in the source. A target
+    // that wraps makes one rectangle per line, and a target the reader cannot follow
+    // makes none at all -- so `rects` behind `ranges` by more than the wraps is a layout
+    // that has lost a link, and `refused` climbing is a document full of `file:`.
+    let ranges: usize = doc
+        .blocks
+        .iter()
+        .chain(doc.footnotes.iter().flat_map(|f| &f.blocks))
+        .map(|b| b.actions.len())
+        .sum();
+    if ranges > 0 {
+        let refused = doc
+            .blocks
+            .iter()
+            .chain(doc.footnotes.iter().flat_map(|f| &f.blocks))
+            .flat_map(|b| b.actions.iter())
+            .filter(|a| matches!(&a.kind, rubrica_doc::ActionKind::Url(u) if !crate::view::openable(u)))
+            .count();
+        let links = page.hotspots.iter().filter(|h| matches!(h.kind, crate::view::HotKind::Url(_))).count();
+        let jumps = page.hotspots.iter().filter(|h| matches!(h.kind, crate::view::HotKind::Cite(_))).count();
+        println!("targets      : {ranges} range(s) -> {links} link rect(s), {jumps} citation rect(s), {refused} refused");
+        let tops: Vec<String> = page.note_tops.iter().map(|t| format!("{t:.1}")).collect();
+        if !tops.is_empty() {
+            println!("  notes at     : {} pt", tops.join(", "));
+        }
     }
     // Struck runs are the only faint ink a page carries, so a faint rule in the op
     // list can only be a strike. Counted rather than trusted: a struck span that sets

@@ -9,13 +9,13 @@
 use std::collections::HashMap;
 use std::path::PathBuf;
 
-use rubrica_doc::{Align, Block, BlockKind, Document, InlineStyle};
+use rubrica_doc::{Action, ActionKind, Align, Block, BlockKind, Document, InlineStyle};
 use rubrica_type::justification::place;
 use rubrica_type::paragraph::{Item, Spacing, StyleId, StyleSpan};
 use rubrica_type::units::Pt;
 use rubrica_type::{BreakOptions, Hyphenation, typeset, typeset_hyphenated};
 use windows::core::{w, Interface, PCWSTR};
-use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, RECT, WPARAM};
+use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, POINT, RECT, WPARAM};
 use windows::Win32::Graphics::Direct2D::Common::{
     D2D1_ALPHA_MODE_PREMULTIPLIED, D2D1_COLOR_F, D2D1_PIXEL_FORMAT, D2D_RECT_F, D2D_SIZE_U,
 };
@@ -31,7 +31,7 @@ use windows::Win32::Graphics::DirectWrite::{
 };
 use windows::Win32::Graphics::Dwm::{DwmSetWindowAttribute, DWMWA_USE_IMMERSIVE_DARK_MODE};
 use windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_B8G8R8A8_UNORM;
-use windows::Win32::Graphics::Gdi::{HBRUSH, InvalidateRect};
+use windows::Win32::Graphics::Gdi::{HBRUSH, InvalidateRect, ScreenToClient};
 use windows::Win32::System::Com::{
     CoInitializeEx, COINIT_APARTMENTTHREADED, COINIT_DISABLE_OLE1DDE,
 };
@@ -50,15 +50,15 @@ use windows::Win32::UI::Input::KeyboardAndMouse::{
 use windows::Win32::UI::Controls::Dialogs::{
     GetOpenFileNameW, OPENFILENAMEW, OFN_FILEMUSTEXIST, OFN_HIDEREADONLY, OFN_PATHMUSTEXIST,
 };
-use windows::Win32::UI::Shell::{DragAcceptFiles, DragFinish, DragQueryFileW, HDROP};
+use windows::Win32::UI::Shell::{DragAcceptFiles, DragFinish, DragQueryFileW, ShellExecuteW, HDROP};
 use windows::Win32::UI::WindowsAndMessaging::{
     CS_HREDRAW, CS_VREDRAW, CREATESTRUCTW, CreateWindowExW, DefWindowProcW, DispatchMessageW,
-    GWLP_USERDATA, GetClientRect, GetWindowLongPtrW, GetMessageW, HWND_TOP, IDC_ARROW, KillTimer,
-    LoadCursorW, MSG, PostQuitMessage, RegisterClassExW, SW_SHOWNORMAL, SetTimer,
-    SetWindowLongPtrW, SetWindowPos, ShowWindow, TranslateMessage, WNDCLASSEXW, WM_DESTROY,
-    WM_DPICHANGED, WM_ERASEBKGND, WM_KEYDOWN, WM_MOUSEWHEEL, WM_NCCREATE, WM_PAINT, WM_SIZE,
-    WM_TIMER, WS_EX_APPWINDOW, WS_OVERLAPPEDWINDOW, SWP_NOACTIVATE, SWP_NOZORDER, WM_DROPFILES,
-    WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEMOVE,
+    GWLP_USERDATA, GetClientRect, GetCursorPos, GetWindowLongPtrW, GetMessageW, HCURSOR, HWND_TOP,
+    HTCLIENT, IDC_ARROW, IDC_HAND, KillTimer, LoadCursorW, MSG, PostQuitMessage, RegisterClassExW,
+    SetCursor, SW_SHOWNORMAL, SetTimer, SetWindowLongPtrW, SetWindowPos, ShowWindow, TranslateMessage,
+    WNDCLASSEXW, WM_DESTROY, WM_DPICHANGED, WM_ERASEBKGND, WM_KEYDOWN, WM_MOUSEWHEEL, WM_NCCREATE,
+    WM_PAINT, WM_SETCURSOR, WM_SIZE, WM_TIMER, WS_EX_APPWINDOW, WS_OVERLAPPEDWINDOW, SWP_NOACTIVATE,
+    SWP_NOZORDER, WM_DROPFILES, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEMOVE,
 };
 use windows_numerics::Vector2;
 
@@ -203,6 +203,45 @@ pub enum Op {
     Line { x0: f32, y0: f32, x1: f32, y1: f32, thickness: f32, color: ColorRole },
 }
 
+/// Where a click lands, and what it means.
+#[derive(Clone, Debug, PartialEq)]
+pub enum HotKind {
+    /// A link to open, already accepted by [`openable`].
+    Url(String),
+    /// A citation of the footnote at this index, whose top of the page is in
+    /// [`Page::note_tops`]. The note is on the page already, so a citation is jumped to
+    /// rather than opened somewhere else.
+    Cite(usize),
+}
+
+/// A rectangle of the document a click can land on, in the same device independent
+/// pixels the [`Op`]s are in and measured from the top of the page rather than of the
+/// window -- so hit-testing is the pointer's y plus the scroll, and nothing else.
+///
+/// One per line rather than one per link: a target that wraps is in two places at
+/// once, and the pointer is only ever in one of them.
+pub struct Hot {
+    pub x: f32,
+    pub y: f32,
+    pub w: f32,
+    pub h: f32,
+    pub kind: HotKind,
+}
+
+/// Everything one typesetting pass produced.
+pub struct Page {
+    pub ops: Vec<Op>,
+    /// The document's height, in points.
+    pub height: Pt,
+    /// The measure chosen for the page and where it starts, which is what the headless
+    /// report measures line edges against.
+    pub column: Pt,
+    pub left: Pt,
+    pub hotspots: Vec<Hot>,
+    /// Where each footnote's first line begins, indexed like [`Document::footnotes`].
+    pub note_tops: Vec<Pt>,
+}
+
 pub struct View {
     d2d: ID2D1Factory,
     target: Option<ID2D1RenderTarget>,
@@ -217,6 +256,17 @@ pub struct View {
     /// answer or the next timer tick would undo it.
     dark_override: Option<bool>,
     brushes: HashMap<ColorRole, ID2D1SolidColorBrush>,
+    /// The targets of the current layout, and where each note begins.
+    hotspots: Vec<Hot>,
+    note_tops: Vec<Pt>,
+    /// The pointer over a clickable target. Both cursors are loaded once:
+    /// `WM_SETCURSOR` is asked on every move, and a shared system cursor is not
+    /// something to fetch afresh each time it answers.
+    arrow: HCURSOR,
+    hand: HCURSOR,
+    /// The hotspot a button is held down on. Releasing somewhere else is a reader
+    /// changing their mind, not a click.
+    pressed: Option<usize>,
     scroll: Pt,
     content_h: Pt,
     client_w: f32,
@@ -258,6 +308,52 @@ fn scale_of(dpi: f32) -> f32 {
     dpi / 72.0
 }
 
+/// Whether a reader may be asked to open a link. Only the schemes that mean "read
+/// this" qualify: `file:`, a bare path and a UNC share are requests to reach the local
+/// disk or to run something, and a document that is being looked at has no business
+/// launching them. A control character is refused for the same reason -- it cannot be
+/// part of an address, and the shell parses more of these strings than a reader would
+/// like to think about.
+pub(crate) fn openable(url: &str) -> bool {
+    let Some((scheme, rest)) = url.split_once(':') else {
+        // A relative link or a bare fragment points inside this file, which is not a
+        // thing to hand to another program.
+        return false;
+    };
+    if url.chars().any(|c| (c as u32) < 0x20) {
+        return false;
+    }
+    match scheme.to_ascii_lowercase().as_str() {
+        "http" | "https" => rest.starts_with("//"),
+        "mailto" => !rest.is_empty(),
+        _ => false,
+    }
+}
+
+/// Hand an accepted address to the shell, which is what decides the browser or the mail
+/// client that answers.
+fn open_url(url: &str) {
+    if !openable(url) {
+        return;
+    }
+    let verb = utf16("open");
+    let target = utf16(url);
+    let r = unsafe {
+        ShellExecuteW(
+            None,
+            PCWSTR(verb.as_ptr()),
+            PCWSTR(target.as_ptr()),
+            PCWSTR::null(),
+            PCWSTR::null(),
+            SW_SHOWNORMAL,
+        )
+    };
+    // Failures come back as small integers in the handle rather than as a null one.
+    if (r.0 as usize) <= 32 {
+        eprintln!("could not open {url}");
+    }
+}
+
 /// Whether a modifier is down. Read from the keyboard state rather than from the
 /// message: `WM_KEYDOWN` carries no modifier flags of its own, and a key that only
 /// means something with `Ctrl` has to ask.
@@ -282,6 +378,12 @@ pub fn run(source: String, path: Option<PathBuf>) -> Result<()> {
     let d2d: ID2D1Factory = unsafe { D2D1CreateFactory(D2D1_FACTORY_TYPE_SINGLE_THREADED, None) }
         .map_err(|e| -> Error { format!("Direct2D: {e}").into() })?;
 
+    let arrow = unsafe { LoadCursorW(None, IDC_ARROW)? };
+    // A pointer that turns into a hand says "this is a target" before the click, which
+    // the colour of the ink by itself does not. Falls back to the arrow on a system
+    // without the hand cursor rather than refusing to start.
+    let hand = unsafe { LoadCursorW(None, IDC_HAND).unwrap_or(arrow) };
+
     let mut view = Box::new(View {
         d2d,
         target: None,
@@ -293,6 +395,11 @@ pub fn run(source: String, path: Option<PathBuf>) -> Result<()> {
         palette: Palette::of(system_prefers_dark()),
         dark_override: None,
         brushes: HashMap::new(),
+        hotspots: Vec::new(),
+        note_tops: Vec::new(),
+        arrow,
+        hand,
+        pressed: None,
         scroll: 0.0,
         content_h: 0.0,
         client_w: 1.0,
@@ -314,7 +421,7 @@ pub fn run(source: String, path: Option<PathBuf>) -> Result<()> {
             style: CS_HREDRAW | CS_VREDRAW,
             lpfnWndProc: Some(wnd_proc),
             hInstance: hinst.into(),
-            hCursor: LoadCursorW(None, IDC_ARROW)?,
+            hCursor: arrow,
             // Null on purpose: the render target covers every client pixel, and a
             // system background brush flashes white while a corner is dragged.
             hbrBackground: HBRUSH::default(),
@@ -556,7 +663,7 @@ impl View {
             }
             WM_KEYDOWN => {
                 let step = self.theme.base * self.theme.body_leading.latin;
-                let page = self.client_h / scale_of(self.dpi) * 0.85;
+                let page = self.page_height();
                 let ctrl = held(VK_CONTROL);
                 match wp.0 as u32 {
                     k if k == VK_UP.0 as u32 => self.scroll_by(-step),
@@ -611,20 +718,39 @@ impl View {
                 LRESULT(0)
             }
             WM_LBUTTONDOWN => {
-                // A press inside the thumb starts a drag; anywhere else pages down.
+                // A press inside the thumb starts a drag; a press on a target waits for
+                // the release; anywhere else pages down.
                 let x = ((lp.0 & 0xFFFF) as i16) as f32;
                 let y = ((lp.0 >> 16) as i16) as f32;
+                self.pressed = None;
                 if self.thumb_hit(x, y) {
                     self.dragging = true;
                     self.scroll_to_thumb(y);
+                } else if let Some(i) = self.hot_at(x, y) {
+                    self.pressed = Some(i);
                 } else if y > self.client_h * 0.5 {
-                    self.scroll_by(self.page());
+                    self.scroll_by(self.page_height());
                 } else {
-                    self.scroll_by(-self.page());
+                    self.scroll_by(-self.page_height());
                 }
                 let _ = SetCapture(hwnd);
                 let _ = InvalidateRect(Some(hwnd), None, false);
                 LRESULT(0)
+            }
+            WM_SETCURSOR => {
+                // Asked to answer on every move over the window. Only the client area is
+                // ours: over the frame the default decides, and overriding it there would
+                // cost the resize cursors too.
+                if (lp.0 & 0xFFFF) as u32 == HTCLIENT {
+                    let mut pt = POINT::default();
+                    let _ = GetCursorPos(&mut pt);
+                    let _ = ScreenToClient(hwnd, &mut pt);
+                    let over = self.hot_at(pt.x as f32, pt.y as f32).is_some();
+                    SetCursor(Some(if over { self.hand } else { self.arrow }));
+                    LRESULT(1)
+                } else {
+                    DefWindowProcW(hwnd, msg, wp, lp)
+                }
             }
             WM_MOUSEMOVE => {
                 if self.dragging {
@@ -634,9 +760,19 @@ impl View {
                 LRESULT(0)
             }
             WM_LBUTTONUP => {
-                if self.dragging {
-                    self.dragging = false;
-                    let _ = ReleaseCapture();
+                // Captured on every press, so released on every release: a window that
+                // keeps the capture after a plain click takes the mouse away from the
+                // rest of the desktop, thumb drags being the only case it is meant for.
+                let _ = ReleaseCapture();
+                self.dragging = false;
+                if let Some(i) = self.pressed.take() {
+                    let x = ((lp.0 & 0xFFFF) as i16) as f32;
+                    let y = ((lp.0 >> 16) as i16) as f32;
+                    // Released where it began: the press was a click rather than a reader
+                    // reaching past the target and deciding against it.
+                    if self.hot_at(x, y) == Some(i) {
+                        self.activate(i, hwnd);
+                    }
                 }
                 LRESULT(0)
             }
@@ -651,6 +787,34 @@ impl View {
     fn scroll_by(&mut self, dy: Pt) {
         self.scroll += dy;
         self.clamp_scroll();
+    }
+
+    /// The target under a pointer position, given in device independent pixels from the
+    /// window's client origin. The rectangles are stored against the top of the
+    /// document, so the only translation the test needs is the scroll.
+    fn hot_at(&self, x: f32, y: f32) -> Option<usize> {
+        let y = y + self.scroll * scale_of(self.dpi);
+        self.hotspots
+            .iter()
+            .position(|h| x >= h.x && x <= h.x + h.w && y >= h.y && y <= h.y + h.h)
+    }
+
+    /// Act on the target at this index in [`View::hotspots`].
+    fn activate(&mut self, i: usize, hwnd: HWND) {
+        let Some(kind) = self.hotspots.get(i).map(|h| h.kind.clone()) else { return };
+        match kind {
+            HotKind::Url(url) => open_url(&url),
+            HotKind::Cite(note) => {
+                if let Some(&top) = self.note_tops.get(note) {
+                    // The note lands a line below the top edge rather than against it,
+                    // so some of the page just left stays in view: a citation is followed
+                    // to read, and reading means being able to come back.
+                    self.scroll = (top - self.theme.base).max(0.0);
+                    self.clamp_scroll();
+                    let _ = unsafe { InvalidateRect(Some(hwnd), None, false) };
+                }
+            }
+        }
     }
 
     /// A relayout can leave the offset past the end of a document that has just grown.
@@ -698,7 +862,7 @@ impl View {
         // document's formulas.
         let mut objects =
             Objects::new(self.images.as_ref(), self.path.as_deref().and_then(|p| p.parent()), &mut self.math);
-        let (ops, h, _column, _left) = build_ops(
+        let page = build_ops(
             &mut self.font,
             &self.theme,
             &self.doc,
@@ -707,8 +871,13 @@ impl View {
             &mut objects,
             self.hyphenator.as_ref(),
         );
-        self.content_h = h;
-        self.ops = ops;
+        // A relayout moves the notes, so a jump still held down from before would now
+        // point at a paragraph rather than at a footnote.
+        self.pressed = None;
+        self.content_h = page.height;
+        self.ops = page.ops;
+        self.hotspots = page.hotspots;
+        self.note_tops = page.note_tops;
     }
 
 }
@@ -719,6 +888,9 @@ struct Ctx<'a> {
     styles: &'a [AppStyle],
     /// Typeset formulas, by cache index. Layout only reads this; interning wrote it.
     math: &'a MathStore,
+    /// Which footnote a citation's label names, which is how a raised number becomes a
+    /// jump to a position on the page.
+    notes: &'a HashMap<String, usize>,
     /// Points to device independent pixels.
     k: f32,
 }
@@ -747,6 +919,9 @@ struct Blk<'a> {
     /// stands back from the measure so the marker can hang in that space. Zero for a
     /// block with no marker, which is every block but a list item and a footnote.
     hang: Pt,
+    /// The block's clickable ranges, already shifted for the marker like [`Blk::spans`]
+    /// is, so both index the same text.
+    actions: &'a [Action],
 }
 
 /// A block readied for layout: its text with the marker already in front of it, and
@@ -761,6 +936,9 @@ struct Prepared {
     /// body text that lines up with neither is not hung.
     hang: Pt,
     table: Option<PreparedTable>,
+    /// The block's clickable ranges, with the marker's length added to both ends so the
+    /// same offsets index [`Prepared::text`] as for [`Prepared::spans`].
+    actions: Vec<Action>,
 }
 
 /// A table cell with its styles already resolved to ids, so column sizing and
@@ -841,10 +1019,34 @@ fn merge_rule(
     *pending = Some(next);
 }
 
+/// Widen this line's clickable rectangles by the node that was just laid out, whose
+/// ink runs from `x0` to `x1`. A node belongs to a target whenever their text overlaps,
+/// which is also how a hyphen or an ellipsis in the middle of a link stays clickable.
+fn merge_hot(hit: &mut [Option<(Pt, Pt)>], actions: &[Action], node: &std::ops::Range<usize>, x0: Pt, x1: Pt) {
+    if x1 <= x0 {
+        return;
+    }
+    for (h, a) in hit.iter_mut().zip(actions) {
+        if a.range.start < node.end && node.start < a.range.end {
+            *h = Some(match *h {
+                Some((p, q)) => (p.min(x0), q.max(x1)),
+                None => (x0, x1),
+            });
+        }
+    }
+}
+
 /// Typeset one block into the display list and return the new document y.
-fn layout_block(font: &mut FontEngine, ctx: &Ctx<'_>, blk: &Blk<'_>, ops: &mut Vec<Op>, mut y: Pt) -> Pt {
-    let Ctx { theme, styles, math, k } = *ctx;
-    let Blk { b, text, spans, base, left, column, hyphenation, size, hang, .. } = *blk;
+fn layout_block(
+    font: &mut FontEngine,
+    ctx: &Ctx<'_>,
+    blk: &Blk<'_>,
+    ops: &mut Vec<Op>,
+    hots: &mut Vec<Hot>,
+    mut y: Pt,
+) -> Pt {
+    let Ctx { theme, styles, math, notes, k } = *ctx;
+    let Blk { b, text, spans, base, left, column, hyphenation, size, hang, actions, .. } = *blk;
     let leading = &blk.leading;
     let mut images_out: Vec<(PathBuf, f32, f32, Pt, Pt)> = Vec::new();
     if b.kind == BlockKind::Rule {
@@ -893,11 +1095,16 @@ fn layout_block(font: &mut FontEngine, ctx: &Ctx<'_>, blk: &Blk<'_>, ops: &mut V
     let mut panel_bottom = y;
 
     for line in &plan.lines {
+        let top = y;
         let placed = place(&para, line);
         // Where this line starts. A line under a hanging marker begins at the marker's
         // right edge, which is the space [`Blk::hang`] bought it; the first line begins
         // at the block's own left, where the marker sits.
         let line_left = left + if line.first { opts.par_indent } else { hang };
+        // How far each clickable range reaches along this line, if it reaches at all.
+        // One rectangle per line rather than one per target, because the pointer is
+        // only ever in one of the places a wrapped link happens to be.
+        let mut hit: Vec<Option<(Pt, Pt)>> = vec![None; actions.len()];
         let mut runs: Vec<PaintRun> = Vec::new();
         // Bars of a formula, as x, top edge, width, thickness and ink, all still
         // relative to this line's baseline because the line has no position yet.
@@ -948,6 +1155,7 @@ fn layout_block(font: &mut FontEngine, ctx: &Ctx<'_>, blk: &Blk<'_>, ops: &mut V
                     }
                     None => {}
                 }
+                merge_hot(&mut hit, actions, &node.text, line_left + slot.x, line_left + slot.x + o.advance);
                 continue;
             }
             let shaped = font.shape_runs(text, node.text.clone(), &st.face, st.size, st.tracking);
@@ -986,6 +1194,7 @@ fn layout_block(font: &mut FontEngine, ctx: &Ctx<'_>, blk: &Blk<'_>, ops: &mut V
                 }
                 at += r.width();
             }
+            merge_hot(&mut hit, actions, &node.text, line_left + slot.x, at);
         }
         end_rule(&mut ruled, &mut bars);
         let natural = ascent + descent;
@@ -1000,6 +1209,20 @@ fn layout_block(font: &mut FontEngine, ctx: &Ctx<'_>, blk: &Blk<'_>, ops: &mut V
         }
         for (file, x, w, a, d) in images_out.drain(..) {
             ops.push(Op::Image { path: file, x, y: (baseline - a) * k, w, h: (a + d) * k });
+        }
+        for (i, h) in hit.iter().enumerate() {
+            let Some((x0, x1)) = *h else { continue };
+            let kind = match &actions[i].kind {
+                // Ink that cannot be followed is not marked as a target at all: a
+                // pointer that stays an arrow is the reader's answer to "nowhere".
+                ActionKind::Url(u) if openable(u) => HotKind::Url(u.clone()),
+                ActionKind::Cite(label) => match notes.get(label.as_str()) {
+                    Some(n) => HotKind::Cite(*n),
+                    None => continue,
+                },
+                _ => continue,
+            };
+            hots.push(Hot { x: x0 * k, y: top * k, w: (x1 - x0) * k, h: line_h * k, kind });
         }
         panel_bottom = y + line_h;
         y += line_h;
@@ -1032,8 +1255,9 @@ fn layout_block(font: &mut FontEngine, ctx: &Ctx<'_>, blk: &Blk<'_>, ops: &mut V
 }
 
 impl View {
-    /// Client-space height of one text page, in points.
-    fn page(&self) -> Pt {
+    /// Client-space height of one text page, in points: most of a window, so a reader
+    /// keeps a little of the previous screen as a place to come back to.
+    fn page_height(&self) -> Pt {
         self.client_h / scale_of(self.dpi) * 0.85
     }
 
@@ -1200,7 +1424,6 @@ impl View {
     }
 }
 
-/// Intern a style for an inline object, which has no font properties at all.
 /// Lay out a grid.
 ///
 /// Columns size to their widest cell, which is what makes a short table look
@@ -1588,7 +1811,15 @@ fn prepare_block(
         // An object span is sized from its own source rather than from a font,
         // and only the caller knows the document directory a relative image
         // should resolve against.
-        let id = match s.style {
+        //
+        // Accent ink is a promise about the click, so a link the reader cannot follow
+        // -- a relative path, a `file:` address -- is set as the prose around it rather
+        // than coloured and left to be discovered.
+        let mut style = s.style;
+        if style.contains(InlineStyle::LINK) && !reaches(&b.actions, &s.range) {
+            style.remove(InlineStyle::LINK);
+        }
+        let id = match style {
             st if st.contains(InlineStyle::OBJECT) => {
                 match b.objects.iter().find(|o| o.range == s.range) {
                     Some(obj) => {
@@ -1625,7 +1856,27 @@ fn prepare_block(
         };
         PreparedTable { head: prep(&t.head), rows: t.rows.iter().map(|r| prep(r)).collect() }
     });
-    Prepared { text, spans, base: base.0 as usize, hang, table }
+    Prepared {
+        text,
+        spans,
+        base: base.0 as usize,
+        hang,
+        table,
+        actions: b
+            .actions
+            .iter()
+            .map(|a| Action { range: a.range.start + shift..a.range.end + shift, kind: a.kind.clone() })
+            .collect(),
+    }
+}
+
+/// Whether any of the block's clickable ranges covers this span's text, i.e. whether
+/// there is anywhere for a click on this ink to go.
+fn reaches(actions: &[Action], range: &std::ops::Range<usize>) -> bool {
+    actions.iter().any(|a| {
+        a.range.start < range.end && range.start < a.range.end
+            && matches!(&a.kind, ActionKind::Url(u) if openable(u))
+    })
 }
 
 /// Where the words of `text` may split, and the advance of the hyphen glyph at the
@@ -1656,8 +1907,8 @@ fn hyphenation_for(
 /// describes exactly what the user sees rather than what a parallel implementation
 /// would have drawn.
 ///
-/// Returns the ops, the document height, the chosen measure and its left edge, all
-/// in points except the ops which are in device independent pixels.
+/// Returns a [`Page`]: the display list in device independent pixels, the heights and
+/// edges the report measures against, and the rectangles a click can land on.
 pub fn build_ops(
     font: &mut FontEngine,
     theme: &Theme,
@@ -1666,7 +1917,7 @@ pub fn build_ops(
     dpi: f32,
     objects: &mut Objects<'_>,
     hyphenator: Option<&Hyphenator>,
-) -> (Vec<Op>, Pt, Pt, Pt) {
+) -> Page {
     let k = scale_of(dpi);
     let margin = theme.base * MARGIN_EM;
     let client_pt = client_w / k;
@@ -1679,6 +1930,13 @@ pub fn build_ops(
 
     let mut styles: Vec<AppStyle> = Vec::new();
     let mut ops = Vec::new();
+    let mut hots = Vec::new();
+    let mut note_tops: Vec<Pt> = Vec::with_capacity(doc.footnotes.len());
+    // A citation names its note by the author's own label, while the page knows notes
+    // only by where they ended up. This is the bridge, and it is built before any
+    // layout because layout is where a citation's text is first read.
+    let notes: HashMap<String, usize> =
+        doc.footnotes.iter().enumerate().map(|(i, f)| (f.label.clone(), i)).collect();
     let mut y = theme.base * 2.0;
     let mut first = true;
 
@@ -1735,7 +1993,7 @@ pub fn build_ops(
             .collect(),
     );
 
-    let ctx = Ctx { theme, styles: &styles, math: &*objects.math, k };
+    let ctx = Ctx { theme, styles: &styles, math: &*objects.math, notes: &notes, k };
 
     for (b, p) in doc.blocks.iter().zip(prepared) {
         let base_left = left;
@@ -1795,8 +2053,10 @@ pub fn build_ops(
                 // The level's marker width, shared by every item at that level so their
                 // bodies line up. A continuation block has already paid it at `left`.
                 hang: if b.list.is_some() { level } else { 0.0 },
+                actions: &p.actions,
             },
             &mut ops,
+            &mut hots,
             y,
         );
     }
@@ -1806,8 +2066,8 @@ pub fn build_ops(
     // prose uses, so a note with two paragraphs wraps and justifies exactly as they
     // would on the page -- the only things it changes are the size and the leading the
     // caller hands in.
-    let mut notes = doc.footnotes.iter().zip(note_units).peekable();
-    if notes.peek().is_some() {
+    let mut apparatus = doc.footnotes.iter().zip(note_units).peekable();
+    if apparatus.peek().is_some() {
         y += theme.note_space(true);
         ops.push(Op::Line {
             x0: left * k,
@@ -1817,10 +2077,13 @@ pub fn build_ops(
             thickness: theme.base * 0.05 * k,
             color: ColorRole::Muted,
         });
-        for (n, (note, units)) in notes.enumerate() {
+        for (n, (note, units)) in apparatus.enumerate() {
             // The first note sits below the rule; after that one note is separated
             // from the last by less than two paragraphs of prose are.
             y += if n == 0 { theme.base * 0.5 } else { theme.note_space(false) };
+            // Where a citation of this note has to land: the top of its first line,
+            // which is what `activate` brings into view.
+            note_tops.push(y);
             for (i, (nb, p)) in note.blocks.iter().zip(units).enumerate() {
                 if i > 0 {
                     y += theme.note_space(false);
@@ -1843,15 +2106,17 @@ pub fn build_ops(
                         size,
                         leading: theme.note_leading(),
                         hang: note_hang,
+                        actions: &p.actions,
                     },
                     &mut ops,
+                    &mut hots,
                     y,
                 );
             }
         }
     }
 
-    (ops, y + theme.base * 2.0, column, left)
+    Page { ops, height: y + theme.base * 2.0, column, left, hotspots: hots, note_tops }
 }
 
 #[cfg(test)]
@@ -1899,5 +2164,85 @@ mod tests {
     fn scrolling_past_the_end_clamps_instead_of_leaving_the_track() {
         let (_, y_over, _, h) = thumb_rect(2400.0, 1000.0, 800.0, 99_000.0, DPI).unwrap();
         assert!(y_over + h <= 800.0 + 0.5, "thumb left the viewport: {y_over}+{h}");
+    }
+
+    fn url(target: &str, range: std::ops::Range<usize>) -> Action {
+        Action { range, kind: ActionKind::Url(target.to_string()) }
+    }
+
+    /// Only the schemes that mean "read this" are worth a pointer. The rest are a
+    /// document asking the reader's machine to run or reach something, and an
+    /// address with a control character in it is not an address.
+    #[test]
+    fn only_an_address_that_means_read_this_is_openable() {
+        for ok in ["https://example.org/a?b=1#c", "http://example.org", "HTTPS://EXAMPLE.ORG/x", "mailto:rd@example.org"] {
+            assert!(openable(ok), "{ok} should open");
+        }
+        for no in [
+            "other.md",
+            "./other.md",
+            "#section",
+            "file:///C:/Windows/system.ini",
+            r#"\\nas\share\document.md"#,
+            "javascript:alert(1)",
+            "cmd:/c calc",
+            "https:/example.org",
+            "mailto:",
+            "https://exa\0mple.org",
+            "https://exa\nmple.org",
+        ] {
+            assert!(!openable(no), "{no} should not open");
+        }
+    }
+
+    #[test]
+    fn a_target_reaches_only_the_ink_that_belongs_to_it() {
+        // "plain [link] plain": the target is the middle node's text alone.
+        let actions = [url("https://e/x", 6..10)];
+        let mut hit: Vec<Option<(Pt, Pt)>> = vec![None; actions.len()];
+        merge_hot(&mut hit, &actions, &(0..6), 0.0, 50.0);
+        merge_hot(&mut hit, &actions, &(6..10), 50.0, 90.0);
+        merge_hot(&mut hit, &actions, &(10..16), 90.0, 140.0);
+        assert_eq!(hit, vec![Some((50.0, 90.0))], "the rectangles reached outside the link");
+    }
+
+    #[test]
+    fn a_target_split_into_nodes_still_covers_the_gap_between_them() {
+        // A link's own text arrives in pieces -- `guide`, ` `, `here` -- and the space
+        // between the pieces is part of the word the reader clicked.
+        let actions = [url("https://e/x", 6..14)];
+        let mut hit: Vec<Option<(Pt, Pt)>> = vec![None; actions.len()];
+        for (range, x0, x1) in
+            [(6..11usize, 50.0f32, 80.0f32), (11..12, 80.0, 88.0), (12..14, 88.0, 104.0)]
+        {
+            merge_hot(&mut hit, &actions, &range, x0, x1);
+        }
+        assert_eq!(hit, vec![Some((50.0, 104.0))]);
+    }
+
+    #[test]
+    fn two_targets_on_one_line_keep_their_own_widths() {
+        let actions = [url("https://e/a", 0..4), url("https://e/b", 6..10)];
+        let mut hit: Vec<Option<(Pt, Pt)>> = vec![None; actions.len()];
+        merge_hot(&mut hit, &actions, &(0..4), 0.0, 40.0);
+        merge_hot(&mut hit, &actions, &(6..10), 70.0, 110.0);
+        assert_eq!(hit, vec![Some((0.0, 40.0)), Some((70.0, 110.0))]);
+    }
+
+    #[test]
+    fn a_target_with_no_width_of_its_own_is_not_a_target() {
+        let actions = [url("https://e/a", 0..4)];
+        let mut hit: Vec<Option<(Pt, Pt)>> = vec![None; actions.len()];
+        merge_hot(&mut hit, &actions, &(0..4), 30.0, 30.0);
+        assert_eq!(hit, vec![None], "an empty rectangle would swallow a click at its edge");
+    }
+
+    #[test]
+    fn ink_is_only_marked_as_a_link_where_it_leads_somewhere() {
+        let actions = [url("https://e/a", 6..10), url("relative.md", 20..26)];
+        assert!(reaches(&actions, &(6..10)));
+        assert!(!reaches(&actions, &(20..26)), "a target the reader cannot follow must not be coloured");
+        // The object character inside a linked figure is the link's whole text.
+        assert!(reaches(&actions, &(8..9)), "part of a target's ink is still its ink");
     }
 }

@@ -369,3 +369,49 @@ fn a_citation_inside_emphasis_stays_emphasised_as_well_as_raised() {
         b.spans
     );
 }
+
+#[test]
+fn a_link_records_one_action_whatever_pieces_its_text_arrives_in() {
+    let doc = Document::parse("see the [guide *and its* title](https://example.org/a) now\n");
+    let b = &doc.blocks[0];
+    assert_eq!(b.actions.len(), 1, "{:?}", b.actions);
+    assert_eq!(b.actions[0].kind, rubrica_doc::ActionKind::Url("https://example.org/a".into()));
+    assert_eq!(&b.text[b.actions[0].range.clone()], "guide and its title");
+}
+
+#[test]
+fn actions_name_the_text_a_click_would_act_on() {
+    let doc = Document::parse("Read [**this**](https://e/b) or [![fig](shot.png)](https://e/c).[^n]\n\n[^n]: note\n");
+    let b = &doc.blocks[0];
+    let targets: Vec<(&str, &str)> = b
+        .actions
+        .iter()
+        .map(|a| {
+            (
+                &b.text[a.range.clone()],
+                match &a.kind {
+                    rubrica_doc::ActionKind::Url(u) => u.as_str(),
+                    rubrica_doc::ActionKind::Cite(l) => l.as_str(),
+                },
+            )
+        })
+        .collect();
+    // The image's alt text is not prose, so the second target's text is the single
+    // placeholder the layout engine will draw a box for.
+    assert_eq!(
+        targets,
+        vec![("this", "https://e/b"), ("\u{FFFC}", "https://e/c"), ("1", "n")]
+    );
+}
+
+#[test]
+fn a_citation_action_points_at_its_number_and_not_at_the_note() {
+    let doc = Document::parse("word[^a] more\n\n[^a]: the note\n");
+    let b = &doc.blocks[0];
+    assert_eq!(b.actions.len(), 1);
+    assert_eq!(b.actions[0].kind, rubrica_doc::ActionKind::Cite("a".into()));
+    assert_eq!(&b.text[b.actions[0].range.clone()], "1", "must cover the raised number alone");
+    // The definition is where a reader lands, not where they clicked, so it carries no
+    // action of its own unless the author linked something inside it.
+    assert!(doc.footnotes[0].blocks[0].actions.is_empty(), "{:?}", doc.footnotes[0].blocks[0].actions);
+}
