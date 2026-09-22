@@ -1235,6 +1235,11 @@ fn intern(styles: &mut Vec<AppStyle>, fallback: &[String], r: crate::theme::Reso
 
 fn marker_for(b: &Block) -> String {
     match b.list {
+        // A task item's box replaces its bullet, as GitHub and CommonMark do: the
+        // bullet would push the box away from the text it belongs to, and a checked
+        // item that reads as a bullet has lost the only information it carried.
+        Some(_) if b.task == Some(true) => "\u{2611} ".to_string(),
+        Some(_) if b.task == Some(false) => "\u{2610} ".to_string(),
         Some(l) if l.ordered => format!("{}. ", l.index.unwrap_or(1)),
         Some(_) => "\u{2022} ".to_string(),
         None => String::new(),
