@@ -92,6 +92,65 @@ pub enum ColorRole {
     Surface,
 }
 
+/// The reader's size preference, as a step on a ladder rather than a free ratio.
+///
+/// A ladder because a reset key has to be able to name the design size again: with
+/// a multiplier carried from press to press, the rounding of the last press is the
+/// error of the next `Ctrl`+`0`, and the page never quite comes back to what it was.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Zoom(i32);
+
+impl Zoom {
+    /// The design's own size. `Ctrl`+`0` returns here and a fresh theme starts here.
+    pub const DESIGN: Zoom = Zoom(0);
+    /// Per step. Coarse on purpose, and the browser convention: two sizes the eye
+    /// cannot separate are one wasted key press, while a jump big enough to be worth
+    /// the press is still small enough not to lose the reader's place in a paragraph.
+    const RATIO: f32 = 1.2;
+    /// The ends of the ladder. Below the first a line is unreadable rather than
+    /// merely small; above the last the measure — which is a number of em, so it
+    /// grows with the size — has long since run into the window edge, and the page
+    /// is a column of two-word lines.
+    const MIN: i32 = -3;
+    const MAX: i32 = 4;
+
+    pub fn up(self) -> Zoom {
+        Zoom((self.0 + 1).min(Self::MAX))
+    }
+
+    pub fn down(self) -> Zoom {
+        Zoom((self.0 - 1).max(Self::MIN))
+    }
+
+    /// The multiplier to apply to the design's body size. Clamped, so a `Zoom` built
+    /// from elsewhere cannot escape the ladder.
+    pub fn factor(self) -> f32 {
+        Self::RATIO.powi(self.0.clamp(Self::MIN, Self::MAX))
+    }
+
+    /// As a percentage of the design, which is the unit a reader is shown: 100 at
+    /// [`Zoom::DESIGN`].
+    pub fn percent(self) -> u32 {
+        (f64::from(self.factor()) * 100.0).round() as u32
+    }
+
+    /// The step nearest a requested percentage, for input that is not key presses —
+    /// a saved preference, or the headless report's `--zoom`.
+    pub fn nearest_percent(pct: f32) -> Zoom {
+        let mut best = Self::DESIGN;
+        let mut closest = f32::INFINITY;
+        for step in Self::MIN..=Self::MAX {
+            let z = Zoom(step);
+            let d = (z.percent() as f32 - pct).abs();
+            if d < closest {
+                closest = d;
+                best = z;
+            }
+        }
+        best
+    }
+}
+
 /// Line height as a multiple of the font size. Chinese needs noticeably more
 /// leading than Latin at the same point size: ideographs are full-square, so the
 /// descender gap that separates Latin lines is absent.
@@ -110,6 +169,9 @@ impl Leading {
 #[derive(Clone, Debug)]
 pub struct Theme {
     pub fonts: Fonts,
+    /// The body size being read right now, in points: the design's own size scaled by
+    /// [`Theme::zoom`]. Written only by [`Theme::set_zoom`], because everything else
+    /// here is stated in ems of it.
     pub base: Pt,
     /// Heading sizes as a multiple of `base`, index 0 = h1.
     pub heading_scale: [f32; 6],
@@ -120,18 +182,25 @@ pub struct Theme {
     pub space_before_heading: f32,
     pub space_before_code: f32,
     /// Longest readable measure, in ems of the body size.
+    ///
+    /// Ems rather than points, so it is a number of characters: a glyph is about half
+    /// an em wide in Latin and a whole em in Chinese, so a measure that is a length in
+    /// ems holds the same count of them at any size. Zooming changes the size of the
+    /// page, not how much text a line carries.
     pub max_measure_em: Pt,
     pub first_line_indent_em: Pt,
     pub quote_indent_em: Pt,
     pub list_indent_em: Pt,
+    /// The reader's size preference, applied to [`Theme::base`] by [`Theme::set_zoom`].
+    /// Carried by the theme so a relayout needs only the theme it is already handed.
+    pub zoom: Zoom,
 }
 
 impl Default for Theme {
     fn default() -> Self {
         Self {
             fonts: Fonts::default(),
-            // 13.5pt is ~18px at 96 dpi, the size long-form CJK reading settles on.
-            base: 13.5,
+            base: Self::DESIGN_BASE,
             heading_scale: [2.0, 1.6, 1.32, 1.15, 1.0, 0.92],
             heading_leading: Leading { latin: 1.3, cjk: 1.5 },
             body_leading: Leading { latin: 1.7, cjk: 1.95 },
@@ -145,7 +214,27 @@ impl Default for Theme {
             first_line_indent_em: 0.0,
             quote_indent_em: 1.2,
             list_indent_em: 1.6,
+            zoom: Zoom::DESIGN,
         }
+    }
+}
+
+impl Theme {
+    /// 13.5pt is ~18px at 96 dpi, the size long-form CJK reading settles on.
+    ///
+    /// A constant rather than a value remembered on the instance: the live [`Theme::base`]
+    /// is always this number times the zoom and never a step off the last press, so
+    /// `Ctrl`+`0` lands exactly here however far the reader had wandered.
+    pub const DESIGN_BASE: Pt = 13.5;
+
+    /// Read the page at a new size.
+    ///
+    /// One number carries the whole zoom because every other metric in a `Theme` is
+    /// already an em of it: leading, block spacing, indents and the measure all follow
+    /// the body size, so the page grows as a design rather than as text in a frame.
+    pub fn set_zoom(&mut self, zoom: Zoom) {
+        self.zoom = zoom;
+        self.base = Self::DESIGN_BASE * zoom.factor();
     }
 }
 
@@ -340,8 +429,7 @@ mod tests {
     }
 
     #[test]
-    fn notes_are_smaller_and_tighter_than_the_prose_they_annotate() {
-        let t = Theme::default();
+    fn notes_are_smaller_and_tighter_than_the_prose_they_annotate() {        let t = Theme::default();
         let body = t.body_size(BlockKind::Paragraph);
         let note = t.note_body_size(BlockKind::Paragraph);
         assert!(note < body, "a note at {note} should sit under body prose at {body}");
@@ -353,5 +441,95 @@ mod tests {
         assert!(nh > note);
         assert!(nh < t.body_size(BlockKind::Heading(1)));
         assert!(t.note_body_size(BlockKind::Heading(1)) > t.note_body_size(BlockKind::Heading(3)));
+    }
+
+    /// Zooming is one number, and that is the claim worth testing: if any metric were
+    /// stated in absolute points instead of ems of the body size, it would stay behind
+    /// and the page would reflow into a shape nobody designed.
+    #[test]
+    fn zoom_scales_every_metric_by_the_same_ratio() {
+        let design = Theme::default();
+        let ratio = Zoom::DESIGN.up().up().up().factor();
+        assert_eq!(design.zoom, Zoom::DESIGN, "a fresh theme is the design size");
+        assert_eq!(design.base, Theme::DESIGN_BASE);
+        let mut t = design.clone();
+        t.set_zoom(Zoom::DESIGN.up().up().up());
+        assert!(
+            (t.base - design.base * ratio).abs() < 1e-3,
+            "body should be {}pt, got {}",
+            design.base * ratio,
+            t.base
+        );
+        for (a, b) in [
+            (t.body_size(BlockKind::Heading(2)), design.body_size(BlockKind::Heading(2))),
+            (t.body_size(BlockKind::Code), design.body_size(BlockKind::Code)),
+            (t.note_size(), design.note_size()),
+            (t.space_before(BlockKind::Paragraph, false), design.space_before(BlockKind::Paragraph, false)),
+            (t.max_measure_em * t.base, design.max_measure_em * design.base),
+        ] {
+            assert!(
+                (a - b * ratio).abs() < 0.02,
+                "metric scaled by {} instead of {ratio}",
+                a / b
+            );
+        }
+        // Ratios the reader has not asked to change must not change: a heading is the
+        // same multiple of body at every size, or zooming would be re-typesetting.
+        assert!(
+            (t.body_size(BlockKind::Heading(1)) / t.base
+                - design.body_size(BlockKind::Heading(1)) / design.base)
+                .abs()
+                < 1e-4
+        );
+    }
+
+    #[test]
+    fn zoom_resets_exactly_and_cannot_run_away() {
+        let mut t = Theme::default();
+        for _ in 0..20 {
+            t.set_zoom(t.zoom.up());
+        }
+        assert!(t.base < Theme::DESIGN_BASE * 2.5, "the ladder has a top: {}", t.base);
+        let largest = t.zoom;
+        for _ in 0..40 {
+            t.set_zoom(t.zoom.down());
+        }
+        assert!(t.base > 6.0, "and a bottom, but not an unreadable one: {}", t.base);
+        t.set_zoom(Zoom::DESIGN);
+        assert_eq!(t.base, Theme::DESIGN_BASE, "Ctrl+0 must return to the design size");
+        // Stepping back and forth lands on the same size each time, which is only true
+        // because the factor comes from the step and not from the last press.
+        let a = {
+            let mut t = Theme::default();
+            for _ in 0..5 {
+                t.set_zoom(t.zoom.up());
+            }
+            for _ in 0..3 {
+                t.set_zoom(t.zoom.down());
+            }
+            t.base
+        };
+        let b = {
+            let mut t = Theme::default();
+            t.set_zoom(t.zoom.down());
+            t.set_zoom(t.zoom.up());
+            t.set_zoom(t.zoom.up());
+            t.base
+        };
+        assert!((a - b).abs() < 1e-4, "{a} vs {b}");
+        assert!(largest.percent() > 100 && Zoom::DESIGN.percent() == 100);
+    }
+
+    #[test]
+    fn a_requested_percentage_lands_on_the_nearest_step() {
+        assert_eq!(Zoom::nearest_percent(100.0), Zoom::DESIGN);
+        // 170% is not on the ladder; the steps around it are 144 and 173.
+        assert_eq!(Zoom::nearest_percent(170.0), Zoom::DESIGN.up().up().up());
+        assert_eq!(Zoom::nearest_percent(1.0), Zoom::nearest_percent(-50.0), "clamped at the bottom");
+        assert_eq!(
+            Zoom::nearest_percent(9999.0),
+            Zoom::DESIGN.up().up().up().up(),
+            "and at the top"
+        );
     }
 }

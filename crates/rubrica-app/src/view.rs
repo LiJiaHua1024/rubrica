@@ -44,6 +44,9 @@ use windows::Win32::UI::Input::KeyboardAndMouse::{
     GetKeyState, ReleaseCapture, SetCapture, VK_CONTROL, VK_O, VK_UP,
 };
 use windows::Win32::UI::Input::KeyboardAndMouse::{VK_DOWN, VK_ESCAPE, VK_NEXT, VK_PRIOR};
+use windows::Win32::UI::Input::KeyboardAndMouse::{
+    VK_0, VK_ADD, VK_D, VK_NUMPAD0, VK_OEM_MINUS, VK_OEM_PLUS, VK_SUBTRACT, VIRTUAL_KEY,
+};
 use windows::Win32::UI::Controls::Dialogs::{
     GetOpenFileNameW, OPENFILENAMEW, OFN_FILEMUSTEXIST, OFN_HIDEREADONLY, OFN_PATHMUSTEXIST,
 };
@@ -63,7 +66,7 @@ use crate::font::{FaceRequest, FontEngine, GlyphRun, ObjectBox, Style as RunStyl
 use crate::hyphen::Hyphenator;
 use crate::images::ImageStore;
 use crate::math::MathStore;
-use crate::theme::{ColorRole, Leading, Theme};
+use crate::theme::{ColorRole, Leading, Theme, Zoom};
 use crate::{Error, Result};
 
 /// The character drawn at a discretionary break, and the range to shape it from.
@@ -209,6 +212,10 @@ pub struct View {
     doc: Document,
     ops: Vec<Op>,
     palette: Palette,
+    /// The palette the reader asked for with `Ctrl`+`D`. `None` follows the system,
+    /// which is what the appearance poll reports; a manual choice has to outrank that
+    /// answer or the next timer tick would undo it.
+    dark_override: Option<bool>,
     brushes: HashMap<ColorRole, ID2D1SolidColorBrush>,
     scroll: Pt,
     content_h: Pt,
@@ -251,6 +258,13 @@ fn scale_of(dpi: f32) -> f32 {
     dpi / 72.0
 }
 
+/// Whether a modifier is down. Read from the keyboard state rather than from the
+/// message: `WM_KEYDOWN` carries no modifier flags of its own, and a key that only
+/// means something with `Ctrl` has to ask.
+fn held(vk: VIRTUAL_KEY) -> bool {
+    unsafe { (GetKeyState(vk.0 as i32) as u16 & 0x8000) != 0 }
+}
+
 pub fn run(source: String, path: Option<PathBuf>) -> Result<()> {
     // Must happen before the first window exists, or the process is already
     // bitmap-scaled and text on a secondary high-density monitor is soft.
@@ -277,6 +291,7 @@ pub fn run(source: String, path: Option<PathBuf>) -> Result<()> {
         doc: Document::parse(&source),
         ops: Vec::new(),
         palette: Palette::of(system_prefers_dark()),
+        dark_override: None,
         brushes: HashMap::new(),
         scroll: 0.0,
         content_h: 0.0,
@@ -389,13 +404,14 @@ unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM)
             PostQuitMessage(0);
             LRESULT(0)
         }
-        WM_PAINT | WM_SIZE | WM_DPICHANGED | WM_MOUSEWHEEL | WM_KEYDOWN | WM_TIMER => {
-            match view {
-                Some(v) => v.on_message(hwnd, msg, wp, lp),
-                None => DefWindowProcW(hwnd, msg, wp, lp),
-            }
-        }
-        _ => DefWindowProcW(hwnd, msg, wp, lp),
+        // Everything else that a created window can receive goes to the view, which
+        // falls through to `DefWindowProcW` itself. Listing the routed messages here as
+        // well was a second source of truth, and one the compiler could not check: a
+        // handler added below and forgotten above is a click that never arrives.
+        _ => match view {
+            Some(v) => v.on_message(hwnd, msg, wp, lp),
+            None => DefWindowProcW(hwnd, msg, wp, lp),
+        },
     }
 }
 
@@ -526,25 +542,55 @@ impl View {
             }
             WM_MOUSEWHEEL => {
                 let ticks = ((wp.0 >> 16) & 0xFFFF) as i16 as f32;
-                self.scroll_by(-ticks / 120.0 * WHEEL_STEP);
-                let _ = InvalidateRect(Some(hwnd), None, false);
+                if held(VK_CONTROL) {
+                    // The one gesture every Windows reader already means: `Ctrl` turns
+                    // the wheel from a scroller into a magnifier. A notch is a whole
+                    // ladder step, which is as fine as a wheel can be made to be.
+                    let zoom = if ticks > 0.0 { self.theme.zoom.up() } else { self.theme.zoom.down() };
+                    self.zoom_to(zoom, hwnd);
+                } else {
+                    self.scroll_by(-ticks / 120.0 * WHEEL_STEP);
+                    let _ = InvalidateRect(Some(hwnd), None, false);
+                }
                 LRESULT(0)
             }
             WM_KEYDOWN => {
                 let step = self.theme.base * self.theme.body_leading.latin;
                 let page = self.client_h / scale_of(self.dpi) * 0.85;
+                let ctrl = held(VK_CONTROL);
                 match wp.0 as u32 {
                     k if k == VK_UP.0 as u32 => self.scroll_by(-step),
                     k if k == VK_DOWN.0 as u32 => self.scroll_by(step),
                     k if k == VK_PRIOR.0 as u32 => self.scroll_by(-page),
                     k if k == VK_NEXT.0 as u32 => self.scroll_by(page),
                     k if k == VK_ESCAPE.0 as u32 => PostQuitMessage(0),
-                    k if k == VK_O.0 as u32
-                        && (GetKeyState(VK_CONTROL.0 as i32) as u16 & 0x8000) != 0 =>
-                    {
+                    k if k == VK_O.0 as u32 && ctrl => {
                         if let Some(path) = self.prompt_for_file(hwnd) {
                             self.load_document(&path);
                         }
+                    }
+                    // The virtual-key codes name physical keys, so both the shifted and
+                    // unshifted form of the same key (`+` and `=`) arrive as one of
+                    // these, and the numpad's own `+`/`-` mean the same thing to a
+                    // reader reaching for the zoom.
+                    k if ctrl && (k == VK_OEM_PLUS.0 as u32 || k == VK_ADD.0 as u32) => {
+                        let z = self.theme.zoom.up();
+                        self.zoom_to(z, hwnd);
+                    }
+                    k if ctrl && (k == VK_OEM_MINUS.0 as u32 || k == VK_SUBTRACT.0 as u32) => {
+                        let z = self.theme.zoom.down();
+                        self.zoom_to(z, hwnd);
+                    }
+                    k if ctrl && (k == VK_0.0 as u32 || k == VK_NUMPAD0.0 as u32) => {
+                        self.zoom_to(Zoom::DESIGN, hwnd);
+                    }
+                    // Both palettes are always one keypress apart, whichever way the
+                    // system setting points: a reader in a bright room at 2pm has the
+                    // same claim on the dark one as anyone whose OS says so.
+                    k if ctrl && k == VK_D.0 as u32 => {
+                        let dark = !self.palette.dark;
+                        self.dark_override = Some(dark);
+                        self.set_dark(dark, hwnd);
                     }
                     _ => {}
                 }
@@ -552,13 +598,11 @@ impl View {
                 LRESULT(0)
             }
             WM_TIMER => {
-                let dark = system_prefers_dark();
-                if dark != self.palette.dark {
-                    self.palette = Palette::of(dark);
-                    self.brushes.clear();
-                    self.apply_dark_titlebar(hwnd);
-                    self.relayout();
-                }
+                // A poll, not a push: there is no message for this setting. The reader's
+                // own choice outranks it, and `set_dark` does nothing when the answer it
+                // gets is already on screen.
+                let dark = self.dark_override.unwrap_or_else(system_prefers_dark);
+                self.set_dark(dark, hwnd);
                 let _ = InvalidateRect(Some(hwnd), None, false);
                 LRESULT(0)
             }
@@ -605,9 +649,47 @@ impl View {
     }
 
     fn scroll_by(&mut self, dy: Pt) {
+        self.scroll += dy;
+        self.clamp_scroll();
+    }
+
+    /// A relayout can leave the offset past the end of a document that has just grown.
+    fn clamp_scroll(&mut self) {
         let view_h = self.client_h / scale_of(self.dpi);
         let max = (self.content_h + self.theme.base - view_h).max(0.0);
-        self.scroll = (self.scroll + dy).clamp(0.0, max);
+        self.scroll = self.scroll.clamp(0.0, max);
+    }
+
+    /// Change the reading size, and keep the reader's place through it.
+    ///
+    /// The scroll offset is a distance in points, and the points it counted have just
+    /// changed size: scaling it by the same ratio leaves the same line of text under
+    /// the top edge. Leaving it is a jump to another paragraph, which is the one thing
+    /// a reader pressing `+` should never get.
+    fn zoom_to(&mut self, zoom: Zoom, hwnd: HWND) {
+        let before = self.theme.base;
+        self.theme.set_zoom(zoom);
+        if (self.theme.base - before).abs() < 0.001 {
+            // Already at an end of the ladder: nothing moved, so nothing repaints.
+            return;
+        }
+        self.scroll *= self.theme.base / before;
+        self.relayout();
+        self.clamp_scroll();
+        let _ = unsafe { InvalidateRect(Some(hwnd), None, false) };
+    }
+
+    /// Paint in one palette or the other. Cheap when it is already the right one, since
+    /// the appearance poll calls this on every tick.
+    fn set_dark(&mut self, dark: bool, hwnd: HWND) {
+        if dark == self.palette.dark {
+            return;
+        }
+        self.palette = Palette::of(dark);
+        // The brushes hold the old inks, keyed by role rather than by palette, so they
+        // have to go; the layout is ink-independent and needs no work.
+        self.brushes.clear();
+        unsafe { self.apply_dark_titlebar(hwnd) };
     }
 
     fn relayout(&mut self) {
