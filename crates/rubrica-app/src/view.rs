@@ -217,6 +217,10 @@ pub enum HotKind {
     /// [`Page::note_tops`]. The note is on the page already, so a citation is jumped to
     /// rather than opened somewhere else.
     Cite(usize),
+    /// A fragment link naming the heading at this index, whose top is in
+    /// [`Page::anchor_tops`]. A table of contents is only worth setting if clicking it
+    /// goes somewhere.
+    Heading(usize),
 }
 
 /// A rectangle of the document a click can land on, in the same device independent
@@ -469,6 +473,9 @@ pub struct Page {
     pub hotspots: Vec<Hot>,
     /// Where each footnote's first line begins, indexed like [`Document::footnotes`].
     pub note_tops: Vec<Pt>,
+    /// Where each heading's first line begins, indexed by the same order the source
+    /// lists them in, so a fragment link can be resolved to one by [`slug`].
+    pub anchor_tops: Vec<Pt>,
     /// Every line of text the page drew, in the order a drag crosses them, which is
     /// what makes the page selectable.
     pub sel: Vec<SelLine>,
@@ -491,6 +498,8 @@ pub struct View {
     /// The targets of the current layout, and where each note begins.
     hotspots: Vec<Hot>,
     note_tops: Vec<Pt>,
+    /// Where each heading begins, for the fragment links in a table of contents.
+    anchor_tops: Vec<Pt>,
     /// The page's text, character by character, as the current layout drew it.
     sel_index: Vec<SelLine>,
     /// What the reader has dragged out, if anything. Cleared by a relayout, whose
@@ -577,6 +586,38 @@ pub(crate) fn openable(url: &str) -> bool {
     }
 }
 
+/// The address a heading answers to, derived from its own text: lowered, a run of
+/// whitespace turned into one hyphen, and nothing kept but letters, digits, hyphens and
+/// underscores -- so the punctuation a heading's prose carries, and the markup around an
+/// inline code span or a formula, all drop out.
+///
+/// Written down as a rule rather than left to taste, because the only way to point at a
+/// heading is for an author to spell this out by hand in a table of contents: if the rule
+/// is not the one they can guess, the link is dead and nothing on the page says why.
+/// A script that writes words without spaces keeps its characters whole, which is what
+/// makes a heading in one language as clickable as a heading in another.
+pub(crate) fn slug(text: &str) -> String {
+    let mut out = String::new();
+    let mut pending = false;
+    for c in text.chars() {
+        if c.is_whitespace() {
+            // Only after something has been kept: a heading that opens with markup or an
+            // indent has no reason to start its address with a hyphen.
+            pending = !out.is_empty();
+            continue;
+        }
+        if !(c.is_alphanumeric() || c == '-' || c == '_') {
+            continue;
+        }
+        if pending {
+            out.push('-');
+            pending = false;
+        }
+        out.extend(c.to_lowercase());
+    }
+    out
+}
+
 /// Hand an accepted address to the shell, which is what decides the browser or the mail
 /// client that answers.
 fn open_url(url: &str) {
@@ -644,6 +685,7 @@ pub fn run(source: String, path: Option<PathBuf>) -> Result<()> {
         brushes: HashMap::new(),
         hotspots: Vec::new(),
         note_tops: Vec::new(),
+        anchor_tops: Vec::new(),
         sel_index: Vec::new(),
         selection: None,
         press_caret: None,
@@ -1150,17 +1192,21 @@ impl View {
         let Some(kind) = self.hotspots.get(i).map(|h| h.kind.clone()) else { return };
         match kind {
             HotKind::Url(url) => open_url(&url),
-            HotKind::Cite(note) => {
-                if let Some(&top) = self.note_tops.get(note) {
-                    // The note lands a line below the top edge rather than against it,
-                    // so some of the page just left stays in view: a citation is followed
-                    // to read, and reading means being able to come back.
-                    self.scroll = (top - self.theme.base).max(0.0);
-                    self.clamp_scroll();
-                    let _ = unsafe { InvalidateRect(Some(hwnd), None, false) };
-                }
-            }
+            HotKind::Cite(note) => self.jump_to(self.note_tops.get(note).copied(), hwnd),
+            HotKind::Heading(at) => self.jump_to(self.anchor_tops.get(at).copied(), hwnd),
         }
+    }
+
+    /// Bring a place on this page to the top of the window.
+    ///
+    /// It lands a line below the edge rather than against it, so some of what the
+    /// reader just left stays in view: a jump is followed in order to read, and reading
+    /// means being able to tell where one came from -- and to get back there.
+    fn jump_to(&mut self, top: Option<Pt>, hwnd: HWND) {
+        let Some(top) = top else { return };
+        self.scroll = (top - self.theme.base).max(0.0);
+        self.clamp_scroll();
+        let _ = unsafe { InvalidateRect(Some(hwnd), None, false) };
     }
 
     /// A relayout can leave the offset past the end of a document that has just grown.
@@ -1225,6 +1271,7 @@ impl View {
         self.ops = page.ops;
         self.hotspots = page.hotspots;
         self.note_tops = page.note_tops;
+        self.anchor_tops = page.anchor_tops;
         // A selection is a pair of places in the old wrapping. Lines have moved, so
         // the words they named are elsewhere, and holding on to the range would show
         // the reader ink they never dragged over.
@@ -1244,6 +1291,9 @@ struct Ctx<'a> {
     /// Which footnote a citation's label names, which is how a raised number becomes a
     /// jump to a position on the page.
     notes: &'a HashMap<String, usize>,
+    /// Which heading a fragment's slug names, indexed the same way -- the bridge from
+    /// the address a table of contents writes to the line it is asking for.
+    anchors: &'a HashMap<String, usize>,
     /// Points to device independent pixels.
     k: f32,
 }
@@ -1409,25 +1459,34 @@ fn emit_hots(
     hots: &mut Vec<Hot>,
     actions: &[Action],
     hit: &[Option<(Pt, Pt)>],
-    notes: &HashMap<String, usize>,
+    ctx: &Ctx,
     top: Pt,
     line_h: Pt,
-    k: f32,
 ) {
+    let k = ctx.k;
     for (i, h) in hit.iter().enumerate() {
         let Some((x0, x1)) = *h else { continue };
-        let Some(kind) = hot_kind(&actions[i].kind, notes) else { continue };
+        let Some(kind) = hot_kind(&actions[i].kind, ctx) else { continue };
         hots.push(Hot { x: x0 * k, y: top * k, w: (x1 - x0) * k, h: line_h * k, kind });
     }
 }
 
 /// The jump an action offers, or `None` when its destination is not on the page or
 /// not openable.
-fn hot_kind(kind: &ActionKind, notes: &HashMap<String, usize>) -> Option<HotKind> {
+fn hot_kind(kind: &ActionKind, ctx: &Ctx) -> Option<HotKind> {
     match kind {
         ActionKind::Url(u) if openable(u) => Some(HotKind::Url(u.clone())),
-        ActionKind::Cite(label) => notes.get(label.as_str()).copied().map(HotKind::Cite),
-        _ => None,
+        // A fragment is an address into this file, so it is answered here rather than
+        // handed to the shell -- and only when the heading it names is on the page.
+        // The reader may have written the heading's own words rather than its address,
+        // so what they wrote goes through the same rule the heading was indexed by.
+        ActionKind::Url(u) => match u.strip_prefix('#') {
+            Some(fragment) => {
+                ctx.anchors.get(&slug(fragment)).copied().map(HotKind::Heading)
+            }
+            None => None,
+        },
+        ActionKind::Cite(label) => ctx.notes.get(label.as_str()).copied().map(HotKind::Cite),
     }
 }
 
@@ -1542,7 +1601,7 @@ fn layout_block(
     mut y: Pt,
 ) -> Pt {
     let Out { ops, hots, sel } = out;
-    let Ctx { theme, styles, math, notes, k } = *ctx;
+    let Ctx { theme, styles, math, k, .. } = *ctx;
     let Blk { b, text, spans, base, left, column, hyphenation, size, hang, actions, .. } = *blk;
     let leading = &blk.leading;
     let mut images_out: Vec<(PathBuf, f32, f32, Pt, Pt)> = Vec::new();
@@ -1718,7 +1777,7 @@ fn layout_block(
         for (file, x, w, a, d) in images_out.drain(..) {
             ops.push(Op::Image { path: file, x, y: (baseline - a) * k, w, h: (a + d) * k });
         }
-        emit_hots(hots, actions, &hit, notes, top, line_h, k);
+        emit_hots(hots, actions, &hit, ctx, top, line_h);
         marks.sort_unstable_by_key(|m| m.0);
         // The first character the block has indexed is the first character of the
         // block, wherever on the page it ended up: that line takes the blank line the
@@ -2165,7 +2224,7 @@ fn layout_table(
                         color,
                     });
                 }
-                emit_hots(hots, &c.actions, &hit, ctx.notes, ly, size * leading, k);
+                emit_hots(hots, &c.actions, &hit, ctx, ly, size * leading);
                 marks.sort_unstable_by_key(|m| m.0);
                 let join = if opens[lines_out] == i {
                     // The first cell of a line the row has reached: a new line of the
@@ -2566,6 +2625,23 @@ pub fn build_ops(
     // layout because layout is where a citation's text is first read.
     let notes: HashMap<String, usize> =
         doc.footnotes.iter().enumerate().map(|(i, f)| (f.label.clone(), i)).collect();
+    // A fragment link addresses a heading by the words in it, and the page knows
+    // headings only by where they landed, so this is the same bridge a citation needs --
+    // built before any layout for the same reason, since layout is where the link's text
+    // is first read. The index is the heading's ordinal among the document's headings,
+    // which is the order `anchor_tops` is filled in below. Where two headings say the
+    // same thing, the address points at the first: that is the only one an author
+    // writing the address by hand can have meant.
+    let mut anchor_tops: Vec<Pt> = Vec::new();
+    let anchors: HashMap<String, usize> = doc
+        .blocks
+        .iter()
+        .filter(|b| matches!(b.kind, BlockKind::Heading(_)))
+        .enumerate()
+        .fold(HashMap::new(), |mut m, (i, b)| {
+            m.entry(slug(&b.text)).or_insert(i);
+            m
+        });
     let mut y = theme.base * 2.0;
     let mut first = true;
 
@@ -2622,7 +2698,7 @@ pub fn build_ops(
             .collect(),
     );
 
-    let ctx = Ctx { theme, styles: &styles, math: &*objects.math, notes: &notes, k };
+    let ctx = Ctx { theme, styles: &styles, math: &*objects.math, notes: &notes, anchors: &anchors, k };
 
     for (b, p) in doc.blocks.iter().zip(prepared) {
         let base_left = left;
@@ -2632,6 +2708,12 @@ pub fn build_ops(
         let size = theme.body_size(b.kind);
         y += theme.space_before(b.kind, first);
         first = false;
+        // Where a fragment link naming this heading has to land. Pushed here, at the top
+        // of the block rather than after it, because the line a reader asks to be taken
+        // to is the one their eye goes to first.
+        if matches!(b.kind, BlockKind::Heading(_)) {
+            anchor_tops.push(y);
+        }
         // A list's geometry belongs to the list, not to whichever block happens to be
         // standing at its level: an item's code fence set at its own, smaller size would
         // start its text a little left of the prose above it.
@@ -2754,7 +2836,16 @@ pub fn build_ops(
         })
     });
 
-    Page { ops, height: y + theme.base * 2.0, column, left, hotspots: hots, note_tops, sel }
+    Page {
+        ops,
+        height: y + theme.base * 2.0,
+        column,
+        left,
+        hotspots: hots,
+        note_tops,
+        anchor_tops,
+        sel,
+    }
 }
 
 #[cfg(test)]
@@ -3032,5 +3123,58 @@ mod tests {
         // the punctuation trailing off the end rather than selecting it.
         let sel = [sel_line("more. ", 0.0, Join::None)];
         assert_eq!(selection_text(&sel, word_at(&sel, Caret { line: 0, ch: 6 })), "more");
+    }
+
+    #[test]
+    fn a_headings_words_become_its_address() {
+        // Each case is one an author has to be able to guess, because guessing is all
+        // writing a fragment link involves.
+        for (heading, want) in [
+            ("Global Breaking", "global-breaking"),
+            ("Using `cargo run`", "using-cargo-run"),
+            // The mark goes and the space it stood in stays: a heading's words are still
+            // its words with the punctuation taken out, not run together.
+            ("Hello, World!", "hello-world"),
+            ("em–dash only", "emdash-only"),
+            ("  padded  heading  ", "padded-heading"),
+            ("snake_case and a – dash", "snake_case-and-a-dash"),
+            ("中西文 混排", "中西文-混排"),
+            ("$x^2$ display", "x2-display"),
+        ] {
+            assert_eq!(slug(heading), want, "{heading:?}");
+        }
+        // What an author writes is the heading's words, not its address, and both sides
+        // of a link go through the same rule, so either spelling arrives.
+        assert_eq!(slug("Global Breaking"), slug("global  breaking"));
+    }
+
+    #[test]
+    fn a_fragment_link_becomes_a_jump_to_its_heading() {
+        let theme = Theme::default();
+        let styles: Vec<AppStyle> = Vec::new();
+        let math = crate::math::MathStore::new();
+        let empty = HashMap::new();
+        let mut anchors = HashMap::new();
+        anchors.insert(slug("Global Breaking"), 0usize);
+        let ctx = Ctx {
+            theme: &theme,
+            styles: &styles,
+            math: &math,
+            notes: &empty,
+            anchors: &anchors,
+            k: 1.0,
+        };
+        let url = |u: &str| ActionKind::Url(u.to_string());
+        assert_eq!(hot_kind(&url("#global-breaking"), &ctx), Some(HotKind::Heading(0)));
+        // The heading's own words in place of an address: the same rule reads them.
+        assert_eq!(hot_kind(&url("#Global Breaking"), &ctx), Some(HotKind::Heading(0)));
+        // A page with no such heading gives no target to click, and a relative path is
+        // still a request for another file rather than a place in this one.
+        assert_eq!(hot_kind(&url("#elsewhere"), &ctx), None);
+        assert_eq!(hot_kind(&url("../other.md"), &ctx), None);
+        assert_eq!(
+            hot_kind(&url("https://example.com"), &ctx),
+            Some(HotKind::Url("https://example.com".into()))
+        );
     }
 }

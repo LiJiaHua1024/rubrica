@@ -204,12 +204,46 @@ pub fn report(source: &str, path: Option<&str>, width: f32, dpi: f32, hyphenate:
     // that has lost a link, and `refused` climbing is a document full of `file:`.
     let ranges = all_actions(&doc).count();
     if ranges > 0 {
+        // Every heading's address, in the order the page indexed them, so a fragment can
+        // be asked whether anything on the page answers it.
+        let slugs: Vec<String> = doc
+            .blocks
+            .iter()
+            .filter(|b| matches!(b.kind, rubrica_doc::BlockKind::Heading(_)))
+            .map(|b| crate::view::slug(&b.text))
+            .collect();
         let refused = all_actions(&doc)
-            .filter(|a| matches!(&a.kind, rubrica_doc::ActionKind::Url(u) if !crate::view::openable(u)))
+            .filter(|a| match &a.kind {
+                rubrica_doc::ActionKind::Url(u) => {
+                    !crate::view::openable(u)
+                        && !u
+                            .strip_prefix('#')
+                            .is_some_and(|f| slugs.contains(&crate::view::slug(f)))
+                }
+                _ => false,
+            })
             .count();
         let links = page.hotspots.iter().filter(|h| matches!(h.kind, crate::view::HotKind::Url(_))).count();
         let jumps = page.hotspots.iter().filter(|h| matches!(h.kind, crate::view::HotKind::Cite(_))).count();
-        println!("targets      : {ranges} range(s) -> {links} link rect(s), {jumps} citation rect(s), {refused} refused");
+        let headings = page.hotspots.iter().filter(|h| matches!(h.kind, crate::view::HotKind::Heading(_))).count();
+        // A fragment that names no heading is the interesting kind of dead link: the
+        // address was spelled out by hand from a heading's own words, and one of the two
+        // has since changed. Nothing on the page says so, so this does.
+        let dead = all_actions(&doc)
+            .filter(|a| match &a.kind {
+                rubrica_doc::ActionKind::Url(u) => {
+                    u.strip_prefix('#').is_some_and(|f| !slugs.contains(&crate::view::slug(f)))
+                }
+                _ => false,
+            })
+            .count();
+        let on_page = slugs.len();
+        println!(
+            "targets      : {ranges} range(s) -> {links} link rect(s), {jumps} citation rect(s), {headings}/{on_page} heading jump(s), {refused} refused"
+        );
+        if dead > 0 {
+            println!("!! {dead} fragment link(s) name no heading on the page");
+        }
         let tops: Vec<String> = page.note_tops.iter().map(|t| format!("{t:.1}")).collect();
         if !tops.is_empty() {
             println!("  notes at     : {} pt", tops.join(", "));
