@@ -55,7 +55,11 @@ opts.ragged = true; // headings, code
 
 $$\sum_{n=1}^{\infty} \frac{1}{n^2} = \frac{\pi^2}{6}$$
 
-上面每一个数字都取自字体自带的 MATH 表：分数线落在 axisHeight 上，分子按 numShift 上移，根号与括号由 glyph assembly 拼出需要的高度，而不是把一个字形纵向拉长。
+$$f(x) = \begin{cases} 1 & x \ge 0 \\ -1 & x < 0 \end{cases}$$
+
+$$\begin{pmatrix} a & b \\ c & d \end{pmatrix} \begin{pmatrix} x \\ y \end{pmatrix} = \begin{pmatrix} ax + by \\ cx + dy \end{pmatrix}$$
+
+上面每一个数字都取自字体自带的 MATH 表：分数线落在 axisHeight 上，分子按 numShift 上移，根号与括号由 glyph assembly 拼出需要的高度，而不是把一个字形纵向拉长。多行的公式也一样——行距取 mathLeading，整块以 axisHeight 为轴居中，所以矩阵和它旁边的分数线同高。
 
 ## 脚注
 

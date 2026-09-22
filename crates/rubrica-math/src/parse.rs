@@ -2,8 +2,9 @@
 //!
 //! Deliberately a subset, not a TeX implementation: the goal is the math people
 //! actually write in Markdown, so fractions, scripts, radicals, stretchy delimiters,
-//! big operators with limits, accents and the common symbol names are handled, and
-//! anything else degrades to its literal characters rather than disappearing.
+//! big operators with limits, accents, multi-row environments and the common symbol
+//! names are handled, and anything else degrades to its literal characters rather than
+//! disappearing.
 //!
 //! Unbalanced braces or an unknown command never fail the parse. A reader that
 //! refuses to show a document because one formula is malformed is worse than one
@@ -63,6 +64,21 @@ pub enum Node {
     },
     /// A fixed space, in mu (1/18 em).
     Space(i16),
+    /// A grid of cells: the `matrix`, `cases`, `aligned` and `array` families, which
+    /// are the only forms in the language that need more than one row.
+    ///
+    /// `rows` holds one entry per cell, each cell already gathered into a row of its
+    /// own nodes, and `columns` -- whose length is the widest row's cell count -- says
+    /// how a cell sits inside its column's width. `delimiters` is the pair the
+    /// environment brings with it, `'\0'` on either side meaning none there, which is
+    /// how `cases` carries its lone brace; the layout grows them to the grid's height
+    /// exactly as it grows a `\left ... \right` pair.
+    Array {
+        rows: Vec<Vec<Node>>,
+        columns: Vec<ColAlign>,
+        kind: ArrayKind,
+        delimiters: Option<(char, char)>,
+    },
 }
 
 /// Where a big operator's limits go: above/below in display style, as scripts
@@ -106,9 +122,49 @@ pub enum BarSide {
     Under,
 }
 
+/// Where a cell sits inside the width its column was measured to.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ColAlign {
+    Left,
+    Center,
+    Right,
+}
+
+/// Which family an environment belongs to, which is what decides the gaps the layout
+/// uses rather than the alignments -- those are already spelled out per column.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ArrayKind {
+    /// `matrix` and its bracketed spellings: centred columns.
+    Matrix,
+    /// `smallmatrix`, set one script step down as the name asks.
+    SmallMatrix,
+    /// `cases`: two left-aligned columns with room before the condition.
+    Cases,
+    /// `aligned`, `align`: `&` is an alignment tab, so the columns alternate
+    /// right-aligned and left-aligned about it and a relation stays in place.
+    Align,
+    /// `gathered`: centred, one cell per row in the usual case.
+    Gathered,
+    /// `array`: the column alignments come from the `{ccc}` argument.
+    Array,
+}
+
 pub struct Parser<'a> {
     src: &'a [u8],
     at: usize,
+}
+
+/// What a run of nodes is being collected up to. Inside an environment the cell and
+/// row separators are structure, so they end the run instead of turning into text.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Ctx {
+    /// The whole formula: nothing closes it, and `&`, `\\` and a stray `\end` are text.
+    Top,
+    /// A brace group or a `\left` body: ends at `}` or at the matching `\right`.
+    Group,
+    /// One cell of an environment: also ends at `&`, `\\` and any `\end`, none of
+    /// which is consumed here -- the environment reads them itself.
+    Cell,
 }
 
 /// Parse a whole formula, the entry point callers use.
@@ -123,7 +179,7 @@ impl<'a> Parser<'a> {
 
     /// Parse the whole input as a row.
     pub fn formula(&mut self) -> Node {
-        Node::Row(self.list(true))
+        Node::Row(self.list(Ctx::Top))
     }
 
     fn peek(&self) -> Option<u8> {
@@ -145,23 +201,47 @@ impl<'a> Parser<'a> {
     /// True at a `\right` that ends a `\left` group, and not at the longer
     /// `\Rightarrow`-style names.
     fn at_right(&self) -> bool {
-        self.rest().strip_prefix(b"\\right").is_some_and(|r| {
+        self.word_at(b"\\right")
+    }
+
+    /// True at an `\end`, which closes -- or fails to close -- the environment being
+    /// read, and not at an `\endash`-style name.
+    fn at_end(&self) -> bool {
+        self.word_at(b"\\end")
+    }
+
+    fn word_at(&self, word: &[u8]) -> bool {
+        self.rest().strip_prefix(word).is_some_and(|r| {
             !r.first().is_some_and(|c| c.is_ascii_alphabetic())
         })
     }
 
-    /// Parse nodes until `}` or, when `top`, the end of input. A `\left` group also
-    /// ends at its `\right`, which is the only way the pair can be matched up.
-    fn list(&mut self, top: bool) -> Vec<Node> {
+    /// True at the end of the cell being collected: a cell separator, a row separator
+    /// or the `\end` that closes the environment.
+    fn at_cell_break(&self) -> bool {
+        matches!(self.peek(), Some(b'&')) || self.at_row_break() || self.at_end()
+    }
+
+    fn at_row_break(&self) -> bool {
+        self.rest().starts_with(b"\\\\")
+    }
+
+    /// Parse nodes until `}` or, when the run is the whole formula, the end of input.
+    /// A `\left` group also ends at its `\right`, which is the only way the pair can be
+    /// matched up, and a cell ends at the separators that structure it.
+    fn list(&mut self, ctx: Ctx) -> Vec<Node> {
         let mut out: Vec<Node> = Vec::new();
         loop {
-            if !top && self.at_right() {
+            if ctx != Ctx::Top && self.at_right() {
+                break;
+            }
+            if ctx == Ctx::Cell && self.at_cell_break() {
                 break;
             }
             match self.peek() {
                 None => break,
                 Some(b'}') => {
-                    if top {
+                    if ctx == Ctx::Top {
                         // A stray closer has no group to end, so it is just a
                         // character. Truncating the rest of the formula over it would
                         // lose the part the reader still needs.
@@ -174,7 +254,7 @@ impl<'a> Parser<'a> {
                 }
                 Some(b'{') => {
                     self.bump();
-                    let inner = Node::Row(self.list(false));
+                    let inner = Node::Row(self.list(Ctx::Group));
                     self.push(&mut out, inner);
                 }
                 Some(b'\\') => {
@@ -270,7 +350,7 @@ impl<'a> Parser<'a> {
         match self.peek() {
             Some(b'{') => {
                 self.bump();
-                Node::Row(self.list(false))
+                Node::Row(self.list(Ctx::Group))
             }
             Some(b'\\') => self.command().unwrap_or(Node::Atom(String::new())),
             Some(_) => {
@@ -314,6 +394,13 @@ impl<'a> Parser<'a> {
 
     fn named(&mut self, name: &str) -> Node {
         match name {
+            "begin" => self.environment(),
+            "end" => {
+                // An `\end` with no `\begin` to answer it: show what was written,
+                // braces and all, instead of cutting the formula short over it.
+                let name = self.braced_text().unwrap_or_default();
+                Node::Atom(format!("\\end{{{name}}}"))
+            }
             "frac" | "dfrac" | "tfrac" => {
                 let a = self.argument();
                 let b = self.argument();
@@ -358,7 +445,7 @@ impl<'a> Parser<'a> {
             }
             "left" => {
                 let l = self.delim();
-                let body = Node::Row(self.list(false));
+                let body = Node::Row(self.list(Ctx::Group));
                 let r = if self.at_right() {
                     self.bump(); // the backslash of `\right`
                     let start = self.at;
@@ -398,6 +485,148 @@ impl<'a> Parser<'a> {
 
     fn accent(&mut self, kind: AccentKind) -> Node {
         Node::Accent { base: Box::new(self.argument()), accent: kind }
+    }
+
+    /// `\begin{X} ... \end{X}`: a grid of cells. The name decides the kind, and with
+    /// it the alignments and the delimiters the environment brings.
+    ///
+    /// Three failures are handled the same way -- an environment whose name is not one
+    /// of ours, one that is never closed, and one closed by an `\end` naming something
+    /// else -- by setting the cells that were read inline beside the literal marker
+    /// text. A reader loses the arrangement, not the mathematics.
+    fn environment(&mut self) -> Node {
+        let Some(name) = self.braced_text() else {
+            // `\begin` with nothing after it: the word itself, and no more eaten.
+            return Node::Atom("\\begin".into());
+        };
+        let Some(kind) = array_kind(&name) else {
+            let (rows, end) = self.env_rows();
+            return Self::degraded(&name, rows, end.as_deref());
+        };
+        // `array` is the one environment whose columns are written out, and the
+        // argument has to be taken here or its braces land in the first cell.
+        let spec = if kind == ArrayKind::Array { self.column_spec() } else { Vec::new() };
+        let (rows, end) = self.env_rows();
+        if end.as_deref() != Some(name.as_str()) {
+            return Self::degraded(&name, rows, end.as_deref());
+        }
+        let cols = rows.iter().map(|r| r.len()).max().unwrap_or(0).max(1);
+        let columns = columns_for(kind, &spec, cols);
+        let rows = rows.into_iter().map(|r| r.into_iter().map(Node::Row).collect()).collect();
+        Node::Array { rows, columns, kind, delimiters: env_delimiters(&name) }
+    }
+
+    /// The cells of an environment's body, split on `&` and `\\`, and the name its
+    /// `\end` carried if it reached one. Whatever closed the run -- a matching `\end`,
+    /// a mismatched one, a stray `}`, a `\right` belonging to an enclosing group or the
+    /// end of the input -- the search stops there rather than eating what follows.
+    fn env_rows(&mut self) -> (Vec<Vec<Vec<Node>>>, Option<String>) {
+        let mut rows: Vec<Vec<Vec<Node>>> = Vec::new();
+        let mut row: Vec<Vec<Node>> = Vec::new();
+        let mut end = None;
+        loop {
+            let cell = self.list(Ctx::Cell);
+            if self.peek() == Some(b'&') {
+                self.bump();
+                row.push(cell);
+                continue;
+            }
+            // A separator with nothing around it is punctuation, not an empty row: a
+            // trailing `\\` before the closer, or two in a row.
+            let blank = cell.is_empty() && row.is_empty();
+            if self.at_row_break() {
+                self.bump_row_break();
+                if !blank {
+                    row.push(cell);
+                    rows.push(std::mem::take(&mut row));
+                }
+                continue;
+            }
+            if !blank {
+                row.push(cell);
+                rows.push(std::mem::take(&mut row));
+            }
+            if self.at_end() {
+                end = self.eat_end();
+            }
+            return (rows, end);
+        }
+    }
+
+    /// Consume a `\\`, its optional `*` and its optional `[distance]`. The row gap is
+    /// not varied per row, but the bracket must not leak into the cell after it.
+    fn bump_row_break(&mut self) {
+        self.bump();
+        self.bump();
+        if self.peek() == Some(b'*') {
+            self.bump();
+        }
+        self.skip_bracketed();
+    }
+
+    /// Consume `\end` -- which the caller has just seen -- and its braced name.
+    fn eat_end(&mut self) -> Option<String> {
+        self.at += 4; // `\end`, the four bytes `at_end` has just checked for
+        while self.peek() == Some(b' ') {
+            self.bump();
+        }
+        self.braced_text()
+    }
+
+    /// An environment's content set in a row, with the markers that failed shown as
+    /// the literal text they are -- what an unknown command already does.
+    fn degraded(name: &str, rows: Vec<Vec<Vec<Node>>>, end: Option<&str>) -> Node {
+        let mut out: Vec<Node> = vec![Node::Atom(format!("\\begin{{{name}}}"))];
+        for row in rows {
+            for mut cell in row {
+                out.append(&mut cell);
+            }
+        }
+        if let Some(end) = end {
+            out.push(Node::Atom(format!("\\end{{{end}}}")));
+        }
+        Node::Row(out)
+    }
+
+    /// A braced word right here, with both braces consumed: an environment's name or
+    /// an `array`'s column spec. `None` and nothing eaten when the braces are not
+    /// there, so a stray `\begin x` leaves the `x` to the formula around it.
+    fn braced_text(&mut self) -> Option<String> {
+        if self.peek() != Some(b'{') {
+            return None;
+        }
+        let close = self.src[self.at + 1..].iter().position(|c| *c == b'}')?;
+        let s = std::str::from_utf8(&self.src[self.at + 1..self.at + 1 + close]).ok()?;
+        self.at += close + 2; // past the contents and both braces
+        Some(s.to_string())
+    }
+
+    /// The `{ccc}` / `{l|l}` argument an `array` takes. Only `l`, `c` and `r` choose an
+    /// alignment; the vertical rules and anything else are consumed and dropped, since
+    /// a rule between columns is not something the layout draws yet.
+    fn column_spec(&mut self) -> Vec<ColAlign> {
+        let Some(spec) = self.braced_text() else {
+            return Vec::new();
+        };
+        spec.chars()
+            .filter_map(|c| match c {
+                'l' => Some(ColAlign::Left),
+                'c' => Some(ColAlign::Center),
+                'r' => Some(ColAlign::Right),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// A `[...]` option, skipped. Nothing is consumed unless the closer is there, so an
+    /// unterminated bracket cannot swallow the rest of the formula.
+    fn skip_bracketed(&mut self) {
+        if self.peek() != Some(b'[') {
+            return;
+        }
+        if let Some(end) = self.src[self.at + 1..].iter().position(|c| *c == b']') {
+            self.at += end + 2;
+        }
     }
 
     /// A command that denotes glyphs rather than structure: a big operator, an
@@ -634,6 +863,57 @@ pub fn big_operator(name: &str) -> Option<(String, Limits)> {
     Some((text.to_string(), limits))
 }
 
+/// Which of the multi-row families an environment name belongs to. `None` is an
+/// environment the layout cannot draw, which the caller degrades instead of failing;
+/// the starred and unstarred spellings of `align` and `gather` differ only in whether
+/// TeX numbers the rows, which a reader never sees here.
+fn array_kind(name: &str) -> Option<ArrayKind> {
+    Some(match name {
+        "matrix" | "pmatrix" | "bmatrix" | "Bmatrix" | "vmatrix" | "Vmatrix" => ArrayKind::Matrix,
+        "smallmatrix" => ArrayKind::SmallMatrix,
+        "cases" | "numcases" | "dcases" => ArrayKind::Cases,
+        "aligned" | "align" | "align*" | "alignat" | "flalign" => ArrayKind::Align,
+        "gathered" | "gather" | "gather*" => ArrayKind::Gathered,
+        "array" | "subarray" => ArrayKind::Array,
+        _ => return None,
+    })
+}
+
+/// The delimiters an environment is drawn with, `'\0'` standing for none on that side
+/// exactly as it does in [`Node::Fence`]. `cases` is the conventional lone brace;
+/// `matrix` and `smallmatrix` come with nothing, and `aligned` never has any.
+fn env_delimiters(name: &str) -> Option<(char, char)> {
+    Some(match name {
+        "pmatrix" => ('(', ')'),
+        "bmatrix" => ('[', ']'),
+        "Bmatrix" => ('\u{27e8}', '\u{27e9}'),
+        "vmatrix" => ('|', '|'),
+        "Vmatrix" => ('\u{2016}', '\u{2016}'),
+        "cases" | "numcases" | "dcases" => ('{', '\0'),
+        _ => return None,
+    })
+}
+
+/// The alignment of each of an environment's `cols` columns. Every family but `array`
+/// has one rule for all of them; an `array` whose spec names fewer columns than it got
+/// repeats the last one it was given, which is the reading that keeps the text aligned
+/// that the writer meant to be.
+fn columns_for(kind: ArrayKind, spec: &[ColAlign], cols: usize) -> Vec<ColAlign> {
+    (0..cols)
+        .map(|j| match kind {
+            ArrayKind::Array => spec
+                .get(j)
+                .or(spec.last())
+                .copied()
+                .unwrap_or(ColAlign::Left),
+            ArrayKind::Cases => ColAlign::Left,
+            ArrayKind::Align => if j.is_multiple_of(2) { ColAlign::Right } else { ColAlign::Left },
+            ArrayKind::Matrix | ArrayKind::SmallMatrix | ArrayKind::Gathered => ColAlign::Center,
+        })
+        .collect()
+}
+
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -678,6 +958,28 @@ mod tests {
             Node::Accent { base, accent } => format!("(accent {accent:?} {})", sexp(base)),
             Node::Bar { body, side } => format!("(bar {side:?} {})", sexp(body)),
             Node::Space(mu) => format!("(space {mu})"),
+            // Columns print as the `l`/`c`/`r` letters they were written with, rows
+            // separated by ` / ` and cells by ` & `, which is the shape of the source.
+            Node::Array { rows, columns, kind, delimiters } => format!(
+                "(array {kind:?} {} {} {})",
+                columns.iter().map(col_letter).collect::<String>(),
+                delimiters.map_or_else(
+                    || "none".into(),
+                    |(l, r)| format!("{}{}", shown(l), shown(r)),
+                ),
+                rows.iter()
+                    .map(|r| format!("[{}]", r.iter().map(sexp).collect::<Vec<_>>().join(" & ")))
+                    .collect::<Vec<_>>()
+                    .join(" / "),
+            ),
+        }
+    }
+
+    fn col_letter(a: &ColAlign) -> char {
+        match a {
+            ColAlign::Left => 'l',
+            ColAlign::Center => 'c',
+            ColAlign::Right => 'r',
         }
     }
 
@@ -786,5 +1088,140 @@ mod tests {
             let out = sexp(&f);
             assert!(!out.contains('\\'), "{src} fell back to literal text: {out}");
         }
+    }
+
+    #[test]
+    fn environments_come_out_as_rows_of_cells() {
+        assert_eq!(
+            of("\\begin{pmatrix} a & b \\\\ c & d \\end{pmatrix}"),
+            "(array Matrix cc () [a & b] / [c & d])"
+        );
+        assert_eq!(
+            of("\\begin{cases} x & x > 0 \\\\ -x & \\text{otherwise} \\end{cases}"),
+            "(array Cases ll {- [x & (x > 0)] / [(- x) & otherwise])",
+            "a piecewise definition keeps both columns and its lone brace"
+        );
+        assert_eq!(
+            of("\\begin{gathered} a \\\\ b \\end{gathered}"),
+            "(array Gathered c none [a] / [b])"
+        );
+        for (env, kind, want) in [
+            ("matrix", "Matrix", "none"),
+            ("pmatrix", "Matrix", "()"),
+            ("bmatrix", "Matrix", "[]"),
+            ("Bmatrix", "Matrix", "⟨⟩"),
+            ("vmatrix", "Matrix", "||"),
+            ("smallmatrix", "SmallMatrix", "none"),
+        ] {
+            let src = format!("\\begin{{{env}}} a \\end{{{env}}}");
+            assert_eq!(of(&src), format!("(array {kind} c {want} [a])"), "{src}");
+        }
+        // `Vmatrix` is the doubled bar, which needs its own character to be visible.
+        assert_eq!(
+            of("\\begin{Vmatrix} a \\end{Vmatrix}"),
+            format!("(array Matrix c \u{2016}\u{2016} [a])")
+        );
+        // `aligned` reads `&` as an alignment tab, so the two halves of a row become
+        // two columns whose alignments point at the tab from either side.
+        assert_eq!(
+            of("\\begin{aligned} x &= 1 \\\\ y &= 2 \\end{aligned}"),
+            "(array Align rl none [x & (= 1)] / [y & (= 2)])"
+        );
+        assert_eq!(
+            of("\\begin{align*} x &= 1 \\end{align*}"),
+            "(array Align rl none [x & (= 1)])",
+            "the starred spelling is the same arrangement"
+        );
+    }
+
+    #[test]
+    fn an_arrays_column_spec_is_consumed_not_shown() {
+        // The vertical rules are dropped -- the layout draws no column rules yet -- but
+        // they cannot be allowed to leak into the first cell as text either.
+        assert_eq!(
+            of("\\begin{array}{l|r} a & b \\end{array}"),
+            "(array Array lr none [a & b])"
+        );
+        assert_eq!(
+            of("\\begin{array}{cc} a & b \\\\ c & d \\end{array}"),
+            "(array Array cc none [a & b] / [c & d])"
+        );
+        // A spec shorter than the row repeats its last column rather than inventing a
+        // centred one.
+        assert_eq!(
+            of("\\begin{array}{cr} a & b & c \\end{array}"),
+            "(array Array crr none [a & b & c])"
+        );
+        assert_eq!(
+            of("\\begin{array} a \\end{array}"),
+            "(array Array l none [a])",
+            "no spec at all is still a grid, not an error"
+        );
+    }
+
+    #[test]
+    fn row_and_cell_separators_end_rows_without_leaving_gaps() {
+        // A trailing `\\` is punctuation, not an empty row.
+        assert_eq!(
+            of("\\begin{matrix} a \\\\ b \\\\ \\end{matrix}"),
+            "(array Matrix c none [a] / [b])"
+        );
+        // `\\*` and `\\[3pt]` are the same row break; the bracket must not reach the
+        // cell after it.
+        assert_eq!(
+            of("\\begin{matrix} a \\\\*[3pt] b \\end{matrix}"),
+            "(array Matrix c none [a] / [b])"
+        );
+        // An `&` with no cell after it is still a column, because the writer asked for
+        // one by typing the tab.
+        assert_eq!(of("\\begin{matrix} a & \\end{matrix}"), "(array Matrix cc none [a & ])");
+        assert_eq!(of("\\begin{matrix} \\end{matrix}"), "(array Matrix c none )", "empty grid");
+    }
+
+    #[test]
+    fn an_environment_nests_in_a_group_and_in_another_cell() {
+        assert_eq!(
+            of("\\left(\\begin{matrix} a \\\\ b \\end{matrix}\\right)"),
+            "(fence () (array Matrix c none [a] / [b]))"
+        );
+        assert_eq!(
+            of("\\begin{pmatrix} \\frac{1}{2} & \\sqrt{x} \\end{pmatrix}"),
+            "(array Matrix cc () [(frac 1 2) & (sqrt x)])",
+            "a cell holds whatever a group can"
+        );
+        assert_eq!(
+            of("\\begin{matrix} \\begin{matrix} a \\end{matrix} & b \\end{matrix}"),
+            "(array Matrix cc none [(array Matrix c none [a]) & b])"
+        );
+        assert_eq!(
+            of("x\\begin{pmatrix} a \\end{pmatrix}^{2}"),
+            "(x (sup (array Matrix c () [a]) 2))",
+            "a script attaches to the whole grid"
+        );
+    }
+
+    #[test]
+    fn a_broken_environment_degrades_to_its_own_text() {
+        // Unknown name: the markers show as written and the content survives.
+        assert_eq!(
+            of("\\begin{psst} a & b \\end{psst}"),
+            "(\\begin{psst} a b \\end{psst})"
+        );
+        // Never closed: what was read is still set, inline.
+        assert_eq!(of("\\begin{pmatrix} a \\\\ b + c"), "(\\begin{pmatrix} a b + c)");
+        // Closed by the wrong name: the grid is abandoned, but neither the written
+        // closer nor the material after it is swallowed.
+        assert_eq!(
+            of("\\begin{pmatrix} a \\end{bmatrix} x"),
+            "((\\begin{pmatrix} a \\end{bmatrix}) x)"
+        );
+        // A bare `\end`, and a `\begin` with no name, are one literal each.
+        assert_eq!(of("\\end{matrix}"), "\\end{matrix}");
+        assert_eq!(of("\\begin x"), "(\\begin x)");
+        // None of them ends the formula early.
+        assert_eq!(
+            of("\\begin{psst}a\\end{psst}\\frac{1}{2}"),
+            "((\\begin{psst} a \\end{psst}) (frac 1 2))"
+        );
     }
 }

@@ -24,7 +24,7 @@
 //! stands in, so a formula still sets acceptably in a font like Consolas instead of
 //! collapsing.
 
-use crate::parse::{AccentKind, BarSide, Limits, Node};
+use crate::parse::{AccentKind, ArrayKind, BarSide, ColAlign, Limits, Node};
 use crate::table::constant;
 
 pub type Pt = f32;
@@ -129,6 +129,19 @@ const MED_MU: Pt = 4.0 / 18.0;
 const THICK_MU: Pt = 5.0 / 18.0;
 const PUNCT_MU: Pt = 2.0 / 18.0;
 
+/// Room between the columns of a grid, as a ratio of the type size: `MATH` says
+/// nothing about arrays, and TeX's `\arraycolsep` -- 5 mu on each side of the rule
+/// between two columns, which is what one column gap therefore is -- is the number
+/// the shape of a matrix is read from.
+const ARRAY_COL_GAP: Pt = THICK_MU;
+/// A `cases` condition stands further from its value than two matrix columns do,
+/// because it is read as a separate clause rather than as more data.
+const CASES_COND_GAP: Pt = 8.0 / 18.0;
+/// Row separation when a face reports nothing for `mathLeading`, which is most of
+/// them: a ratio of the type size, floored by three rule thicknesses wherever the
+/// table is present enough to give those.
+const FALLBACK_ARRAY_LEADING: Pt = 0.2;
+
 /// A metrics-only box: what a sub-layout reports to its caller.
 #[derive(Clone, Copy, Debug, Default)]
 struct Mb {
@@ -204,6 +217,8 @@ impl Engine<'_> {
                 self.big_op(op, *limits, sub.as_deref(), sup.as_deref(), st),
             Node::Accent { base, accent } => self.accent(base, *accent, st),
             Node::Bar { body, side } => self.bar(body, *side, st),
+            Node::Array { rows, columns, kind, delimiters } =>
+                self.array(rows, columns, *kind, *delimiters, st),
             Node::Space(mu) => (
                 Vec::new(),
                 Mb { width: *mu as Pt / 18.0 * st.size, ..Default::default() },
@@ -353,6 +368,107 @@ impl Engine<'_> {
             out.push(Shape::Rule { x: 0.0, y: bar_top, width, thickness: rule });
         }
         (out, Mb { width, ascent: u + n_b.ascent, descent: d + d_b.descent, italic: 0.0 })
+    }
+
+    /// A grid of cells: each column as wide as its widest cell, each row far enough
+    /// below the row above for both rows' own ink plus a clearance, and the whole block
+    /// centred on the axis the way a fraction's stack is.
+    fn array(
+        &mut self,
+        rows: &[Vec<Node>],
+        columns: &[ColAlign],
+        kind: ArrayKind,
+        delimiters: Option<(char, char)>,
+        st: Style,
+    ) -> (Vec<Shape>, Mb) {
+        // Cells are dependent material, so text style and cramped exactly as a
+        // fraction's halves are. `smallmatrix` is the one that is also a script size.
+        let mut inner = Style { display: false, cramped: st.cramped, ..st };
+        if kind == ArrayKind::SmallMatrix {
+            inner.size = self.script_size(st, 1);
+        }
+        let cols = columns.len().max(1);
+        let mut laid: Vec<Vec<(Vec<Shape>, Mb)>> = Vec::with_capacity(rows.len());
+        for row in rows {
+            let mut cells = Vec::with_capacity(row.len());
+            for cell in row {
+                cells.push(self.lay(cell, inner));
+            }
+            laid.push(cells);
+        }
+
+        // Column advance: the widest cell in the column, its leaning ink included, so
+        // that a slanted letter's top cannot overprint the column beside it.
+        let mut widths: Vec<Pt> = vec![0.0; cols];
+        for row in &laid {
+            for (j, (_, cb)) in row.iter().enumerate() {
+                let j = j.min(cols - 1);
+                widths[j] = widths[j].max(cb.ink_width());
+            }
+        }
+        // Column origins. The gap that would follow the last column is not part of the
+        // box, which is why `x` is advanced by it only between columns.
+        let mut lefts: Vec<Pt> = vec![0.0; cols];
+        let mut x: Pt = 0.0;
+        for j in 0..cols {
+            lefts[j] = x;
+            x += widths[j];
+            if j + 1 < cols {
+                x += column_gap(kind, j, inner.size);
+            }
+        }
+        let grid_w = x;
+
+        // Each row's ink extent is the tallest and the deepest of its cells, and the
+        // rows are separated by those extents rather than by a fixed leading, so a
+        // fraction or a stretched delimiter in one row pushes its neighbours apart.
+        let mut rises: Vec<Pt> = Vec::with_capacity(laid.len());
+        let mut falls: Vec<Pt> = Vec::with_capacity(laid.len());
+        for row in &laid {
+            let (mut a, mut d): (Pt, Pt) = (0.0, 0.0);
+            for (_, cb) in row {
+                a = a.max(cb.ascent);
+                d = d.max(cb.descent);
+            }
+            rises.push(a);
+            falls.push(d);
+        }
+        // `mathLeading` is the one MATH number about line spacing and most math faces
+        // leave it at zero, so the clearance is the larger of a ratio of the type size
+        // and three default rule thicknesses.
+        let leading = self.m.percent(constant::MATH_LEADING, FALLBACK_ARRAY_LEADING);
+        let gap = self.rules(3.0, inner.size).max(leading * inner.size);
+        let n_rows = laid.len() as Pt;
+        let stack: Pt = rises.iter().zip(&falls).map(|(a, d)| a + d).sum();
+        let height = stack + gap * (n_rows - 1.0).max(0.0);
+        let axis = self.c(constant::AXIS_HEIGHT, st.size, FALLBACK_AXIS);
+        // The block spans `height` centred on the axis, so its ink top is at
+        // `-axis - height/2` and each row's baseline follows from the heights stacked
+        // above it -- the same inequality a numerator's shift is derived from.
+        let mut baselines = Vec::with_capacity(laid.len());
+        let mut top = -axis - height / 2.0;
+        for i in 0..laid.len() {
+            baselines.push(top + rises[i]);
+            top += rises[i] + falls[i] + gap;
+        }
+
+        let mut out = Vec::new();
+        let mut b = Mb::default();
+        for (i, row) in laid.iter().enumerate() {
+            for (j, (s, cb)) in row.iter().enumerate() {
+                let j = j.min(cols - 1);
+                let a = columns.get(j).copied().unwrap_or(ColAlign::Center);
+                let dx = lefts[j] + align_in(a, widths[j], cb.ink_width());
+                translate(s, dx, baselines[i], &mut out);
+            }
+            b.ascent = b.ascent.max(rises[i] - baselines[i]);
+            b.descent = b.descent.max(falls[i] + baselines[i]);
+        }
+        b.width = grid_w;
+        match delimiters {
+            Some((left, right)) => self.fenced(left, right, &out, b, st),
+            None => (out, b),
+        }
     }
 
     /// Sub- and superscript placement, one inequality per `MATH` constant.
@@ -532,6 +648,20 @@ impl Engine<'_> {
     /// `\left( ... \right)`: the body first, then delimiters grown to its height.
     fn fence(&mut self, left: char, right: char, body: &Node, st: Style) -> (Vec<Shape>, Mb) {
         let (sbody, bb) = self.lay(body, st);
+        self.fenced(left, right, &sbody, bb, st)
+    }
+
+    /// The delimiters around a body that is already laid out. Shared by `\left ...
+    /// \right` and by the environments that bring their own, so a `pmatrix` and a
+    /// parenthesised fraction are grown by one arithmetic and cannot drift apart.
+    fn fenced(
+        &mut self,
+        left: char,
+        right: char,
+        sbody: &[Shape],
+        bb: Mb,
+        st: Style,
+    ) -> (Vec<Shape>, Mb) {
         let axis = self.c(constant::AXIS_HEIGHT, st.size, FALLBACK_AXIS);
         let min = self.c(constant::DELIMITED_SUB_FORMULA_MIN_HEIGHT, st.size, 0.0);
         // Under the threshold the delimiters are ordinary glyphs; over it the pair is
@@ -555,7 +685,7 @@ impl Engine<'_> {
             b.descent = b.descent.max(d);
         }
         let body_x = b.width;
-        translate(&sbody, body_x, 0.0, &mut out);
+        translate(sbody, body_x, 0.0, &mut out);
         b.width += bb.ink_width();
         if right != '\0' {
             let (w, a, d) = self.delimiter(right, st.size, up, down, b.width, &mut out);
@@ -871,5 +1001,28 @@ fn glue(prev: Class, next: Class, size: Pt) -> Pt {
         (Class::Punct, _) => PUNCT_MU * size,
         (Class::Big, _) => THIN_MU * size,
         _ => 0.0,
+    }
+}
+
+/// How far inside a column `w` wide a cell whose ink is `cw` wide starts.
+fn align_in(a: ColAlign, w: Pt, cw: Pt) -> Pt {
+    match a {
+        ColAlign::Left => 0.0,
+        ColAlign::Center => (w - cw) / 2.0,
+        ColAlign::Right => w - cw,
+    }
+}
+
+/// Room between column `j` and the one after it. An alignment tab carries relation
+/// space on top of the column gap, because a tab usually stands in front of an `=` and
+/// the two halves have to read as one relation; a `cases` condition is set further from
+/// its value than matrix columns are. Both are em ratios, since `MATH` has no array
+/// metrics at all.
+fn column_gap(kind: ArrayKind, j: usize, size: Pt) -> Pt {
+    let base = ARRAY_COL_GAP * size;
+    match kind {
+        ArrayKind::Cases if j == 0 => CASES_COND_GAP * size,
+        ArrayKind::Align if j.is_multiple_of(2) => base + THICK_MU * size,
+        _ => base,
     }
 }

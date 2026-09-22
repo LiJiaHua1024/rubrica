@@ -101,6 +101,9 @@ mod tests {
                 constant::SCRIPT_PERCENT_SCALE_DOWN => 0.75,
                 constant::SCRIPT_SCRIPT_PERCENT_SCALE_DOWN => 0.5,
                 constant::RADICAL_DEGREE_BOTTOM_RAISE_PERCENT => 0.6,
+                // Most real math faces leave this at zero, so the value that lets a
+                // test tell the two mocks apart is deliberately a large one.
+                constant::MATH_LEADING => 0.5,
                 _ => fallback,
             }
         }
@@ -153,6 +156,22 @@ mod tests {
                 _ => None,
             })
             .collect()
+    }
+
+    /// Where the runs of one particular text landed, which is how an assertion about a
+    /// grid says something about two columns or two rows rather than about one glyph.
+    fn placed(f: &Formula, text: &str) -> Vec<(f32, f32)> {
+        runs(f)
+            .into_iter()
+            .filter(|(t, ..)| t == text)
+            .map(|(_, x, y, _)| (x, y))
+            .collect()
+    }
+
+    /// Positions come out of the mock's own arithmetic, so an exact float is worth
+    /// asserting; this only keeps the printing of a failure legible.
+    fn near(got: f32, want: f32, what: &str) {
+        assert!((got - want).abs() < 0.001, "{what}: {got}, wanted {want}");
     }
 
     #[test]
@@ -427,5 +446,202 @@ mod tests {
             .collect();
         assert!(gaps.windows(2).all(|w| w[0].abs_diff(w[1]) <= 1), "{gaps:?}");
         assert_eq!(assemble(&[], 10, 100).len(), 0);
+    }
+
+    /// A cell is half an em wide per letter at this size, and its ink runs seven tenths
+    /// above the baseline and two tenths below, so everything a grid measures beyond
+    /// its cells is the room between them.
+    const SZ: f32 = 10.0;
+    const CELL_TOP: f32 = 0.7 * SZ;
+    const CELL_BOTTOM: f32 = 0.2 * SZ;
+    const GLYPH: f32 = 0.5 * SZ;
+
+    #[test]
+    fn a_grid_widens_by_its_columns_and_heightens_by_its_rows() {
+        let mut m = Mock::mathy();
+        let one = set("\\begin{matrix}a\\end{matrix}", SZ, true, &mut m);
+        let wide = set("\\begin{matrix}a&b\\end{matrix}", SZ, true, &mut m);
+        let tall = set("\\begin{matrix}a\\\\c\\end{matrix}", SZ, true, &mut m);
+        let both = set("\\begin{matrix}a&b\\\\c&d\\end{matrix}", SZ, true, &mut m);
+
+        // Two columns cost more than twice one cell, because the gap between them is
+        // real; the same for two rows.
+        assert!(wide.width > 2.0 * one.width, "{} over {}", wide.width, one.width);
+        assert!(tall.height() > 2.0 * one.height(), "a row separation is not free");
+        near(both.width, wide.width, "a second row adds no width");
+        near(both.height(), tall.height(), "a second column adds no height");
+
+        // Four cells, four positions: cells in a column share an x, cells in a row
+        // share a baseline, and neither column nor row collapses onto the other.
+        let at = |t: &str| {
+            let p = placed(&both, t);
+            assert_eq!(p.len(), 1, "{t} was drawn once");
+            p[0]
+        };
+        let (a, b, c, d) = (at("a"), at("b"), at("c"), at("d"));
+        near(a.0, c.0, "the first column's cells align");
+        near(b.0, d.0, "and so do the second's");
+        near(a.1, b.1, "a row's cells share a baseline");
+        near(c.1, d.1, "and so do the next row's");
+        assert!(b.0 > a.0, "the columns are apart: {} vs {}", b.0, a.0);
+        assert!(c.1 > a.1, "the rows are apart: {} vs {}", c.1, a.1);
+        assert!(c.1 - CELL_TOP > a.1 + CELL_BOTTOM, "and their inks do not touch");
+    }
+
+    #[test]
+    fn a_matrix_is_centred_on_the_axis_and_its_columns_are_centred() {
+        let mut m = Mock::mathy();
+        let axis = m.constant(constant::AXIS_HEIGHT, SZ).unwrap();
+        let row = set("\\begin{matrix}a\\end{matrix}", SZ, true, &mut m);
+        // The block straddles the axis by the same distance on either side of it, which
+        // is how a fraction's stack is placed.
+        let ink = CELL_TOP + CELL_BOTTOM;
+        near(row.ascent, axis + ink / 2.0, "the ink top is centred on the axis");
+        near(row.descent, ink / 2.0 - axis, "and the ink bottom the same way");
+        // A narrow cell in a wide column sits in the middle of it.
+        let grid = set("\\begin{matrix}ab\\\\c\\end{matrix}", SZ, true, &mut m);
+        let x_ab = placed(&grid, "ab")[0].0;
+        let x_c = placed(&grid, "c")[0].0;
+        near(x_c - x_ab, (2.0 * GLYPH - GLYPH) / 2.0, "half the slack, on either side");
+    }
+
+    #[test]
+    fn aligned_rows_share_the_x_the_relations_line_up_at() {
+        let mut m = Mock::mathy();
+        let f = set("\\begin{aligned}xy&=1\\\\z&=2\\end{aligned}", SZ, false, &mut m);
+        let equals = placed(&f, "=");
+        assert_eq!(equals.len(), 2, "one relation per row");
+        near(equals[0].0, equals[1].0, "the tabs land in the same column");
+        // The first column is right-aligned about the tab, so the short label ends
+        // where the long one does rather than starting beside it.
+        let x_long = placed(&f, "xy")[0].0;
+        let x_short = placed(&f, "z")[0].0;
+        near(x_short - x_long, GLYPH, "the labels share their right edge");
+        // The tab's own space keeps the relation off the label it belongs to.
+        assert!(equals[0].0 > x_long + 2.0 * GLYPH, "relation space, not nothing");
+    }
+
+    #[test]
+    fn cases_left_aligns_and_asks_for_its_brace_alone() {
+        let mut m = Mock::mathy();
+        m.asked.clear();
+        let f = set("\\begin{cases}a&a>0\\\\b&b<0\\end{cases}", SZ, true, &mut m);
+        let (a, b) = (placed(&f, "a"), placed(&f, "b"));
+        assert_eq!((a.len(), b.len()), (2, 2), "value and condition in each row");
+        near(a[0].0, b[0].0, "both values start at their column's left edge");
+        near(a[1].0, b[1].0, "and so do both conditions");
+        assert!(a[1].0 > a[0].0, "the condition stands to the right");
+        let row = set("\\begin{matrix}a&a\\end{matrix}", SZ, true, &mut m);
+        let cells = placed(&row, "a");
+        let matrix_room = cells[1].0 - cells[0].0 - GLYPH;
+        assert!(
+            a[1].0 - a[0].0 - GLYPH > matrix_room,
+            "a condition is set further off than a matrix column: {matrix_room}"
+        );
+        assert_eq!(
+            m.asked.iter().filter(|(c, _)| *c == '{').count(),
+            1,
+            "one brace and nothing on the right: {:?}",
+            m.asked
+        );
+    }
+
+    #[test]
+    fn a_tall_row_pushes_its_neighbours_apart() {
+        let plain = set("\\begin{matrix}x\\\\z\\end{matrix}", SZ, true, &mut Mock::mathy());
+        let deep =
+            set("\\begin{matrix}\\frac{x}{y}\\\\z\\end{matrix}", SZ, true, &mut Mock::mathy());
+        let separation = |f: &Formula| placed(f, "z")[0].1 - placed(f, "x")[0].1;
+        let (p, d) = (separation(&plain), separation(&deep));
+        assert!(d > p + GLYPH, "a fraction's own ink widens the gap: {d} vs {p}");
+        assert!(deep.height() > plain.height() + GLYPH);
+        // And still no collision: the lower row's ink top is below the fraction's own
+        // ink bottom, which is the denominator's.
+        let den = placed(&deep, "y")[0].1;
+        let lower_top = placed(&deep, "z")[0].1 - CELL_TOP;
+        assert!(lower_top > den + CELL_BOTTOM, "{lower_top} vs {}", den + CELL_BOTTOM);
+    }
+
+    #[test]
+    fn row_separation_asks_mathleading_first() {
+        let with = set("\\begin{matrix}a\\\\b\\end{matrix}", SZ, true, &mut Mock::mathy());
+        let without = set("\\begin{matrix}a\\\\b\\end{matrix}", SZ, true, &mut Mock::bare());
+        let separation = |f: &Formula| placed(f, "b")[0].1 - placed(f, "a")[0].1;
+        assert!(
+            separation(&without) < separation(&with),
+            "the face's own leading widens the rows: {} vs {}",
+            separation(&with),
+            separation(&without)
+        );
+    }
+
+    #[test]
+    fn an_environments_own_delimiters_are_grown_to_the_grid() {
+        let mut m = Mock::mathy();
+        let bare = set("\\begin{matrix}a\\\\c\\\\e\\end{matrix}", SZ, true, &mut m);
+        m.asked.clear();
+        let wrapped = set("\\begin{pmatrix}a\\\\c\\\\e\\end{pmatrix}", SZ, true, &mut m);
+        let heights: Vec<f32> =
+            m.asked.iter().filter(|(c, _)| *c != '\u{221a}').map(|(_, h)| *h).collect();
+        assert_eq!(heights.len(), 2, "both parentheses were asked to stretch");
+        let grid = bare.height();
+        assert!(
+            heights.iter().all(|h| (h - grid).abs() < 0.001),
+            "each reached the grid's own height {grid}: {heights:?}"
+        );
+        assert!(wrapped.width > bare.width, "the delimiters take room of their own");
+        assert!(wrapped.height() >= grid);
+    }
+
+    #[test]
+    fn a_fence_around_an_environment_reaches_the_whole_grid() {
+        let mut m = Mock::mathy();
+        let grid = set("\\begin{matrix}a\\\\c\\\\e\\end{matrix}", SZ, true, &mut m);
+        m.asked.clear();
+        let f = set("\\left(\\begin{matrix}a\\\\c\\\\e\\end{matrix}\\right)", SZ, true, &mut m);
+        let heights: Vec<f32> =
+            m.asked.iter().filter(|(c, _)| *c != '\u{221a}').map(|(_, h)| *h).collect();
+        assert_eq!(heights.len(), 2);
+        assert!(
+            heights.iter().all(|h| (h - grid.height()).abs() < 0.001),
+            "the written pair grew to the grid, not to a line of text: {heights:?}"
+        );
+        assert!(f.shapes.iter().any(|s| matches!(s, Shape::Glyph { index: 12, .. })));
+    }
+
+    #[test]
+    fn a_small_matrix_is_set_a_script_step_down() {
+        let mut m = Mock::mathy();
+        let normal = set("\\begin{matrix}a\\end{matrix}", SZ, true, &mut m);
+        let small = set("\\begin{smallmatrix}a\\end{smallmatrix}", SZ, true, &mut m);
+        let size_of = |f: &Formula| runs(f)[0].3;
+        assert!(size_of(&small) < size_of(&normal), "{} vs {}", size_of(&small), size_of(&normal));
+        assert!(small.width < normal.width && small.height() < normal.height());
+    }
+
+    #[test]
+    fn an_environment_that_cannot_be_drawn_still_sets() {
+        for src in [
+            "\\begin{pmatrix} a & b",
+            "\\begin{psst} a & b \\end{psst}",
+            "\\begin{matrix} a \\end{bmatrix} + 1",
+            "\\end{matrix}",
+            "\\begin",
+            "\\begin{array}{ccc} a & b \\\\ c & d",
+        ] {
+            let mut mathy = Mock::mathy();
+            let mut bare = Mock::bare();
+            let with = set(src, SZ, true, &mut mathy);
+            let without = set(src, SZ, true, &mut bare);
+            for f in [with, without] {
+                assert!(f.width > 0.0, "{src} set to nothing");
+                assert!(!f.shapes.is_empty(), "{src} produced no shapes");
+            }
+        }
+        // A grid with no cells at all is empty, but neither a panic nor a NaN.
+        let mut m = Mock::mathy();
+        let empty = set("\\begin{matrix}\\end{matrix}", SZ, true, &mut m);
+        assert_eq!(empty.width, 0.0);
+        assert!(empty.shapes.is_empty());
     }
 }
