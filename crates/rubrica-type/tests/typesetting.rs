@@ -540,6 +540,17 @@ fn a_final_line_too_wide_for_the_measure_shrinks() {
         "an overfull final line was not shrunk: placed {w}, natural-width sum {base}"
     );
 
+    // Starved: a deficit larger than the glue holds gives back only what the joins
+    // own, and the line hangs by the rest instead of overlapping its glyphs.
+    let mut starved = last.clone();
+    starved.natural = column + last.shrink + 30.0;
+    let w = line_width(&place(&para, &starved));
+    assert!(
+        (w - (base - last.shrink)).abs() < 0.5,
+        "a starved line was compressed past its glue budget: {w} vs {}",
+        base - last.shrink
+    );
+
     // Two exemptions the shrink must not swallow: a final line that merely has room
     // left over stays ragged, and a block that opted out of justification hangs past
     // the measure rather than being squeezed -- squeezing a heading or a code line

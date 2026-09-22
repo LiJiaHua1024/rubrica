@@ -67,11 +67,15 @@ pub fn place(para: &Paragraph, line: &Line) -> Vec<Placed> {
                         (f64::from(shrink), total_shrink)
                     };
                     if total > eps {
-                        // Proportional to each glue's own elasticity, and unbounded:
-                        // TeX lets a line stretch past nominal, which is precisely
-                        // what a "lousy" fitness class records -- capping here would
-                        // silently stop short of the measure instead.
-                        w += slack * (avail / total);
+                        // Stretch is unbounded: TeX lets a line go past nominal, which
+                        // is precisely what a "lousy" fitness class records, and
+                        // capping here would silently stop short of the measure.
+                        // Shrink is not. A join that gives back more than it has would
+                        // slide its glyphs on top of each other, so a starved line
+                        // takes what the glue can spare and hangs past the measure --
+                        // the overfull box TeX reports rather than overlaps.
+                        let give = if slack > 0.0 { slack } else { slack.max(-total) };
+                        w += give * (avail / total);
                     }
                 }
                 out.push(Placed { x: x as Pt, w: w as Pt, node: None });
