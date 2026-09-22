@@ -124,7 +124,7 @@ pub fn report(source: &str, path: Option<&str>, o: &Options) -> Result<()> {
     );
     println!("blocks     : {}   lines: {}   height {:.0}pt", doc.blocks.len(), lines.len(), height);
     println!();
-    println!("  #      left    right    fill  faces");
+    println!("  #      left    right    fill  faces                      the line");
 
     // A justified line must land on the measure; the last line of each block is
     // legitimately short, so report the tight cluster and the outliers separately.
@@ -144,8 +144,18 @@ pub fn report(source: &str, path: Option<&str>, o: &Options) -> Result<()> {
         if over > 0.6 {
             off_measure += 1;
         }
+        // The line's own words, so a row means something on its own: which heading
+        // went long, which fence came up short, without a second run to find out.
+        let excerpt = page.sel.get(i).map_or_else(String::new, |s| {
+            let t: String = s.chars.iter().collect();
+            let t = t.trim();
+            match t.char_indices().nth(18) {
+                Some((at, _)) => format!("{}...", &t[..at]),
+                None => t.to_string(),
+            }
+        });
         println!(
-            "{i:>3}  {:>8.1} {:>8.1} {:>6.3}{} {}",
+            "{i:>3}  {:>8.1} {:>8.1} {:>6.3}{} {:<26} {excerpt}",
             l.left,
             l.right,
             fill,
@@ -201,6 +211,57 @@ pub fn report(source: &str, path: Option<&str>, o: &Options) -> Result<()> {
     let han: usize = source.chars().filter(|c| matches!(*c as u32, 0x4E00..=0x9FFF)).count();
     let latin: usize = source.chars().filter(|c| c.is_ascii_alphabetic()).count();
     println!("source has {han} ideographs and {latin} latin letters");
+    // Which of the page's code was read as a language, and how much of it the page then
+    // wore: the two are counted apart because they fail apart. A fence naming nothing is
+    // set plain by choice, a fence naming a language this build has not met is set plain
+    // as a fact about the build, and a highlighter that was right about every token but
+    // lost them between the layout and the display list would look perfect in the first
+    // number and missing in the second.
+    {
+        let code: Vec<&rubrica_doc::Block> = doc
+            .blocks
+            .iter()
+            .filter(|b| b.kind == rubrica_doc::BlockKind::Code)
+            .collect();
+        let named = code.iter().filter(|b| b.lang.is_some()).count();
+        let read = code
+            .iter()
+            .filter(|b| b.lang.as_deref().is_some_and(crate::highlight::knows))
+            .count();
+        let mut inks: BTreeMap<&'static str, usize> = BTreeMap::new();
+        for op in ops {
+            let crate::view::Op::Runs(runs) = op else { continue };
+            for r in runs {
+                let name = match r.color {
+                    ColorRole::Keyword => "keyword",
+                    ColorRole::String => "string",
+                    ColorRole::Comment => "comment",
+                    ColorRole::Number => "number",
+                    ColorRole::Type => "type",
+                    _ => continue,
+                };
+                *inks.entry(name).or_default() += 1;
+            }
+        }
+        if !code.is_empty() {
+            let names: Vec<String> = inks.iter().map(|(n, c)| format!("{n} x{c}")).collect();
+            println!(
+                "code         : {} block(s), {named} named a language, {read} of those a language \
+                 this build reads; {} run(s) set in syntax ink [{}]",
+                code.len(),
+                inks.values().sum::<usize>(),
+                names.join(", ")
+            );
+            let blind: Vec<&str> = code
+                .iter()
+                .filter(|b| !b.lang.as_deref().is_some_and(crate::highlight::knows))
+                .map(|b| b.lang.as_deref().unwrap_or("(no language)"))
+                .collect();
+            if !blind.is_empty() {
+                println!("  !! {} block(s) set plain: {}", blind.len(), blind.join(", "));
+            }
+        }
+    }
     // Counted from the source as well as from the cache: the two differ whenever a
     // formula repeats, and a formula that set from a face with no `MATH` table
     // still draws, just in the wrong shapes.

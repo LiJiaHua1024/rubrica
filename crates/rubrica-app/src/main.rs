@@ -8,6 +8,7 @@
 mod clipboard;
 mod font;
 mod find;
+mod highlight;
 mod hyphen;
 mod images;
 mod math;

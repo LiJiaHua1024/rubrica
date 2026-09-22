@@ -93,6 +93,20 @@ pub enum ColorRole {
     /// A block surface (the code panel), not an ink: a text colour used as a fill
     /// reads as a smudge rather than a panel.
     Surface,
+    /// The five inks a code block's words are told apart by. They are roles rather than
+    /// colours because a theme has to answer for both its pages: what reads as a string
+    /// on paper the colour of is a dull brown, and the same brown on a night page is
+    /// invisible, so the reader of [`crate::view::Palette`] decides.
+    ///
+    /// Kept few on purpose. A highlighter with twelve inks makes a twenty-line function
+    /// look like a bag of sweets, and the reader's eye gives up on the sixth distinction
+    /// before the code's own shape is visible -- which is the shape these five exist to
+    /// show: what is said, what is meant, and what is a comment on both.
+    Keyword,
+    String,
+    Comment,
+    Number,
+    Type,
 }
 
 /// The reader's size preference, as a step on a ladder rather than a free ratio.

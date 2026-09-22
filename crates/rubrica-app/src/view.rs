@@ -126,6 +126,11 @@ struct Palette {
     muted: Rgb,
     accent: Rgb,
     code_bg: Rgb,
+    keyword: Rgb,
+    string: Rgb,
+    comment: Rgb,
+    number: Rgb,
+    ty: Rgb,
 }
 
 impl Palette {
@@ -138,6 +143,14 @@ impl Palette {
                 muted: Rgb { r: 0.60, g: 0.62, b: 0.66 },
                 accent: Rgb { r: 0.44, g: 0.67, b: 0.95 },
                 code_bg: Rgb { r: 0.155, g: 0.162, b: 0.178 },
+                // A code panel is darker than the page, so the inks on it are lit
+                // rather than dyed: the night page's own text is already 0.855, and a
+                // highlight that stayed below it would read as text that had gone off.
+                keyword: Rgb { r: 0.78, g: 0.61, b: 0.94 },
+                string: Rgb { r: 0.87, g: 0.69, b: 0.51 },
+                comment: Rgb { r: 0.52, g: 0.58, b: 0.55 },
+                number: Rgb { r: 0.55, g: 0.79, b: 0.75 },
+                ty: Rgb { r: 0.62, g: 0.80, b: 0.58 },
             }
         } else {
             Palette {
@@ -147,6 +160,14 @@ impl Palette {
                 muted: Rgb { r: 0.42, g: 0.44, b: 0.47 },
                 accent: Rgb { r: 0.12, g: 0.35, b: 0.66 },
                 code_bg: Rgb { r: 0.937, g: 0.935, b: 0.928 },
+                // All five are dark enough to hold their own against the panel's 0.93
+                // and far enough apart in hue that a keyword, a string and a number
+                // never pass for one another at a glance.
+                keyword: Rgb { r: 0.45, g: 0.20, b: 0.55 },
+                string: Rgb { r: 0.56, g: 0.28, b: 0.13 },
+                comment: Rgb { r: 0.40, g: 0.46, b: 0.42 },
+                number: Rgb { r: 0.09, g: 0.40, b: 0.44 },
+                ty: Rgb { r: 0.16, g: 0.40, b: 0.22 },
             }
         }
     }
@@ -157,6 +178,11 @@ impl Palette {
             ColorRole::Muted | ColorRole::Faint => self.muted,
             ColorRole::Accent => self.accent,
             ColorRole::Surface => self.code_bg,
+            ColorRole::Keyword => self.keyword,
+            ColorRole::String => self.string,
+            ColorRole::Comment => self.comment,
+            ColorRole::Number => self.number,
+            ColorRole::Type => self.ty,
         }
     }
 }
@@ -213,7 +239,10 @@ pub struct PaintRun {
     /// Extra drop below the line's baseline, positive downwards. Zero for prose; a
     /// formula's pieces each sit somewhere of their own within its box.
     dy: f32,
-    color: ColorRole,
+    /// Which of the theme's inks carries this run, recorded for the same reason
+    /// `family` is: the report can then say what the page actually painted rather
+    /// than what the layout asked for.
+    pub color: ColorRole,
 }
 
 pub enum Op {
@@ -4171,6 +4200,29 @@ fn prepare_block(
             _ => intern(styles, &theme.fonts.fallback, r(b.kind, s.style)),
         };
         spans.push(StyleSpan { range: s.range.start + shift..s.range.end + shift, style: id });
+    }
+    // A fence's words mean their language's things rather than the sentence's, so the
+    // one span the parser hands over for the whole block is cut up here and every piece
+    // set in the ink its kind asks for. Where the author named no language, or named one
+    // this build has not heard of, nothing is cut and the block reads as plain source --
+    // which is the honest page rather than a guess at one.
+    let cut = if b.kind == BlockKind::Code {
+        b.lang.as_deref().map_or(Vec::new(), |l| crate::highlight::tokens(l, &b.text))
+    } else {
+        Vec::new()
+    };
+    if !cut.is_empty() {
+        // The marker of the list item the fence sits in stays: it is prose's ink, and
+        // it is not part of the code.
+        spans.retain(|s| s.range.end <= shift);
+        for (range, role) in cut {
+            let mut res = r(b.kind, InlineStyle::EMPTY);
+            res.color = role;
+            spans.push(StyleSpan {
+                range: range.start + shift..range.end + shift,
+                style: intern(styles, &theme.fonts.fallback, res),
+            });
+        }
     }
     let table = b.table.as_ref().map(|t| {
         let mut prep = |cells: &[rubrica_doc::Cell]| -> Vec<PreparedCell> {

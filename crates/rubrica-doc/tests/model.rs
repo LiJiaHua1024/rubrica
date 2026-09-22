@@ -25,6 +25,28 @@ fn headings_paragraphs_and_code_keep_their_order_and_identity() {
 }
 
 #[test]
+fn a_fence_keeps_the_language_it_was_opened_with() {
+    let code = |src: &str| {
+        Document::parse(src)
+            .blocks
+            .iter()
+            .find(|b| b.kind == BlockKind::Code)
+            .and_then(|b| b.lang.clone())
+            .unwrap_or_default()
+    };
+    assert_eq!(code("```rust\nfn main() {}\n```"), "rust".to_string());
+    // The comma is mdBook's way of saying "not a test" and the brace is
+    // Python-Markdown's attributes; neither moves the name.
+    assert_eq!(code("```rust,ignore\nfn main() {}\n```"), "rust".to_string());
+    assert_eq!(code("```py {#intro .highlight}\n1\n```"), "py".to_string());
+    assert_eq!(code("```TypeScript\n1\n```"), "typescript".to_string());
+    // Said nothing is not the same as said `text`: a block whose language is
+    // unknown is set as the plain source it is.
+    assert_eq!(code("```\nhello\n```"), String::new(), "no name, no claim");
+    assert_eq!(code("    indented\n"), String::new());
+}
+
+#[test]
 fn a_soft_break_continues_the_paragraph_rather_than_breaking_the_line() {
     // The whole point of owning Block::text: slicing the source verbatim would
     // hand the engine a newline per wrapped line and every paragraph would set

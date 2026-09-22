@@ -126,6 +126,14 @@ pub struct Block {
     /// What the reader can click: the ranges of [`Block::text`] that are a link or a
     /// citation, in text order and never overlapping.
     pub actions: Vec<Action>,
+    /// The language a fence names after its opening backticks, lower-cased and with any
+    /// attributes after it dropped: `rust,ignore` says `rust`, and ```java title="x"```
+    /// says `java`.
+    ///
+    /// Set only for [`BlockKind::Code`], and only when the author said -- an indented
+    /// block has no information to carry, and guessing a language from what the code
+    /// looks like colours a wrong guess as confidently as a right one.
+    pub lang: Option<String>,
 }
 
 /// An inline non-text box.
@@ -471,11 +479,17 @@ impl Builder {
             Tag::TableRow => self.row.clear(),
             Tag::TableCell => self.cell = Some(Cell::default()),
             Tag::CodeBlock(kind) => {
-                self.open(if matches!(kind, CodeBlockKind::Fenced(_) | CodeBlockKind::Indented) {
-                    BlockKind::Code
-                } else {
-                    BlockKind::Paragraph
-                });
+                let code = matches!(kind, CodeBlockKind::Fenced(_) | CodeBlockKind::Indented);
+                self.open(if code { BlockKind::Code } else { BlockKind::Paragraph });
+                // Carried to the reader rather than matched against a list of languages
+                // here: what `kotlin` means is the page's business, and a document crate
+                // that knows which spellings it recognises would have to be updated to
+                // let a reader read a language that has since been born.
+                if let CodeBlockKind::Fenced(info) = kind {
+                    if let Some(b) = self.cur.as_mut() {
+                        b.lang = fence_language(&info);
+                    }
+                }
             }
             Tag::Emphasis => self.inline.insert(InlineStyle::EMPHASIS),
             Tag::Strong => self.inline.insert(InlineStyle::STRONG),
@@ -626,6 +640,7 @@ impl Builder {
             objects: Vec::new(),
             actions: Vec::new(),
             table: None,
+            lang: None,
         });
     }
 
@@ -795,6 +810,20 @@ fn as_level(l: HeadingLevel) -> u8 {
 fn is_line_break(html: &str) -> bool {
     let tag = html.trim().trim_start_matches('<').trim_end_matches('>');
     tag.trim_end_matches('/').trim_end().eq_ignore_ascii_case("br")
+}
+
+/// The language a fence's info string names, which is its first word.
+///
+/// The comma and the brace are what the rest of the ecosystem hangs on the name:
+/// `rust,ignore` is the mdBook spelling of "this is not a test", and `{#id .class}`
+/// is what Python-Markdown's attribute extension appends. Both leave the language
+/// where they found it, so only the word before them is taken. An empty info string
+/// is `None` rather than `Some("")` -- the author said nothing, and a reader whose
+/// code is not a reader's language should be shown the plain page rather than a
+/// partial guess at one.
+fn fence_language(info: &str) -> Option<String> {
+    let word = info.trim().split([',', ' ', '\t', '\n', '{']).next()?;
+    (!word.is_empty()).then(|| word.to_lowercase())
 }
 
 /// One piece of a raw HTML block, its markup already turned into what it means on a page.
