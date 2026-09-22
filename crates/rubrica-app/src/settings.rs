@@ -1,7 +1,7 @@
 //! What the reader has chosen about the page, and what they had open, kept for the next
 //! window.
 //!
-//! Four numbers and one path under `Software\Rubrica` in the current user's registry,
+//! Five numbers and one path under `Software\Rubrica` in the current user's registry,
 //! which is where a Windows program puts them: no path to choose for a settings file, no
 //! format to invent, no dependency to carry, and the palette the system prefers is
 //! already read out of the same store.
@@ -24,8 +24,21 @@ use crate::view::utf16;
 const SUBKEY: &str = "Software\\Rubrica";
 /// The names the numbers are stored under, in the order [`words`] writes them.
 const NAMES: [&str; 4] = ["Zoom", "Dark", "Face", "Measure"];
-/// The one value that is not a number: the document to open again next time.
+/// The document to open again next time. The one value that is a path rather than a
+/// number -- and the thing [`ANCHOR`] is a place in, which is why the two are written in
+/// the same breath.
 const OPENED: &str = "Document";
+/// How far down that document the reader had got: the index of the character sitting at
+/// the top of the window, counted through the page's characters in reading order.
+///
+/// A place in the prose rather than a distance in points, because the same page is a
+/// different length in every width, face and zoom -- and a start-up can lose one of those
+/// choices, since a remembered face that has left the machine is dropped. A remembered
+/// distance would then name a paragraph the reader was never in; an index names the same
+/// stretch of text in either layout. It is the same thing [`crate::view`] keeps the
+/// reader's place with across a measure change, and a place worth keeping mid-window is
+/// worth keeping across a session.
+const ANCHOR: &str = "Anchor";
 /// What `Dark` holds when the reader asked for the system's own setting to decide. The
 /// same answer as no value at all, which is why nothing has to be deleted to get back
 /// there: a reader who chooses `Follow System` is not asking for a different number, they
@@ -108,24 +121,29 @@ fn read_words(sub: &str) -> Settings {
 }
 
 fn write_words(sub: &str, w: &[u32; 4]) {
-    let sub = utf16(sub);
     for (n, v) in NAMES.iter().zip(w) {
-        let name = utf16(n);
-        let r = unsafe {
-            RegSetKeyValueW(
-                HKEY_CURRENT_USER,
-                PCWSTR(sub.as_ptr()),
-                PCWSTR(name.as_ptr()),
-                REG_DWORD.0,
-                Some(v as *const u32 as *const core::ffi::c_void),
-                std::mem::size_of::<u32>() as u32,
-            )
-        };
-        if r.is_err() {
-            // A settings write that fails costs the reader their next start-up, which is
-            // worth one line on the console even though nothing else can be done about it.
-            eprintln!("settings: cannot write {n}: {r:?}");
-        }
+        write_word(sub, n, *v);
+    }
+}
+
+/// One number, put under `name`.
+fn write_word(sub: &str, name: &str, value: u32) {
+    let sub = utf16(sub);
+    let wide = utf16(name);
+    let r = unsafe {
+        RegSetKeyValueW(
+            HKEY_CURRENT_USER,
+            PCWSTR(sub.as_ptr()),
+            PCWSTR(wide.as_ptr()),
+            REG_DWORD.0,
+            Some(&value as *const u32 as *const core::ffi::c_void),
+            std::mem::size_of::<u32>() as u32,
+        )
+    };
+    if r.is_err() {
+        // A settings write that fails costs the reader their next start-up, which is
+        // worth one line on the console even though nothing else can be done about it.
+        eprintln!("settings: cannot write {name}: {r:?}");
     }
 }
 
@@ -214,24 +232,46 @@ fn read_opened(sub: &str) -> Option<PathBuf> {
     text(sub, OPENED).map(PathBuf::from).filter(|p| p.is_file())
 }
 
-/// Write down what the reader has just opened, so that the next window starts on their
-/// own page rather than on somebody else's sample prose.
-pub fn record_opened(path: &std::path::Path) {
+/// The page and the place in it, written under this key as one pair.
+fn write_reading(sub: &str, path: &std::path::Path, anchor: usize) {
     // A path that is not valid UTF-8 is not a thing worth writing down: it came from a
     // file name this program could not have opened in the first place, and putting it in
     // the registry would only make the next start read it back wrong.
     if let Some(raw) = path.to_str() {
-        write_text(SUBKEY, OPENED, raw);
+        write_text(sub, OPENED, raw);
+        write_word(sub, ANCHOR, anchor as u32);
     }
 }
 
-/// The document to open again, if there is one and it is still where it was left.
+/// The page under this key, if it is still a file, and the place the reader had got to in
+/// it -- or the top, for a key with nothing to say.
+///
+/// The number is not checked against the document's length: a place from a page that has
+/// since grown shorter names no line here, and the window that cannot find it stays where
+/// it would have started anyway.
+fn read_reading(sub: &str) -> Option<(PathBuf, usize)> {
+    let path = read_opened(sub)?;
+    Some((path, word(sub, ANCHOR).unwrap_or(0) as usize))
+}
+
+/// Write down what the reader has open and where in it they are standing, so that the
+/// next window starts on their own page rather than on somebody else's sample prose.
+///
+/// The two go together in one breath because one without the other is a wrong answer: a
+/// place kept against a different document is a jump into a paragraph nobody chose, and a
+/// page that comes back at its top says the reader never got further than they did.
+pub fn record_reading(path: &std::path::Path, anchor: usize) {
+    write_reading(SUBKEY, path, anchor);
+}
+
+/// The document to open again and the place in it, if there is one and it is still where
+/// it was left.
 ///
 /// Being a file is the whole test, not carrying one of the extensions the open dialog
 /// offers: whatever the reader had open is what they asked for, and a page that has since
 /// moved is nothing to start the program over.
-pub fn opened() -> Option<PathBuf> {
-    read_opened(SUBKEY)
+pub fn reading() -> Option<(PathBuf, usize)> {
+    read_reading(SUBKEY)
 }
 
 #[cfg(test)]
@@ -240,6 +280,13 @@ mod tests {
     // Only the tests tidy up after themselves; nothing else this module writes is ever
     // taken away again.
     use windows::Win32::System::Registry::RegDeleteTreeW;
+
+    /// Take a key away before a test starts using it, as well as after: a run that panics
+    /// on the way never reaches its own cleanup, and one test's leftover is the next one's
+    /// wrong first answer.
+    fn clear(sub: &str) {
+        let _ = unsafe { RegDeleteTreeW(HKEY_CURRENT_USER, PCWSTR(utf16(sub).as_ptr())) };
+    }
 
     #[test]
     fn every_step_of_the_ladder_comes_back_as_itself() {
@@ -317,10 +364,11 @@ mod tests {
         );
         // A key that was never written is a first run, not a broken one.
         assert_eq!(read_words(&format!("{sub}\\Absent")), Settings::default());
-        let _ = unsafe { RegDeleteTreeW(HKEY_CURRENT_USER, PCWSTR(utf16(sub).as_ptr())) };
+        clear(sub);
     }
 
-    /// The one value that is not a number: the page to come back to.
+    /// The values that belong to a document rather than to the page: which one to come
+    /// back to, and where in it.
     #[test]
     fn a_remembered_document_is_only_a_document_while_it_exists() {
         let dir = std::env::temp_dir().join(format!("rubrica-opened-{}", std::process::id()));
@@ -330,22 +378,54 @@ mod tests {
         std::fs::write(&file, "# One").expect("a page to point at");
 
         let sub = "Software\\Rubrica Test Document";
+        clear(sub);
         assert_eq!(read_opened(sub), None, "nothing written is nothing to reopen");
         write_text(sub, OPENED, file.to_str().expect("a path in unicode"));
         // The path survives the trip through UTF-16 with its space in it, which is the
         // part a fixed-size numeric buffer could never get wrong.
         assert_eq!(read_opened(sub).as_deref(), Some(file.as_path()));
 
+        // A page written without a place is a page at its top, which is what the reader of
+        // a document they have only just opened deserves.
+        let (path, anchor) = read_reading(sub).expect("the page just written down");
+        assert_eq!(path, file);
+        assert_eq!(anchor, 0, "nothing written is no place");
+
         // A page the reader has moved or deleted is not a thing to start an error over;
         // it is simply no document, and the window opens on the sample.
         std::fs::remove_file(&file).expect("the page taken away again");
         assert_eq!(read_opened(sub), None);
+        assert_eq!(read_reading(sub), None, "nor a place in it");
         // So is a directory, which is what a path with its last part cut off reads as.
         write_text(sub, OPENED, dir.to_str().expect("a path in unicode"));
         assert_eq!(read_opened(sub), None, "a folder is not a document");
 
         let _ = std::fs::remove_dir_all(&dir);
-        let _ = unsafe { RegDeleteTreeW(HKEY_CURRENT_USER, PCWSTR(utf16(sub).as_ptr())) };
+        clear(sub);
+    }
+
+    /// The number that belongs to a page rather than to the window.
+    #[test]
+    fn a_place_belongs_to_the_page_it_was_a_place_in() {
+        let dir = std::env::temp_dir().join(format!("rubrica-anchor-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("a directory to write two pages into");
+        let one = dir.join("one.md");
+        let two = dir.join("two.md");
+        std::fs::write(&one, "# One").expect("a page to stand in for the reader's");
+        std::fs::write(&two, "# Two").expect("a second one");
+
+        let sub = "Software\\Rubrica Test Anchor";
+        clear(sub);
+        write_reading(sub, &one, 4_300);
+        assert_eq!(read_reading(sub), Some((one, 4_300)));
+        // Opening another page puts its top on the record rather than leaving the first
+        // page's number behind to be stood in at the wrong place in the wrong prose.
+        write_reading(sub, &two, 0);
+        assert_eq!(read_reading(sub), Some((two, 0)));
+
+        let _ = std::fs::remove_dir_all(&dir);
+        clear(sub);
     }
 
     /// A step of the ladder, reached by walking it rather than by naming its ratio.

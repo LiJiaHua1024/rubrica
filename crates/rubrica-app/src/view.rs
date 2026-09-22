@@ -1192,6 +1192,15 @@ pub fn run(source: String, path: Option<PathBuf>) -> Result<()> {
     }
     let dark = saved.dark.unwrap_or_else(system_prefers_dark);
 
+    // Where the reader stood the last time this page was open, if this window is the
+    // continuation of that one rather than a page chosen afresh. The path decides rather
+    // than the route here: a document named on the command line comes back to its place
+    // too, which is what double-clicking it in Explorer is. A sample page has no path, and
+    // so no place.
+    let restore = crate::settings::reading()
+        .filter(|(left, _)| Some(left.as_path()) == path.as_deref())
+        .map(|(_, anchor)| anchor);
+
     let mut view = Box::new(View {
         d2d,
         target: None,
@@ -1265,6 +1274,11 @@ pub fn run(source: String, path: Option<PathBuf>) -> Result<()> {
         .map_err(|e| -> Error { format!("CreateWindowExW: {e}").into() })?;
 
         view.attach(hwnd);
+        // After the first layout, since a place is a fact about it, and before the window
+        // is shown, so a reader never watches their page start at its top and move down.
+        if let Some(anchor) = restore {
+            view.restore_to(anchor);
+        }
         let _ = ShowWindow(hwnd, SW_SHOWNORMAL);
         let _ = SetTimer(Some(hwnd), APPEARANCE_TIMER, APPEARANCE_TICK_MS, None);
 
@@ -1375,6 +1389,11 @@ unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM)
         }
         WM_ERASEBKGND => LRESULT(1),
         WM_DESTROY => {
+            // The last thing the view is asked to do, since after this its lines are
+            // already gone and its place with them.
+            if let Some(v) = view {
+                v.remember_reading();
+            }
             PostQuitMessage(0);
             LRESULT(0)
         }
@@ -2072,6 +2091,32 @@ impl View {
         }
         self.clamp_scroll();
         let _ = unsafe { InvalidateRect(Some(hwnd), None, false) };
+    }
+
+    /// Stand the reader where they were standing when this page was last open.
+    ///
+    /// The place is a character index rather than an offset, so a window that comes up at
+    /// another size -- or in another face, because the remembered one had left the machine
+    /// -- finds the same stretch of prose rather than the same number of points down a page
+    /// that is no longer that long. A place the new layout has no line for leaves the top
+    /// alone: a document that has shrunk since the reader left it is not theirs any more.
+    fn restore_to(&mut self, anchor: usize) {
+        let k = scale_of(self.dpi);
+        if let Some(scroll) = scroll_for_anchor(&self.sel_index, anchor, k) {
+            self.scroll = scroll;
+        }
+        self.clamp_scroll();
+    }
+
+    /// Write down where the reader is standing, for the next window on this page.
+    ///
+    /// At the moment of going rather than of choosing, because a reader who scrolls and
+    /// then closes has chosen nothing in between. The document goes with the place: a
+    /// number left over from another page would be a jump into a paragraph nobody is in.
+    fn remember_reading(&self) {
+        let Some(path) = self.path.as_deref() else { return };
+        let anchor = anchor_at(&self.sel_index, self.scroll, scale_of(self.dpi));
+        crate::settings::record_reading(path, anchor.unwrap_or(0));
     }
 
     /// Put what the reader has marked on the clipboard. A copy with nothing marked leaves
@@ -2788,8 +2833,9 @@ impl View {
         // Written here rather than at each place that asks for a document, so that opening
         // one by dialog, by dropping it on the window, or by following a link to it all
         // leave the same thing behind -- and so that a step back to an older page does not
-        // write that older page as the one the reader chose last.
-        crate::settings::record_opened(path);
+        // write that older page as the one the reader chose last. The new page starts at
+        // its top, and says so in the same breath: a page and a place are one pair.
+        crate::settings::record_reading(path, 0);
         // Reading the page already open again is not a step: the reader did not go
         // anywhere, so there is nothing to come back from. `Reload` is this call with the
         // same path, and a history that grew on every `Ctrl`+`R` would be a `Back` that

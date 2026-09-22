@@ -54,9 +54,11 @@ fn main() -> Result<()> {
 ///
 /// A page that has moved or lost its drive since is not worth refusing to start over --
 /// a remembered preference is a guess about what the reader wants next, and a guess that
-/// cannot be honoured is dropped rather than argued about.
+/// cannot be honoured is dropped rather than argued about. The place in the page is not
+/// taken from here: the window asks for it against the path it ended up with, so that a
+/// document named on the command line gets the same treatment.
 fn reopen() -> (Option<PathBuf>, String) {
-    if let Some(path) = settings::opened() {
+    if let Some((path, _)) = settings::reading() {
         if let Ok(source) = std::fs::read_to_string(&path) {
             return (Some(path), source);
         }
