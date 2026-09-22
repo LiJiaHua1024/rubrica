@@ -1573,20 +1573,21 @@ impl View {
                 // Once the reader has put a caret on the page -- by a click or by an
                 // arrow -- the arrows belong to it, up and down included, because that
                 // is what they mean on every text surface they have ever used. Before
-                // then the same two keys are the page's scroll, which is what a reader
+                // then the same keys are the page's own scroll, which is what a reader
                 // who has only used the wheel has no reason to give up.
                 let caretless = self.caret.is_none() && self.selection.is_none();
                 if let Some(m) = motion_of(wp.0 as u32, ctrl) {
-                    let scrolls = caretless && !shift && matches!(m, Motion::Up | Motion::Down);
-                    if !scrolls {
+                    // `Shift` is the reader's own answer to "which caret?", so a marked
+                    // page never moves by itself: the motion goes to the text even when the
+                    // only place to mark from is the top of it.
+                    let page_moves = caretless && !shift && self.scroll_page(m, step);
+                    if !page_moves {
                         self.move_caret(m, shift);
-                        let _ = InvalidateRect(Some(hwnd), None, false);
-                        return LRESULT(0);
                     }
+                    let _ = InvalidateRect(Some(hwnd), None, false);
+                    return LRESULT(0);
                 }
                 match wp.0 as u32 {
-                    k if k == VK_UP.0 as u32 => self.scroll_by(-step),
-                    k if k == VK_DOWN.0 as u32 => self.scroll_by(step),
                     k if k == VK_PRIOR.0 as u32 => self.scroll_by(-page),
                     k if k == VK_NEXT.0 as u32 => self.scroll_by(page),
                     // The way back out of a caret the reader has clicked into: while the
@@ -1876,6 +1877,34 @@ impl View {
         self.caret = Some(to);
         self.selection = (to != anchor).then_some(Selection { from: anchor, to });
         self.scroll_to_caret(to);
+    }
+
+    /// Move the page instead of a caret, on a page that has none: one line for the
+    /// arrows, one of the document's two ends for `Home` and `End` -- with or without
+    /// `Ctrl`, since a page with nothing focused has no line for those keys to be the ends
+    /// of. Summing instead a caret at the start of the first line, as the motions would on
+    /// their own, is a page that appears not to answer `End`: nothing it holds is further
+    /// from the top than the place the key left the reader.
+    ///
+    /// `false` for the sideways motions, which stay the reader's way of putting a caret on
+    /// the page without a mouse -- and from then the same keys mean what they mean
+    /// everywhere else.
+    fn scroll_page(&mut self, m: Motion, step: Pt) -> bool {
+        match m {
+            Motion::Up => self.scroll_by(-step),
+            Motion::Down => self.scroll_by(step),
+            Motion::Home | Motion::DocStart => self.go_to_end(true),
+            Motion::End | Motion::DocEnd => self.go_to_end(false),
+            Motion::Left | Motion::Right | Motion::WordLeft | Motion::WordRight => return false,
+        }
+        true
+    }
+
+    /// Take the page to one of its ends, leaving no caret behind to be the next arrow's
+    /// starting point.
+    fn go_to_end(&mut self, top: bool) {
+        self.scroll = if top { 0.0 } else { Pt::MAX };
+        self.clamp_scroll();
     }
 
     /// Bring the line the caret is on into the window, by the least movement that does.
