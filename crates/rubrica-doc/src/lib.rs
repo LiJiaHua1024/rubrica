@@ -304,6 +304,9 @@ struct Builder {
     row: Vec<Cell>,
     cell: Option<Cell>,
     in_head: bool,
+    /// The source of the raw HTML block being read, gathered whole: see
+    /// [`Builder::set_html`].
+    html: Option<String>,
 }
 
 impl Builder {
@@ -332,15 +335,22 @@ impl Builder {
             }
             // `<br>` is the one piece of inline HTML with typographic meaning, and
             // authors reach for it because a table cell or a list item has no other
-            // way to break a line. Other markup is dropped: a reader that silently
-            // swallows what it cannot render is worse than one that shows plain text,
-            // but printing the tags would be a lie too.
+            // way to break a line. An inline tag carries a style the reader's page has
+            // no answer for, so it is dropped with its name: the words between it and
+            // its partner are already text, and printing the markup among them would be
+            // a lie about what the author meant.
             Event::InlineHtml(h) => {
                 if is_line_break(&h) {
                     self.put("\n", InlineStyle::EMPTY);
                 }
             }
-            Event::Html(_) => {}
+            // A block of raw HTML is collected rather than answered chunk by chunk,
+            // because the parser cuts it at line ends and a sentence does not stop
+            // there; see [`html_pieces`].
+            Event::Html(h) => match self.html.as_mut() {
+                Some(buf) => buf.push_str(&h),
+                None => self.set_html(&h),
+            },
             Event::InlineMath(m) => {
                 self.push_object(ObjectKind::Math { source: (*m).to_owned(), display: false })
             }
@@ -400,6 +410,12 @@ impl Builder {
     fn start(&mut self, tag: Tag<'_>) {
         match tag {
             Tag::Paragraph => self.open(BlockKind::Paragraph),
+            // Its own block, begun and ended by the parser rather than by any tag in the
+            // text: what the block holds is decided once its whole source is in hand.
+            Tag::HtmlBlock => {
+                self.close();
+                self.html = Some(String::new());
+            }
             Tag::Heading { level, .. } => self.open(BlockKind::Heading(as_level(level))),
             Tag::BlockQuote(_) => self.quote_depth += 1,
             Tag::List(start) => {
@@ -505,6 +521,12 @@ impl Builder {
     fn end(&mut self, tag: TagEnd) {
         match tag {
             TagEnd::Paragraph | TagEnd::Heading(_) | TagEnd::CodeBlock => self.close(),
+            TagEnd::HtmlBlock => {
+                if let Some(raw) = self.html.take() {
+                    self.set_html(&raw);
+                }
+                self.close();
+            }
             TagEnd::TableCell => {
                 if let Some(c) = self.cell.take() {
                     self.row.push(c);
@@ -554,6 +576,32 @@ impl Builder {
                 }
             }
             _ => {}
+        }
+    }
+
+    /// Set what a raw HTML block says, with its markup taken out of it.
+    ///
+    /// None of the block's text was ever parsed as Markdown -- an HTML block is read as
+    /// source -- so what arrives here is what the author typed between the tags, which is
+    /// the words of a paragraph and sometimes a `<b>` nobody can see.
+    fn set_html(&mut self, raw: &str) {
+        for piece in html_pieces(raw) {
+            match piece {
+                Piece::Text(t) => self.put(&t, self.inline),
+                Piece::Image { src, alt } => {
+                    self.push_object(ObjectKind::Image { src, alt });
+                }
+                Piece::Paragraph => self.close(),
+                Piece::Rule => {
+                    self.close();
+                    self.open(BlockKind::Rule);
+                    self.close();
+                }
+                Piece::Heading(level) => {
+                    self.close();
+                    self.open(BlockKind::Heading(level));
+                }
+            }
         }
     }
 
@@ -747,4 +795,323 @@ fn as_level(l: HeadingLevel) -> u8 {
 fn is_line_break(html: &str) -> bool {
     let tag = html.trim().trim_start_matches('<').trim_end_matches('>');
     tag.trim_end_matches('/').trim_end().eq_ignore_ascii_case("br")
+}
+
+/// One piece of a raw HTML block, its markup already turned into what it means on a page.
+enum Piece {
+    /// Prose, its whitespace collapsed to what a browser makes of it.
+    Text(String),
+    /// `<img>`: a figure, named as the document names it.
+    Image { src: String, alt: String },
+    /// `<h1>` to `<h6>`.
+    Heading(u8),
+    /// The end of a block-level element, so that what follows is another paragraph.
+    Paragraph,
+    /// `<hr>`, which is `---` under another name.
+    Rule,
+}
+
+/// The elements whose content is a program's source rather than prose. Not one of their
+/// words is text the reader is owed, and a page's script set in the reader's own face is
+/// not a document.
+const NOT_PROSE: [&str; 6] = ["script", "style", "head", "title", "textarea", "template"];
+
+/// The elements that start on a line of their own, and so end the paragraph they arrive in
+/// the middle of. `<li>` is one of them because two of them are two lines rather than one
+/// sentence with a gap in it.
+const BLOCK_LEVEL: [&str; 27] = [
+    "address", "article", "aside", "blockquote", "dd", "div", "dl", "dt", "fieldset",
+    "figcaption", "figure", "footer", "form", "header", "hgroup", "li", "main", "nav", "ol",
+    "p", "pre", "section", "table", "td", "th", "tr", "ul",
+];
+
+/// The prose and the figures a raw HTML block carries, taken out of its markup.
+///
+/// The whole block is scanned at once rather than line by line as the parser hands it over,
+/// because HTML's whitespace has no respect for a line ending: the newline between two
+/// lines is one space, exactly as the eight after a tag are.
+///
+/// What an element *means* is kept where the page has a typographic answer for it -- a
+/// break, a figure, a heading, the end of a paragraph -- and the rest of the markup is
+/// dropped along with the shape it gave, which is the only reading of it that does not
+/// either swallow the author's words or print their tools among them.
+fn html_pieces(raw: &str) -> Vec<Piece> {
+    let mut f = Fragments::default();
+    let mut rest = raw;
+    while let Some(at) = rest.find('<') {
+        f.words(&rest[..at]);
+        let after = &rest[at + 1..];
+        // `<!-- ... -->` and `<!DOCTYPE ...>`: markup with no words in it at all. A comment
+        // runs to its own terminator rather than to the first `>`, because an author writes
+        // `a > b` inside one.
+        if let Some(tail) = after.strip_prefix("--") {
+            rest = match tail.find("-->") {
+                Some(i) => &tail[i + 3..],
+                None => "",
+            };
+            continue;
+        }
+        if after.starts_with('!') {
+            rest = match after.find('>') {
+                Some(i) => &after[i + 1..],
+                None => "",
+            };
+            continue;
+        }
+        // A `<` that is not followed by a name or a slash is the character rather than the
+        // start of a tag -- prose says `x < y` -- and only a tag may swallow up to its `>`.
+        // The whole run to the next tag goes in together, because the space the author put
+        // after the `<` is the one thing a browser would never have dropped.
+        let starts_a_tag =
+            matches!(after.as_bytes().first(), Some(c) if c.is_ascii_alphabetic() || *c == b'/');
+        let close = if starts_a_tag { after.find('>') } else { None };
+        let Some(close) = close else {
+            // No name after the `<`, or no `>` to close it: text to the next tag, or to
+            // the end of the block.
+            let end = after.find('<').map_or(rest.len(), |i| at + 1 + i);
+            f.words(&rest[at..end]);
+            rest = &rest[end..];
+            continue;
+        };
+        f.tag(&after[..close]);
+        rest = &after[close + 1..];
+    }
+    f.words(rest);
+    f.finish()
+}
+
+/// The block being gathered, one tag at a time.
+#[derive(Default)]
+struct Fragments {
+    out: Vec<Piece>,
+    /// The prose gathered since the last piece, its whitespace already collapsed.
+    text: String,
+    /// A space the text ended with, still owed to the word after it. A tag is not a break in
+    /// a sentence: `<b>word</b> next` is a line with a space in it, and `<b>word</b>next` is
+    /// one word -- which is what the author between the tags wrote.
+    owed: bool,
+    /// Whether the element being read holds a program's source rather than prose, which one
+    /// tag decides and a later one undoes.
+    hidden: bool,
+}
+
+impl Fragments {
+    /// Take in a run of text that stood between two tags: keep its words, and all of its
+    /// whitespace that stands for a space.
+    fn words(&mut self, run: &str) {
+        if self.hidden || run.is_empty() {
+            return;
+        }
+        for word in run.split_whitespace() {
+            if self.owed && !self.text.is_empty() {
+                self.text.push(' ');
+            }
+            self.text.push_str(&resolve_entities(word));
+            self.owed = true;
+        }
+        self.owed = run.ends_with(char::is_whitespace);
+    }
+
+    /// The tag between two runs of text.
+    fn tag(&mut self, tag: &str) {
+        let (name, closing) = tag_name(tag);
+        if name.is_empty() {
+            return;
+        }
+        if NOT_PROSE.contains(&name.as_str()) {
+            // One of their end tags is what lets the prose back in, and the text gathered
+            // before the element stays gathered: a script is invisible, not a full stop.
+            self.hidden = !closing;
+            return;
+        }
+        if self.hidden {
+            return;
+        }
+        match name.as_str() {
+            "br" => {
+                self.text.push('\n');
+                self.owed = false;
+            }
+            "img" => {
+                let src = attr(tag, "src").unwrap_or_default();
+                let alt = attr(tag, "alt").unwrap_or_default();
+                self.flush();
+                // A figure with no file named is a hole in the page, which is worse than
+                // the empty alt text that was meant to fill it.
+                if !src.is_empty() {
+                    self.out.push(Piece::Image { src, alt });
+                }
+            }
+            "hr" => {
+                self.flush();
+                self.out.push(Piece::Rule);
+                self.paragraph_end();
+            }
+            _ if let Some(level) = heading(&name) => {
+                self.flush();
+                if closing {
+                    self.paragraph_end();
+                } else {
+                    self.out.push(Piece::Heading(level));
+                }
+            }
+            _ if BLOCK_LEVEL.contains(&name.as_str()) => self.paragraph_end(),
+            _ => {}
+        }
+    }
+
+    /// End the paragraph being gathered, if there is one to end: two block tags together
+    /// are not a paragraph the reader is owed, and neither is one that opens the block.
+    fn paragraph_end(&mut self) {
+        self.flush();
+        if !self.out.is_empty() && !matches!(self.out.last(), Some(Piece::Paragraph)) {
+            self.out.push(Piece::Paragraph);
+        }
+    }
+
+    /// Hand the prose gathered so far over as a piece of its own.
+    fn flush(&mut self) {
+        if !self.text.is_empty() {
+            self.out.push(Piece::Text(std::mem::take(&mut self.text)));
+        }
+        self.owed = false;
+    }
+
+    fn finish(mut self) -> Vec<Piece> {
+        self.flush();
+        self.out
+    }
+}
+
+/// The element a tag names, lower-cased for comparison, and whether it closes the element
+/// rather than opening it: `<div>`, `</div>`, `<BR />`, `<img src="a.png">`.
+///
+/// Empty for anything that is not a name at all, which is how a stray character inside the
+/// markup is dropped rather than read as an element nobody heard of.
+fn tag_name(tag: &str) -> (String, bool) {
+    let closing = tag.starts_with('/');
+    let mut name = String::new();
+    for c in tag[closing as usize..].chars() {
+        if name.is_empty() {
+            // A tag's first character is a letter, whatever follows its name: `<p>` and
+            // `</p>`, but not `<!--` and not `<3`.
+            if !c.is_ascii_alphabetic() {
+                return (String::new(), closing);
+            }
+        } else if !c.is_ascii_alphanumeric() {
+            // `h2` is an element's whole name, and the space after it begins the
+            // attributes; `<hr width=1>` has no more name in it than that.
+            break;
+        }
+        name.extend(c.to_lowercase());
+    }
+    (name, closing)
+}
+
+/// `h1` to `h6`, as their level. The one element here with a size of its own to carry over,
+/// and worth carrying because an author who reaches for it means a heading rather than a
+/// box: `header`, `hgroup` and `html` are none of them a level.
+fn heading(name: &str) -> Option<u8> {
+    let level: u8 = name.strip_prefix('h')?.parse().ok()?;
+    (1..=6).contains(&level).then_some(level)
+}
+
+/// An attribute's value out of a tag. `src="a.png"`, `src='a.png'` and `src=a.png` are the
+/// three spellings an author reaches for, and the last of them ends at a space.
+fn attr(tag: &str, key: &str) -> Option<String> {
+    let mut rest = tag;
+    while let Some(at) = rest.find(key) {
+        let after = &rest[at + key.len()..];
+        // The name has to begin where an attribute does, or `srcset` answers for `src`.
+        let boundary =
+            at == 0 || matches!(rest.as_bytes()[at - 1], b' ' | b'\t' | b'\n' | b'"' | b'\'');
+        rest = after;
+        if !boundary {
+            continue;
+        }
+        let gaps = [' ', '\t', '\n'];
+        let Some(value) = after.trim_start_matches(gaps).strip_prefix('=') else {
+            continue;
+        };
+        let value = value.trim_start_matches(gaps);
+        if let Some(quote) = value.chars().next().filter(|c| matches!(c, '"' | '\'')) {
+            let value = &value[quote.len_utf8()..];
+            return Some(resolve_entities(value.split(quote).next().unwrap_or(value)));
+        }
+        let value = value.split([' ', '\t', '\n', '/']).next().unwrap_or_default();
+        return Some(resolve_entities(value));
+    }
+    None
+}
+
+/// The character references worth resolving, besides the numeric ones. An HTML block is
+/// source rather than parsed text, so its `&amp;` was never the parser's to decode -- and a
+/// reader shown `AT&amp;T` is being read the markup, not the words. `&nbsp;` becomes the
+/// ordinary space, since a page set from scratch has nothing to say about which of its
+/// spaces a line may not end on.
+const ENTITIES: [(&str, char); 20] = [
+    ("amp", '&'),
+    ("lt", '<'),
+    ("gt", '>'),
+    ("quot", '"'),
+    ("apos", '\''),
+    ("nbsp", ' '),
+    ("mdash", '\u{2014}'),
+    ("ndash", '\u{2013}'),
+    ("hellip", '\u{2026}'),
+    ("ldquo", '\u{201c}'),
+    ("rdquo", '\u{201d}'),
+    ("lsquo", '\u{2018}'),
+    ("rsquo", '\u{2019}'),
+    ("bull", '\u{2022}'),
+    ("deg", '\u{b0}'),
+    ("copy", '\u{a9}'),
+    ("reg", '\u{ae}'),
+    ("trade", '\u{2122}'),
+    ("times", '\u{d7}'),
+    ("middot", '\u{b7}'),
+];
+
+/// One word's character references, resolved. Anything that is not a reference -- a bare
+/// `&` in `A & B`, a name nobody defined -- stays written as the author wrote it.
+fn resolve_entities(word: &str) -> String {
+    if !word.contains('&') {
+        return word.to_string();
+    }
+    let mut out = String::with_capacity(word.len());
+    let mut rest = word;
+    loop {
+        let Some(at) = rest.find('&') else {
+            out.push_str(rest);
+            return out;
+        };
+        out.push_str(&rest[..at]);
+        let after = &rest[at + 1..];
+        // Without its terminator a reference is the character an author typed and nothing
+        // else, so it is emitted and the scan moves past it rather than looking again.
+        let Some(end) = after.find(';') else {
+            out.push('&');
+            rest = after;
+            continue;
+        };
+        let name = &after[..end];
+        let resolved = name
+            .strip_prefix('#')
+            .and_then(|digits| match digits.strip_prefix(['x', 'X']) {
+                Some(hex) => u32::from_str_radix(hex, 16).ok(),
+                None => digits.parse::<u32>().ok(),
+            })
+            .and_then(char::from_u32)
+            .or_else(|| ENTITIES.iter().find(|(k, _)| *k == name).map(|(_, c)| *c));
+        match resolved {
+            Some(c) => {
+                out.push(c);
+                rest = &after[end + 1..];
+            }
+            None => {
+                out.push('&');
+                rest = after;
+            }
+        }
+    }
 }

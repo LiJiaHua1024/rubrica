@@ -152,7 +152,8 @@ fn a_loose_item_marks_the_blocks_that_continue_it() {
 }
 
 #[test]
-fn task_list_items_record_their_checked_state() {    let doc = Document::parse("- [x] done\n- [ ] todo\n");
+fn task_list_items_record_their_checked_state() {
+    let doc = Document::parse("- [x] done\n- [ ] todo\n");
     assert_eq!(doc.blocks[0].task, Some(true));
     assert_eq!(doc.blocks[1].task, Some(false));
 }
@@ -443,3 +444,75 @@ fn a_citation_action_points_at_its_number_and_not_at_the_note() {
     // action of its own unless the author linked something inside it.
     assert!(doc.footnotes[0].blocks[0].actions.is_empty(), "{:?}", doc.footnotes[0].blocks[0].actions);
 }
+
+#[test]
+fn a_raw_html_block_keeps_its_words_and_loses_its_markup() {
+    // The alternative is the old behaviour, which is a document with a paragraph that
+    // only exists as `<p>` tags: an author who wraps prose in a div for one class
+    // attribute is not announcing that the prose may be thrown away.
+    let doc = Document::parse("<div class=\"note\">\nSee the <b>words</b>.\n</div>\n");
+    assert_eq!(doc.blocks.len(), 1, "{:?}", doc.blocks);
+    assert_eq!(doc.blocks[0].text, "See the words.");
+    assert_eq!(
+        doc.blocks[0].spans,
+        vec![rubrica_doc::Span { range: 0..14, style: InlineStyle::EMPTY }]
+    );
+}
+
+#[test]
+fn htmls_block_level_tags_end_the_line_they_arrive_on() {
+    let src = "<ul><li>one</li><li>two</li></ul>\n";
+    let doc = Document::parse(src);
+    assert_eq!(doc.blocks.len(), 2, "two items are two lines, not one sentence with a gap");
+    assert_eq!(doc.blocks[0].text, "one");
+    assert_eq!(doc.blocks[1].text, "two");
+}
+
+#[test]
+fn a_heading_written_in_html_is_a_heading() {
+    // The one element whose meaning survives as more than a line break, because the
+    // reader's outline is built from heading blocks and an `<h2>` is an author asking
+    // to be in it.
+    let doc = Document::parse("<h2>Chapter</h2>\nmore prose\n");
+    assert_eq!(kinds("<h2>Chapter</h2>\n"), vec![BlockKind::Heading(2)]);
+    assert_eq!(doc.blocks[0].kind, BlockKind::Heading(2));
+    assert_eq!(doc.blocks[0].text, "Chapter");
+}
+
+#[test]
+fn an_img_tag_becomes_the_figure_it_names() {
+    let doc = Document::parse("<p><img src=\"shot.png\" alt=\"A shot\"></p>\n");
+    let b = &doc.blocks[0];
+    assert_eq!(b.text, "\u{FFFC}");
+    assert_eq!(
+        b.objects,
+        vec![rubrica_doc::ObjectSpan {
+            range: 0..3,
+            kind: rubrica_doc::ObjectKind::Image { src: "shot.png".into(), alt: "A shot".into() }
+        }]
+    );
+}
+
+#[test]
+fn a_scripts_words_are_not_prose() {
+    let src = "<script>\nvar x = 1;\n</script>\n<p>after</p>\n";
+    let doc = Document::parse(src);
+    assert_eq!(doc.blocks.len(), 1, "{:?}", doc.blocks);
+    assert_eq!(doc.blocks[0].text, "after", "a style rule set in the reader's face is not a document");
+}
+
+#[test]
+fn character_references_are_resolved_where_no_parser_ever_read_them() {
+    let doc = Document::parse("<p>AT&amp;T &#39;quoted&#39; &mdash; &ampund &</p>\n");
+    // `&ampund` is not a reference and a bare `&` is a character, so both stay as written:
+    // the reader is shown the author's text, not the encoder's output.
+    assert_eq!(doc.blocks[0].text, "AT&T 'quoted' — &ampund &");
+}
+
+#[test]
+fn a_comment_hides_nothing_else_and_a_loose_angle_bracket_stays() {
+    let doc = Document::parse("<div><!-- 3 < 4 & 5 --></div>\n<p>x < y</p>\n");
+    assert_eq!(doc.blocks.len(), 1, "{:?}", doc.blocks);
+    assert_eq!(doc.blocks[0].text, "x < y");
+}
+
