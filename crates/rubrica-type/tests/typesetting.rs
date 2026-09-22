@@ -275,7 +275,22 @@ fn hard_break_ends_a_line_and_only_the_final_line_is_ragged() {
     assert!(before.contains("theta"), "line before the break: {before:?}");
     assert!(after.starts_with("one"), "line after the break: {after:?}");
     assert!(plan.lines.last().unwrap().is_ragged());
-    assert!(plan.lines[..plan.lines.len() - 1].iter().all(|l| !l.is_ragged()));
+    // Only two kinds of line escape justification: the one the hard break ends
+    // (`\hfil\break` leaves it flush at its natural width) and the paragraph's last.
+    let ragged: Vec<usize> =
+        plan.lines.iter().enumerate().filter(|(_, l)| l.is_ragged()).map(|(i, _)| i).collect();
+    assert_eq!(ragged, vec![hard, plan.lines.len() - 1], "wrong lines were left ragged");
+}
+
+#[test]
+fn a_forced_break_does_not_spread_its_line_across_the_measure() {
+    let text = "第三行\n第四行";
+    let column = 30.0 * SIZE;
+    let (para, plan) = set(text, column);
+    assert_eq!(plan.lines.len(), 2, "the hard break must end a line");
+    assert!(plan.lines[0].forced);
+    let w = line_width(&place(&para, &plan.lines[0]));
+    assert!(w < column * 0.2, "justified a forced line: {w} of {column}");
 }
 
 #[test]

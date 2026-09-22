@@ -434,6 +434,17 @@ pub fn build(
 /// box needs no script-recipe glue because this space already separates them.
 fn emit_space(p: &mut Paragraph, prev_role: &mut Option<Role>, ws: &str, opts: &BuildOptions) {
     if ws.contains('\n') {
+        // `\hfil\break`, which is what a forced break is in TeX: the line ends where
+        // the author said so and is then left flush at its natural width. Without the
+        // filler the line is justified like any other, and because a Chinese line's
+        // glue is stretchable anywhere, three characters after a hard break would be
+        // spread across the whole column.
+        p.items.push(Item::Glue {
+            base: 0.0,
+            stretch: INFINITY,
+            shrink: 0.0,
+            breakable: true,
+        });
         p.items.push(Item::Penalty { penalty: i32::MIN, forced: true, width: 0.0, hyphen: None });
     } else {
         p.items.push(Item::glue(&opts.spacing.latin_space));
