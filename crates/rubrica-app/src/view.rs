@@ -55,11 +55,11 @@ use windows::Win32::UI::Shell::{DragAcceptFiles, DragFinish, DragQueryFileW, She
 use windows::Win32::UI::WindowsAndMessaging::{
     AppendMenuW, CS_DBLCLKS, CS_HREDRAW, CS_VREDRAW, CREATESTRUCTW, CreatePopupMenu,
     CreateWindowExW, DefWindowProcW, DestroyMenu, DispatchMessageW,
-    GWLP_USERDATA, GetClientRect, GetCursorPos, GetWindowLongPtrW, GetMessageW, HCURSOR, HWND_TOP,
-    HTCLIENT, IDC_ARROW, IDC_HAND, KillTimer, LoadCursorW, MF_CHECKED, MF_GRAYED, MF_SEPARATOR,
-    MF_STRING, MSG, PostMessageW, PostQuitMessage, RegisterClassExW, SetCursor, SetForegroundWindow,
-    SetWindowTextW, SW_SHOWNORMAL, SetTimer, SetWindowLongPtrW, SetWindowPos, ShowWindow,
-    TPM_RETURNCMD,
+    GWLP_USERDATA, GetClientRect, GetCursorPos, GetWindowLongPtrW, GetMessageW, HCURSOR, HMENU,
+    HWND_TOP, HTCLIENT, IDC_ARROW, IDC_HAND, KillTimer, LoadCursorW, MF_CHECKED, MF_GRAYED,
+    MF_POPUP, MF_SEPARATOR, MF_STRING, MSG, PostMessageW, PostQuitMessage, RegisterClassExW,
+    SetCursor, SetForegroundWindow, SetWindowTextW, SW_SHOWNORMAL, SetTimer, SetWindowLongPtrW,
+    SetWindowPos, ShowWindow, TPM_RETURNCMD,
     TPM_RIGHTBUTTON, TrackPopupMenuEx, TranslateMessage, WM_CONTEXTMENU, WM_NULL, WNDCLASSEXW,
     WM_DESTROY, WM_DPICHANGED, WM_ERASEBKGND, WM_KEYDOWN, WM_MOUSEWHEEL, WM_NCCREATE, WM_PAINT,
     WM_SETCURSOR, WM_SIZE, WM_TIMER, WS_EX_APPWINDOW, WS_OVERLAPPEDWINDOW, SWP_NOACTIVATE,
@@ -830,6 +830,8 @@ enum Command {
     /// Step to the page the reader came from, and to the one they came from it to.
     GoBack,
     GoForward,
+    /// Jump to the nth heading, index into the same list the outline is built from.
+    Heading(usize),
     Copy,
     SelectAll,
     OpenUrl(String),
@@ -855,7 +857,21 @@ enum Command {
 #[derive(Clone, Debug, PartialEq)]
 enum MenuRow {
     Gap,
-    Row { cmd: Command, label: &'static str, enabled: bool, checked: bool },
+    Row { cmd: Command, label: String, enabled: bool, checked: bool },
+    /// A list of rows one level down. Only ever built when it has something in it: a
+    /// group that opens onto an empty rectangle is a menu teaching the reader that
+    /// nothing here is worth their click, which is worse than not offering the group.
+    Sub { label: &'static str, items: Vec<MenuRow> },
+}
+
+/// A row the reader may or may not be able to ask for.
+fn row(cmd: Command, label: impl Into<String>, enabled: bool) -> MenuRow {
+    MenuRow::Row { cmd, label: label.into(), enabled, checked: false }
+}
+
+/// A row that names which of a group is the one in use.
+fn check(cmd: Command, label: impl Into<String>, on: bool) -> MenuRow {
+    MenuRow::Row { cmd, label: label.into(), enabled: true, checked: on }
 }
 
 /// What the page looks like from the place the menu was called, gathered because the
@@ -883,6 +899,9 @@ struct MenuState {
     face: usize,
     /// Which entry of [`Measure::ALL`] the column is capped at right now.
     measure: usize,
+    /// The page's own outline, which is a fact about the document rather than about the
+    /// reader's choices, and is empty on a page with no headings in it.
+    headings: Vec<Outline>,
     /// Which of those faces this machine can actually draw, index for index with
     /// [`TextFace::ALL`]. A face that is not installed is shown and left dim: it is the
     /// reader's own machine, and hiding the choice they cannot have says less about it
@@ -892,8 +911,6 @@ struct MenuState {
 
 /// The menu, in the order it appears and with the groups it is divided into.
 fn menu_items(s: &MenuState) -> Vec<MenuRow> {
-    let row = |cmd: Command, label, enabled| MenuRow::Row { cmd, label, enabled, checked: false };
-    let check = |cmd: Command, label, on| MenuRow::Row { cmd, label, enabled: true, checked: on };
     // A tab in a menu string starts the accelerator column, which Windows sets
     // right-aligned on its own. Only the rows where the key does exactly what the row
     // says print one: `Ctrl`+`D` picks whichever palette is not on rather than the one it
@@ -910,6 +927,13 @@ fn menu_items(s: &MenuState) -> Vec<MenuRow> {
         v.push(MenuRow::Gap);
         v.push(row(Command::OpenUrl(url.clone()), "Open Link", true));
         v.push(row(Command::CopyUrl(url.clone()), "Copy Link Address", true));
+    }
+    // The document's own shape, one level down, where a long page needs it and a short one
+    // gets nothing -- an outline of three lines is quicker to scroll past than to open.
+    let contents = outline_rows(&s.headings);
+    if !contents.is_empty() {
+        v.push(MenuRow::Gap);
+        v.push(MenuRow::Sub { label: "Contents", items: contents });
     }
     v.push(MenuRow::Gap);
     v.extend([
@@ -941,6 +965,55 @@ fn menu_items(s: &MenuState) -> Vec<MenuRow> {
         row(Command::Reload, "Reload\tCtrl+R", s.from_file),
     ]);
     v
+}
+
+/// Append these rows to a menu, collecting the command each appended id answers to.
+///
+/// A submenu is created, filled and handed to its parent, which then owns it: destroying
+/// the menu the reader was shown takes the whole tree with it, so nothing here has to be
+/// cleaned up by hand. A group that cannot be created is skipped rather than opened empty,
+/// and one that cannot be attached is destroyed at once, since it has no parent to do that
+/// for it.
+fn append_rows(
+    menu: &HMENU,
+    rows: &[MenuRow],
+    next: &mut usize,
+    cmds: &mut HashMap<usize, Command>,
+) {
+    for item in rows {
+        match item {
+            MenuRow::Gap => {
+                let _ = unsafe { AppendMenuW(*menu, MF_SEPARATOR, 0, PCWSTR::null()) };
+            }
+            MenuRow::Row { cmd, label, enabled, checked } => {
+                let text = utf16(label);
+                let mut flags = MF_STRING;
+                if !enabled {
+                    flags |= MF_GRAYED;
+                }
+                if *checked {
+                    flags |= MF_CHECKED;
+                }
+                let id = *next;
+                *next += 1;
+                if unsafe { AppendMenuW(*menu, flags, id, PCWSTR(text.as_ptr())) }.is_ok() {
+                    cmds.insert(id, cmd.clone());
+                }
+            }
+            MenuRow::Sub { label, items } => {
+                let Ok(sub) = (unsafe { CreatePopupMenu() }) else { continue };
+                append_rows(&sub, items, next, cmds);
+                let text = utf16(label);
+                // The item's number is the submenu's own handle for a `MF_POPUP` row,
+                // which is how Windows finds it again -- and why no id is recorded here.
+                if unsafe { AppendMenuW(*menu, MF_POPUP, sub.0 as usize, PCWSTR(text.as_ptr())) }
+                    .is_err()
+                {
+                    let _ = unsafe { DestroyMenu(sub) };
+                }
+            }
+        }
+    }
 }
 
 /// Whether a reader may be asked to open a link. Only the schemes that mean "read
@@ -995,6 +1068,48 @@ pub(crate) fn slug(text: &str) -> String {
         out.extend(c.to_lowercase());
     }
     out
+}
+
+/// One line of the document's outline: the heading's own words, and how deep it sits.
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct Outline {
+    pub level: u8,
+    pub label: String,
+}
+
+/// The document's headings, in the order they were parsed -- which is the order
+/// [`View::anchor_tops`] is filled, so the nth line of the outline jumps to the nth
+/// anchor. `anchors` is how many of them actually landed on the page, which is what keeps
+/// the two lists the same length if a heading ever fails to lay out. A note can carry a
+/// heading of its own, and those are not part of the document's outline: they are not in
+/// `doc.blocks` to begin with.
+fn outline(doc: &Document, anchors: usize) -> Vec<Outline> {
+    doc.blocks
+        .iter()
+        .filter_map(|b| match b.kind {
+            BlockKind::Heading(level) => Some(Outline { level, label: b.text.clone() }),
+            _ => None,
+        })
+        .take(anchors)
+        .collect()
+}
+
+/// The outline as rows of a submenu, indented by level.
+///
+/// An em space per step, because a menu has no other way to say "this belongs to the line
+/// above it": a reader who wrote a third-level heading should see it sit under its own
+/// section rather than beside the chapter it is in. A tab is swapped for a space first,
+/// because in a menu string a tab is not blank -- it opens the accelerator column, and a
+/// heading that happened to carry one would print half of itself on the right.
+fn outline_rows(headings: &[Outline]) -> Vec<MenuRow> {
+    headings
+        .iter()
+        .enumerate()
+        .map(|(i, h)| {
+            let indent = "\u{2003}".repeat(h.level.saturating_sub(1).min(4) as usize);
+            row(Command::Heading(i), indent + &h.label.replace('\t', " "), true)
+        })
+        .collect()
 }
 
 /// Hand an accepted address to the shell, which is what decides the browser or the mail
@@ -1513,7 +1628,12 @@ impl View {
                     // to no purpose: an empty selection is not an edit.
                     k if k == VK_C.0 as u32 && ctrl => self.copy_selection(hwnd),
                     k if k == VK_A.0 as u32 && ctrl => self.select_all(),
-                    _ => {}
+                    // A key this window has no use for goes back to the default handler,
+                    // which is what turns the keyboard's menu key -- and `Shift`+`F10` --
+                    // into the `WM_CONTEXTMENU` that opens the reader's menu. Answering
+                    // every unclaimed key with `0` here would silently cost the one way
+                    // there is to reach that menu without a mouse.
+                    _ => return DefWindowProcW(hwnd, msg, wp, lp),
                 }
                 let _ = InvalidateRect(Some(hwnd), None, false);
                 LRESULT(0)
@@ -1818,35 +1938,21 @@ impl View {
             text: !self.sel_index.is_empty(),
             face: self.theme.face,
             measure: self.theme.measure,
+            headings: outline(&self.doc, self.anchor_tops.len()),
             offered: TextFace::ALL.iter().map(|f| face_drawable(&self.font, f)).collect(),
         };
         let menu = match unsafe { CreatePopupMenu() } {
             Ok(m) => m,
             Err(_) => return,
         };
-        // A row's id is its position in the list, gaps included, so the number the menu
-        // answers with reads back into it without a second table to keep in step.
+        // A row's id is the number it was appended with, taken from one counter shared by
+        // the whole tree of menus, so the number the menu answers with reads back into its
+        // command without a second table to keep in step. Shared rather than per-menu
+        // because a submenu's rows are appended to a different menu, and their positions
+        // would otherwise repeat numbers already in use above them.
         let mut rows: HashMap<usize, Command> = HashMap::new();
-        for (i, item) in menu_items(&state).iter().enumerate() {
-            match item {
-                MenuRow::Gap => {
-                    let _ = unsafe { AppendMenuW(menu, MF_SEPARATOR, 0, PCWSTR::null()) };
-                }
-                MenuRow::Row { cmd, label, enabled, checked } => {
-                    let text = utf16(label);
-                    let mut flags = MF_STRING;
-                    if !enabled {
-                        flags |= MF_GRAYED;
-                    }
-                    if *checked {
-                        flags |= MF_CHECKED;
-                    }
-                    if unsafe { AppendMenuW(menu, flags, i + 1, PCWSTR(text.as_ptr())) }.is_ok() {
-                        rows.insert(i + 1, cmd.clone());
-                    }
-                }
-            }
-        }
+        let mut next = 1usize;
+        append_rows(&menu, &menu_items(&state), &mut next, &mut rows);
         // The flags argument is a plain `u32` here rather than the flag newtype the other
         // menu calls take, which is what makes the `.0` necessary.
         let picked = unsafe {
@@ -1864,6 +1970,10 @@ impl View {
         match cmd {
             Command::GoBack => self.go_back(hwnd),
             Command::GoForward => self.go_forward(hwnd),
+            // The same jump a table of contents link makes, so the two cannot land in
+            // different places: both go through `jump_to`, which is what decides where the
+            // top of a heading sits on the screen and whether this was a step at all.
+            Command::Heading(i) => self.jump_to(self.anchor_tops.get(i).copied(), hwnd),
             Command::Copy => self.copy_selection(hwnd),
             Command::SelectAll => self.select_all(),
             Command::OpenUrl(u) => open_url(&u),
@@ -4218,14 +4328,42 @@ mod tests {
         assert_eq!(caret_rect(&sel, Caret { line: 1, ch: 0 }), None);
     }
 
-    /// The rows a state gives, without the gaps that only divide them.
+    /// The rows a state gives, without the gaps that only divide them and without the
+    /// rows one level down, so a position in this list is a position in the top menu.
     fn rows(s: &MenuState) -> Vec<(Command, bool, bool)> {
         menu_items(s)
             .into_iter()
             .filter_map(|r| match r {
                 MenuRow::Gap => None,
+                MenuRow::Sub { .. } => None,
                 MenuRow::Row { cmd, enabled, checked, .. } => Some((cmd, enabled, checked)),
             })
+            .collect()
+    }
+
+    /// The contents of the `Contents` submenu, with their labels -- which is the one thing
+    /// about an outline row the rest of these helpers throw away.
+    fn contents(s: &MenuState) -> Vec<(Command, String)> {
+        menu_items(s)
+            .into_iter()
+            .find_map(|r| match r {
+                MenuRow::Sub { items, .. } => Some(items),
+                _ => None,
+            })
+            .unwrap_or_default()
+            .into_iter()
+            .map(|r| match r {
+                MenuRow::Row { cmd, label, .. } => (cmd, label),
+                _ => unreachable!("the outline holds nothing but rows"),
+            })
+            .collect()
+    }
+
+    /// A heading list, as [`View`] would gather it from a document: level and words.
+    fn outline_of(headings: &[(u8, &str)]) -> Vec<Outline> {
+        headings
+            .iter()
+            .map(|(level, label)| Outline { level: *level, label: (*label).to_string() })
             .collect()
     }
 
@@ -4246,6 +4384,7 @@ mod tests {
             face: 0,
             offered: vec![true; TextFace::ALL.len()],
             measure: Measure::DESIGN,
+            headings: Vec::new(),
         }
     }
 
@@ -4363,13 +4502,86 @@ mod tests {
     }
 
     #[test]
+    fn the_outline_is_the_document_in_the_order_it_was_laid_out() {
+        let doc = Document::parse("# One\n\ntext\n\n## Two\n\n### Three\n");
+        assert_eq!(
+            outline(&doc, 3),
+            vec![
+                Outline { level: 1, label: "One".into() },
+                Outline { level: 2, label: "Two".into() },
+                Outline { level: 3, label: "Three".into() },
+            ],
+            "the prose between them is not part of the outline, and the levels come from the source"
+        );
+        // Fewer anchors on the page than headings in the source: the outline stops with
+        // them, because a row pointing at an anchor that was never laid out is a row that
+        // does nothing when clicked.
+        assert_eq!(outline(&doc, 1).len(), 1);
+        assert!(outline(&doc, 0).is_empty());
+        assert_eq!(outline(&doc, 99).len(), 3, "and it never invents a heading to fill in");
+        assert!(outline(&Document::parse("only prose"), 4).is_empty());
+    }
+
+    #[test]
+    fn an_outline_row_carries_its_own_place_in_the_document() {
+        let got = outline_rows(&outline_of(&[
+            (1, "Chapter"),
+            (4, "Section"),
+            (6, "Deepest"),
+            (3, "Has\ttab"),
+        ]));
+        // Each row's command is its own position in the list, which is the same index
+        // `anchor_tops` is kept in -- so the outline and a table of contents link cannot
+        // lead to different places.
+        let label = |i: usize| match &got[i] {
+            MenuRow::Row { cmd, label, .. } => {
+                assert_eq!(*cmd, Command::Heading(i));
+                label.clone()
+            }
+            _ => unreachable!("every outline row is a row"),
+        };
+        assert_eq!(label(0), "Chapter");
+        assert_eq!(label(1), "\u{2003}\u{2003}\u{2003}Section");
+        // Deeper than four steps, the indent stops growing: a heading pushed off the right
+        // of the menu is no more use than a flat list of them.
+        assert_eq!(label(2), "\u{2003}\u{2003}\u{2003}\u{2003}Deepest");
+        // A tab in a menu string is not blank -- it starts the accelerator column -- so the
+        // one a heading happens to carry is swapped out before it can split its own name.
+        assert_eq!(label(3), "\u{2003}\u{2003}Has tab");
+    }
+
+    #[test]
+    fn a_page_with_headings_offers_its_outline_and_a_page_without_does_not() {
+        let s = state(false, None, None, false, true);
+        assert!(contents(&s).is_empty(), "nothing to name");
+        assert!(
+            !menu_items(&s).iter().any(|r| matches!(r, MenuRow::Sub { .. })),
+            "no group offering an empty rectangle"
+        );
+
+        let mut s = state(false, None, None, false, true);
+        s.headings = outline_of(&[(1, "One"), (2, "Two"), (2, "Three")]);
+        assert_eq!(
+            contents(&s),
+            vec![
+                (Command::Heading(0), "One".to_string()),
+                (Command::Heading(1), "\u{2003}Two".to_string()),
+                (Command::Heading(2), "\u{2003}Three".to_string()),
+            ]
+        );
+        // Three of them, and the top menu is no longer than it was: the outline is one row
+        // there, however many headings sit behind it.
+        assert_eq!(rows(&s).len(), rows(&state(false, None, None, false, true)).len());
+    }
+
+    #[test]
     fn a_row_that_a_key_also_repeats_prints_the_key() {
         let rows = |s: &MenuState| {
             menu_items(s)
                 .into_iter()
                 .filter_map(|r| match r {
-                    MenuRow::Row { cmd, label, .. } => Some((cmd, label)),
-                    MenuRow::Gap => None,
+                    MenuRow::Row { cmd, label, .. } => Some((cmd, label.clone())),
+                    MenuRow::Gap | MenuRow::Sub { .. } => None,
                 })
                 .collect::<Vec<_>>()
         };
@@ -4528,6 +4740,7 @@ mod tests {
             face: 0,
             offered: vec![true; TextFace::ALL.len()],
             measure: Measure::DESIGN,
+            headings: Vec::new(),
         };
         let got = rows(&s);
         // Two items, in this order: follow it, and take only the address. Both enabled,
