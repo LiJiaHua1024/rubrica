@@ -13,7 +13,7 @@ use rubrica_doc::{Align, Block, BlockKind, Document, InlineStyle};
 use rubrica_type::justification::place;
 use rubrica_type::paragraph::{Item, Spacing, StyleId, StyleSpan};
 use rubrica_type::units::Pt;
-use rubrica_type::{BreakOptions, typeset, typeset_hyphenated};
+use rubrica_type::{BreakOptions, Hyphenation, typeset, typeset_hyphenated};
 use windows::core::{w, Interface, PCWSTR};
 use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, RECT, WPARAM};
 use windows::Win32::Graphics::Direct2D::Common::{
@@ -59,9 +59,10 @@ use windows::Win32::UI::WindowsAndMessaging::{
 };
 use windows_numerics::Vector2;
 
-use crate::font::{FaceRequest, FontEngine, ObjectBox, Style as RunStyle};
+use crate::font::{FaceRequest, FontEngine, GlyphRun, ObjectBox, Style as RunStyle};
 use crate::hyphen::Hyphenator;
 use crate::images::ImageStore;
+use crate::math::MathStore;
 use crate::theme::{ColorRole, Theme};
 use crate::{Error, Result};
 
@@ -149,8 +150,18 @@ struct AppStyle {
     color: ColorRole,
     /// Set instead of font properties for an inline object such as an image.
     object: Option<ObjectBox>,
-    /// The file an object style draws, when it has one.
-    image: Option<PathBuf>,
+    /// What an object style draws, once its box is known.
+    source: Option<ObjectSource>,
+}
+
+/// The thing behind an object placeholder.
+#[derive(Clone, Debug, PartialEq)]
+enum ObjectSource {
+    Image(PathBuf),
+    /// Index into the formula cache, which holds the pieces already shaped: a
+    /// formula is typeset while the line's measure is worked out, and painting it
+    /// must not run the layout a second time.
+    Math(usize),
 }
 
 /// One face's positioned glyphs, in device independent pixels.
@@ -165,6 +176,9 @@ pub struct PaintRun {
     offsets: Vec<DWRITE_GLYPH_OFFSET>,
     pub x: f32,
     pub baseline: f32,
+    /// Extra drop below the line's baseline, positive downwards. Zero for prose; a
+    /// formula's pieces each sit somewhere of their own within its box.
+    dy: f32,
     color: ColorRole,
 }
 
@@ -196,6 +210,8 @@ pub struct View {
     dragging: bool,
     /// Built once a render target exists, since bitmaps need one.
     images: Option<ImageStore>,
+    /// Typeset formulas, kept across relayouts so a document's math is set once.
+    math: MathStore,
     /// English word breaks, when the embedded dictionary loaded.
     hyphenator: Option<Hyphenator>,
 }
@@ -260,6 +276,7 @@ pub fn run(source: String, path: Option<PathBuf>) -> Result<()> {
         path,
         dragging: false,
         images: None,
+        math: MathStore::new(),
         hyphenator: Hyphenator::english(),
     });
 
@@ -584,17 +601,20 @@ impl View {
     }
 
     fn relayout(&mut self) {
-        let (ops, h, _column, _left) =
-            build_ops(
-                &mut self.font,
-                &self.theme,
-                &self.doc,
-                self.client_w,
-                self.dpi,
-                self.images.as_ref(),
-                self.path.as_deref().and_then(|p| p.parent()),
-                self.hyphenator.as_ref(),
-            );
+        // Every field handed in is borrowed for its own reason: the decoder and the
+        // document's directory for figures, the cache so a resize does not reset the
+        // document's formulas.
+        let mut objects =
+            Objects::new(self.images.as_ref(), self.path.as_deref().and_then(|p| p.parent()), &mut self.math);
+        let (ops, h, _column, _left) = build_ops(
+            &mut self.font,
+            &self.theme,
+            &self.doc,
+            self.client_w,
+            self.dpi,
+            &mut objects,
+            self.hyphenator.as_ref(),
+        );
         self.content_h = h;
         self.ops = ops;
     }
@@ -605,6 +625,8 @@ impl View {
 struct Ctx<'a> {
     theme: &'a Theme,
     styles: &'a [AppStyle],
+    /// Typeset formulas, by cache index. Layout only reads this; interning wrote it.
+    math: &'a MathStore,
     /// Points to device independent pixels.
     k: f32,
 }
@@ -618,10 +640,9 @@ struct Blk<'a> {
     left: Pt,
     column: Pt,
     table: Option<&'a PreparedTable>,
-    /// Byte offsets inside this block's text where a word may split.
-    hyphens: &'a [usize],
-    /// Advance of the hyphen glyph at this block's body size.
-    hyphen_width: Pt,
+    /// Where words in this block may split, and the advance of the hyphen glyph at
+    /// this block's body size.
+    hyphenation: Hyphenation<'a>,
 }
 
 /// A table cell with its styles already resolved to ids, so column sizing and
@@ -642,10 +663,31 @@ const CELL_PAD_EM: Pt = 0.6;
 /// The narrowest a column may be squeezed to before it is left to overflow.
 const CELL_MIN_EM: Pt = 3.0;
 
+/// A shaped run turned into something the painter can position: scaled to device
+/// independent pixels, seated `x` from the page edge and `dy` below the baseline of
+/// whichever line carries it.
+///
+/// Prose uses `dy = 0`. A formula's pieces each bring their own offset, which is why
+/// the drop is a property of the run rather than something the line loop assumes.
+fn paint_run(font: &FontEngine, r: &GlyphRun, x: Pt, dy: Pt, k: f32, color: ColorRole) -> Option<PaintRun> {
+    Some(PaintRun {
+        family: font.face_family(r.face),
+        face: font.font_face(r.face)?,
+        em: r.size * k,
+        glyphs: r.glyphs.clone(),
+        advances: r.advances.iter().map(|a| a * k).collect(),
+        offsets: r.offsets.clone(),
+        x: x * k,
+        baseline: 0.0,
+        dy,
+        color,
+    })
+}
+
 /// Typeset one block into the display list and return the new document y.
 fn layout_block(font: &mut FontEngine, ctx: &Ctx<'_>, blk: &Blk<'_>, ops: &mut Vec<Op>, mut y: Pt) -> Pt {
-    let Ctx { theme, styles, k } = *ctx;
-    let Blk { b, text, spans, base, left, column, hyphens, hyphen_width, .. } = *blk;
+    let Ctx { theme, styles, math, k } = *ctx;
+    let Blk { b, text, spans, base, left, column, hyphenation, .. } = *blk;
     let mut images_out: Vec<(PathBuf, f32, f32, Pt, Pt)> = Vec::new();
     if b.kind == BlockKind::Rule {
         y += theme.base * 0.6;
@@ -679,8 +721,7 @@ fn layout_block(font: &mut FontEngine, ctx: &Ctx<'_>, blk: &Blk<'_>, ops: &mut V
         &spacing,
         StyleId(base as u16),
         spans,
-        hyphens,
-        hyphen_width,
+        &hyphenation,
         &opts,
         font,
     );
@@ -695,47 +736,72 @@ fn layout_block(font: &mut FontEngine, ctx: &Ctx<'_>, blk: &Blk<'_>, ops: &mut V
     for line in &plan.lines {
         let placed = place(&para, line);
         let mut runs: Vec<PaintRun> = Vec::new();
+        // Bars of a formula, as x, top edge, width, thickness and ink, all still
+        // relative to this line's baseline because the line has no position yet.
+        let mut bars: Vec<(Pt, Pt, Pt, Pt, ColorRole)> = Vec::new();
         let mut ascent = 0.0f32;
         let mut descent = 0.0f32;
         for slot in placed {
             let Some(node_id) = slot.node else { continue };
             let node = para.node(node_id);
             let st = &styles[node.style.0 as usize];
-            if let (Some(o), Some(file)) = (st.object, st.image.clone()) {
-                // An object contributes its own box to the line and is drawn
-                // from its file, not from any glyph run.
+            if let Some(o) = st.object {
+                // An object contributes its own box to the line and is drawn from
+                // its source, not from the placeholder character's glyphs.
                 ascent = ascent.max(o.ascent);
                 descent = descent.max(o.descent);
-                images_out.push((file, (left + slot.x) * k, o.advance * k, o.ascent, o.descent));
+                match &st.source {
+                    Some(ObjectSource::Image(file)) => {
+                        images_out.push((
+                            file.clone(),
+                            (left + slot.x) * k,
+                            o.advance * k,
+                            o.ascent,
+                            o.descent,
+                        ));
+                    }
+                    Some(ObjectSource::Math(index)) => {
+                        // Every piece arrives at its own place inside the formula's
+                        // box, so nothing here accumulates an advance.
+                        if let Some(entry) = math.get(*index) {
+                            for (r, dx, dy) in &entry.parts {
+                                if let Some(p) = paint_run(font, r, left + slot.x + dx, *dy, k, st.color) {
+                                    runs.push(p);
+                                }
+                            }
+                            bars.extend(entry.rules.iter().map(|(x, top, w, h)| {
+                                (left + slot.x + x, *top, *w, *h, st.color)
+                            }));
+                        }
+                    }
+                    None => {}
+                }
                 continue;
             }
             let shaped = font.shape_runs(text, node.text.clone(), &st.face, st.size, st.tracking);
+            // One span can need several faces -- Latin and Han in one sentence, or a
+            // run that falls back for a symbol -- and each takes up where the last
+            // stopped, since only the whole span's width is what the line broke on.
+            let mut at = left + slot.x;
             for r in shaped {
                 ascent = ascent.max(r.ascent);
                 descent = descent.max(r.descent);
-                runs.push(PaintRun {
-                    family: font.face_family(r.face),
-                    face: match font.font_face(r.face) {
-                        Some(f) => f,
-                        None => continue,
-                    },
-                    em: r.size * k,
-                    glyphs: r.glyphs,
-                    advances: r.advances.iter().map(|a| a * k).collect(),
-                    offsets: r.offsets,
-                    x: (left + slot.x) * k,
-                    baseline: 0.0,
-                    color: st.color,
-                });
+                if let Some(p) = paint_run(font, &r, at, 0.0, k, st.color) {
+                    runs.push(p);
+                }
+                at += r.width();
             }
         }
         let natural = ascent + descent;
         let line_h = (size * leading.for_mixed(mixed)).max(natural * 1.02);
         let baseline = y + (line_h - natural) * 0.5 + ascent;
         for run in runs.iter_mut() {
-            run.baseline = baseline * k;
+            run.baseline = (baseline + run.dy) * k;
         }
         ops.push(Op::Runs(runs));
+        for (x, top, w, h, color) in bars {
+            ops.push(Op::Rect { x: x * k, y: (baseline + top) * k, w: w * k, h: h * k, color });
+        }
         for (file, x, w, a, d) in images_out.drain(..) {
             ops.push(Op::Image { path: file, x, y: (baseline - a) * k, w, h: (a + d) * k });
         }
@@ -1059,9 +1125,11 @@ fn layout_table(
                     let Some(node_id) = slot.node else { continue };
                     let node = para.node(node_id);
                     let st = &styles[node.style.0 as usize];
+                    let mut at = x + pad + shift + slot.x;
                     for r in font.shape_runs(&c.text, node.text.clone(), &st.face, st.size, st.tracking) {
                         ascent = ascent.max(r.ascent);
                         let Some(face) = font.font_face(r.face) else { continue };
+                        let width = r.width();
                         runs.push(PaintRun {
                             family: font.face_family(r.face),
                             face,
@@ -1069,10 +1137,12 @@ fn layout_table(
                             glyphs: r.glyphs,
                             advances: r.advances.iter().map(|a| a * k).collect(),
                             offsets: r.offsets,
-                            x: (x + pad + shift + slot.x) * k,
+                            x: at * k,
                             baseline: 0.0,
+                            dy: 0.0,
                             color: st.color,
                         });
+                        at += width;
                     }
                 }
                 for run in runs.iter_mut() {
@@ -1113,7 +1183,13 @@ fn layout_table(
     y
 }
 
-fn intern_object(styles: &mut Vec<AppStyle>, path: PathBuf, object: ObjectBox) -> StyleId {
+/// Intern an inline object's style: the box the line has to make room for, and what
+/// draws inside it.
+///
+/// No face is asked for, because the object's own pieces -- a bitmap, or a formula's
+/// already-shaped runs -- carry everything the painter needs. `color` still matters:
+/// it is what makes a formula in a heading match the heading's ink.
+fn intern_object(styles: &mut Vec<AppStyle>, source: ObjectSource, color: ColorRole, object: ObjectBox) -> StyleId {
     let app = AppStyle {
         face: FaceRequest {
             family: String::new(),
@@ -1124,9 +1200,9 @@ fn intern_object(styles: &mut Vec<AppStyle>, path: PathBuf, object: ObjectBox) -
         },
         size: 0.0,
         tracking: 0.0,
-        color: ColorRole::Text,
+        color,
         object: Some(object),
-        image: Some(path),
+        source: Some(source),
     };
     if let Some(i) = styles.iter().position(|s| *s == app) {
         return StyleId(i as u16);
@@ -1148,7 +1224,7 @@ fn intern(styles: &mut Vec<AppStyle>, fallback: &[String], r: crate::theme::Reso
         tracking: r.tracking,
         color: r.color,
         object: None,
-        image: None,
+        source: None,
     };
     if let Some(i) = styles.iter().position(|s| *s == app) {
         return StyleId(i as u16);
@@ -1164,6 +1240,91 @@ fn marker_for(b: &Block) -> String {
         None => String::new(),
     }
 }
+/// The services an inline object needs, bundled so that adding a third kind of
+/// figure does not add a third argument to the layout entry point.
+pub struct Objects<'a> {
+    images: Option<&'a ImageStore>,
+    /// Directory a relative image source resolves against, normally the document's.
+    base_dir: Option<&'a std::path::Path>,
+    /// Formulas typeset so far: written while styles are interned, read back when the
+    /// same style ids are laid out, so no document is set twice.
+    math: &'a mut MathStore,
+}
+
+impl<'a> Objects<'a> {
+    pub fn new(
+        images: Option<&'a ImageStore>,
+        base_dir: Option<&'a std::path::Path>,
+        math: &'a mut MathStore,
+    ) -> Objects<'a> {
+        Objects { images, base_dir, math }
+    }
+
+    /// The style for one object span, or `None` when it cannot be shown and its
+    /// placeholder should be left to read as the block's own prose.
+    ///
+    /// `prose` is the block's own resolved style, and gives the object its size and
+    /// ink -- which is what keeps a formula in a heading at heading size and in
+    /// heading colour. It is owned rather than borrowed because growing `styles` below
+    /// cannot alias the table the id was read out of.
+    fn intern(
+        &mut self,
+        font: &FontEngine,
+        styles: &mut Vec<AppStyle>,
+        theme: &Theme,
+        obj: &rubrica_doc::ObjectSpan,
+        column: Pt,
+        prose: AppStyle,
+    ) -> Option<StyleId> {
+        let (size, color) = (prose.size, prose.color);
+        match &obj.kind {
+            rubrica_doc::ObjectKind::Image { src, .. } => {
+                // A missing store means COM or WIC could not be started, which is a
+                // different failure from one bad file and has to be reported as such
+                // rather than passed off as prose.
+                let Some(store) = self.images else {
+                    eprintln!("figures disabled: no image decoder");
+                    return None;
+                };
+                let path = ImageStore::resolve(self.base_dir, src);
+                let Some((w, h)) = store.fit(&path, column) else {
+                    // A missing figure keeps measuring nothing, and is reported once.
+                    // Swapping in the alt text here would shift every later span
+                    // offset, since the block's text and ranges were built already.
+                    eprintln!("image not rendered: {}", path.display());
+                    return None;
+                };
+                // Sit the figure on the baseline with a small descent so it does not
+                // ride above the text.
+                let descent = (h * 0.15).min(theme.base * 0.4);
+                Some(intern_object(
+                    styles,
+                    ObjectSource::Image(path),
+                    color,
+                    ObjectBox { advance: w, ascent: h - descent, descent },
+                ))
+            }
+            rubrica_doc::ObjectKind::Math { source, display } => {
+                // One face for the whole formula, and a MATH table is a property of a
+                // face rather than of a theme role, so this ignores the block's own
+                // fonts entirely. `Cambria Math` is the face the platform ships with
+                // real math tables; the fallback is asked for its own.
+                let names = &theme.fonts.math;
+                let req = FaceRequest {
+                    family: names[0].clone(),
+                    cjk_family: names[0].clone(),
+                    fallback: vec![names[1].clone()],
+                    weight: 400,
+                    italic: false,
+                };
+                let index = self.math.intern(font, &req, source, size, *display)?;
+                let box_ = self.math.get(index)?.object;
+                Some(intern_object(styles, ObjectSource::Math(index), color, box_))
+            }
+        }
+    }
+}
+
 /// Typeset the whole document into a display list.
 ///
 /// Shared verbatim by the window and by `rubrica-app --report`, so a numeric check
@@ -1178,8 +1339,7 @@ pub fn build_ops(
     doc: &Document,
     client_w: f32,
     dpi: f32,
-    images: Option<&ImageStore>,
-    base_dir: Option<&std::path::Path>,
+    objects: &mut Objects<'_>,
     hyphenator: Option<&Hyphenator>,
 ) -> (Vec<Op>, Pt, Pt, Pt) {
     let k = scale_of(dpi);
@@ -1212,47 +1372,21 @@ pub fn build_ops(
         }
         let base = intern(&mut styles, &theme.fonts.fallback, theme.resolve(b.kind, InlineStyle::EMPTY));
         for s in &b.spans {
-            // An object span is sized from its own file rather than from a font,
-            // and only the caller knows the document directory a relative source
+            // An object span is sized from its own source rather than from a font,
+            // and only the caller knows the document directory a relative image
             // should resolve against.
             let id = match s.style {
                 st if st.contains(InlineStyle::OBJECT) => {
-                    let obj = b.objects.iter().find(|o| o.range == s.range);
-                    match (obj, images) {
-                        (Some(o), Some(store)) => {
-                            let src = match &o.kind {
-                                rubrica_doc::ObjectKind::Image { src, .. } => src,
-                            };
-                            let path = ImageStore::resolve(base_dir, src);
-                            match store.fit(&path, column) {
-                                // Sit the figure on the baseline with a small
-                                // descent so it does not ride above the text.
-                                Some((w, h)) => {
-                                    let descent = (h * 0.15).min(theme.base * 0.4);
-                                    intern_object(&mut styles, path, ObjectBox {
-                                        advance: w,
-                                        ascent: h - descent,
-                                        descent,
-                                    })
-                                }
-                                None => {
-                                    // A missing figure keeps measuring nothing, and
-                                    // is reported once. Swapping in the alt text here
-                                    // would shift every later span offset, since the
-                                    // block's text and ranges were built already.
-                                    eprintln!("image not rendered: {}", path.display());
-                                    base
-                                }
-                            }
+                    match b.objects.iter().find(|o| o.range == s.range) {
+                        Some(obj) => {
+                            // Read out of the table before it grows, and by value: the
+                            // intern below pushes into it.
+                            let prose = styles[base.0 as usize].clone();
+                            objects
+                                .intern(font, &mut styles, theme, obj, column, prose)
+                                .unwrap_or(base)
                         }
-                        // A missing store means COM or WIC could not be started,
-                        // which is a different failure from one bad file and has to
-                        // be reported as such rather than passed off as prose.
-                        (Some(_), None) => {
-                            eprintln!("figures disabled: no image decoder");
-                            base
-                        }
-                        _ => base,
+                        None => base,
                     }
                 }
                 _ => intern(&mut styles, &theme.fonts.fallback, theme.resolve(b.kind, s.style)),
@@ -1314,9 +1448,23 @@ pub fn build_ops(
         let size = theme.body_size(b.kind);
         y += theme.space_before(b.kind, first);
         first = false;
-        let left = base_left
+        let mut left = base_left
             + b.quote_depth as Pt * theme.quote_indent_em * theme.base
             + b.list.map_or(0.0, |l| l.depth as Pt * theme.list_indent_em * size);
+        // A displayed equation is the only thing on its line, and an equation on its
+        // own is centred rather than run in to the margin: the prose around it is
+        // justified, so a short line starting at the left edge reads as a line that
+        // broke early, not as a display. It only centres when it fits.
+        if b.spans.len() == 1
+            && matches!(b.objects.first().map(|o| &o.kind), Some(rubrica_doc::ObjectKind::Math { display: true, .. }))
+        {
+            if let Some(s) = spans.last() {
+                if let Some(o) = styles[s.style.0 as usize].object {
+                    let inner = column - (left - base_left);
+                    left += ((inner - o.advance) * 0.5).max(0.0);
+                }
+            }
+        }
         let body_left = if b.list.is_some() {
             left + theme.list_indent_em * size * 0.9
         } else {
@@ -1324,7 +1472,7 @@ pub fn build_ops(
         };
         y = layout_block(
             font,
-            &Ctx { theme, styles: &styles, k },
+            &Ctx { theme, styles: &styles, math: &*objects.math, k },
             &Blk {
                 b,
                 text: &text,
@@ -1333,8 +1481,7 @@ pub fn build_ops(
                 left: body_left,
                 column: column - (body_left - left),
                 table: table.as_ref(),
-                hyphens: &hyphens,
-                hyphen_width,
+                hyphenation: Hyphenation { points: &hyphens, width: hyphen_width },
             },
             &mut ops,
             y,

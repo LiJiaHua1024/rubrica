@@ -27,6 +27,12 @@ pub struct Fonts {
     pub cjk: [String; 3],
     /// Tried when a family is missing or a face lacks a glyph.
     pub fallback: Vec<String>,
+    /// The face formulas are set from, then a substitute.
+    ///
+    /// Named here rather than chosen per role because a `MATH` table is a property of
+    /// a face: the layout constants that place every bar and script come from it, so
+    /// the choice decides how a formula looks more than any size or weight does.
+    pub math: [String; 2],
 }
 
 impl Default for Fonts {
@@ -36,6 +42,7 @@ impl Default for Fonts {
             latin: [at(0), at(1), at(2)],
             cjk: ["Microsoft YaHei".into(), "Microsoft YaHei".into(), "Consolas".into()],
             fallback: vec!["Segoe UI".into(), "Microsoft YaHei".into(), "Segoe UI Symbol".into()],
+            math: ["Cambria Math".into(), "Segoe UI Symbol".into()],
         }
     }
 }

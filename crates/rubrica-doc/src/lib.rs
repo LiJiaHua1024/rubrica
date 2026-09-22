@@ -160,6 +160,12 @@ pub enum ObjectKind {
     /// `src` is as written in the document; resolving it against the document's
     /// directory is the caller's job, since only the caller knows that directory.
     Image { src: String, alt: String },
+    /// A formula in the source's own notation, with the delimiters removed.
+    ///
+    /// `display` is the `$$...$$` form: its own block, with its limits stacked and
+    /// its fractions at full height. Inline `$...$` is compressed to fit a line of
+    /// prose, which is a different layout rather than a different size.
+    Math { source: String, display: bool },
 }
 
 impl Block {
@@ -187,7 +193,8 @@ impl Document {
     pub fn parse(source: &str) -> Document {
         let mut opts = Options::ENABLE_STRIKETHROUGH
             | Options::ENABLE_TASKLISTS
-            | Options::ENABLE_TABLES;
+            | Options::ENABLE_TABLES
+            | Options::ENABLE_MATH;
         // A footnote definition would become a block orphaned from the paragraph
         // that cites it, and citations are invisible without a reference UI. Keep
         // the syntax literal until it has one.
@@ -250,8 +257,17 @@ impl Builder {
             // silently swallows markup it cannot render is worse than one that
             // shows plain text, but showing raw HTML would be a lie too.
             Event::Html(_) | Event::InlineHtml(_) => {}
-            Event::InlineMath(m) => self.push(&m, InlineStyle::EMPHASIS),
-            Event::DisplayMath(m) => self.push(&m, InlineStyle::EMPTY),
+            Event::InlineMath(m) => {
+                self.push_object(ObjectKind::Math { source: (*m).to_owned(), display: false })
+            }
+            Event::DisplayMath(m) => {
+                // The parser reports a displayed formula between blocks, with no
+                // paragraph around it. Closing first is what stops it swallowing the
+                // block that follows: `open` does nothing while one is still current.
+                self.close();
+                self.push_object(ObjectKind::Math { source: (*m).to_owned(), display: true });
+                self.close();
+            }
             Event::Rule => {
                 self.open(BlockKind::Rule);
                 self.close();

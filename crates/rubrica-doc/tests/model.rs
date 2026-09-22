@@ -151,12 +151,11 @@ fn an_image_becomes_one_object_box_not_prose() {
     assert_eq!(b.objects.len(), 1, "{b:?}");
     let o = &b.objects[0];
     assert_eq!(&b.text[o.range.clone()], "\u{FFFC}");
-    match &o.kind {
-        rubrica_doc::ObjectKind::Image { src, alt } => {
-            assert_eq!(src, "img/a.png");
-            assert_eq!(alt, "the diagram");
-        }
-    }
+    let rubrica_doc::ObjectKind::Image { src, alt } = &o.kind else {
+        panic!("the image became {:?}", o.kind)
+    };
+    assert_eq!(src, "img/a.png");
+    assert_eq!(alt, "the diagram");
     let sp = b.spans.iter().find(|s| s.range == o.range).expect("no span for the object");
     assert!(sp.style.contains(InlineStyle::OBJECT), "span style: {:?}", sp.style);
     // The placeholder is one node, so surrounding prose still justifies around it.
@@ -168,6 +167,38 @@ fn an_image_alone_forms_its_own_block() {
     let doc = Document::parse("![only](x.png)\n");
     assert_eq!(doc.blocks.len(), 1);
     assert_eq!(doc.blocks[0].objects.len(), 1);
+}
+
+#[test]
+fn an_inline_formula_is_an_object_box_not_prose() {
+    let doc = Document::parse("for $a^2+b^2$ and more\n");
+    let b = &doc.blocks[0];
+    assert_eq!(b.objects.len(), 1, "{b:?}");
+    let o = &b.objects[0];
+    assert_eq!(&b.text[o.range.clone()], "\u{FFFC}");
+    let rubrica_doc::ObjectKind::Math { source, display } = &o.kind else {
+        panic!("the formula became {:?}", o.kind)
+    };
+    assert_eq!(source, "a^2+b^2");
+    assert!(!display, "a single pair of dollars is the inline form");
+    // The source is what the math engine reads, so the placeholder must not also
+    // appear in the prose it would otherwise justify around.
+    assert!(!b.text.contains('^'), "source leaked into prose: {:?}", b.text);
+}
+
+#[test]
+fn a_displayed_formula_stands_between_two_paragraphs() {
+    let doc = Document::parse("before\n\n$$\\frac{1}{2}$$\n\nafter\n");
+    let texts: Vec<&str> = doc.blocks.iter().map(|b| b.text.as_str()).collect();
+    assert_eq!(doc.blocks.len(), 3, "{texts:?}");
+    assert_eq!(texts[0], "before");
+    assert_eq!(texts[2], "after");
+    let o = &doc.blocks[1].objects[0];
+    let rubrica_doc::ObjectKind::Math { source, display } = &o.kind else {
+        panic!("the formula became {:?}", o.kind)
+    };
+    assert_eq!(source, "\\frac{1}{2}");
+    assert!(display, "$$..$$ asks for display layout");
 }
 
 #[test]

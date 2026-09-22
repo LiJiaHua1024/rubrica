@@ -110,6 +110,7 @@ version = "0.1.0"
 dependencies = [
  "hyphenation",
  "rubrica-doc",
+ "rubrica-math",
  "rubrica-type",
  "windows",
  "windows-numerics",

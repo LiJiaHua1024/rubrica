@@ -8,7 +8,7 @@ use rubrica_type::classify::Role;
 use rubrica_type::justification::{line_width, place};
 use rubrica_type::paragraph::{Item, MonospaceMeasure, Spacing, StyleId, StyleSpan};
 use rubrica_type::units::Pt;
-use rubrica_type::{Paragraph, Plan, typeset};
+use rubrica_type::{Hyphenation, Paragraph, Plan, typeset};
 
 const SIZE: Pt = 16.0;
 
@@ -444,7 +444,7 @@ fn hyph_set(text: &str, column: Pt, hyphens: &[usize], allow: bool) -> (Paragrap
     let mut opts = BreakOptions::new(column);
     opts.hyphenate = allow;
     let para = rubrica_type::paragraph::paragraph_from_text_hyphenated(
-        text, &spacing, StyleId(0), &[], hyphens, 4.0, &mut measure,
+        text, &spacing, StyleId(0), &[], &Hyphenation { points: hyphens, width: 4.0 }, &mut measure,
     );
     let plan = rubrica_type::breaking::break_paragraph(&para, &opts);
     (para, plan)

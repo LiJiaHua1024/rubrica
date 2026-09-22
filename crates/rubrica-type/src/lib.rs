@@ -12,7 +12,7 @@ pub mod units;
 
 pub use breaking::{BreakOptions, Line, Plan};
 pub use justification::{Placed, place};
-pub use paragraph::{Item, Node, Paragraph, Spacing, StyleId};
+pub use paragraph::{Hyphenation, Item, Node, Paragraph, Spacing, StyleId};
 pub use units::Pt;
 
 /// Segment, measure and break a paragraph of text in one call.
@@ -27,24 +27,23 @@ pub fn typeset(
     opts: &BreakOptions,
     measure: &mut dyn paragraph::Measure,
 ) -> (Paragraph, Plan) {
-    typeset_hyphenated(text, spacing, style, spans, &[], 0.0, opts, measure)
+    typeset_hyphenated(text, spacing, style, spans, &Hyphenation::NONE, opts, measure)
 }
 
-/// As [`typeset`], additionally offering the given byte offsets as discretionary
-/// hyphen breaks. `hyphen_width` is the advance of the font's hyphen glyph, which
-/// only a shaping backend can supply.
+/// As [`typeset`], additionally offering the given [`Hyphenation`] as discretionary
+/// hyphen breaks: the byte offsets come from a dictionary the caller has already
+/// consulted, and the hyphen glyph's advance from a shaping backend.
 pub fn typeset_hyphenated(
     text: &str,
     spacing: &Spacing,
     style: StyleId,
     spans: &[paragraph::StyleSpan],
-    hyphens: &[usize],
-    hyphen_width: Pt,
+    hyphenation: &Hyphenation<'_>,
     opts: &BreakOptions,
     measure: &mut dyn paragraph::Measure,
 ) -> (Paragraph, Plan) {
     let para = paragraph::paragraph_from_text_hyphenated(
-        text, spacing, style, spans, hyphens, hyphen_width, measure,
+        text, spacing, style, spans, hyphenation, measure,
     );
     let plan = breaking::break_paragraph(&para, opts);
     (para, plan)

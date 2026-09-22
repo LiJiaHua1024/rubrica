@@ -442,6 +442,41 @@ impl FontEngine {
         self.faces.borrow().get(idx).map(|f| f.family.clone()).unwrap_or_default()
     }
 
+    /// Resolve a family by name to a face index, for a backend that needs the face
+    /// itself rather than shaped text -- the math engine reads its `MATH` table.
+    pub(crate) fn open_face(&self, family: &str, weight: u16, italic: bool) -> Option<usize> {
+        self.face_for(family, weight, italic)
+    }
+
+    /// Glyph ids for `text` in one face; zero where that face has no glyph.
+    pub(crate) fn glyph_ids(&self, face: usize, text: &str) -> Option<Vec<u16>> {
+        self.glyphs_for(face, text)
+    }
+
+    /// `(advance, ink above the baseline, ink below it)` for one glyph, in points.
+    ///
+    /// The bearing box, not the face's global ascent: a formula places its bar and its
+    /// accent against the top of the base that is actually there, and `x` and `h` are
+    /// not the same height.
+    pub(crate) fn glyph_extents(&self, face: usize, glyph: u16, size: Pt) -> (Pt, Pt, Pt) {
+        let Some((face_obj, metrics)) =
+            self.faces.borrow().get(face).map(|f| (f.face.clone(), f.metrics))
+        else {
+            return (0.0, 0.0, 0.0);
+        };
+        let mut m = [DWRITE_GLYPH_METRICS::default()];
+        if unsafe { face_obj.GetDesignGlyphMetrics(&glyph, 1, m.as_mut_ptr(), false) }.is_err() {
+            return (0.0, 0.0, 0.0);
+        }
+        let s = size / metrics.designUnitsPerEm.max(1) as f32;
+        let g = m[0];
+        (
+            g.advanceWidth as f32 * s,
+            (g.verticalOriginY - g.topSideBearing) as f32 * s,
+            (g.advanceHeight as i32 - g.verticalOriginY - g.bottomSideBearing) as f32 * s,
+        )
+    }
+
     /// Sanity probe used at startup and by tests: can we shape anything at all.
     pub fn probe(&self) -> bool {
         let req = FaceRequest {

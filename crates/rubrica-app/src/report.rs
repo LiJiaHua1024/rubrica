@@ -35,6 +35,8 @@ pub fn report(source: &str, path: Option<&str>, width: f32, dpi: f32, hyphenate:
     let _ = unsafe { windows::Win32::System::Com::CoInitializeEx(None, windows::Win32::System::Com::COINIT_MULTITHREADED) };
     let store = crate::images::ImageStore::new().ok();
     let base = path.map(std::path::Path::new).and_then(|p| p.parent());
+    let mut math = crate::math::MathStore::new();
+    let mut objects = crate::view::Objects::new(store.as_ref(), base, &mut math);
     let hyphenator = if hyphenate { crate::hyphen::Hyphenator::english() } else { None };
     let (ops, height, column_pt, _left) = build_ops(
         &mut font,
@@ -42,8 +44,7 @@ pub fn report(source: &str, path: Option<&str>, width: f32, dpi: f32, hyphenate:
         &doc,
         width,
         dpi,
-        store.as_ref(),
-        base,
+        &mut objects,
         hyphenator.as_ref(),
     );
     let k = dpi / 72.0;
@@ -129,5 +130,23 @@ pub fn report(source: &str, path: Option<&str>, width: f32, dpi: f32, hyphenate:
     let han: usize = source.chars().filter(|c| matches!(*c as u32, 0x4E00..=0x9FFF)).count();
     let latin: usize = source.chars().filter(|c| c.is_ascii_alphabetic()).count();
     println!("source has {han} ideographs and {latin} latin letters");
+    // Counted from the source as well as from the cache: the two differ whenever a
+    // formula repeats, and a formula that set from a face with no `MATH` table
+    // still draws, just in the wrong shapes.
+    let asked = doc
+        .blocks
+        .iter()
+        .flat_map(|b| b.objects.iter())
+        .filter(|o| matches!(o.kind, rubrica_doc::ObjectKind::Math { .. }))
+        .count();
+    if asked > 0 {
+        let (set, bars, mut families) = math.census();
+        families.sort();
+        families.dedup();
+        println!(
+            "math         : {asked} formulae, {set} set from [{}], {bars} rules drawn",
+            families.join(", ")
+        );
+    }
     Ok(())
 }

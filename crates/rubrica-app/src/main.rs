@@ -8,6 +8,7 @@
 mod font;
 mod hyphen;
 mod images;
+mod math;
 mod report;
 mod sample;
 mod theme;

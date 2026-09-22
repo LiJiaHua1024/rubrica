@@ -180,6 +180,23 @@ impl Measure for MonospaceMeasure {
     }
 }
 
+/// Where a line may split a word, and what the split costs in width.
+///
+/// The offsets come from a dictionary the caller has already consulted; `width` is
+/// the advance of the font's hyphen glyph, which only a shaping backend can supply,
+/// and which the breaking numbers are meaningless without.
+#[derive(Clone, Copy, Debug)]
+pub struct Hyphenation<'a> {
+    /// Byte offsets inside the text at which a break may be taken.
+    pub points: &'a [usize],
+    pub width: Pt,
+}
+
+impl<'a> Hyphenation<'a> {
+    /// No word may be split.
+    pub const NONE: Hyphenation<'static> = Hyphenation { points: &[], width: 0.0 };
+}
+
 #[derive(Clone, Debug)]
 pub struct BuildOptions<'a> {
     pub spacing: &'a Spacing,
@@ -405,16 +422,15 @@ fn glue_recipe_for(a: Role, b: Role, s: &Spacing) -> &GlueRecipe {
     }
 }
 
-/// As [`paragraph_from_text`], but also splitting Western words at the given byte
-/// offsets, which is how a Knuth-Liang dictionary feeds discretionary breaks in.
-#[allow(clippy::too_many_arguments)]
+/// As [`paragraph_from_text`], but also splitting Western words at the byte offsets
+/// in `hyphenation`, which is how a Knuth-Liang dictionary feeds discretionary
+/// breaks in.
 pub fn paragraph_from_text_hyphenated(
     text: &str,
     spacing: &Spacing,
     style: StyleId,
     spans: &[StyleSpan],
-    hyphens: &[usize],
-    hyphen_width: Pt,
+    hyphenation: &Hyphenation<'_>,
     measure: &mut dyn Measure,
 ) -> Paragraph {
     use unicode_linebreak::BreakOpportunity;
@@ -428,9 +444,9 @@ pub fn paragraph_from_text_hyphenated(
             spacing,
             style_of: style,
             spans,
-            hyphens,
+            hyphens: hyphenation.points,
             hyphen_penalty: 200,
-            hyphen_width,
+            hyphen_width: hyphenation.width,
         },
         measure,
     )

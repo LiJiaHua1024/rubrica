@@ -7,6 +7,7 @@ license.workspace = true
 [dependencies]
 rubrica-type.workspace = true
 rubrica-doc.workspace = true
+rubrica-math.workspace = true
 windows = { version = "0.62", features = [
     "Win32_Foundation",
     "Win32_Graphics_Direct2D",
