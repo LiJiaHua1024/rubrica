@@ -7,12 +7,12 @@
 //! what is actually painted rather than what a second implementation would have
 //! produced -- and it never touches the desktop.
 //!
-//! Run: `rubrica-app --report [file.md] [--width 1080] [--dpi 96] [--zoom 120] [--face 1]`
+//! Run: `rubrica-app --report [file.md] [--width 1080] [--dpi 96] [--zoom 120] [--face 1] [--measure 0]`
 
 use std::collections::BTreeMap;
 
 use crate::font::FontEngine;
-use crate::theme::{ColorRole, TextFace, Theme, Zoom};
+use crate::theme::{ColorRole, Measure, TextFace, Theme, Zoom};
 use crate::view::build_ops;
 use crate::{Error, Result};
 
@@ -23,15 +23,22 @@ struct Line {
     families: Vec<String>,
 }
 
-pub fn report(
-    source: &str,
-    path: Option<&str>,
-    width: f32,
-    dpi: f32,
-    hyphenate: bool,
-    zoom: Zoom,
-    face: usize,
-) -> Result<()> {
+/// The window the document would have been drawn in, and the reader's own choices about
+/// the page. One argument because they are one kind of thing -- every field is a number
+/// a live window would have supplied, and none of them says anything about the text.
+pub struct Options {
+    pub width: f32,
+    pub dpi: f32,
+    pub hyphenate: bool,
+    pub zoom: Zoom,
+    pub face: usize,
+    pub measure: usize,
+}
+
+pub fn report(source: &str, path: Option<&str>, o: &Options) -> Result<()> {
+    // Unpacked at the top so the rest reads as the numbers themselves rather than as a
+    // struct named in front of every one.
+    let Options { width, dpi, hyphenate, zoom, face, measure } = *o;
     let mut font = FontEngine::new().map_err(|e| -> Error { format!("DirectWrite: {e}").into() })?;
     if !font.probe() {
         return Err("no usable font face".into());
@@ -39,6 +46,7 @@ pub fn report(
     let mut theme = Theme::default();
     theme.set_zoom(zoom);
     theme.set_face(face);
+    theme.set_measure(measure);
     let doc = rubrica_doc::Document::parse(source);
     // No render target exists here, so figures are measured from their files
     // through WIC but not decoded to bitmaps -- enough to lay out and report.
@@ -100,8 +108,13 @@ pub fn report(
         TextFace::ALL.iter().filter(|t| crate::view::face_drawable(&font, t)).map(|t| t.label).collect();
     println!("face       : {}  ({} + {})", f.label, f.body, f.heading);
     println!("             installed: {}", installed.join(", "));
+    println!(
+        "measure    : {}  {:.1}pt ({:.1} em)  = {col_dip:.1}dip at {dpi}dpi",
+        Measure::ALL[theme.measure].label,
+        column_pt,
+        column_pt / theme.base
+    );
     println!("blocks     : {}   lines: {}   height {:.0}pt", doc.blocks.len(), lines.len(), height);
-    println!("measure    : {:.1}pt ({:.1} em)  = {col_dip:.1}dip at {dpi}dpi", column_pt, column_pt / theme.base);
     println!();
     println!("  #      left    right    fill  faces");
 

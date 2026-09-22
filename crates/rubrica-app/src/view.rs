@@ -45,8 +45,8 @@ use windows::Win32::UI::Input::KeyboardAndMouse::{
 };
 use windows::Win32::UI::Input::KeyboardAndMouse::{VK_DOWN, VK_ESCAPE, VK_NEXT, VK_PRIOR};
 use windows::Win32::UI::Input::KeyboardAndMouse::{
-    VK_0, VK_A, VK_ADD, VK_C, VK_D, VK_END, VK_HOME, VK_LEFT, VK_NUMPAD0, VK_OEM_MINUS,
-    VK_OEM_PLUS, VK_RIGHT, VK_SHIFT, VK_SUBTRACT, VIRTUAL_KEY,
+    VK_0, VK_A, VK_ADD, VK_C, VK_D, VK_END, VK_HOME, VK_LEFT, VK_NUMPAD0, VK_OEM_4,
+    VK_OEM_6, VK_OEM_MINUS, VK_OEM_PLUS, VK_RIGHT, VK_SHIFT, VK_SUBTRACT, VIRTUAL_KEY,
 };
 use windows::Win32::UI::Controls::Dialogs::{
     GetOpenFileNameW, OPENFILENAMEW, OFN_FILEMUSTEXIST, OFN_HIDEREADONLY, OFN_PATHMUSTEXIST,
@@ -71,7 +71,7 @@ use crate::font::{FaceRequest, FontEngine, GlyphRun, ObjectBox, Style as RunStyl
 use crate::hyphen::Hyphenator;
 use crate::images::ImageStore;
 use crate::math::MathStore;
-use crate::theme::{ColorRole, Leading, TextFace, Theme, Zoom};
+use crate::theme::{ColorRole, Leading, Measure, TextFace, Theme, Zoom};
 use crate::{Error, Result};
 
 /// The character drawn at a discretionary break, and the range to shape it from.
@@ -719,6 +719,13 @@ fn scale_of(dpi: f32) -> f32 {
     dpi / 72.0
 }
 
+/// One rung of the measure ladder either way, stopping at both ends rather than
+/// wrapping: a key pressed past the widest column the page can be set to should do
+/// nothing, not silently teleport the reader to the narrow one.
+fn step_measure(from: usize, delta: i32) -> usize {
+    (from as i32 + delta).clamp(0, Measure::ALL.len() as i32 - 1) as usize
+}
+
 /// What the right-click menu can be asked to do.
 ///
 /// Every one of these is also reachable some other way -- a key, a click, the wheel --
@@ -735,6 +742,8 @@ enum Command {
     ZoomReset,
     /// Set the page in one of the faces [`TextFace::ALL`] offers, by index.
     Face(usize),
+    /// Widen or narrow the column, by index into [`Measure::ALL`].
+    Measure(usize),
     /// Set the palette and keep it set, against whatever the system says next.
     Palette(bool),
     /// Let the system's own setting decide again, which is the only way back out of a
@@ -770,6 +779,8 @@ struct MenuState {
     text: bool,
     /// Which entry of [`TextFace::ALL`] the page is set in right now.
     face: usize,
+    /// Which entry of [`Measure::ALL`] the column is capped at right now.
+    measure: usize,
     /// Which of those faces this machine can actually draw, index for index with
     /// [`TextFace::ALL`]. A face that is not installed is shown and left dim: it is the
     /// reader's own machine, and hiding the choice they cannot have says less about it
@@ -803,6 +814,10 @@ fn menu_items(s: &MenuState) -> Vec<MenuRow> {
         // The face in use is always clickable: a machine that has lost a family since it
         // was chosen still has to be able to choose away from it.
         v.push(if on { check(Command::Face(i), f.label, true) } else { row(Command::Face(i), f.label, ok) });
+    }
+    v.push(MenuRow::Gap);
+    for (i, m) in Measure::ALL.iter().enumerate() {
+        v.push(check(Command::Measure(i), m.label, i == s.measure));
     }
     v.push(MenuRow::Gap);
     v.extend([
@@ -931,8 +946,8 @@ pub fn run(source: String, path: Option<PathBuf>) -> Result<()> {
     //
     // A remembered family that has since left the machine is dropped rather than set:
     // DirectWrite would answer it with a substitute, and a preference that quietly becomes
-    // a different font is worse than no preference at all. The size and the palette are
-    // kept regardless, since neither depends on anything installed.
+    // a different font is worse than no preference at all. The size, the width and the
+    // palette are kept regardless, since none of them depends on anything installed.
     let saved = crate::settings::load();
     let mut theme = Theme::default();
     if let Some(zoom) = saved.zoom {
@@ -943,6 +958,12 @@ pub fn run(source: String, path: Option<PathBuf>) -> Result<()> {
     });
     if let Some(face) = remembered {
         theme.set_face(face);
+    }
+    // A remembered width the window cannot fit is still the reader's own choice, so it
+    // comes back: the layout caps a column at what is available, so a wide measure in a
+    // narrow window costs nothing and shows itself the moment the window grows.
+    if let Some(measure) = saved.measure {
+        theme.set_measure(measure);
     }
     let dark = saved.dark.unwrap_or_else(system_prefers_dark);
 
@@ -1051,6 +1072,48 @@ pub(crate) fn utf16(s: &str) -> Vec<u16> {
 /// is worth setting, neither of which is anything the page has a say in.
 pub(crate) fn face_drawable(font: &FontEngine, f: &TextFace) -> bool {
     font.has_family(f.body) && font.has_family(f.heading)
+}
+
+/// The character at the top of a window scrolled to `scroll`, counted through the page's
+/// characters in reading order.
+///
+/// A line number is the wrong thing to remember a place with when the place has to
+/// survive a reflow, because a reflow is exactly the event that breaks lines apart and
+/// joins them up again. The characters do not move, only where the lines end, so an
+/// index into them names the same stretch of prose in both layouts.
+///
+/// `k` is the points-to-pixels scale, since a scroll offset is in points and the lines
+/// are painted in pixels.
+fn anchor_at(sel: &[SelLine], scroll: f32, k: f32) -> Option<usize> {
+    let top = scroll * k;
+    let mut seen = 0usize;
+    for line in sel {
+        // The first line still reaching into the window. One that ends exactly at the
+        // top edge is above it, and its text is not what the reader is looking at.
+        if line.y + line.h > top {
+            return Some(seen);
+        }
+        seen += line.chars.len();
+    }
+    None
+}
+
+/// Where to scroll so that the line holding `anchor` sits at the top of the window.
+///
+/// `None` when the new layout has no such line, which leaves the offset alone: a page
+/// that has lost the reader's place is worse than one that has not looked for it.
+fn scroll_for_anchor(sel: &[SelLine], anchor: usize, k: f32) -> Option<f32> {
+    let mut seen = 0usize;
+    for (i, line) in sel.iter().enumerate() {
+        if anchor < seen + line.chars.len() {
+            // The top of the document is the top of the document, not the top of its
+            // first line: a reader who was looking at the margin above the text should
+            // not lose it because they changed the width of a line further down.
+            return Some(if i == 0 { 0.0 } else { line.y / k });
+        }
+        seen += line.chars.len();
+    }
+    None
 }
 
 /// Reads the same registry value the Settings app writes. There is no window
@@ -1312,6 +1375,18 @@ impl View {
                     }
                     k if ctrl && (k == VK_0.0 as u32 || k == VK_NUMPAD0.0 as u32) => {
                         self.zoom_to(Zoom::DESIGN, hwnd);
+                    }
+                    // The bracket keys, which are the shape of the thing: two margins
+                    // moving apart or together. Nothing collides with them, because a
+                    // reader never types a bare bracket -- there is no text box in this
+                    // window.
+                    k if ctrl && k == VK_OEM_4.0 as u32 => {
+                        let m = step_measure(self.theme.measure, -1);
+                        self.set_measure(m, hwnd);
+                    }
+                    k if ctrl && k == VK_OEM_6.0 as u32 => {
+                        let m = step_measure(self.theme.measure, 1);
+                        self.set_measure(m, hwnd);
                     }
                     // Both palettes are always one keypress apart, whichever way the
                     // system setting points: a reader in a bright room at 2pm has the
@@ -1602,6 +1677,7 @@ impl View {
             from_file: self.path.is_some(),
             text: !self.sel_index.is_empty(),
             face: self.theme.face,
+            measure: self.theme.measure,
             offered: TextFace::ALL.iter().map(|f| face_drawable(&self.font, f)).collect(),
         };
         let menu = match unsafe { CreatePopupMenu() } {
@@ -1664,6 +1740,7 @@ impl View {
             }
             Command::ZoomReset => self.zoom_to(Zoom::DESIGN, hwnd),
             Command::Face(i) => self.set_face(i, hwnd),
+            Command::Measure(i) => self.set_measure(i, hwnd),
             Command::Palette(dark) => {
                 self.dark_override = Some(dark);
                 self.remember();
@@ -1691,7 +1768,12 @@ impl View {
 
     /// Write down the appearance the reader is looking at, for the next window.
     fn remember(&self) {
-        crate::settings::record(self.theme.zoom, self.dark_override, self.theme.face);
+        crate::settings::record(
+            self.theme.zoom,
+            self.dark_override,
+            self.theme.face,
+            self.theme.measure,
+        );
     }
 
     /// Set the page in another face pairing.
@@ -1707,7 +1789,35 @@ impl View {
         }
         self.theme.set_face(face);
         self.remember();
+        self.relayout_in_place(hwnd);
+    }
+
+    /// Set the page to another measure, and keep the reader's place through the reflow.
+    fn set_measure(&mut self, measure: usize, hwnd: HWND) {
+        if Measure::ALL.get(measure).is_none() || measure == self.theme.measure {
+            return;
+        }
+        self.theme.set_measure(measure);
+        self.remember();
+        self.relayout_in_place(hwnd);
+    }
+
+    /// Reflow the page for a change to its shape, without sending the reader somewhere
+    /// else to look for the paragraph they were in.
+    ///
+    /// A measure change has no scale factor to carry the offset through with, the way
+    /// [`View::zoom_to`] has, because the reflow is not uniform: a paragraph that was
+    /// six lines is now eight. So the place is remembered as what the reader was looking
+    /// at rather than as a distance, and found again where the new layout put it.
+    fn relayout_in_place(&mut self, hwnd: HWND) {
+        let k = scale_of(self.dpi);
+        let anchor = anchor_at(&self.sel_index, self.scroll, k);
         self.relayout();
+        if let Some(a) = anchor {
+            if let Some(scroll) = scroll_for_anchor(&self.sel_index, a, k) {
+                self.scroll = scroll;
+            }
+        }
         self.clamp_scroll();
         let _ = unsafe { InvalidateRect(Some(hwnd), None, false) };
     }
@@ -3894,6 +4004,7 @@ mod tests {
             text,
             face: 0,
             offered: vec![true; TextFace::ALL.len()],
+            measure: Measure::DESIGN,
         }
     }
 
@@ -3913,11 +4024,12 @@ mod tests {
         assert_eq!(got.last().map(|(c, e, _)| (c.clone(), *e)), Some((Command::Reload, false)));
         assert_eq!(
             got.iter().filter(|(_, _, c)| *c).count(),
-            2,
-            "exactly one palette row and one face row are on"
+            3,
+            "exactly one palette row, one face row and one measure row are on"
         );
         assert!(got.iter().any(|(c, _, c2)| *c2 && c == &Command::FollowSystem));
         assert!(got.iter().any(|(c, _, c2)| *c2 && c == &Command::Face(0)));
+        assert!(got.iter().any(|(c, _, c2)| *c2 && c == &Command::Measure(Measure::DESIGN)));
 
         assert_eq!(rows(&state(true, None, None, false, true))[0], (Command::Copy, true, false));
 
@@ -3950,6 +4062,89 @@ mod tests {
     }
 
     #[test]
+    fn the_measure_rows_are_the_whole_ladder_with_one_check_on() {
+        let row = |got: &[(Command, bool, bool)], i| {
+            got.iter().find(|(c, _, _)| c == &Command::Measure(i)).cloned().expect("measure row")
+        };
+        let got = rows(&state(false, None, None, false, true));
+        // Unlike a face, no rung here can be dimmed: a measure is a number of em, not a
+        // family installed somewhere, so nothing about the machine decides it.
+        for i in 0..Measure::ALL.len() {
+            assert_eq!(row(&got, i), (Command::Measure(i), true, i == Measure::DESIGN));
+        }
+        // And they are listed narrow first, in the order the ladder is walked by the keys.
+        let order: Vec<usize> = got
+            .iter()
+            .filter_map(|(c, ..)| match c {
+                Command::Measure(i) => Some(*i),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(order, (0..Measure::ALL.len()).collect::<Vec<_>>());
+
+        let mut s = state(false, None, None, false, true);
+        s.measure = 2;
+        let got = rows(&s);
+        assert_eq!(row(&got, 2), (Command::Measure(2), true, true));
+        assert_eq!(row(&got, 1), (Command::Measure(1), true, false), "the design's own width stays a choice");
+    }
+
+    #[test]
+    fn the_measure_ladder_stops_at_its_ends() {
+        assert_eq!(step_measure(Measure::DESIGN, -1), 0);
+        assert_eq!(step_measure(Measure::DESIGN, 1), 2);
+        assert_eq!(step_measure(Measure::DESIGN, 1).min(Measure::ALL.len() - 1), 2);
+        // Pressed past either end, the key does nothing rather than wrapping: a reader
+        // who has gone as wide as the page gets should not find it suddenly narrow.
+        assert_eq!(step_measure(0, -1), 0);
+        assert_eq!(step_measure(0, -9), 0);
+        assert_eq!(step_measure(2, 1), 2);
+        assert_eq!(step_measure(2, 9), 2);
+        assert_eq!(step_measure(1, 0), 1);
+    }
+
+    #[test]
+    fn a_place_survives_a_reflow_because_characters_do_not_move() {
+        // Six, six and eight characters, stacked at the height the test helper gives
+        // every line, and at one pixel to the point so the numbers below are the
+        // geometry they are read as.
+        let before = vec![
+            sel_line("first!", 0.0, Join::None),
+            sel_line("second", 12.0, Join::None),
+            sel_line("thirdone", 24.0, Join::None),
+        ];
+        assert_eq!(anchor_at(&before, 0.0, 1.0), Some(0));
+        assert_eq!(anchor_at(&before, 12.0, 1.0), Some(6));
+        // A line whose bottom edge is exactly at the top of the window is above it, not
+        // in it: that text has been read already.
+        assert_eq!(anchor_at(&before, 24.0, 1.0), Some(12));
+        assert_eq!(anchor_at(&[], 0.0, 1.0), None);
+        assert_eq!(anchor_at(&before, 999.0, 1.0), None, "scrolled past the last line");
+
+        // The same prose after the column has narrowed: the middle line has split in
+        // two, and everything below it has moved a line down.
+        let after = vec![
+            sel_line("first!", 0.0, Join::None),
+            sel_line("sec", 12.0, Join::None),
+            sel_line("ond", 24.0, Join::None),
+            sel_line("thirdone", 36.0, Join::None),
+        ];
+        let anchor = anchor_at(&before, 24.0, 1.0).expect("a place to keep");
+        assert_eq!(scroll_for_anchor(&after, anchor, 1.0), Some(36.0));
+        // Following the old offset instead would have parked the reader on the tail of a
+        // line that no longer ends where it did, twelve pixels above their own text.
+        assert_eq!(scroll_for_anchor(&before, anchor, 1.0), Some(24.0), "nothing moved, nothing shifts");
+        assert_eq!(anchor_at(&after, 36.0, 1.0), Some(anchor), "and back again");
+        // The top of the document is its top, not the top of its first line of ink.
+        assert_eq!(scroll_for_anchor(&after, 0, 1.0), Some(0.0));
+        // A layout with nothing left to find the place in leaves the offset alone.
+        assert_eq!(scroll_for_anchor(&[], anchor, 1.0), None);
+        assert_eq!(scroll_for_anchor(&after, 999, 1.0), None);
+        // Twice the scale, the same place: the offset is in points and the lines are not.
+        assert_eq!(scroll_for_anchor(&after, anchor, 2.0), Some(18.0));
+    }
+
+    #[test]
     fn a_menu_opened_over_a_link_carries_its_address() {
         let s = MenuState {
             link: Some("https://example.com/x".into()),
@@ -3959,6 +4154,7 @@ mod tests {
             text: true,
             face: 0,
             offered: vec![true; TextFace::ALL.len()],
+            measure: Measure::DESIGN,
         };
         let got = rows(&s);
         // Two items, in this order: follow it, and take only the address. Both enabled,

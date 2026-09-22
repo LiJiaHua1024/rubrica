@@ -194,6 +194,35 @@ impl TextFace {
     ];
 }
 
+/// One of the widths a line of prose is allowed to be set to.
+///
+/// Named choices rather than a slider or a number of characters, because the reader is
+/// not tuning a length: they either want fewer words per line, the design's own, or are
+/// willing to pay for a long line to fill a wide window. Three rungs is the most that
+/// can be told apart at a glance in one reflow, and the middle one is the size the page
+/// was designed at.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Measure {
+    pub label: &'static str,
+    pub em: Pt,
+}
+
+impl Measure {
+    /// What the reader is offered, in the order they see it, indexed by
+    /// [`Theme::measure`]. `28em` is about fifty Latin characters or twenty-eight
+    /// ideographs, which is a book column; `46em` is a newspaper's, which some readers
+    /// on a wide monitor want and which the design would never have chosen for itself.
+    pub const ALL: [Measure; 3] = [
+        Measure { label: "Narrow", em: 28.0 },
+        Measure { label: "Normal", em: 36.0 },
+        Measure { label: "Wide", em: 46.0 },
+    ];
+
+    /// The rung a fresh theme starts on, and the one [`Theme::default`] takes its
+    /// [`Theme::max_measure_em`] from.
+    pub const DESIGN: usize = 1;
+}
+
 #[derive(Clone, Debug)]
 pub struct Theme {
     pub fonts: Fonts,
@@ -215,6 +244,9 @@ pub struct Theme {
     /// an em wide in Latin and a whole em in Chinese, so a measure that is a length in
     /// ems holds the same count of them at any size. Zooming changes the size of the
     /// page, not how much text a line carries.
+    ///
+    /// Written only by [`Theme::set_measure`], which is what keeps it in step with the
+    /// [`Theme::measure`] index the menu reads.
     pub max_measure_em: Pt,
     pub first_line_indent_em: Pt,
     pub quote_indent_em: Pt,
@@ -226,6 +258,9 @@ pub struct Theme {
     /// rather than read back off [`Theme::fonts`], because the menu has to check the row
     /// that is really on the page and two pairings could share a body face.
     pub face: usize,
+    /// Which of [`Measure::ALL`] the width cap came from, kept for the same reason
+    /// [`Theme::face`] is: the menu has to check the row that is on the page.
+    pub measure: usize,
 }
 
 impl Default for Theme {
@@ -239,7 +274,7 @@ impl Default for Theme {
             space_before_body: 0.9,
             space_before_heading: 1.8,
             space_before_code: 1.0,
-            max_measure_em: 36.0,
+            max_measure_em: Measure::ALL[Measure::DESIGN].em,
             // Chinese prose conventionally indents the first line two ideographs;
             // Latin prose does not indent at all when paragraphs are separated by
             // space, so this stays small.
@@ -248,6 +283,7 @@ impl Default for Theme {
             list_indent_em: 1.6,
             zoom: Zoom::DESIGN,
             face: 0,
+            measure: Measure::DESIGN,
         }
     }
 }
@@ -280,6 +316,16 @@ impl Theme {
         self.face = face;
         self.fonts.latin[Role::Body as usize] = f.body.to_string();
         self.fonts.latin[Role::Heading as usize] = f.heading.to_string();
+    }
+
+    /// Set the page to one of the offered measures, by its index in [`Measure::ALL`].
+    ///
+    /// The cap and the index move together and nowhere else, so a layout and the menu
+    /// row that describes it cannot disagree.
+    pub fn set_measure(&mut self, measure: usize) {
+        let Some(m) = Measure::ALL.get(measure) else { return };
+        self.measure = measure;
+        self.max_measure_em = m.em;
     }
 }
 
@@ -441,6 +487,38 @@ mod tests {
         // A face that is not on the list asks for nothing.
         t.set_face(TextFace::ALL.len() + 1);
         assert_eq!(t.face, 3);
+    }
+
+    #[test]
+    fn a_chosen_measure_moves_the_cap_and_nothing_else() {
+        let mut t = Theme::default();
+        // The middle rung is the design's own width, read from the same table the menu
+        // reads -- and the rungs are ordered, because the menu shows them in this order
+        // and a list that wanders from narrow to wide to narrow is not a choice.
+        assert_eq!(t.measure, Measure::DESIGN);
+        assert_eq!(t.max_measure_em, Measure::ALL[Measure::DESIGN].em);
+        assert!(Measure::ALL.windows(2).all(|w| w[0].em < w[1].em));
+
+        t.set_measure(0);
+        assert_eq!(t.max_measure_em, 28.0);
+        assert_eq!(t.measure, 0);
+        t.set_measure(2);
+        assert_eq!(t.max_measure_em, 46.0);
+        // Every other metric is still the design's: a wider column is not a bigger page.
+        assert_eq!(t.base, Theme::DESIGN_BASE);
+        assert_eq!(
+            t.space_before(BlockKind::Paragraph, false),
+            Theme::default().space_before(BlockKind::Paragraph, false)
+        );
+        assert_eq!(t.list_indent_em, Theme::default().list_indent_em);
+        // And the number stays an em, so zooming moves the width of the column in points
+        // while the line carries the same count of characters.
+        t.set_zoom(Zoom::DESIGN.up().up());
+        assert_eq!(t.max_measure_em, 46.0, "the measure is in em, not points");
+        assert!(t.base > Theme::DESIGN_BASE);
+        // A rung above the top of the ladder asks for nothing.
+        t.set_measure(Measure::ALL.len() + 1);
+        assert_eq!(t.measure, 2);
     }
 
     #[test]

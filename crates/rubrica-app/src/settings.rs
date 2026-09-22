@@ -1,11 +1,11 @@
 //! What the reader has chosen about how the page looks, kept for the next window.
 //!
-//! Three numbers under `Software\Rubrica` in the current user's registry, which is where
-//! a Windows program puts three numbers: no path to choose for a settings file, no
+//! Four numbers under `Software\Rubrica` in the current user's registry, which is where
+//! a Windows program puts four numbers: no path to choose for a settings file, no
 //! format to invent, no dependency to carry, and the palette the system prefers is
 //! already read out of the same store.
 //!
-//! The encoding of a state into those three numbers and back is kept apart from the calls
+//! The encoding of a state into those numbers and back is kept apart from the calls
 //! that carry them, so what a stored number means can be read -- and tested -- without a
 //! live registry in the way.
 
@@ -14,12 +14,12 @@ use windows::Win32::System::Registry::{
     HKEY_CURRENT_USER, RegGetValueW, RegSetKeyValueW, RRF_RT_DWORD, REG_DWORD,
 };
 
-use crate::theme::{TextFace, Zoom};
+use crate::theme::{Measure, TextFace, Zoom};
 use crate::view::utf16;
 
 const SUBKEY: &str = "Software\\Rubrica";
-/// The names the three numbers are stored under, in the order [`words`] writes them.
-const NAMES: [&str; 3] = ["Zoom", "Dark", "Face"];
+/// The names the numbers are stored under, in the order [`words`] writes them.
+const NAMES: [&str; 4] = ["Zoom", "Dark", "Face", "Measure"];
 /// What `Dark` holds when the reader asked for the system's own setting to decide. The
 /// same answer as no value at all, which is why nothing has to be deleted to get back
 /// there: a reader who chooses `Follow System` is not asking for a different number, they
@@ -34,18 +34,25 @@ pub struct Settings {
     pub zoom: Option<Zoom>,
     pub dark: Option<bool>,
     pub face: Option<usize>,
+    pub measure: Option<usize>,
 }
 
-/// The three numbers a state is carried by: the size as a percentage of the design, the
-/// palette as one of three answers, the face as its index in [`TextFace::ALL`].
-fn words(zoom: Zoom, dark: Option<bool>, face: usize) -> [u32; 3] {
-    [zoom.percent(), dark.map_or(FOLLOW_SYSTEM, |d| d as u32), face as u32]
+/// The numbers a state is carried by: the size as a percentage of the design, the
+/// palette as one of three answers, and the face and the measure as their index in the
+/// list the menu shows them in.
+fn words(zoom: Zoom, dark: Option<bool>, face: usize, measure: usize) -> [u32; 4] {
+    [
+        zoom.percent(),
+        dark.map_or(FOLLOW_SYSTEM, |d| d as u32),
+        face as u32,
+        measure as u32,
+    ]
 }
 
-/// What three numbers -- or the absence of any of them -- mean. Nothing here is trusted:
+/// What those numbers -- or the absence of any of them -- mean. Nothing here is trusted:
 /// a number from a later version of this program, or one edited by hand, becomes no
 /// choice rather than a crash or a page set in a face that has no index.
-fn read(zoom: Option<u32>, dark: Option<u32>, face: Option<u32>) -> Settings {
+fn read(zoom: Option<u32>, dark: Option<u32>, face: Option<u32>, measure: Option<u32>) -> Settings {
     Settings {
         // Zero is not a percentage of the design; it is what an unfinished write leaves
         // behind, so it reads as no choice rather than as the smallest step.
@@ -56,6 +63,7 @@ fn read(zoom: Option<u32>, dark: Option<u32>, face: Option<u32>) -> Settings {
             _ => None,
         },
         face: face.map(|i| i as usize).filter(|i| *i < TextFace::ALL.len()),
+        measure: measure.map(|i| i as usize).filter(|i| *i < Measure::ALL.len()),
     }
 }
 
@@ -85,10 +93,15 @@ fn word(sub: &str, name: &str) -> Option<u32> {
 
 /// Whatever was written down under this key, or an empty state for a first run.
 fn read_words(sub: &str) -> Settings {
-    read(word(sub, NAMES[0]), word(sub, NAMES[1]), word(sub, NAMES[2]))
+    read(
+        word(sub, NAMES[0]),
+        word(sub, NAMES[1]),
+        word(sub, NAMES[2]),
+        word(sub, NAMES[3]),
+    )
 }
 
-fn write_words(sub: &str, w: &[u32; 3]) {
+fn write_words(sub: &str, w: &[u32; 4]) {
     let sub = utf16(sub);
     for (n, v) in NAMES.iter().zip(w) {
         let name = utf16(n);
@@ -114,8 +127,8 @@ fn write_words(sub: &str, w: &[u32; 3]) {
 ///
 /// Called at the moment of choosing rather than on the way out, because the usual way to
 /// close a window is its own `X`, which ends the process without asking anything of it.
-pub fn record(zoom: Zoom, dark: Option<bool>, face: usize) {
-    write_words(SUBKEY, &words(zoom, dark, face));
+pub fn record(zoom: Zoom, dark: Option<bool>, face: usize, measure: usize) {
+    write_words(SUBKEY, &words(zoom, dark, face, measure));
 }
 
 /// The reader's own choices, as the last run left them.
@@ -137,39 +150,56 @@ mod tests {
         assert_eq!(zoom_of(0), Zoom::DESIGN);
         for step in -3..=4 {
             let z = zoom_of(step);
-            assert_eq!(read(Some(z.percent()), None, None).zoom, Some(z), "step {step}");
+            assert_eq!(read(Some(z.percent()), None, None, None).zoom, Some(z), "step {step}");
         }
     }
 
     #[test]
     fn a_stored_number_that_is_not_a_choice_becomes_no_choice() {
-        let s = read(Some(120), Some(1), Some(2));
+        let s = read(Some(120), Some(1), Some(2), Some(0));
         assert_eq!(s.zoom, Some(Zoom::nearest_percent(120.0)));
         assert_eq!(s.dark, Some(true));
         assert_eq!(s.face, Some(2));
+        assert_eq!(s.measure, Some(0));
 
         // The palette asked of the system, and no value at all, mean the same thing.
-        assert_eq!(read(None, Some(FOLLOW_SYSTEM), None).dark, None);
-        assert_eq!(read(None, None, None), Settings::default());
-        // A face past the end of the list, a zoom of no size at all, and a palette number
-        // that has never meant anything -- none of them is a choice to make.
-        let bogus = read(Some(0), Some(7), Some(TextFace::ALL.len() as u32));
+        assert_eq!(read(None, Some(FOLLOW_SYSTEM), None, None).dark, None);
+        assert_eq!(read(None, None, None, None), Settings::default());
+        // A face or a measure past the end of its list, a zoom of no size at all, and a
+        // palette number that has never meant anything: none of them is a choice to make.
+        let bogus = read(
+            Some(0),
+            Some(7),
+            Some(TextFace::ALL.len() as u32),
+            Some(Measure::ALL.len() as u32),
+        );
         assert_eq!(bogus.zoom, None);
         assert_eq!(bogus.dark, None);
         assert_eq!(bogus.face, None);
+        assert_eq!(bogus.measure, None);
+        // The top rung of each list is a real choice; only the one past it is not.
+        assert_eq!(
+            read(None, None, Some(TextFace::ALL.len() as u32 - 1), Some(Measure::ALL.len() as u32 - 1)),
+            Settings {
+                face: Some(TextFace::ALL.len() - 1),
+                measure: Some(Measure::ALL.len() - 1),
+                ..Settings::default()
+            }
+        );
     }
 
     #[test]
     fn the_words_a_state_writes_are_the_words_that_read_back() {
-        let w = words(Zoom::DESIGN.up(), Some(false), 3);
-        let s = read(Some(w[0]), Some(w[1]), Some(w[2]));
+        let w = words(Zoom::DESIGN.up(), Some(false), 3, 2);
+        let s = read(Some(w[0]), Some(w[1]), Some(w[2]), Some(w[3]));
         assert_eq!(s.zoom, Some(Zoom::DESIGN.up()));
         assert_eq!(s.dark, Some(false));
         assert_eq!(s.face, Some(3));
+        assert_eq!(s.measure, Some(2));
         // `Follow System` round-trips into having no opinion, which is what it asks for.
-        let w = words(Zoom::DESIGN, None, 0);
+        let w = words(Zoom::DESIGN, None, 0, 1);
         assert_eq!(w[1], FOLLOW_SYSTEM);
-        assert_eq!(read(Some(w[0]), Some(w[1]), Some(w[2])).dark, None);
+        assert_eq!(read(Some(w[0]), Some(w[1]), Some(w[2]), Some(w[3])).dark, None);
     }
 
     /// The whole road a setting travels: out to the registry and back. What the tests
@@ -177,10 +207,15 @@ mod tests {
     #[test]
     fn a_choice_written_down_is_a_choice_read_back() {
         let sub = "Software\\Rubrica Test";
-        write_words(sub, &words(Zoom::DESIGN.up().up(), Some(true), 2));
+        write_words(sub, &words(Zoom::DESIGN.up().up(), Some(true), 2, 0));
         assert_eq!(
             read_words(sub),
-            Settings { zoom: Some(Zoom::DESIGN.up().up()), dark: Some(true), face: Some(2) }
+            Settings {
+                zoom: Some(Zoom::DESIGN.up().up()),
+                dark: Some(true),
+                face: Some(2),
+                measure: Some(0),
+            }
         );
         // A key that was never written is a first run, not a broken one.
         assert_eq!(read_words(&format!("{sub}\\Absent")), Settings::default());
