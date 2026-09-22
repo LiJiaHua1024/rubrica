@@ -3095,7 +3095,21 @@ fn layout_block(
     }
 
     let mixed = text.chars().any(|c| matches!(c as u32, 0x3000..=0x303F | 0x4E00..=0x9FFF | 0x3040..=0x30FF | 0xFF00..=0xFFEF));
-    let spacing = Spacing::for_size(size);
+    // A fence is a grid: its spaces are the face's own space wide, a run of them is as
+    // wide as it is long, and none of it moves when the line is set. The prose recipe
+    // -- a third of an em, elastic, collapsed -- sets `let x` and `let  x` the same
+    // distance apart and leaves two code lines of equal length ending in different
+    // columns, which is the promise a monospace face exists to keep.
+    let grid = if b.kind == BlockKind::Code {
+        let st = &styles[base];
+        font.shape_runs(" ", 0..1, &st.face, st.size, st.tracking)
+            .iter()
+            .map(|r| r.width())
+            .sum()
+    } else {
+        0.0
+    };
+    let spacing = if grid > 0.0 { Spacing::monospace(size, grid) } else { Spacing::for_size(size) };
     let mut opts = BreakOptions::new(column);
     opts.ragged = b.ragged();
     opts.par_indent = theme.first_line_indent_em * size;

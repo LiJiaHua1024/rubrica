@@ -98,6 +98,55 @@ fn a_style_cut_inside_an_unbreakable_word_joins_instead_of_spacing() {
 }
 
 #[test]
+fn a_grid_space_keeps_a_coloured_line_where_the_plain_one_sat() {
+    // Syntax colours cut a fence into spans, and a cut landing next to a space must not
+    // nudge the words after it. Under the prose recipe it does: UAX #14 offers no break
+    // between the `;` and the `//`, so the plain line keeps that space inside a box
+    // while the coloured one, cut at the same offset, has to make it a word space.
+    let text = "let x = 1; // note";
+    let spans = [
+        StyleSpan { range: 0..3, style: StyleId(1) },
+        StyleSpan { range: 11..19, style: StyleId(2) },
+    ];
+    let unit = SIZE * 0.5;
+    let prose = Spacing::for_size(SIZE);
+    let grid = Spacing::monospace(SIZE, unit);
+    assert_ne!(
+        width_of_line(text, &prose, &[]),
+        width_of_line(text, &prose, &spans),
+        "the prose recipe moves the ink, which is what the grid is there to stop"
+    );
+    let plain = width_of_line(text, &grid, &[]);
+    assert_eq!(plain, width_of_line(text, &grid, &spans), "cutting the line into colours moved its ink");
+    // And that width is the source's own character count, spaces included.
+    assert_eq!(plain, text.chars().count() as Pt * unit);
+}
+
+#[test]
+fn a_run_of_spaces_in_a_grid_is_as_wide_as_it_is_long() {
+    // The columns an author lined up with spaces are the alignment a monospace block
+    // has to keep, so a run of them is as wide as it is long. Prose collapses the run,
+    // the way a browser does, and there that behaviour is the point.
+    let unit = SIZE * 0.5;
+    let grid = Spacing::monospace(SIZE, unit);
+    assert_eq!(width_of_line("name   one", &grid, &[]), 10.0 * unit);
+    assert_eq!(width_of_line("name   two", &grid, &[]), 10.0 * unit);
+    let prose = Spacing::for_size(SIZE);
+    assert_eq!(
+        width_of_line("name   one", &prose, &[]),
+        width_of_line("name one", &prose, &[]),
+        "prose stopped collapsing what its author only meant as one space"
+    );
+}
+
+fn width_of_line(text: &str, spacing: &Spacing, spans: &[StyleSpan]) -> Pt {
+    let mut measure = MonospaceMeasure { size: SIZE, factor: 0.5 };
+    let (para, plan) = typeset(text, spacing, StyleId(0), spans, &BreakOptions::new(500.0), &mut measure);
+    assert_eq!(plan.lines.len(), 1, "the line wrapped: {:?}", plan.lines);
+    line_width(&place(&para, &plan.lines[0]))
+}
+
+#[test]
 fn a_break_the_source_offers_still_gets_the_scripts_glue() {
     // The join above must not swallow the gap the mixed-script rule exists to put
     // there: these two boundaries really are break opportunities.
@@ -113,6 +162,30 @@ fn a_break_the_source_offers_still_gets_the_scripts_glue() {
         para.items.iter().any(|it| matches!(*it, Item::Glue { base, breakable, .. }
             if base == spacing.mixed.base && breakable)),
         "quarter-em glue disappeared at the Han/Latin break opportunity"
+    );
+}
+
+#[test]
+fn a_break_the_source_offers_with_nothing_written_at_it_costs_no_width() {
+    // ASCII punctuation is `Common`, which makes the hyphen in `rubrica-app` part of a
+    // Western word's own characters -- and UAX #14 still offers a break after it. The
+    // break may be taken; the gap may not appear, because no file contains a space
+    // there. Same story for every `:` in a URL and every `-` in a flag.
+    let spacing = Spacing::for_size(SIZE);
+    let mut measure = MonospaceMeasure { size: SIZE, factor: 0.5 };
+    let (para, plan) =
+        typeset("rubrica-app", &spacing, StyleId(0), &[], &BreakOptions::new(500.0), &mut measure);
+    assert_eq!(
+        line_width(&place(&para, &plan.lines[0])),
+        11.0 * SIZE * 0.5,
+        "a space appeared where the author wrote a hyphen: {:?}",
+        para.items
+    );
+    assert!(
+        para.items.iter().any(|it| matches!(*it, Item::Glue { base, breakable, .. }
+            if base == 0.0 && breakable)),
+        "the offered break stopped being a place a line may split: {:?}",
+        para.items
     );
 }
 

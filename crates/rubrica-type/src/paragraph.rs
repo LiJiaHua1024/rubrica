@@ -63,7 +63,7 @@ impl GlueRecipe {
     }
 }
 
-/// The three glue flavours a mixed-script paragraph needs. Values are expressed
+/// The glue flavours a mixed-script paragraph needs. The recipes are expressed
 /// relative to the CJK em so a theme can retune them as one knob set.
 #[derive(Clone, Debug)]
 pub struct Spacing {
@@ -75,6 +75,12 @@ pub struct Spacing {
     pub cjk_join: GlueRecipe,
     /// Between an ideograph and a Western word: the classic 1/4 em, adjustable.
     pub mixed: GlueRecipe,
+    /// Whether a run of literal spaces is as many spaces as its author wrote.
+    ///
+    /// Off for prose, where a browser collapses the run to one word space and the
+    /// author's alignment was never meant to be seen. On for a monospace block, where
+    /// the run *is* the alignment: a column drawn with spaces has to keep its column.
+    pub literal_space_runs: bool,
 }
 
 impl Spacing {
@@ -93,7 +99,17 @@ impl Spacing {
             },
             cjk_join: GlueRecipe { base: 0.0, stretch: size * 0.08, shrink: size * 0.20 },
             mixed: GlueRecipe { base: size * 0.25, stretch: size * 0.125, shrink: size * 0.125 },
+            literal_space_runs: false,
         }
+    }
+
+    /// The spacing of a monospace block, whose word space is the face's own advance
+    /// rather than a third of an em. Nothing about it stretches or shrinks and a run of
+    /// spaces is as wide as it is long, because the author lined something up with it:
+    /// two lines of the same character count then end in the same column, which is the
+    /// only promise a grid makes.
+    pub fn monospace(size: Pt, advance: Pt) -> Self {
+        Self { latin_space: GlueRecipe::fixed(advance), literal_space_runs: true, ..Self::for_size(size) }
     }
 }
 
@@ -447,17 +463,32 @@ fn emit_space(p: &mut Paragraph, prev_role: &mut Option<Role>, ws: &str, opts: &
         });
         p.items.push(Item::Penalty { penalty: i32::MIN, forced: true, width: 0.0, hyphen: None });
     } else {
-        p.items.push(Item::glue(&opts.spacing.latin_space));
+        let r = opts.spacing.latin_space;
+        // One space's recipe, or the run's own length worth of it. Breaking anywhere
+        // inside the run is the same either way: glue left at a line's end is trimmed.
+        let n = if opts.spacing.literal_space_runs { ws.chars().count() as Pt } else { 1.0 };
+        p.items.push(Item::Glue {
+            base: r.base * n,
+            stretch: r.stretch * n,
+            shrink: r.shrink * n,
+            breakable: true,
+        });
     }
     *prev_role = None;
 }
+
+/// A break the source offers where its author wrote nothing: the line may split
+/// here, but no air appears on the page. ASCII punctuation is `Common`, so `-`, `/`
+/// and `:` all reach this arm -- a word space at one of them would set `rubrica-app`
+/// as `rubrica- app`, a character that is in no file.
+const NO_AIR: GlueRecipe = GlueRecipe::fixed(0.0);
 
 fn glue_recipe_for(a: Role, b: Role, s: &Spacing) -> &GlueRecipe {
     match (a, b) {
         (Role::Cjk, Role::Cjk) => &s.cjk_join,
         (Role::Cjk, Role::Western) | (Role::Western, Role::Cjk) => &s.mixed,
         (Role::Cjk, Role::Other) | (Role::Other, Role::Cjk) => &s.mixed,
-        _ => &s.latin_space,
+        _ => &NO_AIR,
     }
 }
 
