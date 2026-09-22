@@ -45,7 +45,7 @@ use windows::Win32::UI::Input::KeyboardAndMouse::{
 };
 use windows::Win32::UI::Input::KeyboardAndMouse::{VK_DOWN, VK_ESCAPE, VK_NEXT, VK_PRIOR};
 use windows::Win32::UI::Input::KeyboardAndMouse::{
-    VK_0, VK_A, VK_ADD, VK_C, VK_D, VK_END, VK_HOME, VK_LEFT, VK_NUMPAD0, VK_OEM_4,
+    VK_0, VK_A, VK_ADD, VK_C, VK_D, VK_END, VK_HOME, VK_LEFT, VK_MENU, VK_NUMPAD0, VK_OEM_4,
     VK_OEM_6, VK_OEM_MINUS, VK_OEM_PLUS, VK_R, VK_RIGHT, VK_SHIFT, VK_SUBTRACT, VIRTUAL_KEY,
 };
 use windows::Win32::UI::Controls::Dialogs::{
@@ -58,11 +58,13 @@ use windows::Win32::UI::WindowsAndMessaging::{
     GWLP_USERDATA, GetClientRect, GetCursorPos, GetWindowLongPtrW, GetMessageW, HCURSOR, HWND_TOP,
     HTCLIENT, IDC_ARROW, IDC_HAND, KillTimer, LoadCursorW, MF_CHECKED, MF_GRAYED, MF_SEPARATOR,
     MF_STRING, MSG, PostMessageW, PostQuitMessage, RegisterClassExW, SetCursor, SetForegroundWindow,
-    SW_SHOWNORMAL, SetTimer, SetWindowLongPtrW, SetWindowPos, ShowWindow, TPM_RETURNCMD,
+    SetWindowTextW, SW_SHOWNORMAL, SetTimer, SetWindowLongPtrW, SetWindowPos, ShowWindow,
+    TPM_RETURNCMD,
     TPM_RIGHTBUTTON, TrackPopupMenuEx, TranslateMessage, WM_CONTEXTMENU, WM_NULL, WNDCLASSEXW,
     WM_DESTROY, WM_DPICHANGED, WM_ERASEBKGND, WM_KEYDOWN, WM_MOUSEWHEEL, WM_NCCREATE, WM_PAINT,
     WM_SETCURSOR, WM_SIZE, WM_TIMER, WS_EX_APPWINDOW, WS_OVERLAPPEDWINDOW, SWP_NOACTIVATE,
     SWP_NOZORDER, WM_DROPFILES, WM_LBUTTONDOWN, WM_LBUTTONDBLCLK, WM_LBUTTONUP, WM_MOUSEMOVE,
+    WM_SYSKEYDOWN,
 };
 use windows_numerics::Vector2;
 
@@ -680,6 +682,11 @@ pub struct View {
     client_h: f32,
     dpi: f32,
     path: Option<PathBuf>,
+    /// The pages the reader has left behind, and the ones they have stepped away from.
+    /// Filled by any change of page -- a link, a dropped file, a second document out of
+    /// the dialog -- so that the last thing they were reading is never more than one key
+    /// away, and empty until there is a second page to have come from.
+    history: History,
     /// Set while the pointer is dragging the scroll thumb.
     dragging: bool,
     /// Where the left button went down, in client pixels. A press that has moved past
@@ -726,6 +733,93 @@ fn step_measure(from: usize, delta: i32) -> usize {
     (from as i32 + delta).clamp(0, Measure::ALL.len() as i32 - 1) as usize
 }
 
+/// A page the reader was on, and how far down it they had got.
+///
+/// `path` is `None` for the built-in sample, which is a page like any other: the reader
+/// can leave it, and be asked back to.
+#[derive(Clone, Debug, PartialEq)]
+struct Visit {
+    path: Option<PathBuf>,
+    scroll: Pt,
+}
+
+impl Visit {
+    /// Whether this place could still be stood on, which for a page that has come off a
+    /// removed drive since it was left it cannot.
+    fn readable(&self) -> bool {
+        self.path.as_ref().is_none_or(|p| p.is_file())
+    }
+}
+
+/// The pages the reader has left behind, and the ones a step forward would take them to.
+///
+/// A step is a change of page or a jump within one, because the two are the same
+/// experience to the reader: they looked at something, followed a link away from it, and
+/// want what they were looking at back.
+#[derive(Default)]
+struct History {
+    past: Vec<Visit>,
+    future: Vec<Visit>,
+}
+
+impl History {
+    /// Leave a place behind on the way to a new one.
+    ///
+    /// What was ahead is thrown away, as every browser does and for the same reason: the
+    /// reader has taken a different road here, so the places further along the old one
+    /// are not where they are going next.
+    fn leave(&mut self, from: Visit) {
+        self.past.push(from);
+        self.future.clear();
+    }
+
+    /// Step back, leaving the place being stood on where it can be come forward to.
+    fn back(&mut self, from: Visit) -> Option<Visit> {
+        let there = self.past.pop()?;
+        self.future.push(from);
+        Some(there)
+    }
+
+    fn forward(&mut self, from: Visit) -> Option<Visit> {
+        let there = self.future.pop()?;
+        self.past.push(from);
+        Some(there)
+    }
+
+    /// One end of the road, nearest the reader first.
+    fn end(&self, back: bool) -> &[Visit] {
+        if back {
+            &self.past
+        } else {
+            &self.future
+        }
+    }
+
+    /// The nearest place at one end that could still be stood on: a step lands there
+    /// rather than nowhere, even though a nearer page has come off a removed drive.
+    fn walkable(&self, back: bool) -> Option<&Visit> {
+        self.end(back).iter().rev().find(|v| v.readable())
+    }
+
+    /// Whether a step either way has somewhere to land, which is what dims the two rows
+    /// at the top of the menu. It asks of the whole end of the road rather than of its
+    /// last entry alone: a reader who deleted a page they had visited should still find
+    /// `Back` lit, because the page behind that one is still there.
+    fn leads(&self, back: bool) -> bool {
+        self.walkable(back).is_some()
+    }
+
+    /// Drop the places at one end that nothing can stand on again, so that a step which
+    /// has to pass through a deleted page passes through it once rather than on every
+    /// press -- and so that the next place to land is the nearest one at that end.
+    fn prune(&mut self, back: bool) {
+        let stack = if back { &mut self.past } else { &mut self.future };
+        while stack.last().is_some_and(|v| !v.readable()) {
+            stack.pop();
+        }
+    }
+}
+
 /// What the right-click menu can be asked to do.
 ///
 /// Every one of these is also reachable some other way -- a key, a click, the wheel --
@@ -733,6 +827,9 @@ fn step_measure(from: usize, delta: i32) -> usize {
 /// can test, and the window is not open in a test.
 #[derive(Clone, Debug, PartialEq)]
 enum Command {
+    /// Step to the page the reader came from, and to the one they came from it to.
+    GoBack,
+    GoForward,
     Copy,
     SelectAll,
     OpenUrl(String),
@@ -766,6 +863,11 @@ enum MenuRow {
 /// copy nothing, or checks a palette that is not on the screen, teaches the reader to
 /// distrust the whole list.
 struct MenuState {
+    /// Whether a step back or forward has a page to land on. A reader who has opened one
+    /// document and never followed a link out of it has no road behind them, and a `Back`
+    /// that does nothing when pressed teaches them the menu is not to be believed.
+    can_back: bool,
+    can_forward: bool,
     /// The address under the pointer, when a link that leads out is what is under it.
     link: Option<String>,
     selected: bool,
@@ -798,6 +900,9 @@ fn menu_items(s: &MenuState) -> Vec<MenuRow> {
     // is standing next to, and the bracket keys step the measure rather than settling on
     // a rung, so a hint on either would promise a different thing from the one it keeps.
     let mut v = vec![
+        row(Command::GoBack, "Back\tAlt+\u{2190}", s.can_back),
+        row(Command::GoForward, "Forward\tAlt+\u{2192}", s.can_forward),
+        MenuRow::Gap,
         row(Command::Copy, "Copy\tCtrl+C", s.selected),
         row(Command::SelectAll, "Select All\tCtrl+A", s.text),
     ];
@@ -1000,6 +1105,7 @@ pub fn run(source: String, path: Option<PathBuf>) -> Result<()> {
         client_h: 1.0,
         dpi: 96.0,
         path,
+        history: History::default(),
         dragging: false,
         press_at: None,
         images: None,
@@ -1412,6 +1518,23 @@ impl View {
                 let _ = InvalidateRect(Some(hwnd), None, false);
                 LRESULT(0)
             }
+            // `Alt` plus an arrow arrives here rather than at `WM_KEYDOWN`, which is why
+            // the two steps cannot ride on the handler above. Everything this arm does not
+            // want is handed straight back, because the default handler is what makes
+            // `Alt`+`F4` close a window and `Alt`+`Space` open the system menu.
+            WM_SYSKEYDOWN => {
+                let k = wp.0 as u32;
+                let alt = held(VK_MENU);
+                if alt && k == VK_LEFT.0 as u32 {
+                    self.apply_command(Command::GoBack, hwnd);
+                    LRESULT(0)
+                } else if alt && k == VK_RIGHT.0 as u32 {
+                    self.apply_command(Command::GoForward, hwnd);
+                    LRESULT(0)
+                } else {
+                    DefWindowProcW(hwnd, msg, wp, lp)
+                }
+            }
             WM_CONTEXTMENU => {
                 // `wParam` is the window and `lParam` the screen point the right button
                 // was over -- except when the key that opened this was the keyboard's
@@ -1638,7 +1761,7 @@ impl View {
             HotKind::Cite(note) => self.jump_to(self.note_tops.get(note).copied(), hwnd),
             HotKind::Heading(at) => self.jump_to(self.anchor_tops.get(at).copied(), hwnd),
             HotKind::Document(path) => {
-                self.load_document(&path);
+                self.load_document(&path, hwnd);
                 let _ = unsafe { InvalidateRect(Some(hwnd), None, false) };
             }
         }
@@ -1651,8 +1774,16 @@ impl View {
     /// means being able to tell where one came from -- and to get back there.
     fn jump_to(&mut self, top: Option<Pt>, hwnd: HWND) {
         let Some(top) = top else { return };
+        let from = self.here();
         self.scroll = (top - self.theme.base).max(0.0);
         self.clamp_scroll();
+        // Only a jump that goes somewhere is a step, which keeps the deliberate ones --
+        // a citation, a table of contents entry -- in the history and the aimless ones out
+        // of it: a page whose every click on an already-visible heading added a rung would
+        // turn `Back` into a way of walking backwards through one screen of text.
+        if (self.scroll - from.scroll).abs() > 0.5 {
+            self.history.leave(from);
+        }
         let _ = unsafe { InvalidateRect(Some(hwnd), None, false) };
     }
 
@@ -1678,6 +1809,8 @@ impl View {
         let mut pt = POINT { x, y };
         let _ = unsafe { ScreenToClient(hwnd, &mut pt) };
         let state = MenuState {
+            can_back: self.history.leads(true),
+            can_forward: self.history.leads(false),
             link: self.pointer_link(pt.x as f32, pt.y as f32),
             selected: self.selection.is_some_and(|s| s.from != s.to),
             dark: self.dark_override,
@@ -1729,6 +1862,8 @@ impl View {
     /// Do one of the things the menu offers, most of which are also keys.
     fn apply_command(&mut self, cmd: Command, hwnd: HWND) {
         match cmd {
+            Command::GoBack => self.go_back(hwnd),
+            Command::GoForward => self.go_forward(hwnd),
             Command::Copy => self.copy_selection(hwnd),
             Command::SelectAll => self.select_all(),
             Command::OpenUrl(u) => open_url(&u),
@@ -1761,12 +1896,12 @@ impl View {
             }
             Command::OpenFile => {
                 if let Some(path) = unsafe { self.prompt_for_file(hwnd) } {
-                    self.load_document(&path);
+                    self.load_document(&path, hwnd);
                 }
             }
             Command::Reload => {
                 if let Some(path) = self.path.clone() {
-                    self.load_document(&path);
+                    self.load_document(&path, hwnd);
                 }
             }
         }
@@ -2521,25 +2656,116 @@ impl View {
         DragFinish(h);
         let path = String::from_utf16_lossy(&buf[..written]);
         let path = path.trim_end_matches(char::from(0)).to_string();
-        self.load_document(std::path::Path::new(&path));
+        self.load_document(std::path::Path::new(&path), hwnd);
         let _ = InvalidateRect(Some(hwnd), None, false);
     }
 
-    /// Replace the open document, resetting the view to its top.
-    fn load_document(&mut self, path: &std::path::Path) {
+    /// The place the reader is standing: this page, at this offset down it.
+    fn here(&self) -> Visit {
+        Visit { path: self.path.clone(), scroll: self.scroll }
+    }
+
+    /// Replace the open document, resetting the view to its top, and leave the page being
+    /// stood on behind where a step back can find it again.
+    fn load_document(&mut self, path: &std::path::Path, hwnd: HWND) {
+        let from = self.here();
+        // Asked before the page is replaced, because after it `self.path` is the very
+        // path being compared against.
+        let same = self.path.as_deref() == Some(path);
+        if !self.show_document(path, hwnd) {
+            return;
+        }
+        // Written here rather than at each place that asks for a document, so that opening
+        // one by dialog, by dropping it on the window, or by following a link to it all
+        // leave the same thing behind -- and so that a step back to an older page does not
+        // write that older page as the one the reader chose last.
+        crate::settings::record_opened(path);
+        // Reading the page already open again is not a step: the reader did not go
+        // anywhere, so there is nothing to come back from. `Reload` is this call with the
+        // same path, and a history that grew on every `Ctrl`+`R` would be a `Back` that
+        // landed on the same text at the top of the window.
+        if !same {
+            self.history.leave(from);
+        }
+    }
+
+    /// Read a file and make it the page, saying whether that worked.
+    fn show_document(&mut self, path: &std::path::Path, hwnd: HWND) -> bool {
         match std::fs::read_to_string(path) {
             Ok(src) => {
-                self.doc = rubrica_doc::Document::parse(&src);
-                self.path = Some(path.to_path_buf());
-                self.scroll = 0.0;
-                self.relayout();
-                // Written here rather than at each place that asks for a document, so
-                // that opening one by dialog, by dropping it on the window, or by
-                // following a link to it all leave the same thing behind.
-                crate::settings::record_opened(path);
+                self.set_page(src, Some(path.to_path_buf()), hwnd);
+                true
             }
-            Err(e) => eprintln!("cannot open {}: {e}", path.display()),
+            Err(e) => {
+                eprintln!("cannot open {}: {e}", path.display());
+                false
+            }
         }
+    }
+
+    /// Make this text the page, from its top, and name it on the title bar. The title is
+    /// part of the page rather than of the call that got here, because this is the one
+    /// place every route to a new document passes through -- and a reader who has just
+    /// stepped back to a document of the same name as this one needs to see which is
+    /// which.
+    fn set_page(&mut self, source: String, path: Option<PathBuf>, hwnd: HWND) {
+        self.doc = rubrica_doc::Document::parse(&source);
+        self.path = path;
+        self.scroll = 0.0;
+        self.relayout();
+        let title = utf16(&window_title(self.path.as_deref()));
+        let _ = unsafe { SetWindowTextW(hwnd, PCWSTR(title.as_ptr())) };
+    }
+
+    /// Step back, or forward again after a step back.
+    fn go_back(&mut self, hwnd: HWND) {
+        self.step(hwnd, true);
+    }
+
+    fn go_forward(&mut self, hwnd: HWND) {
+        self.step(hwnd, false);
+    }
+
+    /// Take one step either way along the road the reader has travelled.
+    ///
+    /// The places that have gone off the disk since they were left are dropped on the way,
+    /// so a deleted page costs the reader that page and not their step.
+    fn step(&mut self, hwnd: HWND, back: bool) {
+        self.history.prune(back);
+        let here = self.here();
+        let there = if back {
+            self.history.back(here)
+        } else {
+            self.history.forward(here)
+        };
+        let Some(there) = there else {
+            // Nowhere to go, which the menu dims and the key cannot prevent. A reader who
+            // has been at one page since the window opened presses Alt+left on instinct,
+            // and the answer is that nothing moves.
+            return;
+        };
+        self.reopen(there, hwnd);
+    }
+
+    /// Stand on a remembered place: the page it was on, at the offset it was left at.
+    fn reopen(&mut self, there: Visit, hwnd: HWND) {
+        if let Some(path) = &there.path {
+            // A step back to a heading on the page already open is the common kind of
+            // jump, and re-reading that file would be the slowest way of doing nothing --
+            // so the page is only loaded when it is a different one from the one being
+            // stood on. Where it cannot be read at all, the place has come off a removed
+            // drive since it was left, and the step is abandoned rather than faked.
+            if self.path.as_deref() != Some(path.as_path()) && !self.show_document(path, hwnd) {
+                return;
+            }
+        } else if self.path.is_some() {
+            // The built-in sample, which is a page the reader can leave and be asked back
+            // to but has no file to read again.
+            self.set_page(crate::sample::DOCUMENT.to_string(), None, hwnd);
+        }
+        self.scroll = there.scroll;
+        self.clamp_scroll();
+        let _ = unsafe { InvalidateRect(Some(hwnd), None, false) };
     }
 
     /// The common dialog. Returns the chosen path, if the user did not cancel.
@@ -4008,6 +4234,10 @@ mod tests {
     /// did this page come off a disk, is there any text at all.
     fn state(selected: bool, link: Option<&str>, dark: Option<bool>, from_file: bool, text: bool) -> MenuState {
         MenuState {
+            // A page with no road behind it, which is what a menu asked about the sample
+            // after a fresh start reports.
+            can_back: false,
+            can_forward: false,
             link: link.map(str::to_string),
             selected,
             dark,
@@ -4024,9 +4254,12 @@ mod tests {
         let empty = state(false, None, None, false, true);
         let got = rows(&empty);
         // Nothing marked, so the copy is dimmed rather than promising an empty clipboard.
-        assert_eq!(got[0], (Command::Copy, false, false));
+        // The two steps come first, so the text's own rows start one group lower.
+        assert_eq!(got[0], (Command::GoBack, false, false));
+        assert_eq!(got[1], (Command::GoForward, false, false));
+        assert_eq!(got[2], (Command::Copy, false, false));
         // A page with text can have it all taken, even with nothing marked yet.
-        assert_eq!(got[1], (Command::SelectAll, true, false));
+        assert_eq!(got[3], (Command::SelectAll, true, false));
         assert!(
             !got.iter().any(|(c, _, _)| matches!(c, Command::OpenUrl(_) | Command::CopyUrl(_))),
             "no link under the pointer means no item about one"
@@ -4042,14 +4275,43 @@ mod tests {
         assert!(got.iter().any(|(c, _, c2)| *c2 && c == &Command::Face(0)));
         assert!(got.iter().any(|(c, _, c2)| *c2 && c == &Command::Measure(Measure::DESIGN)));
 
-        assert_eq!(rows(&state(true, None, None, false, true))[0], (Command::Copy, true, false));
+        assert_eq!(rows(&state(true, None, None, false, true))[2], (Command::Copy, true, false));
 
         let got = rows(&state(false, None, Some(true), true, true));
         assert!(got.iter().any(|(c, _, on)| *on && c == &Command::Palette(true)));
         assert!(!got.iter().any(|(c, _, on)| *on && c == &Command::FollowSystem));
         assert_eq!(got.last().map(|(c, e, _)| (c.clone(), *e)), Some((Command::Reload, true)));
 
-        assert_eq!(rows(&state(false, None, None, false, false))[1], (Command::SelectAll, false, false));
+        assert_eq!(rows(&state(false, None, None, false, false))[3], (Command::SelectAll, false, false));
+    }
+
+    #[test]
+    fn the_two_steps_are_only_lit_when_they_have_somewhere_to_land() {
+        let steps = |back: bool, forward: bool| {
+            let mut s = state(false, None, None, false, true);
+            s.can_back = back;
+            s.can_forward = forward;
+            let got = rows(&s);
+            (got[0].1, got[1].1)
+        };
+        assert_eq!(steps(false, false), (false, false), "a first page has no road at all");
+        assert_eq!(steps(true, false), (true, false));
+        assert_eq!(steps(false, true), (false, true));
+        // Both at once is the ordinary case after a step back: the page came from and the
+        // page was left are both there, and neither may be dimmed.
+        assert_eq!(steps(true, true), (true, true));
+        // And they are the first thing on the menu, above the group that starts with the
+        // copy -- which is where a reader looking for them expects the list to open.
+        assert!(menu_items(&state(false, None, None, false, true)).windows(3).any(|w| {
+            matches!(
+                (&w[0], &w[1], &w[2]),
+                (
+                    MenuRow::Row { cmd: Command::GoBack, .. },
+                    MenuRow::Row { cmd: Command::GoForward, .. },
+                    MenuRow::Gap
+                )
+            )
+        }));
     }
 
     #[test]
@@ -4113,6 +4375,8 @@ mod tests {
         };
         let got = rows(&state(true, None, None, true, true));
         for (cmd, key) in [
+            (&Command::GoBack, "Back\tAlt+\u{2190}"),
+            (&Command::GoForward, "Forward\tAlt+\u{2192}"),
             (&Command::Copy, "Copy\tCtrl+C"),
             (&Command::SelectAll, "Select All\tCtrl+A"),
             (&Command::ZoomIn, "Increase Text\tCtrl++"),
@@ -4127,7 +4391,7 @@ mod tests {
         // Nothing else may claim one. `Ctrl`+`D` picks whichever palette is not on the
         // screen rather than the row it would be printed on, and the bracket keys step
         // the measure instead of settling on the rung they are next to.
-        assert_eq!(got.iter().filter(|(_, l)| l.contains('\t')).count(), 7);
+        assert_eq!(got.iter().filter(|(_, l)| l.contains('\t')).count(), 9);
     }
 
     #[test]
@@ -4142,6 +4406,72 @@ mod tests {
         assert_eq!(step_measure(2, 1), 2);
         assert_eq!(step_measure(2, 9), 2);
         assert_eq!(step_measure(1, 0), 1);
+    }
+
+    /// A page with no file behind it -- the built-in sample -- which is a place the
+    /// reader can leave and be asked back to like any other.
+    fn at(scroll: Pt) -> Visit {
+        Visit { path: None, scroll }
+    }
+
+    /// A page that is not on this machine, which is what a document the reader deleted
+    /// since leaving it becomes.
+    fn absent() -> Visit {
+        Visit {
+            path: Some(std::env::temp_dir().join("Rubrica absent 4f2a.md")),
+            scroll: 9.0,
+        }
+    }
+
+    #[test]
+    fn the_two_steps_walk_the_road_the_reader_took() {
+        let mut h = History::default();
+        assert!(!h.leads(true) && !h.leads(false), "a first page has no road at all");
+        // Read A, follow a link to B part-way down, and leave B on the way to C.
+        h.leave(at(0.0));
+        h.leave(at(12.0));
+        assert_eq!(h.end(true).last(), Some(&at(12.0)), "the last place left is the first one back to");
+        // Stepping back hands over the place the reader is standing at, which is what
+        // makes the same step forward again a possible thing to ask for.
+        assert_eq!(h.back(at(30.0)), Some(at(12.0)));
+        assert_eq!(h.end(false).last(), Some(&at(30.0)), "the page just left is where forward goes");
+        assert_eq!(h.forward(at(12.0)), Some(at(30.0)), "so the road can be walked down again");
+        assert!(!h.leads(false), "with nothing further along it");
+        assert_eq!(h.back(at(30.0)), Some(at(12.0)), "and back up it, as often as asked");
+    }
+
+    #[test]
+    fn a_new_road_takes_away_the_old_one() {
+        let mut h = History::default();
+        h.leave(at(0.0));
+        h.back(at(9.0));
+        assert!(h.leads(false), "the page stepped back from is still ahead");
+        // The reader then follows a link of their own rather than finishing that walk.
+        // Where the old road went next is no longer where they are going.
+        h.leave(at(4.0));
+        assert!(!h.leads(false), "the rest of it is gone with the new one");
+        assert!(h.leads(true), "and what was behind is untouched");
+    }
+
+    #[test]
+    fn a_page_the_reader_deleted_is_walked_past_not_landed_on() {
+        let gone = absent();
+        assert!(!gone.readable(), "a file that is not there is not a place");
+        assert!(at(0.0).readable(), "and a page with no file to read is always one");
+        let mut h = History { past: vec![at(2.0), gone.clone()], ..Default::default() };
+        assert_eq!(h.end(true).last(), Some(&gone), "the nearest thing behind is the dead page");
+        assert!(h.leads(true), "but the road behind it is still somewhere to go");
+        h.prune(true);
+        assert_eq!(h.end(true).last(), Some(&at(2.0)), "pruning stops at the first place that lives");
+        // An end of the road that is all dead is no road: the step is refused rather than
+        // taken into nothing, and the place being stood on is not pushed onto the far side
+        // by a step that never happened.
+        h.past = vec![gone.clone()];
+        assert!(!h.leads(true));
+        h.prune(true);
+        assert!(h.past.is_empty());
+        assert_eq!(h.back(at(0.0)), None);
+        assert!(h.future.is_empty());
     }
 
     #[test]
@@ -4188,6 +4518,8 @@ mod tests {
     #[test]
     fn a_menu_opened_over_a_link_carries_its_address() {
         let s = MenuState {
+            can_back: false,
+            can_forward: false,
             link: Some("https://example.com/x".into()),
             selected: false,
             dark: None,
