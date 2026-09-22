@@ -37,9 +37,31 @@ fn main() -> Result<()> {
         let options = report::Options { width, dpi, hyphenate, zoom, face, measure };
         return report::report(&source, shown.as_deref(), &options);
     }
+    // A file named on the command line is what the reader asked for, and one that cannot
+    // be read is worth stopping on. Nothing named is not a request for the sample,
+    // though: the reader was here before, and the page they left is the one to come back
+    // to.
     let arg = std::env::args_os().nth(1).map(PathBuf::from);
-    let (path, source) = load(arg.as_ref().and_then(|p| p.to_str()))?;
+    let (path, source) = match arg.as_ref().and_then(|p| p.to_str()) {
+        Some(p) => load(Some(p))?,
+        None => reopen(),
+    };
     view::run(source, path)
+}
+
+/// What to show when nothing was named: the document the reader had open last, and the
+/// sample if there is no such thing or it has outgrown its name.
+///
+/// A page that has moved or lost its drive since is not worth refusing to start over --
+/// a remembered preference is a guess about what the reader wants next, and a guess that
+/// cannot be honoured is dropped rather than argued about.
+fn reopen() -> (Option<PathBuf>, String) {
+    if let Some(path) = settings::opened() {
+        if let Ok(source) = std::fs::read_to_string(&path) {
+            return (Some(path), source);
+        }
+    }
+    (None, sample::DOCUMENT.to_string())
 }
 
 /// Read a document, falling back to the built-in sample.

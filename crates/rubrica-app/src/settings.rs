@@ -1,7 +1,8 @@
-//! What the reader has chosen about how the page looks, kept for the next window.
+//! What the reader has chosen about the page, and what they had open, kept for the next
+//! window.
 //!
-//! Four numbers under `Software\Rubrica` in the current user's registry, which is where
-//! a Windows program puts four numbers: no path to choose for a settings file, no
+//! Four numbers and one path under `Software\Rubrica` in the current user's registry,
+//! which is where a Windows program puts them: no path to choose for a settings file, no
 //! format to invent, no dependency to carry, and the palette the system prefers is
 //! already read out of the same store.
 //!
@@ -9,9 +10,12 @@
 //! that carry them, so what a stored number means can be read -- and tested -- without a
 //! live registry in the way.
 
+use std::path::PathBuf;
+
 use windows::core::PCWSTR;
 use windows::Win32::System::Registry::{
-    HKEY_CURRENT_USER, RegGetValueW, RegSetKeyValueW, RRF_RT_DWORD, REG_DWORD,
+    HKEY_CURRENT_USER, RegGetValueW, RegSetKeyValueW, RRF_RT_REG_DWORD, RRF_RT_REG_SZ, REG_DWORD,
+    REG_SZ,
 };
 
 use crate::theme::{Measure, TextFace, Zoom};
@@ -20,6 +24,8 @@ use crate::view::utf16;
 const SUBKEY: &str = "Software\\Rubrica";
 /// The names the numbers are stored under, in the order [`words`] writes them.
 const NAMES: [&str; 4] = ["Zoom", "Dark", "Face", "Measure"];
+/// The one value that is not a number: the document to open again next time.
+const OPENED: &str = "Document";
 /// What `Dark` holds when the reader asked for the system's own setting to decide. The
 /// same answer as no value at all, which is why nothing has to be deleted to get back
 /// there: a reader who chooses `Follow System` is not asking for a different number, they
@@ -78,7 +84,7 @@ fn word(sub: &str, name: &str) -> Option<u32> {
             HKEY_CURRENT_USER,
             PCWSTR(sub.as_ptr()),
             PCWSTR(name.as_ptr()),
-            RRF_RT_DWORD,
+            RRF_RT_REG_DWORD,
             None,
             Some(&mut value as *mut u32 as *mut core::ffi::c_void),
             Some(&mut len),
@@ -134,6 +140,98 @@ pub fn record(zoom: Zoom, dark: Option<bool>, face: usize, measure: usize) {
 /// The reader's own choices, as the last run left them.
 pub fn load() -> Settings {
     read_words(SUBKEY)
+}
+
+/// One string, or `None` when this machine has nothing of that name to give.
+fn text(sub: &str, name: &str) -> Option<String> {
+    let sub = utf16(sub);
+    let name = utf16(name);
+    // The length is asked for first, because a path can be any length and the buffer it
+    // is read into has to be cut to size beforehand.
+    let mut len = 0u32;
+    let r = unsafe {
+        RegGetValueW(
+            HKEY_CURRENT_USER,
+            PCWSTR(sub.as_ptr()),
+            PCWSTR(name.as_ptr()),
+            RRF_RT_REG_SZ,
+            None,
+            None,
+            Some(&mut len),
+        )
+    };
+    if r.is_err() || len == 0 {
+        return None;
+    }
+    let mut units = vec![0u16; len as usize / 2];
+    let r = unsafe {
+        RegGetValueW(
+            HKEY_CURRENT_USER,
+            PCWSTR(sub.as_ptr()),
+            PCWSTR(name.as_ptr()),
+            RRF_RT_REG_SZ,
+            None,
+            Some(units.as_mut_ptr() as *mut core::ffi::c_void),
+            Some(&mut len),
+        )
+    };
+    if r.is_err() {
+        return None;
+    }
+    // `len` comes back as the bytes actually copied, terminator included, and a value
+    // written by something other than this program may not have one.
+    let taken = (len as usize / 2).min(units.len());
+    Some(String::from_utf16_lossy(&units[..taken]).trim_end_matches('\0').to_string())
+}
+
+/// One string, put under `name`.
+///
+/// `RegSetKeyValueW` rather than the value-only call, because it also brings the key into
+/// being -- which a first run has no other way of getting.
+fn write_text(sub: &str, name: &str, raw: &str) {
+    let sub = utf16(sub);
+    let value = utf16(name);
+    // [`utf16`] appends the terminator the registry expects, and the byte count is taken
+    // from the encoded length rather than counted separately.
+    let units = utf16(raw);
+    let r = unsafe {
+        RegSetKeyValueW(
+            HKEY_CURRENT_USER,
+            PCWSTR(sub.as_ptr()),
+            PCWSTR(value.as_ptr()),
+            REG_SZ.0,
+            Some(units.as_ptr() as *const core::ffi::c_void),
+            (units.len() * 2) as u32,
+        )
+    };
+    if r.is_err() {
+        eprintln!("settings: cannot write {name}: {r:?}");
+    }
+}
+
+/// The path written down under this key, if it is still a file.
+fn read_opened(sub: &str) -> Option<PathBuf> {
+    text(sub, OPENED).map(PathBuf::from).filter(|p| p.is_file())
+}
+
+/// Write down what the reader has just opened, so that the next window starts on their
+/// own page rather than on somebody else's sample prose.
+pub fn record_opened(path: &std::path::Path) {
+    // A path that is not valid UTF-8 is not a thing worth writing down: it came from a
+    // file name this program could not have opened in the first place, and putting it in
+    // the registry would only make the next start read it back wrong.
+    if let Some(raw) = path.to_str() {
+        write_text(SUBKEY, OPENED, raw);
+    }
+}
+
+/// The document to open again, if there is one and it is still where it was left.
+///
+/// Being a file is the whole test, not carrying one of the extensions the open dialog
+/// offers: whatever the reader had open is what they asked for, and a page that has since
+/// moved is nothing to start the program over.
+pub fn opened() -> Option<PathBuf> {
+    read_opened(SUBKEY)
 }
 
 #[cfg(test)]
@@ -219,6 +317,34 @@ mod tests {
         );
         // A key that was never written is a first run, not a broken one.
         assert_eq!(read_words(&format!("{sub}\\Absent")), Settings::default());
+        let _ = unsafe { RegDeleteTreeW(HKEY_CURRENT_USER, PCWSTR(utf16(sub).as_ptr())) };
+    }
+
+    /// The one value that is not a number: the page to come back to.
+    #[test]
+    fn a_remembered_document_is_only_a_document_while_it_exists() {
+        let dir = std::env::temp_dir().join(format!("rubrica-opened-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("a directory to write a page into");
+        let file = dir.join("chapter one.md");
+        std::fs::write(&file, "# One").expect("a page to point at");
+
+        let sub = "Software\\Rubrica Test Document";
+        assert_eq!(read_opened(sub), None, "nothing written is nothing to reopen");
+        write_text(sub, OPENED, file.to_str().expect("a path in unicode"));
+        // The path survives the trip through UTF-16 with its space in it, which is the
+        // part a fixed-size numeric buffer could never get wrong.
+        assert_eq!(read_opened(sub).as_deref(), Some(file.as_path()));
+
+        // A page the reader has moved or deleted is not a thing to start an error over;
+        // it is simply no document, and the window opens on the sample.
+        std::fs::remove_file(&file).expect("the page taken away again");
+        assert_eq!(read_opened(sub), None);
+        // So is a directory, which is what a path with its last part cut off reads as.
+        write_text(sub, OPENED, dir.to_str().expect("a path in unicode"));
+        assert_eq!(read_opened(sub), None, "a folder is not a document");
+
+        let _ = std::fs::remove_dir_all(&dir);
         let _ = unsafe { RegDeleteTreeW(HKEY_CURRENT_USER, PCWSTR(utf16(sub).as_ptr())) };
     }
 

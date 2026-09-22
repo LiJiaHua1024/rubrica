@@ -2533,6 +2533,10 @@ impl View {
                 self.path = Some(path.to_path_buf());
                 self.scroll = 0.0;
                 self.relayout();
+                // Written here rather than at each place that asks for a document, so
+                // that opening one by dialog, by dropping it on the window, or by
+                // following a link to it all leave the same thing behind.
+                crate::settings::record_opened(path);
             }
             Err(e) => eprintln!("cannot open {}: {e}", path.display()),
         }
