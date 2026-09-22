@@ -63,7 +63,7 @@ use crate::font::{FaceRequest, FontEngine, GlyphRun, ObjectBox, Style as RunStyl
 use crate::hyphen::Hyphenator;
 use crate::images::ImageStore;
 use crate::math::MathStore;
-use crate::theme::{ColorRole, Theme};
+use crate::theme::{ColorRole, Leading, Theme};
 use crate::{Error, Result};
 
 /// The character drawn at a discretionary break, and the range to shape it from.
@@ -148,6 +148,13 @@ struct AppStyle {
     size: Pt,
     tracking: f32,
     color: ColorRole,
+    /// Lift off the line's baseline, positive upwards, matching
+    /// [`crate::theme::ResolvedStyle::raise`]. Zero for prose; the painter turns it
+    /// into the run's negative drop.
+    ///
+    /// It is not part of [`RunStyle`], because raising a run moves where it is drawn
+    /// and not how wide it is: the line must break on the same advance the page paints.
+    raise: Pt,
     /// Set instead of font properties for an inline object such as an image.
     object: Option<ObjectBox>,
     /// What an object style draws, once its box is known.
@@ -643,6 +650,24 @@ struct Blk<'a> {
     /// Where words in this block may split, and the advance of the hyphen glyph at
     /// this block's body size.
     hyphenation: Hyphenation<'a>,
+    /// The block's body size and the leading to set its lines at, both chosen by the
+    /// caller rather than read off [`Blk::b`]'s kind.
+    ///
+    /// A footnote's prose is an ordinary Markdown paragraph that has to sit smaller
+    /// and tighter than the page's, and the document model cannot say so itself:
+    /// Markdown has no footnote block kind, only a definition the reader collects.
+    size: Pt,
+    leading: Leading,
+}
+
+/// A block readied for layout: its text with the marker already in front of it, and
+/// every inline style resolved to an id in the table.
+struct Prepared {
+    text: String,
+    spans: Vec<StyleSpan>,
+    /// The id of the block's own prose style, which is also what a marker is set in.
+    base: usize,
+    table: Option<PreparedTable>,
 }
 
 /// A table cell with its styles already resolved to ids, so column sizing and
@@ -687,7 +712,8 @@ fn paint_run(font: &FontEngine, r: &GlyphRun, x: Pt, dy: Pt, k: f32, color: Colo
 /// Typeset one block into the display list and return the new document y.
 fn layout_block(font: &mut FontEngine, ctx: &Ctx<'_>, blk: &Blk<'_>, ops: &mut Vec<Op>, mut y: Pt) -> Pt {
     let Ctx { theme, styles, math, k } = *ctx;
-    let Blk { b, text, spans, base, left, column, hyphenation, .. } = *blk;
+    let Blk { b, text, spans, base, left, column, hyphenation, size, .. } = *blk;
+    let leading = &blk.leading;
     let mut images_out: Vec<(PathBuf, f32, f32, Pt, Pt)> = Vec::new();
     if b.kind == BlockKind::Rule {
         y += theme.base * 0.6;
@@ -708,8 +734,6 @@ fn layout_block(font: &mut FontEngine, ctx: &Ctx<'_>, blk: &Blk<'_>, ops: &mut V
         return y;
     }
 
-    let size = theme.body_size(b.kind);
-    let leading = theme.line_spacing(b.kind);
     let mixed = text.chars().any(|c| matches!(c as u32, 0x3000..=0x303F | 0x4E00..=0x9FFF | 0x3040..=0x30FF | 0xFF00..=0xFFEF));
     let spacing = Spacing::for_size(size);
     let mut opts = BreakOptions::new(column);
@@ -779,14 +803,19 @@ fn layout_block(font: &mut FontEngine, ctx: &Ctx<'_>, blk: &Blk<'_>, ops: &mut V
                 continue;
             }
             let shaped = font.shape_runs(text, node.text.clone(), &st.face, st.size, st.tracking);
+            // A raised run hangs above this line's baseline, so its ink joins the
+            // ascent and its own descent is measured from where it now stands: the
+            // line grows upwards to make room for it, and a superscript never
+            // pushes the baseline down into the line below.
+            let dy = -st.raise;
             // One span can need several faces -- Latin and Han in one sentence, or a
             // run that falls back for a symbol -- and each takes up where the last
             // stopped, since only the whole span's width is what the line broke on.
             let mut at = left + slot.x;
             for r in shaped {
-                ascent = ascent.max(r.ascent);
-                descent = descent.max(r.descent);
-                if let Some(p) = paint_run(font, &r, at, 0.0, k, st.color) {
+                ascent = ascent.max(r.ascent - dy);
+                descent = descent.max((r.descent + dy).max(0.0));
+                if let Some(p) = paint_run(font, &r, at, dy, k, st.color) {
                     runs.push(p);
                 }
                 at += r.width();
@@ -1127,7 +1156,8 @@ fn layout_table(
                     let st = &styles[node.style.0 as usize];
                     let mut at = x + pad + shift + slot.x;
                     for r in font.shape_runs(&c.text, node.text.clone(), &st.face, st.size, st.tracking) {
-                        ascent = ascent.max(r.ascent);
+                        // A citation inside a cell is raised like one inside prose.
+                        ascent = ascent.max(r.ascent + st.raise);
                         let Some(face) = font.font_face(r.face) else { continue };
                         let width = r.width();
                         runs.push(PaintRun {
@@ -1139,7 +1169,7 @@ fn layout_table(
                             offsets: r.offsets,
                             x: at * k,
                             baseline: 0.0,
-                            dy: 0.0,
+                            dy: -st.raise,
                             color: st.color,
                         });
                         at += width;
@@ -1201,6 +1231,8 @@ fn intern_object(styles: &mut Vec<AppStyle>, source: ObjectSource, color: ColorR
         size: 0.0,
         tracking: 0.0,
         color,
+        // An object places itself: its pieces carry their own offsets.
+        raise: 0.0,
         object: Some(object),
         source: Some(source),
     };
@@ -1223,6 +1255,7 @@ fn intern(styles: &mut Vec<AppStyle>, fallback: &[String], r: crate::theme::Reso
         size: r.size,
         tracking: r.tracking,
         color: r.color,
+        raise: r.raise,
         object: None,
         source: None,
     };
@@ -1330,6 +1363,114 @@ impl<'a> Objects<'a> {
     }
 }
 
+/// How one block is set: what leads it, and the size override when its own kind
+/// does not decide.
+///
+/// The two arrive together and say one thing -- this paragraph is a footnote's, so
+/// it is led by its number and set down from the page's prose -- so they travel
+/// together rather than as two arguments every caller has to keep in step.
+struct Setting {
+    marker: String,
+    size: Option<Pt>,
+}
+
+/// Read one block ready for layout: its marker in front of the text, and every
+/// inline style, object and table cell resolved to an id in `styles`.
+///
+/// `set.size` overrides the size the block's kind implies, which is how a note's
+/// prose is set down: the block is an ordinary Markdown paragraph, and the document
+/// model cannot say it is a note's, because Markdown has no footnote block kind --
+/// footnotes are a construct of the reader. `None` means the kind decides, which is
+/// every block on the page itself.
+fn prepare_block(
+    font: &FontEngine,
+    theme: &Theme,
+    styles: &mut Vec<AppStyle>,
+    objects: &mut Objects<'_>,
+    b: &Block,
+    set: &Setting,
+    column: Pt,
+) -> Prepared {
+    let smaller = set.size;
+    let r = |kind: BlockKind, inline: InlineStyle| match smaller {
+        Some(size) => theme.resolve_at(kind, inline, size),
+        None => theme.resolve(kind, inline),
+    };
+    let shift = set.marker.len();
+    let mut text = set.marker.clone();
+    text.push_str(&b.text);
+    let mut spans: Vec<StyleSpan> = Vec::with_capacity(b.spans.len() + 1);
+    if shift > 0 {
+        let id = intern(styles, &theme.fonts.fallback, r(BlockKind::Paragraph, InlineStyle::EMPTY));
+        spans.push(StyleSpan { range: 0..shift, style: id });
+    }
+    let base = intern(styles, &theme.fonts.fallback, r(b.kind, InlineStyle::EMPTY));
+    for s in &b.spans {
+        // An object span is sized from its own source rather than from a font,
+        // and only the caller knows the document directory a relative image
+        // should resolve against.
+        let id = match s.style {
+            st if st.contains(InlineStyle::OBJECT) => {
+                match b.objects.iter().find(|o| o.range == s.range) {
+                    Some(obj) => {
+                        // Read out of the table before it grows, and by value: the
+                        // intern below pushes into it.
+                        let prose = styles[base.0 as usize].clone();
+                        objects.intern(font, styles, theme, obj, column, prose).unwrap_or(base)
+                    }
+                    None => base,
+                }
+            }
+            _ => intern(styles, &theme.fonts.fallback, r(b.kind, s.style)),
+        };
+        spans.push(StyleSpan { range: s.range.start + shift..s.range.end + shift, style: id });
+    }
+    let table = b.table.as_ref().map(|t| {
+        let mut prep = |cells: &[rubrica_doc::Cell]| -> Vec<PreparedCell> {
+            cells
+                .iter()
+                .enumerate()
+                .map(|(i, c)| PreparedCell {
+                    text: c.text.clone(),
+                    spans: c
+                        .spans
+                        .iter()
+                        .map(|sp| StyleSpan {
+                            range: sp.range.clone(),
+                            style: intern(styles, &theme.fonts.fallback, r(b.kind, sp.style)),
+                        })
+                        .collect(),
+                    align: t.aligns.get(i).copied().unwrap_or_default(),
+                })
+                .collect()
+        };
+        PreparedTable { head: prep(&t.head), rows: t.rows.iter().map(|r| prep(r)).collect() }
+    });
+    Prepared { text, spans, base: base.0 as usize, table }
+}
+
+/// Where the words of `text` may split, and the advance of the hyphen glyph at the
+/// block's own base style.
+fn hyphenation_for(
+    text: &str,
+    styles: &[AppStyle],
+    base: usize,
+    hyphenator: Option<&Hyphenator>,
+    font: &mut FontEngine,
+) -> (Vec<usize>, Pt) {
+    let points: Vec<usize> = hyphenator.map(|h| h.points(text)).filter(|v| !v.is_empty()).unwrap_or_default();
+    let width = if points.is_empty() {
+        0.0
+    } else {
+        let st = &styles[base];
+        font.shape_runs(HYPHEN, HYPHEN_RANGE, &st.face, st.size, st.tracking)
+            .iter()
+            .map(|r| r.width())
+            .sum()
+    };
+    (points, width)
+}
+
 /// Typeset the whole document into a display list.
 ///
 /// Shared verbatim by the window and by `rubrica-app --report`, so a numeric check
@@ -1363,68 +1504,32 @@ pub fn build_ops(
     let mut first = true;
 
     // Interning has to finish before measuring, because the engine resolves a
-    // StyleId through the installed table.
-    let mut prepared: Vec<(String, Vec<StyleSpan>, usize, Option<PreparedTable>)> = Vec::new();
+    // StyleId through the installed table. That includes the notes' table, which is
+    // why they are readied here and drawn at the very end.
+    let mut prepared: Vec<Prepared> = Vec::with_capacity(doc.blocks.len());
     for b in &doc.blocks {
-        let marker = marker_for(b);
-        let shift = marker.len();
-        let mut text = marker;
-        text.push_str(&b.text);
-        let mut spans: Vec<StyleSpan> = Vec::with_capacity(b.spans.len() + 1);
-        if shift > 0 {
-            let id = intern(&mut styles, &theme.fonts.fallback, theme.resolve(BlockKind::Paragraph, InlineStyle::EMPTY));
-            spans.push(StyleSpan { range: 0..shift, style: id });
-        }
-        let base = intern(&mut styles, &theme.fonts.fallback, theme.resolve(b.kind, InlineStyle::EMPTY));
-        for s in &b.spans {
-            // An object span is sized from its own source rather than from a font,
-            // and only the caller knows the document directory a relative image
-            // should resolve against.
-            let id = match s.style {
-                st if st.contains(InlineStyle::OBJECT) => {
-                    match b.objects.iter().find(|o| o.range == s.range) {
-                        Some(obj) => {
-                            // Read out of the table before it grows, and by value: the
-                            // intern below pushes into it.
-                            let prose = styles[base.0 as usize].clone();
-                            objects
-                                .intern(font, &mut styles, theme, obj, column, prose)
-                                .unwrap_or(base)
-                        }
-                        None => base,
-                    }
-                }
-                _ => intern(&mut styles, &theme.fonts.fallback, theme.resolve(b.kind, s.style)),
-            };
-            spans.push(StyleSpan { range: s.range.start + shift..s.range.end + shift, style: id });
-        }
-        let table = b.table.as_ref().map(|t| {
-            let mut prep = |cells: &[rubrica_doc::Cell]| -> Vec<PreparedCell> {
-                cells
-                    .iter()
-                    .enumerate()
-                    .map(|(i, c)| PreparedCell {
-                        text: c.text.clone(),
-                        spans: c
-                            .spans
-                            .iter()
-                            .map(|sp| StyleSpan {
-                                range: sp.range.clone(),
-                                style: intern(
-                                    &mut styles,
-                                    &theme.fonts.fallback,
-                                    theme.resolve(b.kind, sp.style),
-                                ),
-                            })
-                            .collect(),
-                        align: t.aligns.get(i).copied().unwrap_or_default(),
-                    })
-                    .collect()
-            };
-            PreparedTable { head: prep(&t.head), rows: t.rows.iter().map(|r| prep(r)).collect() }
-        });
-        prepared.push((text, spans, base.0 as usize, table));
+        let set = Setting { marker: marker_for(b), size: None };
+        prepared.push(prepare_block(font, theme, &mut styles, objects, b, &set, column));
     }
+    let note_units: Vec<Vec<Prepared>> = doc
+        .footnotes
+        .iter()
+        .map(|note| {
+            note.blocks
+                .iter()
+                .enumerate()
+                .map(|(i, nb)| {
+                    // The number leads the note's first block. Later blocks are the
+                    // same note continuing, so they need no marker of their own.
+                    let set = Setting {
+                        marker: if i == 0 { format!("{}. ", note.number) } else { String::new() },
+                        size: Some(theme.note_body_size(nb.kind)),
+                    };
+                    prepare_block(font, theme, &mut styles, objects, nb, &set, column)
+                })
+                .collect()
+        })
+        .collect();
 
     font.begin_layout(
         styles
@@ -1433,23 +1538,13 @@ pub fn build_ops(
             .collect(),
     );
 
-    for (b, (text, spans, base, table)) in doc.blocks.iter().zip(prepared) {
+    let ctx = Ctx { theme, styles: &styles, math: &*objects.math, k };
+
+    for (b, p) in doc.blocks.iter().zip(prepared) {
         let base_left = left;
         // Offsets are computed against the block's own text, which already carries
         // the list marker, so they need no shifting.
-        let hyphens: Vec<usize> = hyphenator
-            .map(|h| h.points(&text))
-            .filter(|v| !v.is_empty())
-            .unwrap_or_default();
-        let hyphen_width = if hyphens.is_empty() {
-            0.0
-        } else {
-            let st = &styles[base];
-            font.shape_runs(HYPHEN, HYPHEN_RANGE, &st.face, st.size, st.tracking)
-                .iter()
-                .map(|r| r.width())
-                .sum()
-        };
+        let (hyphens, hyphen_width) = hyphenation_for(&p.text, &styles, p.base, hyphenator, font);
         let size = theme.body_size(b.kind);
         y += theme.space_before(b.kind, first);
         first = false;
@@ -1463,7 +1558,7 @@ pub fn build_ops(
         if b.spans.len() == 1
             && matches!(b.objects.first().map(|o| &o.kind), Some(rubrica_doc::ObjectKind::Math { display: true, .. }))
         {
-            if let Some(s) = spans.last() {
+            if let Some(s) = p.spans.last() {
                 if let Some(o) = styles[s.style.0 as usize].object {
                     let inner = column - (left - base_left);
                     left += ((inner - o.advance) * 0.5).max(0.0);
@@ -1477,23 +1572,74 @@ pub fn build_ops(
         };
         y = layout_block(
             font,
-            &Ctx { theme, styles: &styles, math: &*objects.math, k },
+            &ctx,
             &Blk {
                 b,
-                text: &text,
-                spans: &spans,
-                base,
+                text: &p.text,
+                spans: &p.spans,
+                base: p.base,
                 left: body_left,
                 column: column - (body_left - left),
-                table: table.as_ref(),
+                table: p.table.as_ref(),
                 hyphenation: Hyphenation { points: &hyphens, width: hyphen_width },
+                size,
+                leading: theme.line_spacing(b.kind),
             },
             &mut ops,
             y,
         );
     }
 
-(ops, y + theme.base * 2.0, column, left)
+    // The apparatus, after the last block: a rule across the measure, then each note
+    // under its number. Everything below goes through the same `layout_block` the
+    // prose uses, so a note with two paragraphs wraps and justifies exactly as they
+    // would on the page -- the only things it changes are the size and the leading the
+    // caller hands in.
+    let mut notes = doc.footnotes.iter().zip(note_units).peekable();
+    if notes.peek().is_some() {
+        y += theme.note_space(true);
+        ops.push(Op::Line {
+            x0: left * k,
+            y0: y * k,
+            x1: (left + column) * k,
+            y1: y * k,
+            thickness: theme.base * 0.05 * k,
+            color: ColorRole::Muted,
+        });
+        for (n, (note, units)) in notes.enumerate() {
+            // The first note sits below the rule; after that one note is separated
+            // from the last by less than two paragraphs of prose are.
+            y += if n == 0 { theme.base * 0.5 } else { theme.note_space(false) };
+            for (i, (nb, p)) in note.blocks.iter().zip(units).enumerate() {
+                if i > 0 {
+                    y += theme.note_space(false);
+                }
+                let (hyphens, hyphen_width) =
+                    hyphenation_for(&p.text, &styles, p.base, hyphenator, font);
+                let size = theme.note_body_size(nb.kind);
+                y = layout_block(
+                    font,
+                    &ctx,
+                    &Blk {
+                        b: nb,
+                        text: &p.text,
+                        spans: &p.spans,
+                        base: p.base,
+                        left,
+                        column,
+                        table: p.table.as_ref(),
+                        hyphenation: Hyphenation { points: &hyphens, width: hyphen_width },
+                        size,
+                        leading: theme.note_leading(),
+                    },
+                    &mut ops,
+                    y,
+                );
+            }
+        }
+    }
+
+    (ops, y + theme.base * 2.0, column, left)
 }
 
 #[cfg(test)]

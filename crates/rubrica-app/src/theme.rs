@@ -66,6 +66,13 @@ pub struct ResolvedStyle {
     pub tracking: f32,
     pub color: ColorRole,
     pub mono: bool,
+    /// How far the run sits above the baseline of the line carrying it, in points.
+    ///
+    /// Positive is **up**, which is the direction the only thing that uses it needs:
+    /// a raised citation mark. The painter negates it into the run's drop, and the
+    /// line loop counts it into the ascent so a raised run cannot be clipped by the
+    /// line above. Zero for prose.
+    pub raise: Pt,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -156,20 +163,58 @@ impl Theme {
         }
     }
 
+    /// The size a footnote's prose is set at: smaller than the page, so the
+    /// apparatus reads as apparatus rather than as more of the argument.
+    pub fn note_size(&self) -> Pt {
+        self.base * 0.82
+    }
+
+    /// As [`Theme::body_size`], for a block *inside* a note. A heading in a note
+    /// keeps its ratio to body rather than collapsing to the note's size, because a
+    /// definition's structure is the author's, not the reader's to flatten.
+    pub fn note_body_size(&self, kind: BlockKind) -> Pt {
+        self.note_size() * (self.body_size(kind) / self.base)
+    }
+
+    /// Leading for a note, tighter than body prose: the smaller size already closes
+    /// the lines up, and a note is meant to read as one item rather than as a page.
+    pub fn note_leading(&self) -> Leading {
+        Leading { latin: 1.45, cjk: 1.6 }
+    }
+
+    /// Space above a note, or above the rule that opens the list when `first`.
+    /// Takes the same `first` flag as [`Theme::space_before`] for the same job.
+    pub fn note_space(&self, first: bool) -> Pt {
+        self.base * if first { 1.4 } else { 0.45 }
+    }
+
     /// Resolve a block kind plus inline flags into concrete run properties.
     pub fn resolve(&self, kind: BlockKind, inline: InlineStyle) -> ResolvedStyle {
+        self.resolve_at(kind, inline, self.body_size(kind))
+    }
+
+    /// As [`Theme::resolve`], for a block whose size the caller has chosen rather
+    /// than taken from its kind -- a footnote's prose, which is Markdown body text
+    /// set at the note's scale.
+    pub fn resolve_at(&self, kind: BlockKind, inline: InlineStyle, block: Pt) -> ResolvedStyle {
         let role = match inline {
             s if s.contains(InlineStyle::CODE) => Role::Mono,
             _ if kind == BlockKind::Code => Role::Mono,
             _ if matches!(kind, BlockKind::Heading(_)) => Role::Heading,
             _ => Role::Body,
         };
-        let size = match kind {
+        let mut size = match kind {
             // Inline code inside a heading should not jump to the mono scale.
-            BlockKind::Code => self.base * 0.92,
-            BlockKind::Heading(_) => self.body_size(kind) * 0.94,
-            _ => self.base,
+            BlockKind::Heading(_) => block * 0.94,
+            _ => block,
         };
+        // A raised mark: smaller than its word, and seated near its cap height,
+        // which is where a superscript belongs whatever the surrounding size is.
+        let mut raise = 0.0;
+        if inline.contains(InlineStyle::SUPERSCRIPT) {
+            size *= 0.7;
+            raise = block * 0.62;
+        }
         let mut weight = match kind {
             BlockKind::Heading(_) => 700,
             BlockKind::Rule => 400,
@@ -201,6 +246,7 @@ impl Theme {
             tracking,
             color,
             mono: role == Role::Mono,
+            raise,
         }
     }
 
@@ -266,5 +312,40 @@ mod tests {
         let t = Theme::default();
         assert!(t.resolve(BlockKind::Heading(1), InlineStyle::EMPTY).tracking < 0.0);
         assert_eq!(t.resolve(BlockKind::Paragraph, InlineStyle::EMPTY).tracking, 0.0);
+    }
+
+    #[test]
+    fn a_superscript_is_smaller_raised_and_keeps_its_words_voice() {
+        let t = Theme::default();
+        let body = t.resolve(BlockKind::Paragraph, InlineStyle::EMPTY);
+        let sup = t.resolve(BlockKind::Paragraph, InlineStyle::SUPERSCRIPT);
+        assert!((sup.size - body.size * 0.7).abs() < 0.01, "raised text is 0.7em of its word");
+        assert!(sup.raise > 0.0, "a raised run must be lifted");
+        assert_eq!(body.raise, 0.0, "only a raised run moves off the baseline");
+        // The mark belongs to the word before it, so a different face or ink colour
+        // would read as a second word rather than as a mark on the first.
+        assert_eq!(sup.family, body.family);
+        assert_eq!(sup.color, body.color);
+        assert_eq!(sup.weight, body.weight);
+        // In a heading it scales with the heading instead of collapsing to body.
+        let h = t.resolve(BlockKind::Heading(1), InlineStyle::SUPERSCRIPT);
+        assert!(h.size > sup.size * 1.5, "{h:?} vs {sup:?}");
+        assert!(h.raise > sup.raise, "a bigger word needs a bigger lift");
+    }
+
+    #[test]
+    fn notes_are_smaller_and_tighter_than_the_prose_they_annotate() {
+        let t = Theme::default();
+        let body = t.body_size(BlockKind::Paragraph);
+        let note = t.note_body_size(BlockKind::Paragraph);
+        assert!(note < body, "a note at {note} should sit under body prose at {body}");
+        assert!(t.note_leading().latin < t.body_leading.latin);
+        assert!(t.note_leading().cjk < t.body_leading.cjk);
+        // A note's own structure survives the smaller size: a heading in a note is
+        // still bigger than the note's prose, and still smaller than a real heading.
+        let nh = t.note_body_size(BlockKind::Heading(1));
+        assert!(nh > note);
+        assert!(nh < t.body_size(BlockKind::Heading(1)));
+        assert!(t.note_body_size(BlockKind::Heading(1)) > t.note_body_size(BlockKind::Heading(3)));
     }
 }

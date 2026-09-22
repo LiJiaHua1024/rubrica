@@ -43,6 +43,18 @@ fn a_hard_break_survives_as_a_forced_line_break() {
 }
 
 #[test]
+fn a_br_tag_breaks_the_line_like_a_backslash() {
+    // The one inline-HTML spelling with typographic meaning -- and the only way to
+    // break a line inside a table cell, where a backslash does not work.
+    let src = "第一行<br>第二行\n\n甲<br />乙<BR>丙\n\n丙<span class=\"x\">丁</span>戊\n";
+    let doc = Document::parse(src);
+    assert_eq!(doc.blocks[0].text, "第一行\n第二行");
+    assert_eq!(doc.blocks[1].text, "甲\n乙\n丙");
+    // Markup that is not a break still leaves no trace of its tags in the text.
+    assert_eq!(doc.blocks[2].text, "丙丁戊");
+}
+
+#[test]
 fn inline_styles_become_spans_over_the_block_text() {
     let src = "plain **bold** *it* `code` ~~gone~~ [link](https://example.com)";
     let doc = Document::parse(src);
@@ -228,4 +240,95 @@ fn a_table_with_cjk_cells_keeps_its_grid() {
     let t = doc.blocks[0].table.as_ref().expect("no table");
     assert_eq!(t.head[0].text, "名称");
     assert_eq!(t.rows[0][1].text, "三");
+}
+
+// --- footnotes -------------------------------------------------------------
+
+/// The spans over a block that carry a given flag, with the text they cover.
+fn styled(b: &rubrica_doc::Block, flag: InlineStyle) -> Vec<(&str, usize)> {
+    b.spans
+        .iter()
+        .filter(|s| s.style.contains(flag))
+        .map(|s| (&b.text[s.range.clone()], s.range.start))
+        .collect()
+}
+
+#[test]
+fn a_citation_becomes_raised_digits_in_the_citing_block() {
+    let doc = Document::parse("One[^a] two.\n\n[^a]: the note\n");
+    let b = &doc.blocks[0];
+    // No brackets and no inserted space: the style is what separates the mark from
+    // the word, and a literal gap would let justification open one out.
+    assert_eq!(b.text, "One1 two.");
+    assert_eq!(styled(b, InlineStyle::SUPERSCRIPT), vec![("1", 3)]);
+    // The digits must be their own span, since nothing else carries the flag.
+    let plain: Vec<&str> = b
+        .spans
+        .iter()
+        .filter(|s| !s.style.contains(InlineStyle::SUPERSCRIPT))
+        .map(|s| &b.text[s.range.clone()])
+        .collect();
+    assert_eq!(plain, vec!["One", " two."], "{:?}", b.spans);
+}
+
+#[test]
+fn citations_are_numbered_in_first_citation_order_and_a_repeat_reuses_its_number() {
+    // `b` is defined first but cited second, so definition order must not win.
+    let doc = Document::parse("One[^b] two[^a] three[^b].\n\n[^b]: second\n\n[^a]: first\n");
+    let nums: Vec<usize> = doc.footnotes.iter().map(|f| f.number).collect();
+    let labels: Vec<&str> = doc.footnotes.iter().map(|f| f.label.as_str()).collect();
+    assert_eq!(nums, vec![1, 2], "{doc:?}");
+    assert_eq!(labels, vec!["b", "a"], "numbering follows the citations, not the definitions");
+    assert_eq!(doc.blocks[0].text, "One1 two2 three1.");
+    let marks: Vec<&str> = styled(&doc.blocks[0], InlineStyle::SUPERSCRIPT)
+        .into_iter()
+        .map(|(t, _)| t)
+        .collect();
+    assert_eq!(marks, vec!["1", "2", "1"], "the repeat citation reuses its number");
+}
+
+#[test]
+fn definitions_leave_the_page_and_keep_their_own_blocks() {
+    let src = "Cite[^a].\n\n[^a]: note body\n\n[^b]: other note\n";
+    let doc = Document::parse(src);
+    assert_eq!(doc.blocks.len(), 1, "a definition must not orphan into the prose");
+    assert_eq!(doc.blocks[0].text, "Cite1.");
+    assert_eq!(doc.footnotes.len(), 2);
+    assert_eq!(doc.footnotes[0].blocks[0].text, "note body");
+    assert_eq!(doc.footnotes[1].blocks[0].text, "other note");
+    assert_eq!(doc.footnotes[1].number, 2, "uncited, so numbered after the cited one");
+}
+
+#[test]
+fn a_definition_keeps_its_heading_and_list_structure() {
+    let doc = Document::parse("Cite[^h].\n\n[^h]: # Real heading\n\n    - one\n    - two\n");
+    let blocks = &doc.footnotes[0].blocks;
+    let kinds: Vec<rubrica_doc::BlockKind> = blocks.iter().map(|b| b.kind).collect();
+    assert_eq!(kinds, vec![BlockKind::Heading(1), BlockKind::Paragraph, BlockKind::Paragraph]);
+    assert_eq!(blocks[0].text, "Real heading");
+    assert_eq!(blocks.iter().skip(1).map(|b| b.list.map(|l| l.depth)).collect::<Vec<_>>(), vec![Some(0), Some(0)]);
+}
+
+#[test]
+fn a_definition_with_two_paragraphs_keeps_both() {
+    let doc = Document::parse("Cite[^n].\n\n[^n]: para one\n\n    para two\n");
+    let blocks = &doc.footnotes[0].blocks;
+    let texts: Vec<&str> = blocks.iter().map(|b| b.text.as_str()).collect();
+    assert_eq!(texts, vec!["para one", "para two"], "{texts:?}");
+}
+
+#[test]
+fn a_citation_inside_emphasis_stays_emphasised_as_well_as_raised() {
+    let doc = Document::parse("word *bold[^a]* tail\n\n[^a]: note\n");
+    let b = &doc.blocks[0];
+    let raised = b
+        .spans
+        .iter()
+        .find(|s| s.style.contains(InlineStyle::SUPERSCRIPT))
+        .expect("no raised span");
+    assert!(
+        raised.style.contains(InlineStyle::EMPHASIS),
+        "the mark lost the emphasis it was cited inside of: {:?}",
+        b.spans
+    );
 }

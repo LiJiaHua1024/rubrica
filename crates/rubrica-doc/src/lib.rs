@@ -42,6 +42,11 @@ impl InlineStyle {
     /// Marks an inline object placeholder rather than a decoration. The character
     /// in the span is U+FFFC; what it stands for lives in [`Block::objects`].
     pub const OBJECT: InlineStyle = InlineStyle(1 << 5);
+    /// Raised text that belongs to the word before it: a footnote's citation number.
+    ///
+    /// A position rather than an emphasis, which is why it is its own bit: nothing
+    /// about the *voice* of the digits changes, only where they sit on the line.
+    pub const SUPERSCRIPT: InlineStyle = InlineStyle(1 << 6);
 
     #[inline]
     pub const fn bits(self) -> u8 {
@@ -187,24 +192,49 @@ impl Block {
 #[derive(Clone, Debug)]
 pub struct Document {
     pub blocks: Vec<Block>,
+    /// The footnotes, in the order their numbers ask to be read.
+    ///
+    /// Definitions are kept out of [`Document::blocks`] because a note's blocks
+    /// belong under their number, not in the prose's reading order: a note with two
+    /// paragraphs is two paragraphs *of the note*, and setting them inline would
+    /// orphan them from the citation that explains why they are there.
+    pub footnotes: Vec<Footnote>,
+}
+
+/// One footnote: its number, the label the author wrote, and its definition.
+#[derive(Clone, Debug)]
+pub struct Footnote {
+    /// 1-based, assigned by first citation. Two citations of one label share it.
+    pub number: usize,
+    /// The author's own `[^label]`, kept so a reader can offer both orders.
+    pub label: String,
+    /// The definition's blocks, with their headings, lists and paragraphs intact.
+    pub blocks: Vec<Block>,
 }
 
 impl Document {
     pub fn parse(source: &str) -> Document {
-        let mut opts = Options::ENABLE_STRIKETHROUGH
+        let opts = Options::ENABLE_STRIKETHROUGH
             | Options::ENABLE_TASKLISTS
             | Options::ENABLE_TABLES
-            | Options::ENABLE_MATH;
-        // A footnote definition would become a block orphaned from the paragraph
-        // that cites it, and citations are invisible without a reference UI. Keep
-        // the syntax literal until it has one.
-        opts.remove(Options::ENABLE_FOOTNOTES);
+            | Options::ENABLE_MATH
+            | Options::ENABLE_FOOTNOTES;
         let mut st = Builder::default();
         for ev in Parser::new_ext(source, opts) {
             st.event(ev);
         }
         st.finish()
     }
+}
+
+/// A definition being collected, before its number is known.
+#[derive(Clone, Debug)]
+struct Draft {
+    label: String,
+    /// Zero until the label is cited: an uncited definition is numbered last, in
+    /// document order, rather than dropped.
+    number: usize,
+    blocks: Vec<Block>,
 }
 
 #[derive(Default)]
@@ -215,6 +245,15 @@ struct Builder {
     quote_depth: u8,
     /// One entry per open list, holding its info and the next item number.
     lists: Vec<(ListInfo, u64)>,
+    /// Definitions by label, in the order they were defined.
+    notes: Vec<Draft>,
+    /// How many labels have been cited, which is the next number to hand out:
+    /// numbers follow first-citation order rather than the order definitions happen
+    /// to be parsed in, which pulldown reports last and in its own sequence.
+    cited: usize,
+    /// Index into `notes` while a definition's blocks are being read, which is where
+    /// [`Builder::close`] sends them instead of into the body.
+    note: Option<usize>,
     /// Accumulated while inside `Tag::Image`; its alt text is captured, not set.
     image: Option<(String, String)>,
     /// Accumulated while inside `Tag::Table`.
@@ -253,10 +292,17 @@ impl Builder {
                     b.task = Some(checked);
                 }
             }
-            // Inline HTML and entities are deliberately dropped: a reader that
-            // silently swallows markup it cannot render is worse than one that
-            // shows plain text, but showing raw HTML would be a lie too.
-            Event::Html(_) | Event::InlineHtml(_) => {}
+            // `<br>` is the one piece of inline HTML with typographic meaning, and
+            // authors reach for it because a table cell or a list item has no other
+            // way to break a line. Other markup is dropped: a reader that silently
+            // swallows what it cannot render is worse than one that shows plain text,
+            // but printing the tags would be a lie too.
+            Event::InlineHtml(h) => {
+                if is_line_break(&h) {
+                    self.push("\n", InlineStyle::EMPTY);
+                }
+            }
+            Event::Html(_) => {}
             Event::InlineMath(m) => {
                 self.push_object(ObjectKind::Math { source: (*m).to_owned(), display: false })
             }
@@ -272,8 +318,32 @@ impl Builder {
                 self.open(BlockKind::Rule);
                 self.close();
             }
-            Event::FootnoteReference(_) => {}
+            Event::FootnoteReference(label) => {
+                // The number's digits, and nothing else: no brackets and no space.
+                // `SUPERSCRIPT` is what separates them from the word they belong to,
+                // so the citation reads as a mark on the text rather than as text.
+                let n = self.cite(label.as_ref());
+                self.push(&n.to_string(), self.inline | InlineStyle::SUPERSCRIPT);
+            }
         }
+    }
+
+    /// The number for `label`, handing out the next one on its first citation.
+    ///
+    /// Keyed by label rather than by position, because a document may cite `[^a]`
+    /// before defining it, define the same label twice, or cite one label from two
+    /// paragraphs -- and every one of those has to show the same digit.
+    fn cite(&mut self, label: &str) -> usize {
+        if let Some(d) = self.notes.iter_mut().find(|d| d.label == label) {
+            if d.number == 0 {
+                self.cited += 1;
+                d.number = self.cited;
+            }
+            return d.number;
+        }
+        self.cited += 1;
+        self.notes.push(Draft { label: label.to_string(), number: self.cited, blocks: Vec::new() });
+        self.cited
     }
 
     fn start(&mut self, tag: Tag<'_>) {
@@ -344,6 +414,28 @@ impl Builder {
             Tag::Image { dest_url, .. } => {
                 self.image = Some((dest_url.to_string(), String::new()));
             }
+            Tag::FootnoteDefinition(label) => {
+                // Definitions are parsed after the whole body, so a cited label is
+                // already here with its number; an uncited one joins now and is
+                // numbered after every citation.
+                let i = match self.notes.iter().position(|d| d.label == label.as_ref()) {
+                    Some(i) => i,
+                    None => {
+                        self.notes.push(Draft {
+                            label: label.to_string(),
+                            number: 0,
+                            blocks: Vec::new(),
+                        });
+                        self.notes.len() - 1
+                    }
+                };
+                // One label defined twice appends to the same note: both texts are
+                // the author's, and the citation cannot point at two numbers.
+                // Closing first stops a block still open in the body being filed
+                // under the definition when the definition ends.
+                self.close();
+                self.note = Some(i);
+            }
             _ => {}
         }
     }
@@ -377,6 +469,10 @@ impl Builder {
             }
             TagEnd::Item => {
                 self.close();
+            }
+            TagEnd::FootnoteDefinition => {
+                self.close();
+                self.note = None;
             }
             TagEnd::BlockQuote(_) => self.quote_depth = self.quote_depth.saturating_sub(1),
             TagEnd::List(_) => {
@@ -456,25 +552,51 @@ impl Builder {
                     s.range.end = s.range.end.min(b.text.len());
                 }
             }
-            let empty = b.text.trim().is_empty();
-            let has_table = b.table.as_ref().is_some_and(|t| !t.head.is_empty() || !t.rows.is_empty());
-            if !empty || b.kind == BlockKind::Rule || has_table {
-                self.blocks.push(b);
+            if worth_setting(&b) {
+                // A definition's blocks belong to the definition, not to the page's
+                // reading order, so they leave `blocks` here rather than being
+                // filtered out of it later.
+                match self.note {
+                    Some(i) => self.notes[i].blocks.push(b),
+                    None => self.blocks.push(b),
+                }
             }
         }
     }
 
     fn finish(mut self) -> Document {
         self.close();
-        // A table and a rule carry no block text of their own, so a test on
-        // `text` alone would drop them; this must agree with `close`.
-        self.blocks.retain(|b| {
-            !b.text.trim().is_empty()
-                || b.kind == BlockKind::Rule
-                || b.table.as_ref().is_some_and(|t| !t.head.is_empty() || !t.rows.is_empty())
-        });
-        Document { blocks: self.blocks }
+        self.blocks.retain(worth_setting);
+        // An uncited definition is numbered last, in document order: losing an
+        // author's text is worse than a number no citation points at.
+        for d in self.notes.iter_mut() {
+            if d.number == 0 {
+                self.cited += 1;
+                d.number = self.cited;
+            }
+        }
+        let mut footnotes: Vec<Footnote> = self
+            .notes
+            .into_iter()
+            // A label cited but never defined has no blocks to show, and a bare
+            // number in the list would claim a note that does not exist.
+            .filter(|d| !d.blocks.is_empty())
+            .map(|d| Footnote { number: d.number, label: d.label, blocks: d.blocks })
+            .collect();
+        for f in footnotes.iter_mut() {
+            f.blocks.retain(worth_setting);
+        }
+        footnotes.sort_by_key(|f| f.number);
+        Document { blocks: self.blocks, footnotes }
     }
+}
+
+/// Whether a block is worth setting. A table and a rule carry no text of their own,
+/// so a test on `text` alone would drop them.
+fn worth_setting(b: &Block) -> bool {
+    !b.text.trim().is_empty()
+        || b.kind == BlockKind::Rule
+        || b.table.as_ref().is_some_and(|t| !t.head.is_empty() || !t.rows.is_empty())
 }
 
 /// Append text to a cell, merging with the previous span when the style matches.
@@ -500,4 +622,11 @@ fn as_level(l: HeadingLevel) -> u8 {
         HeadingLevel::H5 => 5,
         HeadingLevel::H6 => 6,
     }
+}
+
+/// `<br>`, `<br/>`, `<br />` and their upper-case spellings: the only tag inline
+/// HTML is allowed to change the page with.
+fn is_line_break(html: &str) -> bool {
+    let tag = html.trim().trim_start_matches('<').trim_end_matches('>');
+    tag.trim_end_matches('/').trim_end().eq_ignore_ascii_case("br")
 }

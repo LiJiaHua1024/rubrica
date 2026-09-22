@@ -148,5 +148,29 @@ pub fn report(source: &str, path: Option<&str>, width: f32, dpi: f32, hyphenate:
             families.join(", ")
         );
     }
+    // Counted two ways on purpose: the marks in the text are what the reader can
+    // follow, the entries in `footnotes` are what the author defined, and a document
+    // where those disagree is the interesting one -- an uncited definition still has
+    // to be set, and a citation with no note behind it has nothing to show.
+    let cited = {
+        let mut numbers: Vec<usize> = Vec::new();
+        for b in &doc.blocks {
+            for s in &b.spans {
+                if s.style.contains(rubrica_doc::InlineStyle::SUPERSCRIPT) {
+                    if let Ok(n) = b.text[s.range.clone()].parse::<usize>() {
+                        if !numbers.contains(&n) {
+                            numbers.push(n);
+                        }
+                    }
+                }
+            }
+        }
+        numbers.len()
+    };
+    let defined = doc.footnotes.len();
+    if cited > 0 || defined > 0 {
+        let blocks: usize = doc.footnotes.iter().map(|f| f.blocks.len()).sum();
+        println!("footnotes    : {cited} cited, {defined} defined, {blocks} blocks set");
+    }
     Ok(())
 }
