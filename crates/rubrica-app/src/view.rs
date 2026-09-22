@@ -53,12 +53,15 @@ use windows::Win32::UI::Controls::Dialogs::{
 };
 use windows::Win32::UI::Shell::{DragAcceptFiles, DragFinish, DragQueryFileW, ShellExecuteW, HDROP};
 use windows::Win32::UI::WindowsAndMessaging::{
-    CS_DBLCLKS, CS_HREDRAW, CS_VREDRAW, CREATESTRUCTW, CreateWindowExW, DefWindowProcW, DispatchMessageW,
+    AppendMenuW, CS_DBLCLKS, CS_HREDRAW, CS_VREDRAW, CREATESTRUCTW, CreatePopupMenu,
+    CreateWindowExW, DefWindowProcW, DestroyMenu, DispatchMessageW,
     GWLP_USERDATA, GetClientRect, GetCursorPos, GetWindowLongPtrW, GetMessageW, HCURSOR, HWND_TOP,
-    HTCLIENT, IDC_ARROW, IDC_HAND, KillTimer, LoadCursorW, MSG, PostQuitMessage, RegisterClassExW,
-    SetCursor, SW_SHOWNORMAL, SetTimer, SetWindowLongPtrW, SetWindowPos, ShowWindow, TranslateMessage,
-    WNDCLASSEXW, WM_DESTROY, WM_DPICHANGED, WM_ERASEBKGND, WM_KEYDOWN, WM_MOUSEWHEEL, WM_NCCREATE,
-    WM_PAINT, WM_SETCURSOR, WM_SIZE, WM_TIMER, WS_EX_APPWINDOW, WS_OVERLAPPEDWINDOW, SWP_NOACTIVATE,
+    HTCLIENT, IDC_ARROW, IDC_HAND, KillTimer, LoadCursorW, MF_CHECKED, MF_GRAYED, MF_SEPARATOR,
+    MF_STRING, MSG, PostMessageW, PostQuitMessage, RegisterClassExW, SetCursor, SetForegroundWindow,
+    SW_SHOWNORMAL, SetTimer, SetWindowLongPtrW, SetWindowPos, ShowWindow, TPM_RETURNCMD,
+    TPM_RIGHTBUTTON, TrackPopupMenuEx, TranslateMessage, WM_CONTEXTMENU, WM_NULL, WNDCLASSEXW,
+    WM_DESTROY, WM_DPICHANGED, WM_ERASEBKGND, WM_KEYDOWN, WM_MOUSEWHEEL, WM_NCCREATE, WM_PAINT,
+    WM_SETCURSOR, WM_SIZE, WM_TIMER, WS_EX_APPWINDOW, WS_OVERLAPPEDWINDOW, SWP_NOACTIVATE,
     SWP_NOZORDER, WM_DROPFILES, WM_LBUTTONDOWN, WM_LBUTTONDBLCLK, WM_LBUTTONUP, WM_MOUSEMOVE,
 };
 use windows_numerics::Vector2;
@@ -712,6 +715,88 @@ fn scale_of(dpi: f32) -> f32 {
     dpi / 72.0
 }
 
+/// What the right-click menu can be asked to do.
+///
+/// Every one of these is also reachable some other way -- a key, a click, the wheel --
+/// because a menu item that exists only on the menu is a code path nothing but a pointer
+/// can test, and the window is not open in a test.
+#[derive(Clone, Debug, PartialEq)]
+enum Command {
+    Copy,
+    SelectAll,
+    OpenUrl(String),
+    CopyUrl(String),
+    ZoomIn,
+    ZoomOut,
+    ZoomReset,
+    /// Set the palette and keep it set, against whatever the system says next.
+    Palette(bool),
+    /// Let the system's own setting decide again, which is the only way back out of a
+    /// manual choice once the room's light has changed.
+    FollowSystem,
+    OpenFile,
+    /// Read the file this page came from again, from disk.
+    Reload,
+}
+
+/// One row of that menu.
+#[derive(Clone, Debug, PartialEq)]
+enum MenuRow {
+    Gap,
+    Row { cmd: Command, label: &'static str, enabled: bool, checked: bool },
+}
+
+/// What the page looks like from the place the menu was called, gathered because the
+/// menu has to say true things about the moment it is opened in: an item that offers to
+/// copy nothing, or checks a palette that is not on the screen, teaches the reader to
+/// distrust the whole list.
+struct MenuState {
+    /// The address under the pointer, when a link that leads out is what is under it.
+    link: Option<String>,
+    selected: bool,
+    /// `None` while the system's setting is the one deciding.
+    dark: Option<bool>,
+    /// Whether this page came from a file, which is what makes reading it again a
+    /// possible thing to ask for.
+    from_file: bool,
+    /// Whether the page has any text at all, which is the difference between an empty
+    /// document and a document nothing has been marked in.
+    text: bool,
+}
+
+/// The menu, in the order it appears and with the groups it is divided into.
+fn menu_items(s: &MenuState) -> Vec<MenuRow> {
+    let row = |cmd: Command, label, enabled| MenuRow::Row { cmd, label, enabled, checked: false };
+    let check = |cmd: Command, label, on| MenuRow::Row { cmd, label, enabled: true, checked: on };
+    let mut v = vec![
+        row(Command::Copy, "Copy", s.selected),
+        row(Command::SelectAll, "Select All", s.text),
+    ];
+    if let Some(url) = &s.link {
+        v.push(MenuRow::Gap);
+        v.push(row(Command::OpenUrl(url.clone()), "Open Link", true));
+        v.push(row(Command::CopyUrl(url.clone()), "Copy Link Address", true));
+    }
+    v.push(MenuRow::Gap);
+    v.extend([
+        row(Command::ZoomIn, "Increase Text", true),
+        row(Command::ZoomOut, "Decrease Text", true),
+        row(Command::ZoomReset, "Actual Size", true),
+    ]);
+    v.push(MenuRow::Gap);
+    v.extend([
+        check(Command::Palette(false), "Light", s.dark == Some(false)),
+        check(Command::Palette(true), "Dark", s.dark == Some(true)),
+        check(Command::FollowSystem, "Follow System", s.dark.is_none()),
+    ]);
+    v.push(MenuRow::Gap);
+    v.extend([
+        row(Command::OpenFile, "Open\u{2026}", true),
+        row(Command::Reload, "Reload", s.from_file),
+    ]);
+    v
+}
+
 /// Whether a reader may be asked to open a link. Only the schemes that mean "read
 /// this" qualify: `file:`, a bare path and a UNC share are requests to reach the local
 /// disk or to run something, and a document that is being looked at has no business
@@ -1189,18 +1274,26 @@ impl View {
                     // A copy with nothing selected leaves the clipboard alone. Clearing
                     // it would throw away what the reader put there from somewhere else,
                     // to no purpose: an empty selection is not an edit.
-                    k if k == VK_C.0 as u32 && ctrl => {
-                        if let Some(s) = self.selection {
-                            let text = selection_text(&self.sel_index, s);
-                            if let Err(e) = clipboard::copy_text(hwnd, &text) {
-                                eprintln!("clipboard: {e}");
-                            }
-                        }
-                    }
+                    k if k == VK_C.0 as u32 && ctrl => self.copy_selection(hwnd),
                     k if k == VK_A.0 as u32 && ctrl => self.select_all(),
                     _ => {}
                 }
                 let _ = InvalidateRect(Some(hwnd), None, false);
+                LRESULT(0)
+            }
+            WM_CONTEXTMENU => {
+                // `wParam` is the window and `lParam` the screen point the right button
+                // was over -- except when the key that opened this was the keyboard's
+                // menu key, which reports no point at all and takes the pointer's.
+                let (x, y) = if lp.0 == -1 {
+                    let mut pt = POINT::default();
+                    let _ = GetCursorPos(&mut pt);
+                    (pt.x, pt.y)
+                } else {
+                    (((lp.0 & 0xFFFF) as u16) as i16 as i32, (((lp.0 >> 16) as i32) << 16 >> 16))
+                };
+                let _ = SetForegroundWindow(hwnd);
+                self.popup_menu(x, y, hwnd);
                 LRESULT(0)
             }
             WM_TIMER => {
@@ -1426,6 +1519,126 @@ impl View {
         self.scroll = (top - self.theme.base).max(0.0);
         self.clamp_scroll();
         let _ = unsafe { InvalidateRect(Some(hwnd), None, false) };
+    }
+
+    /// The address of the link under this client point, when one of those is what the
+    /// pointer is on. A jump within the page answers to a click well enough that the
+    /// menu has nothing to add, and a citation of a note is already on screen.
+    fn pointer_link(&self, x: f32, y: f32) -> Option<String> {
+        let kind = self.hot_at(x, y).and_then(|i| self.hotspots.get(i)).map(|h| h.kind.clone())?;
+        match kind {
+            HotKind::Url(u) => Some(u),
+            _ => None,
+        }
+    }
+
+    /// Open the menu at a screen point and do what was picked from it.
+    ///
+    /// The window comes forward first: a menu opened over a window that is not the
+    /// frontmost one takes the click that was meant to dismiss it, which is documented
+    /// behaviour of `TrackPopupMenu` rather than a curiosity, and the reason for the
+    /// message after the menu has gone -- without it the window has no particular reason
+    /// to notice the menu is no longer there.
+    fn popup_menu(&mut self, x: i32, y: i32, hwnd: HWND) {
+        let mut pt = POINT { x, y };
+        let _ = unsafe { ScreenToClient(hwnd, &mut pt) };
+        let state = MenuState {
+            link: self.pointer_link(pt.x as f32, pt.y as f32),
+            selected: self.selection.is_some_and(|s| s.from != s.to),
+            dark: self.dark_override,
+            from_file: self.path.is_some(),
+            text: !self.sel_index.is_empty(),
+        };
+        let menu = match unsafe { CreatePopupMenu() } {
+            Ok(m) => m,
+            Err(_) => return,
+        };
+        // A row's id is its position in the list, gaps included, so the number the menu
+        // answers with reads back into it without a second table to keep in step.
+        let mut rows: HashMap<usize, Command> = HashMap::new();
+        for (i, item) in menu_items(&state).iter().enumerate() {
+            match item {
+                MenuRow::Gap => {
+                    let _ = unsafe { AppendMenuW(menu, MF_SEPARATOR, 0, PCWSTR::null()) };
+                }
+                MenuRow::Row { cmd, label, enabled, checked } => {
+                    let text = utf16(label);
+                    let mut flags = MF_STRING;
+                    if !enabled {
+                        flags |= MF_GRAYED;
+                    }
+                    if *checked {
+                        flags |= MF_CHECKED;
+                    }
+                    if unsafe { AppendMenuW(menu, flags, i + 1, PCWSTR(text.as_ptr())) }.is_ok() {
+                        rows.insert(i + 1, cmd.clone());
+                    }
+                }
+            }
+        }
+        // The flags argument is a plain `u32` here rather than the flag newtype the other
+        // menu calls take, which is what makes the `.0` necessary.
+        let picked = unsafe {
+            TrackPopupMenuEx(menu, (TPM_RETURNCMD | TPM_RIGHTBUTTON).0, x, y, hwnd, None)
+        };
+        let _ = unsafe { DestroyMenu(menu) };
+        if let Some(cmd) = rows.remove(&(picked.0.max(0) as usize)) {
+            self.apply_command(cmd, hwnd);
+        }
+        let _ = unsafe { PostMessageW(Some(hwnd), WM_NULL, WPARAM(0), LPARAM(0)) };
+    }
+
+    /// Do one of the things the menu offers, most of which are also keys.
+    fn apply_command(&mut self, cmd: Command, hwnd: HWND) {
+        match cmd {
+            Command::Copy => self.copy_selection(hwnd),
+            Command::SelectAll => self.select_all(),
+            Command::OpenUrl(u) => open_url(&u),
+            Command::CopyUrl(u) => {
+                if let Err(e) = clipboard::copy_text(hwnd, &u) {
+                    eprintln!("clipboard: {e}");
+                }
+            }
+            Command::ZoomIn => {
+                let z = self.theme.zoom.up();
+                self.zoom_to(z, hwnd);
+            }
+            Command::ZoomOut => {
+                let z = self.theme.zoom.down();
+                self.zoom_to(z, hwnd);
+            }
+            Command::ZoomReset => self.zoom_to(Zoom::DESIGN, hwnd),
+            Command::Palette(dark) => {
+                self.dark_override = Some(dark);
+                self.set_dark(dark, hwnd);
+            }
+            Command::FollowSystem => {
+                self.dark_override = None;
+                let dark = system_prefers_dark();
+                self.set_dark(dark, hwnd);
+            }
+            Command::OpenFile => {
+                if let Some(path) = unsafe { self.prompt_for_file(hwnd) } {
+                    self.load_document(&path);
+                }
+            }
+            Command::Reload => {
+                if let Some(path) = self.path.clone() {
+                    self.load_document(&path);
+                }
+            }
+        }
+        let _ = unsafe { InvalidateRect(Some(hwnd), None, false) };
+    }
+
+    /// Put what the reader has marked on the clipboard. A copy with nothing marked leaves
+    /// the clipboard alone.
+    fn copy_selection(&self, hwnd: HWND) {
+        let Some(s) = self.selection else { return };
+        let text = selection_text(&self.sel_index, s);
+        if let Err(e) = clipboard::copy_text(hwnd, &text) {
+            eprintln!("clipboard: {e}");
+        }
     }
 
     /// A relayout can leave the offset past the end of a document that has just grown.
@@ -3484,5 +3697,72 @@ mod tests {
         // it was following ends; off the page there is no bar at all.
         assert_eq!(caret_rect(&sel, Caret { line: 0, ch: 9 }).map(|r| r.0), Some(3.0 * CHAR));
         assert_eq!(caret_rect(&sel, Caret { line: 1, ch: 0 }), None);
+    }
+
+    /// The rows a state gives, without the gaps that only divide them.
+    fn rows(s: &MenuState) -> Vec<(Command, bool, bool)> {
+        menu_items(s)
+            .into_iter()
+            .filter_map(|r| match r {
+                MenuRow::Gap => None,
+                MenuRow::Row { cmd, enabled, checked, .. } => Some((cmd, enabled, checked)),
+            })
+            .collect()
+    }
+
+    /// A menu's whole state, written out because the fields are the questions the menu
+    /// asks: is anything marked, is there an address here, who is deciding the palette,
+    /// did this page come off a disk, is there any text at all.
+    fn state(selected: bool, link: Option<&str>, dark: Option<bool>, from_file: bool, text: bool) -> MenuState {
+        MenuState { link: link.map(str::to_string), selected, dark, from_file, text }
+    }
+
+    #[test]
+    fn the_menu_says_true_things_about_the_moment() {
+        let empty = state(false, None, None, false, true);
+        let got = rows(&empty);
+        // Nothing marked, so the copy is dimmed rather than promising an empty clipboard.
+        assert_eq!(got[0], (Command::Copy, false, false));
+        // A page with text can have it all taken, even with nothing marked yet.
+        assert_eq!(got[1], (Command::SelectAll, true, false));
+        assert!(
+            !got.iter().any(|(c, _, _)| matches!(c, Command::OpenUrl(_) | Command::CopyUrl(_))),
+            "no link under the pointer means no item about one"
+        );
+        // The document came from nowhere, so there is nothing on disk to read again.
+        assert_eq!(got.last().map(|(c, e, _)| (c.clone(), *e)), Some((Command::Reload, false)));
+        assert_eq!(got.iter().filter(|(_, _, c)| *c).count(), 1, "exactly one palette row is on");
+        assert!(got.iter().any(|(c, _, c2)| *c2 && c == &Command::FollowSystem));
+
+        assert_eq!(rows(&state(true, None, None, false, true))[0], (Command::Copy, true, false));
+
+        let got = rows(&state(false, None, Some(true), true, true));
+        assert!(got.iter().any(|(c, _, on)| *on && c == &Command::Palette(true)));
+        assert!(!got.iter().any(|(c, _, on)| *on && c == &Command::FollowSystem));
+        assert_eq!(got.last().map(|(c, e, _)| (c.clone(), *e)), Some((Command::Reload, true)));
+
+        assert_eq!(rows(&state(false, None, None, false, false))[1], (Command::SelectAll, false, false));
+    }
+
+    #[test]
+    fn a_menu_opened_over_a_link_carries_its_address() {
+        let s = MenuState {
+            link: Some("https://example.com/x".into()),
+            selected: false,
+            dark: None,
+            from_file: false,
+            text: true,
+        };
+        let got = rows(&s);
+        // Two items, in this order: follow it, and take only the address. Both enabled,
+        // because the pointer being there is the whole condition.
+        let open = got.iter().position(|(c, _, _)| matches!(c, Command::OpenUrl(_)));
+        let copy = got.iter().position(|(c, _, _)| matches!(c, Command::CopyUrl(_)));
+        assert_eq!(open.map(|i| i + 1), copy);
+        assert!(got.iter().any(|(c, e, _)| *e && c == &Command::OpenUrl("https://example.com/x".into())));
+        assert!(got.iter().any(|(c, e, _)| *e && c == &Command::CopyUrl("https://example.com/x".into())));
+        // The gaps divide the list into groups rather than padding it, and the link's own
+        // group is one of them.
+        assert!(menu_items(&s).windows(2).any(|w| matches!(&w[0], MenuRow::Gap) && matches!(&w[1], MenuRow::Row { cmd: Command::OpenUrl(_), .. })));
     }
 }
