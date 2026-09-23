@@ -70,8 +70,12 @@ pub struct Spacing {
     /// A literal space between two Western words: stretchable, mildly shrinkable.
     pub latin_space: GlueRecipe,
     /// Between two ideographs. Base is zero -- ideographs are already side by
-    /// side -- but it must stretch and shrink or justification has nothing to
-    /// work with. This is the mechanism CJK-LaTeX's `\CJKglue` provides.
+    /// side -- but it must stretch or justification has nothing to work with. This is
+    /// the mechanism CJK-LaTeX's `\CJKglue` provides, and the reason a Chinese line
+    /// breaks flush at both edges without a single word space in it.
+    ///
+    /// Its shrink is none, because a gap of no air has none to give: see
+    /// [`Item::glue`].
     pub cjk_join: GlueRecipe,
     /// Between an ideograph and a Western word: the classic 1/4 em, adjustable.
     pub mixed: GlueRecipe,
@@ -97,7 +101,7 @@ impl Spacing {
                 stretch: size * 0.1667,
                 shrink: size * 0.1111,
             },
-            cjk_join: GlueRecipe { base: 0.0, stretch: size * 0.08, shrink: size * 0.20 },
+            cjk_join: GlueRecipe { base: 0.0, stretch: size * 0.08, shrink: 0.0 },
             mixed: GlueRecipe { base: size * 0.25, stretch: size * 0.125, shrink: size * 0.125 },
             literal_space_runs: false,
         }
@@ -140,7 +144,12 @@ impl Item {
         Item::Glue {
             base: recipe.base,
             stretch: recipe.stretch,
-            shrink: recipe.shrink,
+            // A gap can close; it cannot eat ink. Without the cap a theme that retunes
+            // the recipes -- and the inter-ideograph join in particular, whose base is
+            // nothing at all -- hands the solver room that is really its neighbour's
+            // glyphs sliding on top of each other, because the solver reads shrink as
+            // width the line may give back and `place` spends it evenly.
+            shrink: recipe.shrink.min(recipe.base),
             breakable: true,
         }
     }

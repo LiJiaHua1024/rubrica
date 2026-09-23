@@ -6,7 +6,7 @@
 use rubrica_type::breaking::BreakOptions;
 use rubrica_type::classify::Role;
 use rubrica_type::justification::{line_width, place};
-use rubrica_type::paragraph::{Item, MonospaceMeasure, Spacing, StyleId, StyleSpan};
+use rubrica_type::paragraph::{GlueRecipe, Item, MonospaceMeasure, Spacing, StyleId, StyleSpan};
 use rubrica_type::units::{INFINITY, Pt};
 use rubrica_type::{Hyphenation, Paragraph, Plan, typeset, typeset_hyphenated};
 
@@ -313,22 +313,42 @@ fn mixed_script_joins_get_the_quarter_em_glue() {
 }
 
 #[test]
-fn ideograph_join_glue_is_compressible() {
+fn ideographs_are_separated_by_stretchable_glue() {
     let spacing = Spacing::for_size(SIZE);
     assert!(spacing.cjk_join.stretch > 0.0);
-    assert!(spacing.cjk_join.shrink > 0.0);
+    assert_eq!(spacing.cjk_join.shrink, 0.0, "a join with no air in it has none to give back");
     let text = "中文中文中文";
     let mut measure = MonospaceMeasure { size: SIZE, factor: 0.5 };
     let (para, _) = typeset(text, &spacing, StyleId(0), &[], &BreakOptions::new(500.0), &mut measure);
     let joins = para
         .items
         .iter()
-        .filter(|it| matches!(**it, Item::Glue { base, stretch, shrink, .. }
+        .filter(|it| matches!(**it, Item::Glue { base, stretch, .. }
             if (base - spacing.cjk_join.base).abs() < 0.01
-                && (stretch - spacing.cjk_join.stretch).abs() < 0.01
-                && (shrink - spacing.cjk_join.shrink).abs() < 0.01))
+                && (stretch - spacing.cjk_join.stretch).abs() < 0.01))
         .count();
     assert!(joins >= 5, "adjacent ideographs should be separated by glue, found {joins}");
+}
+
+#[test]
+fn a_recipe_cannot_declare_more_shrink_than_the_gap_holds() {
+    // The recipes are one knob set a theme may retune, so the cap is what makes a
+    // retune safe rather than a way to overlap ink from a settings screen.
+    let roomy = GlueRecipe { base: 8.0, stretch: 2.0, shrink: 3.0 };
+    assert!(
+        matches!(Item::glue(&roomy), Item::Glue { shrink, .. } if (shrink - 3.0).abs() < 0.01),
+        "a space that holds 8pt may give back the 3pt it asked for"
+    );
+    let tight = GlueRecipe { base: 8.0, stretch: 2.0, shrink: 20.0 };
+    assert!(
+        matches!(Item::glue(&tight), Item::Glue { shrink, .. } if (shrink - 8.0).abs() < 0.01),
+        "a join may close, but the line stops there"
+    );
+    let airless = GlueRecipe { base: 0.0, stretch: 2.0, shrink: 3.2 };
+    assert!(
+        matches!(Item::glue(&airless), Item::Glue { shrink, .. } if shrink == 0.0),
+        "ideographs touching already have nothing left to give"
+    );
 }
 
 #[test]
@@ -715,22 +735,24 @@ fn a_final_line_too_wide_for_the_measure_shrinks() {
     // `\parfillskip`'s infinite stretch excuses the last line from being *short*. It
     // has never excused it from being wide -- and the solver calls a wide line legal
     // as long as its glue can shrink, so somebody has to do that shrinking.
-    let text = "中文排版是一件需要认真对待的事情，行首与行尾都要对齐才能形成稳定的版面节奏。";
-    let column = 12.0 * SIZE;
-    let (para, plan) = set(text, column);
+    let column = 26.0 * SIZE;
+    let (para, plan) = set(PROSE, column);
     let last = plan.lines.last().unwrap();
     assert!(last.is_ragged() && last.stretch >= INFINITY / 2.0, "the final line must hold \\parfillskip");
 
     let base = line_width(&place(&para, last));
-    assert!(last.shrink > 24.0, "the line needs glue to shrink: {}", last.shrink);
+    assert!(last.shrink > 4.0, "the line needs glue to shrink: {}", last.shrink);
 
-    // Too wide for the measure by 24pt: the glue has to take all of it back. The
-    // line's own ink is untouched -- only its joins tighten.
+    // Too wide for the measure by half of what its own spaces hold: the glue has to
+    // take all of it back. The line's ink is untouched -- only its word spaces
+    // tighten. Half rather than a fixed number of points, because the budget is what
+    // the line has, and a case that spends all of it cannot tell a cap from a cure.
     let mut over = last.clone();
-    over.natural = column + 24.0;
+    let deficit = last.shrink * 0.5;
+    over.natural = column + deficit;
     let w = line_width(&place(&para, &over));
     assert!(
-        (w - (base - 24.0)).abs() < 0.5,
+        (w - (base - deficit)).abs() < deficit * 0.1,
         "an overfull final line was not shrunk: placed {w}, natural-width sum {base}"
     );
 
@@ -760,6 +782,36 @@ fn a_final_line_too_wide_for_the_measure_shrinks() {
     block.natural = column + 24.0;
     let w = line_width(&place(&para, &block));
     assert!((w - base).abs() < 0.5, "a ragged block was squeezed to fit: {w} vs {base}");
+}
+
+/// The worst negative width any glue on any justified line of `text` ends up with,
+/// over a sweep of measures. A glue slot below zero is ink laid over ink.
+fn worst_squeeze(text: &str) -> Pt {
+    let mut worst = 0.0f32;
+    for tenth in 130u16..260 {
+        let (para, plan) = set_ems(text, f32::from(tenth) / 10.0);
+        for l in plan.lines.iter().take(plan.lines.len().saturating_sub(1)) {
+            for p in place(&para, l) {
+                if p.node.is_none() {
+                    worst = worst.min(p.w);
+                }
+            }
+        }
+    }
+    worst
+}
+
+#[test]
+fn a_join_never_gives_back_more_air_than_it_holds() {
+    // Inter-ideograph glue has a base of nothing: two Han characters at natural width
+    // already touch, so every point of shrink the recipe offers slides one glyph onto
+    // the next. The solver reads that shrink as room and buys an extra character with
+    // it, which is why a squeezed footnote read as characters running into each other.
+    // A gap may close; it may not eat ink.
+    let cjk = "全局断行的代价函数决定了每一行的富余量，重复引用同一个脚注得到的是同一个数字。上标和公式的下标是同一套机制，渲染的每一段文字本来就带着自己的下降量。";
+    let mixed = "引擎在 Han 与 Latin 的边界自动插入约四分之一 em 的可调间距，作者不需要手动加空格：使用Rust编写、Direct2D绘制、以及Microsoft YaHei渲染中文。";
+    assert!(worst_squeeze(cjk) >= 0.0, "a CJK line overlapped its glyphs by {}pt", worst_squeeze(cjk));
+    assert!(worst_squeeze(mixed) >= 0.0, "a mixed line overlapped its glyphs by {}pt", worst_squeeze(mixed));
 }
 
 #[test]
@@ -805,9 +857,17 @@ fn a_tight_box_breaks_where_a_loose_ragged_block_hangs() {
     // measure and the painter leaves it hanging there. In prose that only trespasses
     // into the margin. A table cell has a neighbour at that exact spot, and the two
     // overwrite each other. Withdrawing the shrink leaves the solver one answer: break.
-    let text = "一格里的汉字排满了以后应当";
-    let column = 6.0 * SIZE;
-    assert_eq!(text.chars().count(), 13);
+    //
+    // The box is sized from the block's own width rather than written down, because the
+    // hang has to be small enough for the glue to cover -- and an ideograph join covers
+    // nothing any more, which is what `a_join_never_gives_back_more_air_than_it_holds`
+    // is for. Word spaces still do, so this is the case they make.
+    let text = "arranging type so that written language stays legible";
+    let (_, wide) = set_box(text, 10_000.0, false);
+    assert_eq!(wide.lines.len(), 1, "the probe needs the whole block on one line");
+    let whole = &wide.lines[0];
+    assert!(whole.shrink > 8.0, "the case needs glue that shrinks: {}", whole.shrink);
+    let column = whole.natural - whole.shrink * 0.5;
 
     let (para, loose) = set_box(text, column, false);
     assert_eq!(loose.lines.len(), 1, "a loose box was already forced to break");

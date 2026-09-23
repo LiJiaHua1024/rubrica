@@ -2,8 +2,9 @@
 //!
 //! Which glue is elastic is the whole subject. An English line stretches only at
 //! word spaces; a Chinese line has no word spaces, so it stretches at the thin
-//! join between ideographs -- which is why the join must be *compressible glue*
-//! and not a fixed gap. Because every ideograph pair carries the same recipe,
+//! join between ideographs -- which is why the join must be *stretchable glue* and
+//! not a fixed gap, and why it may not shrink at all: there is no air there to
+//! take back. Because every ideograph pair carries the same recipe,
 //! proportional distribution spreads the slack evenly on its own.
 
 use crate::breaking::Line;

@@ -4,8 +4,8 @@
 //! whatever raggedness falls out, move on. This module scores every legal set of
 //! breaks for a paragraph at once and keeps the cheapest. That is the difference
 //! between "acceptable" and "even" justification -- and for Chinese, where the
-//! only elastic material is the thin compressible space between ideographs, it is
-//! the difference between justifying at all and not.
+//! only elastic material is the thin space between ideographs and it only opens
+//! one way, it is the difference between justifying at all and not.
 //!
 //! The scoring model is TeX's: cubic badness, four fitness classes with
 //! class-jump penalties, and a pretolerance/tolerance pair so the cheap pass runs
