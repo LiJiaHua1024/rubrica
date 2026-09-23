@@ -51,6 +51,11 @@ cargo test --workspace                    # the whole engine, headless
 cargo clippy --workspace --all-targets
 ```
 
+The [build workflow](https://github.com/LiJiaHua1024/rubrica/actions/workflows/build.yml)
+produces a Windows x64 artifact on pushes to `main`, version tags, and manual runs.
+Download `rubrica-windows-x64` from a run's Artifacts section. It contains the
+executable, both licenses, this README, and `SHA256SUMS`; GitHub retains it for 30 days.
+
 ## Verifying a page without opening a window
 
 `--report` rebuilds the *same* display list the window paints and prints the numbers:

@@ -2042,7 +2042,7 @@ mod tests {
         // `Vmatrix` is the doubled bar, which needs its own character to be visible.
         assert_eq!(
             of("\\begin{Vmatrix} a \\end{Vmatrix}"),
-            format!("(array Matrix c \u{2016}\u{2016} [a])")
+            "(array Matrix c \u{2016}\u{2016} [a])"
         );
         // `aligned` reads `&` as an alignment tab, so the two halves of a row become
         // two columns whose alignments point at the tab from either side.
