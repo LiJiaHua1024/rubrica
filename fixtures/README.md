@@ -13,6 +13,9 @@ cargo run -q -p rubrica-app -- --report --width 900 fixtures/delims.md
   Its glyph census should include Cambria Math for the two cell formulas.
 - `defs.md` exercises definition lines and ordinary wrapped prose.
 - `delims.md` exercises TeX inline and display delimiters alongside literal code.
+- `rtl.md` exercises Arabic/Hebrew shaping, mixed scripts, digits, mirrored brackets,
+  isolates, wrapped RTL paragraphs, links, and aligned table cells. Use `--shapes` to
+  inspect each painted run's embedding level, left edge, DirectWrite origin and glyphs.
 
 The parser tests also read these exact files so their document structure remains
 reproducible without a font or a desktop session.

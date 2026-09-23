@@ -11,7 +11,7 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use rubrica_doc::{Action, ActionKind, Align, Block, BlockKind, Document, InlineStyle};
-use rubrica_type::justification::place;
+use rubrica_type::justification::place_bidi;
 use rubrica_type::paragraph::{Item, Spacing, StyleId, StyleSpan};
 use rubrica_type::units::Pt;
 use rubrica_type::{BreakOptions, Hyphenation, typeset, typeset_hyphenated};
@@ -240,6 +240,7 @@ enum ObjectSource {
 
 /// One face's positioned glyphs, in device independent pixels.
 pub struct PaintRun {
+    pub bidi_level: u8,
     face: IDWriteFontFace,
     /// Resolved family, recorded at layout time so the report can show which face
     /// actually carried each run without a COM round trip per frame.
@@ -257,6 +258,12 @@ pub struct PaintRun {
     /// `family` is: the report can then say what the page actually painted rather
     /// than what the layout asked for.
     pub color: ColorRole,
+}
+
+/// DirectWrite places an odd-level run from its right edge; the display list and
+/// all hit geometry continue to store the physical left edge.
+pub(crate) fn glyph_origin(left: f32, width: f32, level: u8) -> f32 {
+    left + if level % 2 == 1 { width } else { 0.0 }
 }
 
 pub enum Op {
@@ -327,10 +334,13 @@ pub struct SelLine {
     /// What separates this line from the one before it in the text a copy hands back.
     pub join: Join,
     pub chars: Vec<char>,
-    /// The left edge of every boundary: `xs.len() == chars.len() + 1`, non-decreasing.
+    /// Logical leading edges; bidi text can run in either direction.
     /// A step of no width is a character the source has and this line does not paint,
     /// which is what a wrapped line's space between two of its words looks like.
     pub xs: Vec<f32>,
+    /// Logical trailing edge per character. At a bidi boundary this need not be
+    /// the next character's leading edge: selections can have disjoint rectangles.
+    pub ends: Vec<f32>,
 }
 
 /// A place in the page's text: a character index in a [`SelLine`], where `ch` equal to
@@ -379,25 +389,38 @@ pub fn caret_at(sel: &[SelLine], x: f32, y: f32) -> Caret {
     // The nearest boundary, because a character's own ink starts a point or two to the
     // right of the slot it was allocated, and a click that means the next character
     // must not keep selecting the one before it.
-    let mut ch = l.xs.len().saturating_sub(1);
-    for (i, &edge) in l.xs.iter().enumerate() {
-        if edge > x {
-            ch = if i > 0 && (x - l.xs[i - 1]) < (edge - x) { i - 1 } else { i };
-            break;
-        }
-    }
+    let ch = l.xs.iter().enumerate().min_by(|(i, a), (j, b)| {
+        (*a - x).abs().total_cmp(&(*b - x).abs()).then(j.cmp(i))
+    }).map_or(0, |(i, _)| i);
     Caret { line, ch }
 }
 
-/// The rectangles to lay under a selection, one per line it touches.
+/// Visual rectangles for a logical selection; a bidi line can need several.
 pub fn selection_rects(sel: &[SelLine], s: Selection) -> Vec<(f32, f32, f32, f32)> {
     let mut out = Vec::new();
     for (line, lo, hi) in pieces(sel, s) {
         let l = &sel[line];
-        let (x0, x1) = (l.xs[lo], l.xs[hi]);
-        if x1 - x0 > 0.0 {
-            out.push((x0, l.y, x1 - x0, l.h));
+        let mut spans: Vec<_> = (0..l.chars.len()).map(|i| {
+            (l.xs[i].min(l.ends[i]), l.xs[i].max(l.ends[i]), (lo..hi).contains(&i))
+        }).filter(|(a, b, _)| b > a).collect();
+        spans.sort_by(|a, b| a.0.total_cmp(&b.0));
+        let mut merged: Vec<(f32, f32)> = Vec::new();
+        let mut adjacent = false;
+        for (a, b, selected) in spans {
+            if !selected {
+                adjacent = false;
+                continue;
+            }
+            // Synthetic CJK/script glue has no source character, but still belongs
+            // under the band when both adjacent pieces of ink are selected.
+            if let Some(last) = merged.last_mut().filter(|_| adjacent) {
+                last.1 = last.1.max(b);
+            } else {
+                merged.push((a, b));
+            }
+            adjacent = true;
         }
+        out.extend(merged.into_iter().map(|(a, b)| (a, l.y, b - a, l.h)));
     }
     out
 }
@@ -588,6 +611,42 @@ pub fn next_caret(sel: &[SelLine], from: Caret, m: Motion) -> Caret {
     let at = clamp_caret(sel, from);
     let last = sel.len() - 1;
     let end_of = |line: usize| sel[line].chars.len();
+    let current = &sel[at.line];
+    if current.xs.windows(2).any(|w| w[1] < w[0]) {
+        let mut order: Vec<_> = (0..current.xs.len()).collect();
+        order.sort_by(|a, b| current.xs[*a].total_cmp(&current.xs[*b]).then(a.cmp(b)));
+        let index = order.iter().position(|ch| *ch == at.ch).unwrap();
+        let visual = match m {
+            Motion::Left | Motion::WordLeft => index.checked_sub(1),
+            Motion::Right | Motion::WordRight => (index + 1 < order.len()).then_some(index + 1),
+            Motion::Home => Some(0),
+            Motion::End => Some(order.len() - 1),
+            Motion::Up | Motion::Down => {
+                let line = if matches!(m, Motion::Up) { at.line.saturating_sub(1) } else { (at.line + 1).min(last) };
+                return caret_at(sel, current.xs[at.ch], sel[line].y + sel[line].h * 0.5);
+            }
+            _ => None,
+        };
+        if let Some(mut i) = visual {
+            if matches!(m, Motion::WordLeft | Motion::WordRight) {
+                let right = matches!(m, Motion::WordRight);
+                let word = word_at(sel, Caret { line: at.line, ch: order[i] });
+                loop {
+                    let next = if right { i.checked_add(1).filter(|j| *j < order.len()) } else { i.checked_sub(1) };
+                    let Some(j) = next else { break };
+                    if order[j] < word.from.ch || order[j] > word.to.ch { break; }
+                    i = j;
+                }
+            }
+            return Caret { line: at.line, ch: order[i] };
+        }
+        if matches!(m, Motion::Left | Motion::WordLeft | Motion::Right | Motion::WordRight) {
+            let right = matches!(m, Motion::Right | Motion::WordRight);
+            let line = if right { (at.line + 1).min(last) } else { at.line.saturating_sub(1) };
+            if line == at.line { return at; }
+            return caret_at(sel, if right { f32::MIN } else { f32::MAX }, sel[line].y + sel[line].h * 0.5);
+        }
+    }
     let moved = match m {
         // A line break is one position to cross, not two: coming down at the end of a
         // line lands the caret at the start of the next, the way a drag would.
@@ -607,11 +666,11 @@ pub fn next_caret(sel: &[SelLine], from: Caret, m: Motion) -> Caret {
                 at
             }
         }
-        // The same column where the line has one, and the end of it where it does not:
-        // an index that has only drawn lines cannot know which character a reader's eye
-        // was following down a paragraph.
-        Motion::Up => Caret { line: at.line.saturating_sub(1), ch: at.ch },
-        Motion::Down => Caret { line: (at.line + 1).min(last), ch: at.ch },
+        // Keep the visual column even when the neighbouring line reads backwards.
+        Motion::Up | Motion::Down => {
+            let line = if matches!(m, Motion::Up) { at.line.saturating_sub(1) } else { (at.line + 1).min(last) };
+            caret_at(sel, current.xs[at.ch], sel[line].y + sel[line].h * 0.5)
+        }
         Motion::Home => Caret { line: at.line, ch: 0 },
         Motion::End => Caret { line: at.line, ch: end_of(at.line) },
         Motion::DocStart => Caret { line: 0, ch: 0 },
@@ -3020,6 +3079,7 @@ const CELL_MIN_EM: Pt = 3.0;
 /// the drop is a property of the run rather than something the line loop assumes.
 fn paint_run(font: &FontEngine, r: &GlyphRun, x: Pt, dy: Pt, k: f32, color: ColorRole) -> Option<PaintRun> {
     Some(PaintRun {
+        bidi_level: r.bidi_level,
         family: font.face_family(r.face),
         face: font.font_face(r.face)?,
         em: r.size * k,
@@ -3086,40 +3146,43 @@ fn merge_rule(
     *pending = Some(next);
 }
 
-/// Widen this line's clickable rectangles by the node that was just laid out, whose
+/// Extend this line's clickable rectangles by the node that was just laid out, whose
 /// ink runs from `x0` to `x1`. A node belongs to a target whenever their text overlaps,
 /// which is also how a hyphen or an ellipsis in the middle of a link stays clickable.
-fn merge_hot(hit: &mut [Option<(Pt, Pt)>], actions: &[Action], node: &std::ops::Range<usize>, x0: Pt, x1: Pt) {
+fn merge_hot(hit: &mut [Vec<(Pt, Pt)>], actions: &[Action], node: &std::ops::Range<usize>, x0: Pt, x1: Pt) {
     if x1 <= x0 {
         return;
     }
     for (h, a) in hit.iter_mut().zip(actions) {
         if a.range.start < node.end && node.start < a.range.end {
-            *h = Some(match *h {
-                Some((p, q)) => (p.min(x0), q.max(x1)),
-                None => (x0, x1),
-            });
+            if let Some(last) = h.last_mut().filter(|last| x0 <= last.1 + 0.01 && x1 >= last.0) {
+                last.0 = last.0.min(x0);
+                last.1 = last.1.max(x1);
+            } else {
+                h.push((x0, x1));
+            }
         }
     }
 }
 
-/// Turn this line's merged target rectangles into clickable hotspots, one per target
-/// that leads somewhere. A target whose ink is unopenable -- a relative path, a
+/// Turn this line's target rectangles into hotspots, preserving disjoint bidi spans.
+/// A target whose ink is unopenable -- a relative path, a
 /// citation of a label no note answers -- is not marked at all, so a pointer that
 /// stays an arrow is the reader's answer to "nowhere".
 fn emit_hots(
     hots: &mut Vec<Hot>,
     actions: &[Action],
-    hit: &[Option<(Pt, Pt)>],
+    hit: &[Vec<(Pt, Pt)>],
     ctx: &Ctx,
     top: Pt,
     line_h: Pt,
 ) {
     let k = ctx.k;
     for (i, h) in hit.iter().enumerate() {
-        let Some((x0, x1)) = *h else { continue };
         let Some(kind) = hot_kind(&actions[i].kind, ctx) else { continue };
-        hots.push(Hot { x: x0 * k, y: top * k, w: (x1 - x0) * k, h: line_h * k, kind });
+        for &(x0, x1) in h {
+            hots.push(Hot { x: x0 * k, y: top * k, w: (x1 - x0) * k, h: line_h * k, kind: kind.clone() });
+        }
     }
 }
 
@@ -3173,29 +3236,61 @@ pub(crate) fn document_link(base: Option<&std::path::Path>, url: &str) -> Option
 
 /// Where each character of a shaped run begins, in points from the left of the page.
 ///
-/// DirectWrite reports a cluster as a UTF-16 index into the run's own text, which is
-/// also its byte offset for anything in the Basic Multilingual Plane -- the walk below
-/// is exact for the rest. Shaping swallows a character into its neighbour's ligature
-/// without giving it an entry, and the caller reads that one off the gap.
-fn mark_run(text: &str, run: &GlyphRun, base: Pt, out: &mut Vec<(usize, Pt)>) {
-    let sub = &text[run.text.clone()];
-    let units = sub.encode_utf16().count();
-    let mut byte_of = vec![run.text.end; units + 1];
-    let mut u = 0usize;
-    for (b, c) in sub.char_indices() {
-        byte_of[u] = run.text.start + b;
-        u += c.len_utf16();
+/// DirectWrite maps UTF-16 code units to glyph indices. Convert those indices into
+/// advances in the run's direction, then map them back to source UTF-8 boundaries.
+fn mark_run(text: &str, run: &GlyphRun, base: Pt, out: &mut Vec<(usize, Pt, Pt)>) {
+    // DirectWrite's cluster map is UTF-16 text -> glyph index, not its inverse.
+    // Preserve all code units even when a ligature uses fewer glyphs than letters.
+    let mut edges = vec![0.0];
+    for width in &run.advances {
+        edges.push(edges.last().copied().unwrap() + width);
     }
-    let mut acc: Pt = 0.0;
-    let mut prev = usize::MAX;
-    for (gi, cl) in run.clusters.iter().enumerate() {
-        let c = (*cl as usize).min(units);
-        if c != prev {
-            out.push((byte_of[c], base + acc));
-            prev = c;
+    let mut boundaries: Vec<_> = run.clusters.iter().map(|c| *c as usize).collect();
+    boundaries.push(run.glyphs.len());
+    boundaries.sort_unstable();
+    boundaries.dedup();
+    let mut unit = 0;
+    let mut chars = Vec::new();
+    for (byte, c) in text[run.text.clone()].char_indices() {
+        let cluster = run.clusters.get(unit).copied().unwrap_or(0) as usize;
+        chars.push((run.text.start + byte, cluster));
+        unit += c.len_utf16();
+    }
+    let mut at = 0;
+    while at < chars.len() {
+        let cluster = chars[at].1.min(run.glyphs.len());
+        let mut end = at + 1;
+        while end < chars.len() && chars[end].1 == cluster { end += 1; }
+        let next = boundaries.iter().copied().find(|b| *b > cluster).unwrap_or(run.glyphs.len());
+        let a = edges[cluster];
+        let b = edges[next];
+        let position = |offset: Pt| {
+            if run.bidi_level % 2 == 1 { base + run.width() - offset } else { base + offset }
+        };
+        for (i, &(byte, _)) in chars[at..end].iter().enumerate() {
+            let start = a + (b - a) * i as Pt / (end - at) as Pt;
+            let finish = a + (b - a) * (i + 1) as Pt / (end - at) as Pt;
+            out.push((byte, position(start), position(finish)));
         }
-        acc += run.advances.get(gi).copied().unwrap_or(0.0);
+        at = end;
     }
+}
+
+/// Record elastic whitespace at its actual visual position, including spaces
+/// between runs with different directions. Wrapped-away whitespace stays zero width.
+fn mark_glue(text: &str, slot: &rubrica_type::Placed, left: Pt,
+    segs: &mut Vec<(std::ops::Range<usize>, Pt, Pt)>, marks: &mut Vec<(usize, Pt, Pt)>) {
+    let Some((start, end)) = slot.source.filter(|(a, b)| b > a) else { return };
+    let count = text[start..end].chars().count() as Pt;
+    let x = left + slot.x;
+    let pos = |i: usize| {
+        let offset = slot.w * i as Pt / count;
+        x + if slot.bidi_level % 2 == 1 { slot.w - offset } else { offset }
+    };
+    for (i, (byte, _)) in text[start..end].char_indices().enumerate() {
+        marks.push((start + byte, pos(i), pos(i + 1)));
+    }
+    segs.push((start..end, x, x + slot.w));
 }
 
 /// Index one drawn line character by character, from the source rather than from the
@@ -3222,62 +3317,45 @@ fn mark_line(
     text: &str,
     band: Band,
     segs: &[(std::ops::Range<usize>, Pt, Pt)],
-    marks: &[(usize, Pt)],
+    marks: &[(usize, Pt, Pt)],
     consumed: &mut usize,
 ) -> Option<SelLine> {
     let Band { top, h, k, join } = band;
+    // Placement is visual; copying, find, and document anchors stay logical.
+    let mut segs = segs.to_vec();
+    segs.sort_by_key(|s| s.0.start);
     let first = segs.first()?;
     let mut l = SelLine {
-        y: top * k,
-        h: h * k,
-        join,
-        chars: Vec::new(),
-        xs: Vec::new(),
+        y: top * k, h: h * k, join,
+        chars: Vec::new(), xs: Vec::new(), ends: Vec::new(),
     };
-    let mut mi = 0usize;
-    let mut at = first.1;
-    for (range, x0, x1) in segs {
-        // A line centred or right-aligned in a box too small for it can put its ink
-        // left of where the box starts; the index keeps to the box.
-        let (x0, x1) = (*x0, x1.max(*x0));
+    let edge = |byte: usize| marks.binary_search_by_key(&byte, |m| m.0).ok().map(|i| marks[i]);
+    let mut at = edge(first.0.start).map_or(first.1, |m| m.1);
+    for (range, x0, x1) in &segs {
+        let start = edge(range.start).map_or(*x0, |m| m.1);
         if range.start > *consumed {
             let gap = &text[*consumed..range.start];
-            let n = gap.chars().count().max(1) as f64;
-            let (from, to) = (f64::from(at), f64::from(x0));
+            let n = gap.chars().count().max(1) as Pt;
+            // Between directional runs, use the adjacent visual edges, not the
+            // potentially distant leading caret of the next logical character.
+            let from = if at <= *x0 || at >= *x1 { at } else { start };
+            let to = if from <= *x0 { *x0 } else if from >= *x1 { *x1 } else { from };
             for (i, c) in gap.chars().enumerate() {
                 l.chars.push(c);
-                l.xs.push((from + (to - from) * (i as f64 / n)) as Pt);
+                l.xs.push((from + (to - from) * i as Pt / n) * k);
+                l.ends.push((from + (to - from) * (i + 1) as Pt / n) * k);
             }
-            at = x0;
         }
-        for (b, c) in text[range.clone()].char_indices() {
-            let off = range.start + b;
-            while mi < marks.len() && marks[mi].0 < off {
-                mi += 1;
-            }
-            // A mark past this segment's right edge belongs to a later one, since a
-            // run that fell back to another face can be shaped out of order.
-            let x = marks
-                .get(mi)
-                .filter(|m| m.0 == off && m.1 <= x1)
-                .map_or(at, |m| m.1)
-                .max(x0)
-                .min(x1);
+        for (byte, c) in text[range.clone()].char_indices() {
+            let (_, a, b) = edge(range.start + byte).unwrap_or((0, *x0, *x1));
             l.chars.push(c);
-            l.xs.push(x.max(l.xs.last().copied().unwrap_or(x)));
+            l.xs.push(a * k);
+            l.ends.push(b * k);
+            at = b;
         }
-        at = x1;
         *consumed = range.end;
     }
-    l.xs.push(at);
-    // The boundaries are measured in the points the layout works in, but the index is
-    // read against a pointer, whose coordinates arrive in the scaled space `y` and `h`
-    // were converted into just above. Leaving `xs` in points put every click a third of
-    // the way between the margin and the pointer at 144 dpi -- and the band the reader
-    // then saw for the selection was drawn from the same wrong numbers.
-    for x in l.xs.iter_mut() {
-        *x *= k;
-    }
+    l.xs.push(at * k);
     (!l.chars.is_empty()).then_some(l)
 }
 
@@ -3363,9 +3441,10 @@ fn layout_block(
     // by every line of it because the space between two of them is in neither.
     let mut consumed = 0usize;
 
+    let bidi = rubrica_type::BidiInfo::new(text, None);
     for line in &plan.lines {
         let top = y;
-        let placed = place(&para, line);
+        let placed = place_bidi(&para, line, &bidi);
         if line.hyphen.is_some_and(|h| para.node(h).advance > 0.0) {
             hyphens.breaks += 1;
         }
@@ -3374,9 +3453,8 @@ fn layout_block(
         // at the block's own left, where the marker sits.
         let line_left = left + if line.first { opts.par_indent } else { hang };
         // How far each clickable range reaches along this line, if it reaches at all.
-        // One rectangle per line rather than one per target, because the pointer is
-        // only ever in one of the places a wrapped link happens to be.
-        let mut hit: Vec<Option<(Pt, Pt)>> = vec![None; actions.len()];
+        // Mixed-direction links may occupy several disjoint rectangles on one line.
+        let mut hit: Vec<Vec<(Pt, Pt)>> = vec![Vec::new(); actions.len()];
         let mut runs: Vec<PaintRun> = Vec::new();
         // Bars of a formula, as x, top edge, width, thickness and ink, all still
         // relative to this line's baseline because the line has no position yet.
@@ -3387,13 +3465,19 @@ fn layout_block(
         // paints and the two edges it sits between, plus the marks shaping left behind
         // for the characters inside them.
         let mut segs: Vec<(std::ops::Range<usize>, Pt, Pt)> = Vec::new();
-        let mut marks: Vec<(usize, Pt)> = Vec::new();
+        let mut marks: Vec<(usize, Pt, Pt)> = Vec::new();
         // One strike rule per line rather than per node: the layout core makes every
         // ideograph and every word its own node, so a struck Chinese phrase would
         // otherwise draw a separate op per character.
         let mut ruled: Option<Rule> = None;
         for slot in placed {
-            let Some(node_id) = slot.node else { continue };
+            let Some(node_id) = slot.node else {
+                mark_glue(text, &slot, line_left, &mut segs, &mut marks);
+                if let Some((a, b)) = slot.source {
+                    merge_hot(&mut hit, actions, &(a..b), line_left + slot.x, line_left + slot.x + slot.w);
+                }
+                continue;
+            };
             let node = para.node(node_id);
             let st = &styles[node.style.0 as usize];
             // A node of any other style -- unstruck, or struck in another face --
@@ -3949,10 +4033,10 @@ impl View {
                 glyphAdvances: run.advances.as_ptr(),
                 glyphOffsets: run.offsets.as_ptr(),
                 isSideways: false.into(),
-                bidiLevel: 0,
+                bidiLevel: run.bidi_level as u32,
             };
             target.DrawGlyphRun(
-                Vector2::new(run.x, run.baseline - up),
+                Vector2::new(glyph_origin(run.x, run.advances.iter().sum(), run.bidi_level), run.baseline - up),
                 &gr,
                 &brush,
                 DWRITE_MEASURING_MODE_NATURAL,
@@ -4109,29 +4193,38 @@ fn layout_table(
             let mut consumed = 0usize;
             let mut lines_out = 0usize;
             let mut ly = top + pad * 0.5;
+            let bidi = rubrica_type::BidiInfo::new(&c.text, None);
             for line in &plan.lines {
-                let placed = place(&para, line);
+                let placed = place_bidi(&para, line, &bidi);
                 if line.hyphen.is_some() {
                     hyphens.breaks += 1;
                 }
-                let w = placed.last().map(|p| p.x + p.w).unwrap_or(0.0);
+                let start = placed.first().map_or(0.0, |p| p.x);
+                let w = placed.last().map(|p| p.x + p.w - start).unwrap_or(0.0);
                 let shift = match c.align {
                     Align::Left => 0.0,
                     Align::Center => (inner - w) * 0.5,
                     Align::Right => (inner - w).max(0.0),
-                };
+                } - start;
                 let mut runs: Vec<PaintRun> = Vec::new();
                 let mut ascent = 0.0f32;
                 let mut segs: Vec<(std::ops::Range<usize>, Pt, Pt)> = Vec::new();
-                let mut marks: Vec<(usize, Pt)> = Vec::new();
-                let mut hit: Vec<Option<(Pt, Pt)>> = vec![None; c.actions.len()];
+                let mut marks: Vec<(usize, Pt, Pt)> = Vec::new();
+                let mut hit: Vec<Vec<(Pt, Pt)>> = vec![Vec::new(); c.actions.len()];
                 let mut bars: Vec<(Pt, Pt, Pt, Pt, ColorRole)> = Vec::new();
                 // An image's box, waiting for the line's baseline: file, x and width
                 // already in device pixels, ascent and descent still in points.
                 let mut pics: Vec<(std::path::PathBuf, f32, f32, Pt, Pt)> = Vec::new();
                 let mut ruled: Option<Rule> = None;
                 for slot in placed {
-                    let Some(node_id) = slot.node else { continue };
+                    let Some(node_id) = slot.node else {
+                        mark_glue(&c.text, &slot, x + pad + shift, &mut segs, &mut marks);
+                        if let Some((a, b)) = slot.source {
+                            let left = x + pad + shift + slot.x;
+                            merge_hot(&mut hit, &c.actions, &(a..b), left, left + slot.w);
+                        }
+                        continue;
+                    };
                     let node = para.node(node_id);
                     let st = &styles[node.style.0 as usize];
                     if ruled.as_ref().is_some_and(|r| r.style != node.style) {
@@ -4209,6 +4302,7 @@ fn layout_table(
                             );
                         }
                         runs.push(PaintRun {
+                            bidi_level: r.bidi_level,
                             family: font.face_family(r.face),
                             face,
                             em: r.size * k,
@@ -5201,11 +5295,11 @@ mod tests {
     fn a_target_reaches_only_the_ink_that_belongs_to_it() {
         // "plain [link] plain": the target is the middle node's text alone.
         let actions = [url("https://e/x", 6..10)];
-        let mut hit: Vec<Option<(Pt, Pt)>> = vec![None; actions.len()];
+        let mut hit: Vec<Vec<(Pt, Pt)>> = vec![Vec::new(); actions.len()];
         merge_hot(&mut hit, &actions, &(0..6), 0.0, 50.0);
         merge_hot(&mut hit, &actions, &(6..10), 50.0, 90.0);
         merge_hot(&mut hit, &actions, &(10..16), 90.0, 140.0);
-        assert_eq!(hit, vec![Some((50.0, 90.0))], "the rectangles reached outside the link");
+        assert_eq!(hit, vec![vec![(50.0, 90.0)]], "the rectangles reached outside the link");
     }
 
     #[test]
@@ -5213,30 +5307,30 @@ mod tests {
         // A link's own text arrives in pieces -- `guide`, ` `, `here` -- and the space
         // between the pieces is part of the word the reader clicked.
         let actions = [url("https://e/x", 6..14)];
-        let mut hit: Vec<Option<(Pt, Pt)>> = vec![None; actions.len()];
+        let mut hit: Vec<Vec<(Pt, Pt)>> = vec![Vec::new(); actions.len()];
         for (range, x0, x1) in
             [(6..11usize, 50.0f32, 80.0f32), (11..12, 80.0, 88.0), (12..14, 88.0, 104.0)]
         {
             merge_hot(&mut hit, &actions, &range, x0, x1);
         }
-        assert_eq!(hit, vec![Some((50.0, 104.0))]);
+        assert_eq!(hit, vec![vec![(50.0, 104.0)]]);
     }
 
     #[test]
     fn two_targets_on_one_line_keep_their_own_widths() {
         let actions = [url("https://e/a", 0..4), url("https://e/b", 6..10)];
-        let mut hit: Vec<Option<(Pt, Pt)>> = vec![None; actions.len()];
+        let mut hit: Vec<Vec<(Pt, Pt)>> = vec![Vec::new(); actions.len()];
         merge_hot(&mut hit, &actions, &(0..4), 0.0, 40.0);
         merge_hot(&mut hit, &actions, &(6..10), 70.0, 110.0);
-        assert_eq!(hit, vec![Some((0.0, 40.0)), Some((70.0, 110.0))]);
+        assert_eq!(hit, vec![vec![(0.0, 40.0)], vec![(70.0, 110.0)]]);
     }
 
     #[test]
     fn a_target_with_no_width_of_its_own_is_not_a_target() {
         let actions = [url("https://e/a", 0..4)];
-        let mut hit: Vec<Option<(Pt, Pt)>> = vec![None; actions.len()];
+        let mut hit: Vec<Vec<(Pt, Pt)>> = vec![Vec::new(); actions.len()];
         merge_hot(&mut hit, &actions, &(0..4), 30.0, 30.0);
-        assert_eq!(hit, vec![None], "an empty rectangle would swallow a click at its edge");
+        assert_eq!(hit, vec![Vec::<(Pt, Pt)>::new()], "an empty rectangle would swallow a click at its edge");
     }
 
     #[test]
@@ -5255,18 +5349,20 @@ mod tests {
     /// arithmetic a test writes is the arithmetic it checks.
     fn sel_line(text: &str, y: f32, join: Join) -> SelLine {
         let chars: Vec<char> = text.chars().collect();
-        let xs = (0..=chars.len()).map(|i| i as f32 * CHAR).collect();
-        SelLine { y, h: CHAR * 1.5, join, chars, xs }
+        let xs: Vec<_> = (0..=chars.len()).map(|i| i as f32 * CHAR).collect();
+        let ends = xs[1..].to_vec();
+        SelLine { y, h: CHAR * 1.5, join, chars, xs, ends }
     }
 
     /// A line whose character at `squeezed_at` was given no width by the break that
     /// swallowed it, which is what a wrapped line's own inter-word space looks like.
     fn squeezed(text: &str, y: f32, squeezed_at: usize) -> SelLine {
         let chars: Vec<char> = text.chars().collect();
-        let xs = (0..=chars.len())
+        let xs: Vec<_> = (0..=chars.len())
             .map(|i| (i - (i > squeezed_at) as usize) as f32 * CHAR)
             .collect();
-        SelLine { y, h: CHAR * 1.5, join: Join::None, chars, xs }
+        let ends = xs[1..].to_vec();
+        SelLine { y, h: CHAR * 1.5, join: Join::None, chars, xs, ends }
     }
 
     #[test]
@@ -5291,7 +5387,7 @@ mod tests {
     #[test]
     fn a_lines_boundaries_are_stated_in_the_units_a_pointer_arrives_in() {
         let segs = [(0..2, 10.0f32, 30.0f32)];
-        let marks = [(0usize, 10.0f32), (1usize, 20.0f32)];
+        let marks = [(0usize, 10.0f32, 20.0f32), (1usize, 20.0f32, 30.0f32)];
         let mut consumed = 0usize;
         let band = Band { top: 4.0, h: 12.0, k: 1.5, join: Join::None };
         let l = mark_line("ab", band, &segs, &marks, &mut consumed).expect("two characters");
@@ -6017,5 +6113,120 @@ mod tests {
         // The gaps divide the list into groups rather than padding it, and the link's own
         // group is one of them.
         assert!(menu_items(&s).windows(2).any(|w| matches!(&w[0], MenuRow::Gap) && matches!(&w[1], MenuRow::Row { cmd: Command::OpenUrl(_), .. })));
+    }
+}
+#[cfg(test)]
+mod bidi_tests {
+    use super::*;
+
+    #[test]
+    fn glyph_origins_and_disjoint_links_use_the_visual_geometry() {
+        assert_eq!(glyph_origin(20.0, 30.0, 0), 20.0);
+        assert_eq!(glyph_origin(20.0, 30.0, 1), 50.0);
+        assert_eq!(glyph_origin(20.0, 30.0, 2), 20.0);
+        let actions = [Action { range: 0..4, kind: ActionKind::Url("https://example.org".into()) }];
+        let mut hits = vec![Vec::new()];
+        merge_hot(&mut hits, &actions, &(0..1), 0.0, 10.0);
+        merge_hot(&mut hits, &actions, &(4..6), 10.0, 30.0);
+        merge_hot(&mut hits, &actions, &(1..4), 30.0, 50.0);
+        assert_eq!(hits, [vec![(0.0, 10.0), (30.0, 50.0)]]);
+    }
+
+    /// Exercise the same placement -> cluster mapping -> selection path as the
+    /// renderer, with deterministic advances and no DirectWrite/font dependency.
+    fn bidi_line(text: &str, scale: f32) -> SelLine {
+        let mut measure = rubrica_type::paragraph::MonospaceMeasure { size: 10.0, factor: 1.0 };
+        let (para, plan) = rubrica_type::typeset(text, &Spacing::for_size(10.0), StyleId(0),
+            &[], &BreakOptions::new(300.0), &mut measure);
+        assert_eq!(plan.lines.len(), 1);
+        let bidi = rubrica_type::BidiInfo::new(text, None);
+        let mut segs = Vec::new();
+        let mut marks = Vec::new();
+        for slot in place_bidi(&para, &plan.lines[0], &bidi) {
+            let Some(id) = slot.node else {
+                mark_glue(text, &slot, 0.0, &mut segs, &mut marks);
+                continue;
+            };
+            let node = para.node(id);
+            let chars: Vec<_> = text[node.text.clone()].chars().collect();
+            let clusters = chars.iter().enumerate().flat_map(|(i, c)| {
+                std::iter::repeat_n(i as u16, c.len_utf16())
+            }).collect();
+            let run = GlyphRun {
+                bidi_level: slot.bidi_level, face: 0, size: 10.0, text: node.text.clone(),
+                glyphs: vec![1; chars.len()], advances: vec![10.0; chars.len()],
+                offsets: vec![], clusters, ascent: 8.0, descent: 2.0, line_gap: 0.0,
+            };
+            mark_run(text, &run, slot.x, &mut marks);
+            segs.push((node.text.clone(), slot.x, slot.x + slot.w));
+        }
+        marks.sort_by_key(|m| m.0);
+        mark_line(text, Band { top: 0.0, h: 10.0, k: scale, join: Join::None },
+            &segs, &marks, &mut 0).unwrap()
+    }
+
+    #[test]
+    fn rtl_pointer_arrows_and_copy_follow_the_drawn_positions() {
+        let line = bidi_line("אב גד", 1.5);
+        assert!(line.xs.windows(2).all(|w| w[0] >= w[1]));
+        let sel = [line];
+        for ch in 0..sel[0].xs.len() {
+            assert_eq!(caret_at(&sel, sel[0].xs[ch], 1.0), Caret { line: 0, ch });
+        }
+        let from = Caret { line: 0, ch: 0 };
+        assert_eq!(next_caret(&sel, from, Motion::Left).ch, 1);
+        assert_eq!(next_caret(&sel, from, Motion::Home).ch, 5);
+        assert_eq!(next_caret(&sel, from, Motion::End).ch, 0);
+        let all = Selection { from, to: Caret { line: 0, ch: 5 } };
+        assert_eq!(selection_text(&sel, all), "אב גד");
+        let rects = selection_rects(&sel, all);
+        assert_eq!(rects.len(), 1);
+        assert!((rects[0].0 + rects[0].2 - 450.0).abs() < 0.001);
+    }
+
+    #[test]
+    fn a_logical_bidi_selection_can_have_disjoint_visual_rectangles() {
+        let sel = [bidi_line("Aאב12גדZ", 1.0)];
+        let selection = Selection { from: Caret { line: 0, ch: 0 }, to: Caret { line: 0, ch: 2 } };
+        assert_eq!(selection_text(&sel, selection), "Aא");
+        let rects = selection_rects(&sel, selection);
+        assert_eq!(rects.len(), 2);
+        assert_eq!(rects[0], (0.0, 0.0, 10.0, 10.0));
+        assert_eq!(rects[1], (60.0, 0.0, 10.0, 10.0));
+        let needle = crate::find::Needle::of(&sel);
+        let hits = needle.hits("אב12");
+        assert_eq!(selection_text(&sel, needle.span(&hits[0]).unwrap()), "אב12");
+    }
+
+    #[test]
+    fn clusters_map_utf16_characters_to_glyphs_including_ligatures() {
+        let text = "لا😀ב";
+        let run = GlyphRun {
+            bidi_level: 1, face: 0, size: 10.0, text: 0..text.len(),
+            glyphs: vec![1, 2, 3], advances: vec![12.0, 20.0, 8.0], offsets: vec![],
+            clusters: vec![0, 0, 1, 1, 2], ascent: 8.0, descent: 2.0, line_gap: 0.0,
+        };
+        let mut marks = Vec::new();
+        mark_run(text, &run, 0.0, &mut marks);
+        assert_eq!(marks, [(0, 40.0, 34.0), (2, 34.0, 28.0), (4, 28.0, 8.0), (8, 8.0, 0.0)]);
+    }
+
+    #[test]
+    fn bidi_spaces_do_not_select_the_intervening_rtl_word() {
+        let sel = [bidi_line("abc אבג xyz", 1.0)];
+        let selection = Selection { from: Caret { line: 0, ch: 7 }, to: Caret { line: 0, ch: 8 } };
+        assert_eq!(selection_text(&sel, selection), " ");
+        let rects = selection_rects(&sel, selection);
+        assert_eq!(rects.len(), 1);
+        assert!(rects[0].2 < 10.0);
+    }
+
+    #[test]
+    fn a_full_selection_covers_synthetic_script_glue() {
+        let sel = [bidi_line("中abc文", 1.0)];
+        let all = Selection { from: Caret { line: 0, ch: 0 }, to: Caret { line: 0, ch: 5 } };
+        let rects = selection_rects(&sel, all);
+        assert_eq!(rects.len(), 1);
+        assert_eq!(rects[0].2, sel[0].xs[5] - sel[0].xs[0]);
     }
 }

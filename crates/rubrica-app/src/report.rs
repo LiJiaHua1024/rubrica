@@ -224,9 +224,8 @@ pub fn report(source: &str, path: Option<&str>, o: &Options) -> Result<()> {
         );
     }
 
-    // Every character on the page that reads the other way. The engine has no bidi, so
-    // this is not a count of what works -- it is the size of the hole, per document, and
-    // the number to look at before claiming an Arabic page is merely laid out badly.
+    // Compare RTL source coverage with the embedding levels actually sent to the
+    // painter. Nested even levels represent numbers or LTR text inside an RTL run.
     let rtl: Vec<usize> = page
         .sel
         .iter()
@@ -234,12 +233,18 @@ pub fn report(source: &str, path: Option<&str>, o: &Options) -> Result<()> {
         .filter(|n| *n > 0)
         .collect();
     if !rtl.is_empty() {
+        let mut levels = BTreeMap::<u8, usize>::new();
+        for op in ops {
+            if let crate::view::Op::Runs(runs) = op {
+                for run in runs { *levels.entry(run.bidi_level).or_default() += 1; }
+            }
+        }
         println!(
-            "right-to-left: {} char(s) on {} line(s), all of them laid out left to \
-             right -- `bidiLevel` is fixed at 0",
+            "right-to-left: {} char(s) on {} line(s), Unicode bidi placement enabled",
             rtl.iter().sum::<usize>(),
             rtl.len()
         );
+        println!("bidi runs    : {levels:?} (embedding level: painted runs)");
     }
 
     println!();
@@ -387,6 +392,15 @@ pub fn report(source: &str, path: Option<&str>, o: &Options) -> Result<()> {
     // census and a screen apart on the page. This prints the display list itself.
     if shapes {
         math.dump(&font);
+        for op in ops {
+            let crate::view::Op::Runs(runs) = op else { continue };
+            for run in runs {
+                let width: f32 = run.advances.iter().sum();
+                let origin = crate::view::glyph_origin(run.x, width, run.bidi_level);
+                println!("glyph run    : level={} left={:.2} origin={:.2} width={:.2} baseline={:.2} face={} glyphs={:?}",
+                    run.bidi_level, run.x, origin, width, run.baseline, run.family, run.glyphs);
+            }
+        }
     }
     // Counted two ways on purpose: the marks in the text are what the reader can
     // follow, the entries in `footnotes` are what the author defined, and a document
@@ -540,7 +554,8 @@ pub fn report(source: &str, path: Option<&str>, o: &Options) -> Result<()> {
         let malformed = page
             .sel
             .iter()
-            .filter(|l| l.xs.len() != l.chars.len() + 1 || l.xs.windows(2).any(|w| w[1] < w[0]))
+            .filter(|l| l.xs.len() != l.chars.len() + 1 || l.ends.len() != l.chars.len()
+                || l.xs.iter().chain(&l.ends).any(|x| !x.is_finite()))
             .count();
         let unordered = page.sel.windows(2).filter(|w| w[1].y < w[0].y).count();
         println!(

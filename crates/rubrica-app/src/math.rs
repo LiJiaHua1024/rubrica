@@ -99,6 +99,7 @@ impl MathStore {
                     let (advance, ascent, descent) = font.glyph_extents(face, *index, *size);
                     parts.push((
                         GlyphRun {
+                            bidi_level: 0,
                             face,
                             size: *size,
                             text: 0..0,

@@ -131,6 +131,7 @@ mod tests {
             join,
             chars,
             xs: (0..=text.chars().count()).map(|i| i as f32 * CHAR).collect(),
+            ends: (1..=text.chars().count()).map(|i| i as f32 * CHAR).collect(),
         }
     }
 

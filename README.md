@@ -36,6 +36,11 @@ withholds them from its first pass, so a paragraph that can be set without hyphe
 set without hyphens. A code line too long for the measure is cut at a character instead,
 with no mark drawn — a hyphen inside an identifier would be a lie about its name.
 
+**Bidirectional text.** Arabic, Hebrew, Latin, digits and Chinese can share a paragraph.
+The Unicode bidirectional algorithm resolves paragraph direction and embedding levels;
+visual reordering happens after Knuth–Plass line breaking. DirectWrite supplies script
+shaping and mirrored glyphs, while selection, search and copying retain source order.
+
 ## Building
 
 Requires the MSVC toolchain and Windows.
@@ -67,7 +72,7 @@ bugs were found, and it never touches the desktop.
 ```
 rubrica-app --report --width 900 document.md
 rubrica-app --report --dpi 144 --zoom 120 --face 1 --measure 2 document.md
-rubrica-app --report --shapes document.md      # every piece of a formula, with coordinates
+rubrica-app --report --shapes document.md      # formula pieces and glyph runs, with coordinates
 rubrica-app --report --no-hyphenate document.md
 ```
 
@@ -130,8 +135,6 @@ internals, which is why the whole engine is testable from a console.
 
 ## Known limitations
 
-- **No right-to-left text.** `bidiLevel` is fixed at 0, so Arabic and Hebrew are shaped
-  but laid out left to right. `--report` counts how much of a page that affects.
 - Windows-only by construction, and no installer: it is a single `.exe`.
 - No document writing, no tabs, no PDF export.
 

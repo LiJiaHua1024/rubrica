@@ -10,5 +10,6 @@ description = "Headless typesetting core: CJK-aware paragraph model, Knuth-Plass
 [dependencies]
 unicode-linebreak.workspace = true
 unicode-script.workspace = true
+unicode-bidi = "0.3"
 
 [dev-dependencies]

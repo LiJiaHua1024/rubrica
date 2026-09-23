@@ -9,6 +9,7 @@ pub mod classify;
 pub mod justification;
 pub mod paragraph;
 pub mod units;
+pub use unicode_bidi::{BidiInfo, Level};
 
 pub use breaking::{BreakOptions, Line, Plan};
 pub use justification::{Placed, place};

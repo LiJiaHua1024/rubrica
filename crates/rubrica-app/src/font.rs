@@ -19,20 +19,13 @@ use rubrica_type::paragraph::{Measure, StyleId};
 use rubrica_type::units::Pt;
 use windows::core::{BOOL, PCWSTR, Result as WResult};
 use windows::Win32::Foundation::E_FAIL;
-/// Script handed to the analyzer.
-///
-/// Zero is USP10's common, neutral script: it asks for no script-specific glyph
-/// forms. Naming the real script (Han, Latin, ...) would need `IDWriteTextAnalysisSource`
-/// and `..Sink` COM implementations, since `AnalyzeScript` takes interfaces rather than
-/// buffers -- a deliberate follow-up, not an oversight, and shaping degrades to
-/// font-default behaviour until then.
-const SCRIPT_COMMON: u16 = 0;
+mod analysis;
 
 use windows::Win32::Graphics::DirectWrite::{
     DWRITE_FACTORY_TYPE_SHARED, DWRITE_FONT_METRICS, DWRITE_FONT_STRETCH_NORMAL,
     DWRITE_FONT_STYLE_ITALIC, DWRITE_FONT_STYLE_NORMAL, DWRITE_FONT_WEIGHT,
     DWRITE_GLYPH_METRICS, DWRITE_GLYPH_OFFSET, DWRITE_SCRIPT_ANALYSIS,
-    DWRITE_SCRIPT_SHAPES_DEFAULT, DWRITE_SHAPING_GLYPH_PROPERTIES,
+    DWRITE_SHAPING_GLYPH_PROPERTIES,
     DWRITE_SHAPING_TEXT_PROPERTIES, DWriteCreateFactory,
     IDWriteFactory, IDWriteFontCollection, IDWriteFont, IDWriteFontFace, IDWriteTextAnalyzer,
 };
@@ -47,6 +40,7 @@ struct Face {
 /// A shaped, positioned run: the painter's unit of work.
 #[derive(Clone, Debug, PartialEq)]
 pub struct GlyphRun {
+    pub bidi_level: u8,
     /// Index into the engine's face table.
     pub face: usize,
     pub size: Pt,
@@ -56,7 +50,7 @@ pub struct GlyphRun {
     /// Horizontal advance per glyph, in points, tracking folded in.
     pub advances: Vec<f32>,
     pub offsets: Vec<DWRITE_GLYPH_OFFSET>,
-    /// Text position each glyph came from, for caret and hit-testing later.
+    /// Glyph index for every UTF-16 code unit, including all units of a ligature.
     pub clusters: Vec<u16>,
     /// Ascender height at `size`, in points, for placing the baseline.
     pub ascent: Pt,
@@ -107,6 +101,7 @@ pub struct FontEngine {
     faces: RefCell<Vec<Face>>,
     resolved: RefCell<HashMap<(String, u16, bool), Option<usize>>>,
     shaped: RefCell<HashMap<ShapeKey, Vec<GlyphRun>>>,
+    analyzed: RefCell<HashMap<String, Vec<TextRun>>>,
     /// `(position, thickness)` of this face's strikeout rule, in design units, read
     /// from its file: a face is asked once, however many struck runs it carries.
     strikeout: RefCell<HashMap<usize, Option<(f32, f32)>>>,
@@ -115,6 +110,9 @@ pub struct FontEngine {
 
 #[derive(Clone, Hash, PartialEq, Eq)]
 struct ShapeKey {
+    bidi_level: u8,
+    script: u16,
+    shapes: i32,
     /// Face index, not a family name: two weights of one family would otherwise
     /// collide and hand back kerning measured off the wrong face.
     face: usize,
@@ -124,6 +122,13 @@ struct ShapeKey {
     /// Content-addressed: the same characters at the same size shape the same way
     /// wherever they appear, so repeated text across a document stays a hit.
     text: Box<[u16]>,
+}
+
+#[derive(Clone)]
+struct TextRun {
+    range: Range<usize>,
+    level: u8,
+    script: DWRITE_SCRIPT_ANALYSIS,
 }
 
 impl FontEngine {
@@ -140,6 +145,7 @@ impl FontEngine {
                 faces: RefCell::new(Vec::new()),
                 resolved: RefCell::new(HashMap::new()),
                 shaped: RefCell::new(HashMap::new()),
+                analyzed: RefCell::new(HashMap::new()),
                 strikeout: RefCell::new(HashMap::new()),
                 styles: RefCell::new(Vec::new()),
             })
@@ -171,6 +177,7 @@ impl FontEngine {
     /// Install the style table the layout pass will index with its `StyleId`s.
     pub fn begin_layout(&self, styles: Vec<Style>) {
         *self.styles.borrow_mut() = styles;
+        self.analyzed.borrow_mut().clear();
         // Content-addressed run cache stays valid across documents; face handles
         // depend only on (family, weight, slant) so they do too.
     }
@@ -291,32 +298,58 @@ impl FontEngine {
         size: Pt,
         tracking: f32,
     ) -> Vec<GlyphRun> {
-        let slice = &text[range.clone()];
-        let mut out = Vec::new();
-        let mut at = 0usize;
-        while at < slice.len() {
-            let rest = &slice[at..];
-            // Nothing on the request's list has the next character. Draw it from the
-            // requested face anyway: `.notdef` is a box a reader can see and a report can
-            // count, while stopping here turns the rest of the run into invisible text.
-            let face = match self.resolve_face(req, rest) {
-                Some(f) => f,
-                None => match self.face_for(&req.family, req.weight, req.italic) {
-                    Some(f) => f,
-                    // No face at all -- a machine with no fonts, or a family that was
-                    // uninstalled mid-run. There is nothing left to draw with.
-                    None => break,
-                },
-            };
-            let taken = self.covered_prefix(face, rest).max(first_char_len(rest));
-            let chunk = &rest[..taken];
-            let mut runs = self.shape_with_face(chunk, range.start + at, face, size, tracking);
-            out.append(&mut runs);
-            at += taken;
+        if !self.analyzed.borrow().contains_key(text) {
+            let bidi = rubrica_type::BidiInfo::new(text, None);
+            let scripts = analysis::scripts(&self.analyzer, text).unwrap_or_default();
+            let mut runs: Vec<TextRun> = Vec::new();
+            let mut unit = 0;
+            for (at, c) in text.char_indices() {
+                let level = bidi.levels[at].number();
+                let script = scripts.get(unit).copied().unwrap_or_default();
+                unit += c.len_utf16();
+                if let Some(last) = runs.last_mut().filter(|r| r.level == level && r.script == script) {
+                    last.range.end = at + c.len_utf8();
+                } else {
+                    runs.push(TextRun { range: at..at + c.len_utf8(), level, script });
+                }
+            }
+            self.analyzed.borrow_mut().insert(text.to_owned(), runs);
         }
-        out
+        let analysis: Vec<_> = self.analyzed.borrow()[text].iter().filter_map(|r| {
+            let start = r.range.start.max(range.start);
+            let end = r.range.end.min(range.end);
+            (start < end).then(|| TextRun { range: start..end, ..r.clone() })
+        }).collect();
+        let mut out = Vec::new();
+        for item in analysis {
+            let slice = &text[item.range.clone()];
+            let mut at = 0usize;
+            while at < slice.len() {
+                let rest = &slice[at..];
+                // Nothing on the request's list has the next character. Draw it from the
+                // requested face anyway: `.notdef` is a box a reader can see and a report can
+                // count, while stopping here turns the rest of the run into invisible text.
+                let face = match self.resolve_face(req, rest) {
+                    Some(f) => f,
+                    None => match self.face_for(&req.family, req.weight, req.italic) {
+                        Some(f) => f,
+                        // No face at all -- a machine with no fonts, or a family that was
+                        // uninstalled mid-run. There is nothing left to draw with.
+                        None => break,
+                    },
+                };
+                let taken = self.covered_prefix(face, rest).max(first_char_len(rest));
+                let chunk = &rest[..taken];
+                let mut runs = self.shape_with_face(chunk, item.range.start + at, face, size, tracking, &item);
+                out.append(&mut runs);
+                at += taken;
+            }
+        }
+        let levels: Vec<_> = out.iter().map(|r| rubrica_type::Level::new(r.bidi_level).unwrap()).collect();
+        rubrica_type::BidiInfo::reorder_visual(&levels).into_iter().map(|i| out[i].clone()).collect()
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn shape_with_face(
         &self,
         text: &str,
@@ -324,9 +357,13 @@ impl FontEngine {
         face: usize,
         size: Pt,
         tracking: f32,
+        item: &TextRun,
     ) -> Vec<GlyphRun> {
         let units: Vec<u16> = text.encode_utf16().collect();
         let key = ShapeKey {
+            bidi_level: item.level,
+            script: item.script.script,
+            shapes: item.script.shapes.0,
             face,
             size_q: (size * 64.0).round() as i32,
             track_q: (tracking * 4096.0).round() as i32,
@@ -361,8 +398,8 @@ impl FontEngine {
         let scale = size / upem;
         let n = units.len() as u32;
 
-        let sa =
-            DWRITE_SCRIPT_ANALYSIS { script: SCRIPT_COMMON, shapes: DWRITE_SCRIPT_SHAPES_DEFAULT };
+        let sa = item.script;
+        let rtl = item.level % 2 == 1;
         let nul = utf16("");
 
         // A shaping pass can expand past the character count; grow and retry.
@@ -379,7 +416,7 @@ impl FontEngine {
                     n,
                     Some(&face_obj),
                     false,
-                    false,
+                    rtl,
                     &sa,
                     PCWSTR(nul.as_ptr()),
                     None,
@@ -423,7 +460,7 @@ impl FontEngine {
                 Some(&face_obj),
                 size,
                 false,
-                false,
+                rtl,
                 &sa,
                 PCWSTR(nul.as_ptr()),
                 None,
@@ -446,14 +483,16 @@ impl FontEngine {
         }
         if tracking != 0.0 {
             for a in advances.iter_mut() {
-                *a += tracking * size;
+                // Combining marks and bidi controls have no advance of their own.
+                if *a > 0.0 { *a += tracking * size; }
             }
         }
         let run = GlyphRun {
+            bidi_level: item.level,
             face,
             size,
             text: text_start..text_start + text.len(),
-            clusters: cluster_map.iter().take(count as usize).copied().collect(),
+            clusters: cluster_map,
             glyphs,
             advances,
             offsets,

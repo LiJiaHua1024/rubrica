@@ -17,6 +17,10 @@ pub struct Placed {
     pub x: Pt,
     pub w: Pt,
     pub node: Option<u32>,
+    /// Logical UTF-8 source range, including real spaces, set by `place_bidi`.
+    pub source: Option<(usize, usize)>,
+    /// Resolved UBA level for this slot; odd levels read right to left.
+    pub bidi_level: u8,
 }
 
 /// Lay out one line at its target width. Ragged lines get natural widths -- unless
@@ -56,7 +60,7 @@ pub fn place(para: &Paragraph, line: &Line) -> Vec<Placed> {
         match items[i] {
             Item::Box { node } => {
                 let w = f64::from(para.node(node).advance);
-                out.push(Placed { x: x as Pt, w: w as Pt, node: Some(node) });
+                out.push(Placed { x: x as Pt, w: w as Pt, node: Some(node), source: None, bidi_level: 0 });
                 x += w;
             }
             Item::Glue { base, stretch, shrink, .. } => {
@@ -79,7 +83,7 @@ pub fn place(para: &Paragraph, line: &Line) -> Vec<Placed> {
                         w += give * (avail / total);
                     }
                 }
-                out.push(Placed { x: x as Pt, w: w as Pt, node: None });
+                out.push(Placed { x: x as Pt, w: w as Pt, node: None, source: None, bidi_level: 0 });
                 x += w;
             }
             Item::Penalty { .. } => {
@@ -94,7 +98,7 @@ pub fn place(para: &Paragraph, line: &Line) -> Vec<Placed> {
     // glyph by the solver; here it is given a slot so the painter draws it.
     if let Some(h) = line.hyphen {
         let node = para.node(h);
-        out.push(Placed { x: x as Pt, w: f64::from(node.advance) as Pt, node: Some(h) });
+        out.push(Placed { x: x as Pt, w: f64::from(node.advance) as Pt, node: Some(h), source: None, bidi_level: 0 });
     }
     out
 }
@@ -102,4 +106,49 @@ pub fn place(para: &Paragraph, line: &Line) -> Vec<Placed> {
 /// Right edge of a placed line, for assertions and for hanging punctuation.
 pub fn line_width(placed: &[Placed]) -> Pt {
     placed.last().map(|p| p.x + p.w).unwrap_or(0.0)
+}
+
+/// Apply UAX #9 L1/L2 after logical line breaking and glue trimming. Return slots
+/// in visual order, with left-edge coordinates; glyph direction is still per run.
+/// Keeping the analysis outside this function lets all lines share one UBA pass.
+pub fn place_bidi(para: &Paragraph, line: &Line, bidi: &crate::BidiInfo<'_>) -> Vec<Placed> {
+    let mut slots = place(para, line);
+    let ranges: Vec<_> = slots.iter().filter_map(|s| s.node)
+        .map(|n| para.node(n).text.clone()).filter(|r| !r.is_empty()).collect();
+    let Some(first) = ranges.first() else { return slots };
+    let end = ranges.last().unwrap().end;
+    let Some(p) = bidi.paragraphs.iter().find(|p| p.range.contains(&first.start)) else {
+        return slots;
+    };
+    let levels = bidi.reordered_levels(p, first.start..end);
+    let mut cursor = first.start;
+    let mut slot_levels = Vec::new();
+    for i in 0..slots.len() {
+        let level = if let Some(n) = slots[i].node {
+            let r = &para.node(n).text;
+            cursor = r.end;
+            slots[i].source = Some((r.start, r.end));
+            let at = if r.is_empty() { r.start.saturating_sub(1) } else { r.start };
+            levels.get(at).copied().unwrap_or(p.level)
+        } else {
+            let next = slots[i + 1..].iter().filter_map(|s| s.node)
+                .map(|n| para.node(n).text.start).next().unwrap_or(cursor);
+            slots[i].source = Some((cursor, next));
+            let level = if cursor < next { levels[cursor] } else {
+                slot_levels.last().copied().unwrap_or(p.level)
+            };
+            cursor = next;
+            level
+        };
+        slots[i].bidi_level = level.number();
+        slot_levels.push(level);
+    }
+    let width: Pt = slots.iter().map(|s| s.w).sum();
+    let mut x = if p.level.is_rtl() { (line.target - width).max(0.0) } else { 0.0 };
+    crate::BidiInfo::reorder_visual(&slot_levels).into_iter().map(|i| {
+        let mut slot = slots[i];
+        slot.x = x;
+        x += slot.w;
+        slot
+    }).collect()
 }

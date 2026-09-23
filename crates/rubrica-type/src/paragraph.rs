@@ -294,8 +294,15 @@ pub fn build(
     measure: &mut dyn Measure,
 ) -> Paragraph {
     let mut p = Paragraph { nodes: Vec::new(), items: Vec::new() };
+    // Direction changes split shaping boxes, but do not create line breaks.
+    let bidi = crate::BidiInfo::new(text, None);
     // Split points: every permitted break, plus hard breaks.
     let mut cuts: Vec<(usize, bool)> = Vec::with_capacity(breaks.len() + 1);
+    for (at, _) in text.char_indices().skip(1) {
+        if bidi.levels[at] != bidi.levels[at - 1] {
+            cuts.push((at, false));
+        }
+    }
     for &(at, required) in breaks {
         if at > 0 && at < text.len() {
             cuts.push((at, required));
