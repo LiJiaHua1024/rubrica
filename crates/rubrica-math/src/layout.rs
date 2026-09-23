@@ -24,7 +24,9 @@
 //! stands in, so a formula still sets acceptably in a font like Consolas instead of
 //! collapsing.
 
-use crate::parse::{AccentKind, ArrayKind, BarSide, BigRole, ColAlign, FracStyle, Limits, Node};
+use crate::parse::{
+    AccentKind, ArrayKind, BarSide, BigRole, ColAlign, FracStyle, Limits, MathStyle, Node,
+};
 use crate::table::constant;
 
 pub type Pt = f32;
@@ -266,6 +268,20 @@ impl Engine<'_> {
                 Rulings { rows: rules, columns: col_rules },
                 st,
             ),
+            Node::Styled { body, style } => {
+                // The switch's whole job is to hand the body a different style: a
+                // displayed fraction keeps its proportions and a `\sum` stacks its
+                // limits, and the two script sizes are the face's own percentages rather
+                // than a size this file invents.
+                let mut s = st;
+                match style {
+                    MathStyle::Display => s.display = true,
+                    MathStyle::Text => s.display = false,
+                    MathStyle::Script => s.size = self.script_size(st, 1),
+                    MathStyle::ScriptScript => s.size = self.script_size(st, 2),
+                }
+                self.lay(body, s)
+            }
             Node::Space(mu) => (
                 Vec::new(),
                 Mb { width: *mu as Pt / 18.0 * st.size, ..Default::default() },

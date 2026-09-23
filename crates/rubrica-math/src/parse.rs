@@ -103,6 +103,10 @@ pub enum Node {
     Boxed { body: Box<Node> },
     /// A fixed space, in mu (1/18 em).
     Space(i16),
+    /// `\displaystyle`, `\textstyle`, `\scriptstyle`, `\scriptscriptstyle`: the body is
+    /// the group the switch was written in, as far as this parser can tell it -- see
+    /// [`MathStyle`].
+    Styled { body: Box<Node>, style: MathStyle },
     /// A grid of cells: the `matrix`, `cases`, `aligned` and `array` families, which
     /// are the only forms in the language that need more than one row.
     ///
@@ -261,6 +265,9 @@ pub struct Parser<'a> {
     /// that knows whether the rule it stands for goes above the next row or below the
     /// last one.
     hline: bool,
+    /// A style switch read while collecting, which the run it belongs to wraps itself in
+    /// when it closes. See [`Node::Styled`].
+    style: Option<MathStyle>,
     /// The boundaries an environment's rows were read with, claimed by the builder that
     /// read them. See [`Parser::env_rows`].
     row_rules: Vec<bool>,
@@ -284,7 +291,19 @@ enum Infix {
     Above,
 }
 
-/// What a run of nodes is being collected up to. Inside an environment the cell and
+/// The style a run of the formula asks to be set in, written with TeX's four switch
+/// commands. These are not decoration: `\displaystyle` is what makes a fraction in an
+/// inline formula keep its displayed proportions and a `\sum` stack its limits, and
+/// `\scriptstyle` is the name for the size two levels down.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MathStyle {
+    Display,
+    Text,
+    Script,
+    ScriptScript,
+}
+
+/// The style a run of nodes is being collected up to. Inside an environment the cell and
 /// row separators are structure, so they end the run instead of turning into text.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Ctx {
@@ -311,6 +330,7 @@ impl<'a> Parser<'a> {
             welding: false,
             infix: None,
             hline: false,
+            style: None,
             row_rules: Vec::new(),
         }
     }
@@ -465,6 +485,13 @@ impl<'a> Parser<'a> {
                 Node::Fence { left, right, body: Box::new(body) }
             }
         }
+        if let Some(mode) = self.style.take() {
+            // The switch styles the run it was read in. A group nested where it was
+            // written closes first and claims it, which is the scope TeX's own gives:
+            // `\(\displaystyle ... \)` never reaches out of its parentheses.
+            let body = std::mem::take(&mut out);
+            out.push(Node::Styled { body: Box::new(Node::Row(body)), style: mode });
+        }
         out
     }
 
@@ -602,6 +629,12 @@ impl<'a> Parser<'a> {
                 has_bar: true,
                 style: FracStyle::Auto,
             },
+            // The four style switches take no argument: they ask how the rest of the
+            // group is to be set, and the run wraps itself when it closes.
+            "displaystyle" => self.style_switch(MathStyle::Display),
+            "textstyle" => self.style_switch(MathStyle::Text),
+            "scriptstyle" => self.style_switch(MathStyle::Script),
+            "scriptscriptstyle" => self.style_switch(MathStyle::ScriptScript),
             // A rule across the grid, recorded for the environment reader to place at the
             // boundary it was written at; nothing is emitted here, because `hline` as a
             // word in the middle of a cell is the bug being fixed.
@@ -855,6 +888,13 @@ impl<'a> Parser<'a> {
         let label = self.argument();
         let base = self.argument();
         Node::Stack { base: Box::new(base), label: Box::new(label), side }
+    }
+
+    /// A style switch, which emits nothing itself: the run being collected wraps itself
+    /// in [`Node::Styled`] when it closes. See [`MathStyle`].
+    fn style_switch(&mut self, mode: MathStyle) -> Node {
+        self.style = Some(mode);
+        Node::Atom(String::new())
     }
 
     /// The argument of an alphabet-switching command, read *inside* that alphabet:
@@ -1640,6 +1680,7 @@ mod tests {
             Node::Stack { base, label, side } =>
                 format!("(stack {side:?} {} {})", sexp(base), sexp(label)),
             Node::Boxed { body } => format!("(boxed {})", sexp(body)),
+            Node::Styled { body, style } => format!("(style {style:?} {})", sexp(body)),
             Node::Space(mu) => format!("(space {mu})"),
             // Columns print as the `l`/`c`/`r` letters they were written with, rows
             // separated by ` / ` and cells by ` & `, which is the shape of the source.

@@ -484,6 +484,46 @@ mod tests {
     }
 
     #[test]
+    fn a_style_switch_restates_the_proportions_around_it() {
+        // The four switches take no argument and change what the run around them means:
+        // in an inline formula `\displaystyle` is the difference between a `\sum` whose
+        // limits ride beside it and one that stacks them, and it is what the face's
+        // display constants are read for at all.
+        let mut m = Mock::mathy();
+        let inline = set("\\sum_i", 10.0, false, &mut m);
+        let displayed = set("\\displaystyle\\sum_i", 10.0, false, &mut m);
+        let beside = |f: &Formula| {
+            f.shapes.iter().find_map(|s| match s {
+                Shape::Run { text, x, .. } if plain(text) == "i" => Some(*x),
+                _ => None,
+            })
+        };
+        let (plain_i, stacked_i) = (beside(&inline).unwrap(), beside(&displayed).unwrap());
+        assert!(
+            plain_i >= 5.0,
+            "inline, the limit rides after the operator, not under it: {plain_i}"
+        );
+        assert!(stacked_i < plain_i, "display, it is stacked under: {stacked_i}");
+        // The script sizes are the face's own percentages, two steps apart.
+        let size_of = |src: &str| {
+            typeset(src, 10.0, false, &mut Mock::mathy())
+                .shapes
+                .iter()
+                .map(|s| match s {
+                    Shape::Run { size, .. } => *size,
+                    _ => 0.0,
+                })
+                .fold(0.0f32, f32::max)
+        };
+        near(size_of("\\scriptstyle x"), 7.5, "one step down at the table's 75 percent");
+        near(size_of("\\scriptscriptstyle x"), 3.75, "two steps, composed");
+        assert_eq!(size_of("\\textstyle \\frac{1}{2}"), 10.0, "a style is not a size");
+        // A switch stays inside the group that wrote it.
+        let nested = typeset("{\\displaystyle x} y", 10.0, false, &mut Mock::mathy());
+        assert!(!nested.shapes.is_empty() && nested.width > 0.0, "{nested:?}");
+    }
+
+    #[test]
     fn a_stacked_label_is_centred_over_its_base_and_lifts_the_box() {
         let f = set("\\overset{nn}{=}", 10.0, false, &mut Mock::mathy());
         let (x, y, size) = one(&f, "nn");
