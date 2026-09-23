@@ -101,6 +101,12 @@ pub enum Node {
         columns: Vec<ColAlign>,
         kind: ArrayKind,
         delimiters: Option<(char, char)>,
+        /// A rule across the grid before row `i`, for `i` in `0..=rows.len()`: the last
+        /// entry is the rule *below* the last row, which is where an author written
+        /// `\hline` before `\end` puts it. One entry per boundary, so `rules.len()` is
+        /// always one more than `rows.len()` -- `\hline` twice in a row is one rule,
+        /// because two adjacent rules would be drawn on top of each other.
+        rules: Vec<bool>,
     },
 }
 
@@ -220,6 +226,13 @@ pub struct Parser<'a> {
     /// An infix fraction command seen while collecting, waiting for the run around it to
     /// be assembled into the two halves it asks for. See [`Parser::list`].
     infix: Option<Infix>,
+    /// Set by an `\hline` and claimed by the environment reader, which is the only thing
+    /// that knows whether the rule it stands for goes above the next row or below the
+    /// last one.
+    hline: bool,
+    /// The boundaries an environment's rows were read with, claimed by the builder that
+    /// read them. See [`Parser::env_rows`].
+    row_rules: Vec<bool>,
 }
 
 /// The two commands that sit *between* their operands instead of in front of them.
@@ -251,7 +264,15 @@ pub fn parse(src: &str) -> Node {
 
 impl<'a> Parser<'a> {
     pub fn new(s: &'a str) -> Parser<'a> {
-        Parser { src: s.as_bytes(), at: 0, alphabet: None, welding: false, infix: None }
+        Parser {
+            src: s.as_bytes(),
+            at: 0,
+            alphabet: None,
+            welding: false,
+            infix: None,
+            hline: false,
+            row_rules: Vec::new(),
+        }
     }
 
     /// Parse the whole input as a row.
@@ -535,6 +556,13 @@ impl<'a> Parser<'a> {
                 has_bar: true,
                 style: FracStyle::Auto,
             },
+            // A rule across the grid, recorded for the environment reader to place at the
+            // boundary it was written at; nothing is emitted here, because `hline` as a
+            // word in the middle of a cell is the bug being fixed.
+            "hline" => {
+                self.hline = true;
+                Node::Atom(String::new())
+            }
             // The infix pair, which is the one place in this subset where a command does
             // not stand in front of its arguments: TeX takes the whole run before it as
             // the numerator and the whole run after it as the denominator, so `list` is
@@ -719,6 +747,7 @@ impl<'a> Parser<'a> {
                     columns: columns_for(ArrayKind::Gathered, &[], cols),
                     kind: ArrayKind::Gathered,
                     delimiters: None,
+                    rules: std::mem::take(&mut self.row_rules),
                 }
             }
             // A modifier on the preceding big operator, which the layout reads off
@@ -834,7 +863,13 @@ impl<'a> Parser<'a> {
         let cols = rows.iter().map(|r| r.len()).max().unwrap_or(0).max(1);
         let columns = columns_for(kind, &spec, cols);
         let rows = rows.into_iter().map(|r| r.into_iter().map(Node::Row).collect()).collect();
-        Node::Array { rows, columns, kind, delimiters: env_delimiters(&name) }
+        Node::Array {
+            rows,
+            columns,
+            kind,
+            delimiters: env_delimiters(&name),
+            rules: std::mem::take(&mut self.row_rules),
+        }
     }
 
     /// The cells of an environment's body, split on `&` and `\\`, and the name its
@@ -845,8 +880,17 @@ impl<'a> Parser<'a> {
         let mut rows: Vec<Vec<Vec<Node>>> = Vec::new();
         let mut row: Vec<Vec<Node>> = Vec::new();
         let mut end = None;
+        // One entry per boundary: before each row, and one after the last. Written here
+        // rather than returned because the rules belong to the grid the rows become, and
+        // both of this file's grid builders read the body through this one function.
+        self.row_rules.clear();
+        let mut rule = false;
         loop {
             let cell = self.list(Ctx::Cell);
+            // Claimed even when the cell turns out to be empty: an `\hline` on a line of
+            // its own is a rule at this boundary, not a row of nothing.
+            rule |= self.hline;
+            self.hline = false;
             if self.peek() == Some(b'&') {
                 self.bump();
                 row.push(cell);
@@ -860,16 +904,21 @@ impl<'a> Parser<'a> {
                 if !blank {
                     row.push(cell);
                     rows.push(std::mem::take(&mut row));
+                    self.row_rules.push(rule);
+                    rule = false;
                 }
                 continue;
             }
             if !blank {
                 row.push(cell);
                 rows.push(std::mem::take(&mut row));
+                self.row_rules.push(rule);
+                rule = false;
             }
             if self.at_end() {
                 end = self.eat_end();
             }
+            self.row_rules.push(rule);
             return (rows, end);
         }
     }
@@ -1434,7 +1483,9 @@ mod tests {
             Node::Space(mu) => format!("(space {mu})"),
             // Columns print as the `l`/`c`/`r` letters they were written with, rows
             // separated by ` / ` and cells by ` & `, which is the shape of the source.
-            Node::Array { rows, columns, kind, delimiters } => format!(
+            // The rules are left out of the sketch -- they are asserted where they are
+            // the thing under test, on the node itself.
+            Node::Array { rows, columns, kind, delimiters, .. } => format!(
                 "(array {kind:?} {} {} {})",
                 columns.iter().map(col_letter).collect::<String>(),
                 delimiters.map_or_else(
@@ -1563,6 +1614,45 @@ mod tests {
         let bmod = of("a\\bmod b");
         assert!(bmod.contains(" mod ") && !bmod.contains("bmod"), "{bmod}");
         assert_eq!(of("x\\qed"), "(x ∎)", "the tombstone closes a proof, it does not name it");
+    }
+
+    /// The rule boundaries of the grid a formula is, which is what an `\hline` decides.
+    fn rules_of(src: &str) -> Vec<bool> {
+        match &parse(src) {
+            Node::Row(v) => match &v[..] {
+                [Node::Array { rules, .. }] => rules.clone(),
+                [Node::Fence { body, .. }] => match &**body {
+                    Node::Array { rules, .. } => rules.clone(),
+                    other => panic!("not a grid in a fence: {other:?}"),
+                },
+                other => panic!("not one grid: {other:?}"),
+            },
+            other => panic!("not one grid: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_rule_across_a_grid_belongs_to_the_boundary_it_was_written_at() {
+        // `\hline` used to arrive in the first cell as the word `hline`, because the
+        // environment reader hands every command to `list` and `list` did not know it.
+        // One entry per boundary: above each row, plus one below the last.
+        assert_eq!(
+            rules_of("\\begin{array}{c}\\hline a\\\\b\\\\\\hline\\end{array}"),
+            vec![true, false, true],
+        );
+        // A rule written between two rows is the middle boundary and nothing at the ends.
+        assert_eq!(rules_of("\\begin{matrix}a\\\\\\hline b\\end{matrix}"), [false, true, false]);
+        // A grid with no rules in it still reports one `false` per boundary, so the
+        // layout never has to guess whether the author meant none or wrote none yet.
+        assert_eq!(rules_of("\\begin{matrix}a\\\\b\\\\c\\end{matrix}"), [false; 4]);
+        assert_eq!(rules_of("\\begin{matrix}a\\end{matrix}"), [false, false]);
+        // The name never reaches a cell, however the column spec is written.
+        let g = of("\\begin{array}{|c|}\\hline 1\\\\\\hline 2\\\\\\hline\\end{array}");
+        assert!(!g.contains("hline"), "{g}");
+        assert_eq!(
+            rules_of("\\begin{array}{|c|}\\hline 1\\\\\\hline 2\\\\\\hline\\end{array}"),
+            [true, true, true],
+        );
     }
 
     #[test]

@@ -242,8 +242,14 @@ impl Engine<'_> {
             Node::Bar { body, side } => self.bar(body, *side, st),
             Node::Stack { base, label, side } => self.stack(base, label, *side, st),
             Node::Boxed { body } => self.boxed(body, st),
-            Node::Array { rows, columns, kind, delimiters } =>
-                self.array(rows, columns, *kind, *delimiters, st),
+            Node::Array { rows, columns, kind, delimiters, rules } => self.array(
+                rows,
+                columns,
+                *kind,
+                *delimiters,
+                rules,
+                st,
+            ),
             Node::Space(mu) => (
                 Vec::new(),
                 Mb { width: *mu as Pt / 18.0 * st.size, ..Default::default() },
@@ -427,6 +433,7 @@ impl Engine<'_> {
         columns: &[ColAlign],
         kind: ArrayKind,
         delimiters: Option<(char, char)>,
+        rules: &[bool],
         st: Style,
     ) -> (Vec<Shape>, Mb) {
         // Cells are dependent material, so text style and cramped exactly as a
@@ -513,6 +520,27 @@ impl Engine<'_> {
             b.descent = b.descent.max(falls[i] + baselines[i]);
         }
         b.width = grid_w;
+        // `\hline`: a rule across the grid at the boundary it was written at, in the
+        // middle of the clearance the rows already keep apart -- the gap is at least
+        // three rule thicknesses, so a rule never touches the ink above or under it,
+        // and the grid does not have to grow for one.
+        let t = self.rules(1.0, inner.size);
+        for i in rules.iter().enumerate().filter(|(_, r)| **r).map(|(i, _)| i) {
+            let line = if i == 0 {
+                baselines.first().map_or(0.0, |b0| b0 - rises[0] - gap / 2.0)
+            } else if i >= laid.len() {
+                let last = laid.len() - 1;
+                baselines[last] + falls[last] + gap / 2.0
+            } else {
+                (baselines[i] - rises[i] + baselines[i - 1] + falls[i - 1]) / 2.0
+            };
+            out.push(Shape::Rule { x: 0.0, y: line - t / 2.0, width: grid_w, thickness: t });
+            if i == 0 {
+                b.ascent = b.ascent.max(t / 2.0 - line);
+            } else if i >= laid.len() {
+                b.descent = b.descent.max(line + t / 2.0);
+            }
+        }
         match delimiters {
             Some((left, right)) => self.fenced(left, right, &out, b, st),
             None => (out, b),

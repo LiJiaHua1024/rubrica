@@ -430,6 +430,32 @@ mod tests {
     }
 
     #[test]
+    fn a_ruled_grid_draws_its_rules_across_the_grid() {
+        let f = set(
+            "\\begin{array}{c}\\hline a\\\\ b\\\\\\hline\\end{array}",
+            10.0,
+            true,
+            &mut Mock::mathy(),
+        );
+        let edges = frame(&f);
+        assert_eq!(edges.len(), 2, "one rule above the first row, one below the last");
+        for (_, _, w, t) in &edges {
+            near(*w, 5.0, "a rule spans the grid, which is one cell wide");
+            near(*t, 1.0, "and is one default rule thick");
+        }
+        // The two rules are the grid's own extremes, so they sit the same distance above
+        // and below the axis the block is centred on -- which is the fact a mis-centred
+        // rule would break, and it does not depend on how tall the rows happen to be.
+        let (top, bottom) = (edges[0].1 + 0.5, edges[1].1 + 0.5);
+        near((top + bottom) / 2.0, -4.0, "the rules are equidistant from the axis");
+        // And the box knows it: a rule is ink, so the outer edge of each is what the
+        // ascent and the descent are measured to -- which is what stops a line of text
+        // or a grown delimiter from drawing over one.
+        near(-f.ascent, edges[0].1, "the top rule's upper edge is the top of the box");
+        near(f.descent, edges[1].1 + 1.0, "and the bottom rule's lower edge its bottom");
+    }
+
+    #[test]
     fn a_stacked_label_is_centred_over_its_base_and_lifts_the_box() {
         let f = set("\\overset{nn}{=}", 10.0, false, &mut Mock::mathy());
         let (x, y, size) = one(&f, "nn");
