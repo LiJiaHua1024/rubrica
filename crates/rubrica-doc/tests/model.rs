@@ -777,3 +777,13 @@ fn tracked_note_fixture_keeps_cell_math_and_footnotes() {
     }).count();
     assert_eq!(math, 2, "formulas in cells must stay attached to their cells");
 }
+
+#[test]
+fn a_soft_wrapped_term_stays_one_term() {
+    let doc = Document::parse("A long term\ncontinues here\n: its definition\n");
+    assert_eq!(doc.blocks.len(), 2);
+    assert_eq!(doc.blocks[0].kind, BlockKind::Term);
+    assert_eq!(doc.blocks[0].text, "A long term continues here");
+    assert_eq!(doc.blocks[1].kind, BlockKind::Definition);
+    assert_eq!(doc.blocks[1].text, "its definition");
+}

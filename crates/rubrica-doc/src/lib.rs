@@ -1017,14 +1017,32 @@ fn split_definitions(b: Block, breaks: Vec<usize>) -> Vec<Block> {
     if !lines.iter().any(|r| opens_a_definition(&b.text, r)) {
         return vec![b];
     }
-    lines
-        .into_iter()
-        .filter_map(|r| {
-            let def = opens_a_definition(&b.text, &r);
-            let head = r.start + if def { leading_definition(&b.text, &r) } else { 0 };
-            piece(&b, head..r.end, if def { BlockKind::Definition } else { BlockKind::Term })
-        })
-        .collect()
+    let mut pieces = Vec::new();
+    let mut term: Option<std::ops::Range<usize>> = None;
+    for r in lines {
+        if opens_a_definition(&b.text, &r) {
+            if let Some(range) = term.take() {
+                if let Some(part) = piece(&b, range, BlockKind::Term) {
+                    pieces.push(part);
+                }
+            }
+            let head = r.start + leading_definition(&b.text, &r);
+            if let Some(part) = piece(&b, head..r.end, BlockKind::Definition) {
+                pieces.push(part);
+            }
+        } else if let Some(range) = term.as_mut() {
+            // Soft-wrapped lines before a definition are one term, not new terms.
+            range.end = r.end;
+        } else {
+            term = Some(r);
+        }
+    }
+    if let Some(range) = term {
+        if let Some(part) = piece(&b, range, BlockKind::Term) {
+            pieces.push(part);
+        }
+    }
+    pieces
 }
 
 /// True for a line that opens with a colon and a space, which is the whole syntax.
