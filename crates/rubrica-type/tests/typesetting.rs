@@ -12,6 +12,28 @@ use rubrica_type::{Hyphenation, Paragraph, Plan, typeset, typeset_hyphenated};
 
 const SIZE: Pt = 16.0;
 
+#[test]
+fn korean_keep_all_retains_words_across_style_changes_and_forced_breaks() {
+    let text = "한국어 단어\n다음 中文";
+    let mut spacing = Spacing::for_size(SIZE);
+    spacing.keep_korean_words = true;
+    let spans = [StyleSpan { range: 3..6, style: StyleId(1) }];
+    let mut measure = MonospaceMeasure { size: SIZE, factor: 1.0 };
+    let mut options = BreakOptions::new(3.5 * SIZE);
+    options.ragged = true;
+    let (para, plan) = typeset(text, &spacing, StyleId(0), &spans, &options, &mut measure);
+    let lines: Vec<_> = plan.lines.iter().map(|l| text_of(&para, text, l)).collect();
+    assert_eq!(&lines[..2], ["한국어", "단어"]);
+    assert!(lines[2].starts_with("다음"));
+    assert_eq!(lines[2..].concat(), "다음中文");
+    assert!(para.nodes.iter().any(|n| n.style == StyleId(1)));
+    // The setting only suppresses Korean word-internal opportunities.
+    let chinese = "中文排版测试";
+    let (para, plan) = typeset(chinese, &spacing, StyleId(0), &[], &options, &mut measure);
+    assert!(plan.lines.len() > 1);
+    assert_eq!(plan.lines.iter().map(|l| text_of(&para, chinese, l)).collect::<String>(), chinese);
+}
+
 fn set(text: &str, column: Pt) -> (Paragraph, Plan) {
     set_indent(text, column, 0.0)
 }

@@ -85,6 +85,8 @@ pub struct Spacing {
     /// author's alignment was never meant to be seen. On for a monospace block, where
     /// the run *is* the alignment: a column drawn with spaces has to keep its column.
     pub literal_space_runs: bool,
+    /// Keep Korean syllables in the same word together; spaces remain breakable.
+    pub keep_korean_words: bool,
 }
 
 impl Spacing {
@@ -104,6 +106,7 @@ impl Spacing {
             cjk_join: GlueRecipe { base: 0.0, stretch: size * 0.08, shrink: 0.0 },
             mixed: GlueRecipe { base: size * 0.25, stretch: size * 0.125, shrink: size * 0.125 },
             literal_space_runs: false,
+            keep_korean_words: false,
         }
     }
 
@@ -519,10 +522,7 @@ pub fn paragraph_from_text_hyphenated(
     hyphenation: &Hyphenation<'_>,
     measure: &mut dyn Measure,
 ) -> Paragraph {
-    use unicode_linebreak::BreakOpportunity;
-    let breaks: Vec<(usize, bool)> = unicode_linebreak::linebreaks(text)
-        .map(|(at, kind)| (at, kind == BreakOpportunity::Mandatory))
-        .collect();
+    let breaks = break_opportunities(text, spacing);
     build(
         text,
         &breaks,
@@ -546,10 +546,7 @@ pub fn paragraph_from_text(
     spans: &[StyleSpan],
     measure: &mut dyn Measure,
 ) -> Paragraph {
-    use unicode_linebreak::BreakOpportunity;
-    let breaks: Vec<(usize, bool)> = unicode_linebreak::linebreaks(text)
-        .map(|(at, kind)| (at, kind == BreakOpportunity::Mandatory))
-        .collect();
+    let breaks = break_opportunities(text, spacing);
     build(
         text,
         &breaks,
@@ -563,4 +560,16 @@ pub fn paragraph_from_text(
         },
         measure,
     )
+}
+
+fn break_opportunities(text: &str, spacing: &Spacing) -> Vec<(usize, bool)> {
+    use unicode_linebreak::BreakOpportunity;
+    let hangul = |c: char| matches!(c as u32,
+        0x1100..=0x11ff | 0x3130..=0x318f | 0xa960..=0xa97f | 0xac00..=0xd7ff);
+    unicode_linebreak::linebreaks(text)
+        .map(|(at, kind)| (at, kind == BreakOpportunity::Mandatory))
+        .filter(|&(at, mandatory)| mandatory || !spacing.keep_korean_words
+            || !(text[..at].chars().next_back().is_some_and(hangul)
+                && text[at..].chars().next().is_some_and(hangul)))
+        .collect()
 }

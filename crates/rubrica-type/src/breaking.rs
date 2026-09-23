@@ -248,7 +248,13 @@ fn score(
     // scores the line as if it had no shrinkable glue at all and reaches for a break.
     let sh = if opts.tight_box { 0.0 } else { f64::from(shrink) };
     let eps = f64::from(EPSILON);
-    let (ratio, bad) = if delta > eps {
+    let (ratio, bad) = if delta > eps && opts.ragged {
+        // Ragged alignment leaves free space at the edge. A one-word line has no
+        // internal glue at all, but that must not make its unused margin illegal.
+        let r = if stretch >= INFINITY / 2.0 { 0.0 }
+            else { (delta / f64::from(target.max(EPSILON))) as Pt };
+        (r, badness(3.0 * r))
+    } else if delta > eps {
         if st <= eps {
             (10.0, 10000)
         } else {
@@ -264,8 +270,8 @@ fn score(
 
     // Overfull (shrink-starved) lines are legal but cost enormously -- that is how
     // TeX reports them instead of dropping text. Underfull ones beyond tolerance
-    // are simply not allowed, except in a ragged block, where leftover space is
-    // free and the widest-edge-wins tie-break fills lines greedily.
+    // are simply not allowed, except in a ragged block, where margin space costs
+    // less than stretching the words and even a single-word line is legal.
     if delta > 0.0 && bad > tolerance && !(opts.ragged && bad < 10000) {
         return None;
     }
