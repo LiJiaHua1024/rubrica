@@ -15,6 +15,7 @@ mod hyphen;
 mod images;
 mod math;
 mod report;
+mod reading;
 mod sample;
 mod settings;
 mod tables;

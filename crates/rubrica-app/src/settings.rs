@@ -1,7 +1,7 @@
 //! What the reader has chosen about the page, what they had open and where they left the
 //! window, kept for the next one.
 //!
-//! Ten numbers and one path under `Software\Rubrica` in the current user's registry,
+//! Appearance, window geometry and per-document preferences under `Software\Rubrica`,
 //! which is where a Windows program puts them: no path to choose for a settings file, no
 //! format to invent, no dependency to carry, and the palette the system prefers is
 //! already read out of the same store.
@@ -101,7 +101,7 @@ fn read(zoom: Option<u32>, dark: Option<u32>, face: Option<u32>, measure: Option
 }
 
 /// One number, or `None` when this machine has nothing of that name to give.
-fn word(sub: &str, name: &str) -> Option<u32> {
+pub(crate) fn word(sub: &str, name: &str) -> Option<u32> {
     let sub = utf16(sub);
     let name = utf16(name);
     let mut value = 0u32;
@@ -141,7 +141,7 @@ fn write_words(sub: &str, w: &[u32; 4]) {
 }
 
 /// One number, put under `name`.
-fn write_word(sub: &str, name: &str, value: u32) {
+pub(crate) fn write_word(sub: &str, name: &str, value: u32) {
     let sub = utf16(sub);
     let wide = utf16(name);
     let r = unsafe {
@@ -174,8 +174,91 @@ pub fn load() -> Settings {
     read_words(SUBKEY)
 }
 
+pub fn keep_line_breaks() -> bool {
+    word(SUBKEY, "KeepLineBreaks") == Some(1)
+}
+
+pub fn record_line_breaks(keep: bool) {
+    write_word(SUBKEY, "KeepLineBreaks", u32::from(keep));
+}
+
+pub fn editor() -> String {
+    text(SUBKEY, "Editor").filter(|s| !s.is_empty()).unwrap_or_else(|| "notepad.exe".into())
+}
+
+pub fn record_editor(path: &std::path::Path) {
+    write_text(SUBKEY, "Editor", &path.to_string_lossy());
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct DocumentSettings {
+    pub line_breaks: Option<bool>,
+    pub plain: Option<bool>,
+    pub source: bool,
+    pub text: rubrica_doc::plain::TextOptions,
+    pub encoding: crate::reading::Encoding,
+}
+
+impl DocumentSettings {
+    fn words(self) -> [u32; 6] {
+        [self.line_breaks.map_or(2, u32::from), self.plain.map_or(2, u32::from),
+            u32::from(self.source), match self.text.paragraphs {
+                rubrica_doc::plain::ParagraphRule::Auto => 0,
+                rubrica_doc::plain::ParagraphRule::Lines => 1,
+                rubrica_doc::plain::ParagraphRule::BlankLines => 2,
+            }, u32::from(self.text.chapters),
+            crate::reading::Encoding::ALL.iter().position(|e| *e == self.encoding).unwrap_or(0) as u32]
+    }
+
+    fn from_words(w: [Option<u32>; 6]) -> Self {
+        let optional = |v| match v { Some(0) => Some(false), Some(1) => Some(true), _ => None };
+        Self {
+            line_breaks: optional(w[0]), plain: optional(w[1]), source: w[2] == Some(1),
+            text: rubrica_doc::plain::TextOptions {
+                paragraphs: match w[3] {
+                    Some(1) => rubrica_doc::plain::ParagraphRule::Lines,
+                    Some(2) => rubrica_doc::plain::ParagraphRule::BlankLines,
+                    _ => rubrica_doc::plain::ParagraphRule::Auto,
+                },
+                chapters: w[4] != Some(0),
+            },
+            encoding: w[5].and_then(|v| crate::reading::Encoding::ALL.get(v as usize).copied()).unwrap_or_default(),
+        }
+    }
+}
+
+const DOCUMENT_NAMES: [&str; 6] = ["LineBreaks", "Plain", "Source", "Paragraphs", "Chapters", "Encoding"];
+
+fn document_key(path: &std::path::Path) -> (String, String) {
+    // Canonical paths make Explorer, relative links and the open dialog share a record.
+    // Retain the exact path beside the hash so a collision never restores another book.
+    let absolute = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
+    let raw = absolute.to_string_lossy().into_owned();
+    let hash = raw.as_bytes().iter().fold(0xcbf29ce484222325u64,
+        |h, b| (h ^ u64::from(*b)).wrapping_mul(0x100000001b3));
+    (format!("{SUBKEY}\\Documents\\{hash:016x}"), raw)
+}
+
+pub fn document(path: &std::path::Path) -> DocumentSettings {
+    let (sub, raw) = document_key(path);
+    if text(&sub, "Path").as_deref() != Some(raw.as_str()) { return DocumentSettings::default(); }
+    DocumentSettings::from_words(DOCUMENT_NAMES.map(|name| word(&sub, name)))
+}
+
+pub fn record_document(path: &std::path::Path, settings: DocumentSettings) {
+    let (sub, raw) = document_key(path);
+    write_text(&sub, "Path", &raw);
+    for (name, value) in DOCUMENT_NAMES.iter().zip(settings.words()) { write_word(&sub, name, value); }
+}
+
+pub fn document_anchor(path: &std::path::Path) -> Option<usize> {
+    let (sub, raw) = document_key(path);
+    if text(&sub, "Path").as_deref() != Some(raw.as_str()) { return None; }
+    word(&sub, ANCHOR).map(|v| v as usize)
+}
+
 /// One string, or `None` when this machine has nothing of that name to give.
-fn text(sub: &str, name: &str) -> Option<String> {
+pub(crate) fn text(sub: &str, name: &str) -> Option<String> {
     let sub = utf16(sub);
     let name = utf16(name);
     // The length is asked for first, because a path can be any length and the buffer it
@@ -220,7 +303,7 @@ fn text(sub: &str, name: &str) -> Option<String> {
 ///
 /// `RegSetKeyValueW` rather than the value-only call, because it also brings the key into
 /// being -- which a first run has no other way of getting.
-fn write_text(sub: &str, name: &str, raw: &str) {
+pub(crate) fn write_text(sub: &str, name: &str, raw: &str) {
     let sub = utf16(sub);
     let value = utf16(name);
     // [`utf16`] appends the terminator the registry expects, and the byte count is taken
@@ -276,6 +359,9 @@ fn read_reading(sub: &str) -> Option<(PathBuf, usize)> {
 /// page that comes back at its top says the reader never got further than they did.
 pub fn record_reading(path: &std::path::Path, anchor: usize) {
     write_reading(SUBKEY, path, anchor);
+    let (sub, raw) = document_key(path);
+    write_text(&sub, "Path", &raw);
+    write_word(&sub, ANCHOR, anchor.min(u32::MAX as usize) as u32);
 }
 
 /// The document to open again and the place in it, if there is one and it is still where
@@ -434,6 +520,24 @@ pub fn window() -> Option<Frame> {
 
 #[cfg(test)]
 mod tests {    use super::*;
+
+    #[test]
+    fn document_preferences_round_trip_and_reject_unknown_values() {
+        let chosen = DocumentSettings {
+            line_breaks: Some(true), plain: Some(false), source: true,
+            text: rubrica_doc::plain::TextOptions {
+                paragraphs: rubrica_doc::plain::ParagraphRule::BlankLines, chapters: false,
+            },
+            encoding: crate::reading::Encoding::Big5,
+        };
+        assert_eq!(DocumentSettings::from_words(chosen.words().map(Some)), chosen);
+        assert_eq!(DocumentSettings::from_words([None; 6]), DocumentSettings::default());
+        assert_eq!(DocumentSettings::from_words([Some(u32::MAX); 6]), DocumentSettings::default());
+        for encoding in crate::reading::Encoding::ALL {
+            let preferences = DocumentSettings { encoding, ..Default::default() };
+            assert_eq!(DocumentSettings::from_words(preferences.words().map(Some)), preferences);
+        }
+    }
     // Only the tests tidy up after themselves; nothing else this module writes is ever
     // taken away again.
     use windows::Win32::System::Registry::RegDeleteTreeW;
