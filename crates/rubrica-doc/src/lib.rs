@@ -275,6 +275,17 @@ impl Document {
     }
 }
 
+/// The source of a formula, with the line breaks it was wrapped on turned into the
+/// spaces they were written for.
+///
+/// A displayed equation over three source lines is one equation, and LaTeX reads the
+/// breaks as spaces. Passing them on reached the shaper as characters, which is two
+/// wrapped lines and two empty boxes in the middle of the page -- visible in the report
+/// as `notdef` and invisible in the source, which is a well-formed equation.
+fn math_source(m: &str) -> String {
+    m.chars().map(|c| if matches!(c, '\n' | '\r' | '\t') { ' ' } else { c }).collect()
+}
+
 /// The line `s` starts on, with its terminator, and what follows it. A final line with
 /// no terminator is still a line; an empty `s` has no line at all.
 fn line_of(s: &str) -> Option<(&str, &str)> {
@@ -409,15 +420,16 @@ impl Builder {
                 Some(buf) => buf.push_str(&h),
                 None => self.set_html(&h),
             },
-            Event::InlineMath(m) => {
-                self.push_object(ObjectKind::Math { source: (*m).to_owned(), display: false })
-            }
+            Event::InlineMath(m) => self.push_object(ObjectKind::Math {
+                source: math_source(&m),
+                display: false,
+            }),
             Event::DisplayMath(m) => {
                 // The parser reports a displayed formula between blocks, with no
                 // paragraph around it. Closing first is what stops it swallowing the
                 // block that follows: `open` does nothing while one is still current.
                 self.close();
-                self.push_object(ObjectKind::Math { source: (*m).to_owned(), display: true });
+                self.push_object(ObjectKind::Math { source: math_source(&m), display: true });
                 self.close();
             }
             Event::Rule => {

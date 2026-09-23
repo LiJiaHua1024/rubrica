@@ -650,6 +650,21 @@ impl<'a> Parser<'a> {
             "overset" | "stackrel" => self.stack(BarSide::Over),
             "underset" => self.stack(BarSide::Under),
             "boxed" | "fbox" => Node::Boxed { body: Box::new(self.argument()) },
+            // The one grid written as an argument rather than as an environment:
+            // `\sum_{\substack{i<j\\k\neq l}}` puts two lines under an operator's limit,
+            // which is how a condition that will not fit on one line is set. `env_rows`
+            // stops at the closing brace on its own, having eaten it.
+            "substack" if self.peek() == Some(b'{') => {
+                self.bump();
+                let (rows, _) = self.env_rows();
+                let cols = rows.iter().map(|r| r.len()).max().unwrap_or(0).max(1);
+                Node::Array {
+                    rows: rows.into_iter().map(|r| r.into_iter().map(Node::Row).collect()).collect(),
+                    columns: columns_for(ArrayKind::Gathered, &[], cols),
+                    kind: ArrayKind::Gathered,
+                    delimiters: None,
+                }
+            }
             // A modifier on the preceding big operator, which the layout reads off
             // the node itself; emitting nothing keeps `a \lim\limits b` working.
             "limits" | "nolimits" => Node::Atom(String::new()),
@@ -1492,6 +1507,14 @@ mod tests {
         let bmod = of("a\\bmod b");
         assert!(bmod.contains(" mod ") && !bmod.contains("bmod"), "{bmod}");
         assert_eq!(of("x\\qed"), "(x ∎)", "the tombstone closes a proof, it does not name it");
+    }
+
+    #[test]
+    fn a_substack_stacks_two_conditions_under_the_operator() {
+        let got = of("\\sum_{\\substack{i<j\\\\k\\neq l}}");
+        assert!(got.contains("array Gathered"), "{got}");
+        assert!(got.contains("i < j") && got.contains("k ≠ l"), "{got}");
+        assert!(!got.contains("substack"), "the name is not on the page: {got}");
     }
 
     #[test]

@@ -539,6 +539,23 @@ fn a_comment_hides_nothing_else_and_a_loose_angle_bracket_stays() {
 }
 
 #[test]
+fn a_formula_wrapped_over_several_lines_is_still_one_formula_of_one_line() {
+    let doc = Document::parse("$$a +\nb +\r\nc$$\n");
+    let src = match &doc.blocks[0].objects[0].kind {
+        rubrica_doc::ObjectKind::Math { source, display } => {
+            assert!(display, "a `$$` equation is displayed");
+            source.clone()
+        }
+        other => panic!("not a formula: {other:?}"),
+    };
+    assert_eq!(src, "a + b +  c", "the breaks are the spaces the author meant");
+    assert!(!src.contains('\n') && !src.contains('\r'), "no character left to draw as a box");
+    // An inline formula written on one line is left exactly as written.
+    let one = Document::parse("$a+b$\n").blocks[0].objects[0].kind.clone();
+    assert!(matches!(one, rubrica_doc::ObjectKind::Math { source: _, display: false }));
+}
+
+#[test]
 fn a_documents_front_matter_is_not_set_as_prose() {
     let src = "---\ntitle: Notes\ntags: [a, b]\n---\n\n# First real heading\n\nBody.\n";
     let doc = Document::parse(src);

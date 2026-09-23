@@ -593,6 +593,7 @@ mod tests {
             "\\int_0^\\infty x\\,dx",
             "\\hat{a} + \\overline{b}",
             "\\overset{p}{=} q",
+            "\\sum_{\\substack{i<j\\\\k\\neq l}} P(i,j)",
             "\\boxed{\\frac{1}{2}}",
             "\\frobnicate{x}",
         ] {
