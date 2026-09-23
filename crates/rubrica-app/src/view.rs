@@ -4331,10 +4331,14 @@ impl<'a> Objects<'a> {
                 ))
             }
             rubrica_doc::ObjectKind::Math { source, display } => {
-                // One face for the whole formula, and a MATH table is a property of a
-                // face rather than of a theme role, so this ignores the block's own
-                // fonts entirely. `Cambria Math` is the face the platform ships with
-                // real math tables; the fallback is asked for its own.
+                // One face for the whole formula's *structure*, because a `MATH` table is
+                // a property of a face rather than of a theme role: the constants that
+                // place every bar and script come from it, so the choice decides how a
+                // formula looks more than any size or weight does. `Cambria Math` is the
+                // face the platform ships with real math tables; the fallback is asked
+                // for its own. Text the symbol face cannot carry -- a `\text{其中}` in a
+                // Chinese document -- goes back to the block's prose face, which is the
+                // one thing the math face has no hope of supplying.
                 let names = &theme.fonts.math;
                 let req = FaceRequest {
                     family: names[0].clone(),
@@ -4343,7 +4347,7 @@ impl<'a> Objects<'a> {
                     weight: 400,
                     italic: false,
                 };
-                let index = self.math.intern(font, &req, source, size, *display)?;
+                let index = self.math.intern(font, &req, &prose.face, source, size, *display)?;
                 let box_ = self.math.get(index)?.object;
                 Some(intern_object(styles, ObjectSource::Math(index), color, box_))
             }

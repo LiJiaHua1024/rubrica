@@ -18,7 +18,7 @@ pub mod layout;
 pub mod parse;
 pub mod table;
 
-pub use layout::{layout, Extents, Formula, MathMeasure, Shape, Stacked};
+pub use layout::{layout, Extents, Formula, MathMeasure, Running, Shape, Stacked};
 pub use parse::{parse, Limits, Node, Parser};
 pub use table::{assemble, constant, Construction, MathTable, Part, Placed, Variant, MATH_TAG};
 
@@ -27,9 +27,28 @@ pub fn typeset(src: &str, size: f32, display: bool, m: &mut dyn MathMeasure) -> 
     layout(&parse(src), size, display, m)
 }
 
+/// The math-italic codepoints of a string mapped back to the letters the source spelled:
+/// an identifier reaches a [`Node`] as `Alphabet::Italic`, so a test that is about
+/// *positions* asks where `x` went and means the `𝑥` the parser made of it.
+#[cfg(test)]
+pub(crate) fn plain(s: &str) -> String {
+    s.chars()
+        .map(|c| match c as u32 {
+            0x1D434..=0x1D44D => char::from(b'A' + (c as u32 - 0x1D434) as u8),
+            0x210E => 'h',
+            0x1D44E..=0x1D454 => char::from(b'a' + (c as u32 - 0x1D44E) as u8),
+            // `h` is spelled outside the block, so `i` is where `g`'s successor would
+            // have been had the block not left a reserved hole at U+1D455.
+            0x1D456..=0x1D467 => char::from(b'i' + (c as u32 - 0x1D456) as u8),
+            _ => c,
+        })
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
 
     /// A face with predictable metrics: every glyph is half an em wide, seven tenths
     /// above the baseline and two tenths below, so an assertion about a position is an
@@ -39,14 +58,19 @@ mod tests {
         table: bool,
         /// The heights the layout has asked a delimiter to grow to.
         asked: Vec<(char, f32)>,
+        /// The widths it has asked an accent to grow to, which it asks for separately:
+        /// a hat is widened by a different coverage of the table than a bracket is
+        /// grown by, and a test needs to tell a face with none from a base that never
+        /// needed one.
+        widened: Vec<(char, f32)>,
     }
 
     impl Mock {
         fn mathy() -> Mock {
-            Mock { table: true, asked: Vec::new() }
+            Mock { table: true, asked: Vec::new(), widened: Vec::new() }
         }
         fn bare() -> Mock {
-            Mock { table: false, asked: Vec::new() }
+            Mock { table: false, asked: Vec::new(), widened: Vec::new() }
         }
     }
 
@@ -119,6 +143,20 @@ mod tests {
                 Stacked { index: 12, baseline_up: 0.8 * height, width: 0.4 * size },
             ])
         }
+
+        /// The wider drawings of a hat only, and only past the natural mark's own
+        /// width -- which is the mock's half-em advance -- so a test can tell "the face
+        /// has none" from "the base was never wide enough to ask".
+        fn widen(&mut self, ch: char, size: f32, width: f32) -> Option<Vec<Running>> {
+            self.widened.push((ch, width));
+            if ch != '\u{302}' || width <= 0.5 * size {
+                return None;
+            }
+            Some(vec![
+                Running { index: 21, x: 0.0, width: 0.4 * size },
+                Running { index: 22, x: 0.4 * size, width: 0.4 * size },
+            ])
+        }
     }
 
     fn set(src: &str, size: f32, display: bool, m: &mut dyn MathMeasure) -> Formula {
@@ -152,7 +190,9 @@ mod tests {
         f.shapes
             .iter()
             .filter_map(|s| match s {
-                Shape::Run { text, x, y, size } => Some((text.clone(), *x, *y, *size)),
+                // Reported in the letters the source spelled: an identifier is math
+                // italic by the time it is laid out.
+                Shape::Run { text, x, y, size } => Some((plain(text), *x, *y, *size)),
                 _ => None,
             })
             .collect()
@@ -259,7 +299,7 @@ mod tests {
         let short = set("x^a", 10.0, false, &mut m);
         let tall = set("\\frac{x}{y}^a", 10.0, false, &mut m);
         let sup_y = |f: &Formula| f.shapes.iter().find_map(|s| match s {
-            Shape::Run { text, y, .. } if text == "a" => Some(*y),
+            Shape::Run { text, y, .. } if plain(text) == "a" => Some(*y),
             _ => None,
         });
         assert!(
@@ -325,7 +365,7 @@ mod tests {
         let t = set("\\sum_{i}^{n}", 10.0, false, &mut m);
         let y_of = |f: &Formula, s: &str| {
             f.shapes.iter().find_map(|sh| match sh {
-                Shape::Run { text, x, y, .. } if text == s => Some((*x, *y)),
+                Shape::Run { text, x, y, .. } if plain(text) == s => Some((*x, *y)),
                 _ => None,
             })
         };
@@ -369,7 +409,7 @@ mod tests {
             .shapes
             .iter()
             .filter_map(|s| match s {
-                Shape::Run { text: t, x, y, size } if t == text => Some((*x, *y, *size)),
+                Shape::Run { text: t, x, y, size } if plain(t) == text => Some((*x, *y, *size)),
                 _ => None,
             })
             .collect();
@@ -435,6 +475,71 @@ mod tests {
         // The label takes the room of a limit, not of an atom, so the glue before `b`
         // is the relation's own either way and the sentence does not tear open.
         near(stacked - plain, 0.0, "space after a stacked relation");
+    }
+
+    /// Where the pieces of a grown shape landed, in the order they are drawn. A wide
+    /// accent and a tall bracket are both assembled from glyph ids, so nothing else in
+    /// a formula says whether the face's variants were used or its natural mark was.
+    fn grown(f: &Formula) -> Vec<(u16, f32, f32)> {
+        f.shapes
+            .iter()
+            .filter_map(|s| match s {
+                Shape::Glyph { index, x, y, .. } => Some((*index, *x, *y)),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn a_wide_accent_is_drawn_from_the_wider_mark_the_face_offers() {
+        let mut m = Mock::mathy();
+        let f = set("\\widehat{ab}", 10.0, false, &mut m);
+        // Two half-em letters against a natural mark one half-em wide, so the wider
+        // drawing is asked for at exactly the width the base's ink covers.
+        assert_eq!(m.widened, vec![('\u{302}', 10.0)], "asked once, at the base's ink");
+        let g = grown(&f);
+        assert_eq!(g.len(), 2, "the assembled mark rather than the natural one");
+        near(g[0].1, 1.0, "the first piece starts where the centred mark begins");
+        near(g[1].1, 5.0, "and the second follows it along the base");
+        // `flattenedAccentBaseHeight` rather than `accentBaseHeight`: a flattened mark
+        // tolerates a taller base before it has to be lifted, so it sits lower here.
+        near(g[0].2, -8.0, "the flattened accent's own baseline");
+        near(f.ascent, 15.0, "the box still clears the natural mark's height");
+    }
+
+    #[test]
+    fn a_narrow_accent_stays_the_size_the_design_made_it() {
+        let mut m = Mock::mathy();
+        let f = set("\\hat{ab}", 10.0, false, &mut m);
+        assert!(m.widened.is_empty(), "no wider drawing was ever asked for");
+        let (x, y, _) = one(&f, "\u{302}");
+        near(x, 2.5, "the natural mark, centred on its base");
+        near(y, -9.5, "and lifted by the smaller of the two constants");
+        assert!(grown(&f).is_empty(), "one shaped run, nothing assembled");
+    }
+
+    #[test]
+    fn a_face_with_no_wider_mark_still_gets_the_natural_one() {
+        let mut m = Mock::mathy();
+        // The mock keeps wider drawings for the hat alone, so a `widetilde` asks and
+        // is refused -- which is the answer that has to degrade to the natural mark
+        // rather than to no accent at all.
+        let f = set("\\widetilde{ab}", 10.0, false, &mut m);
+        assert_eq!(m.widened.len(), 1, "the question was still asked");
+        assert!(grown(&f).is_empty(), "and nothing was assembled from it");
+        let (x, _, _) = one(&f, "\u{303}");
+        near(x, 2.5, "the tilde that draws is the face's own");
+    }
+
+    #[test]
+    fn a_wide_accent_over_a_narrow_base_is_not_asked_about() {
+        let mut m = Mock::mathy();
+        // `\widehat{x}` is one letter wide, the same as the natural mark's own advance,
+        // so asking the face for a variant would let it swap the design's lettering for
+        // nothing gained. The licence is the wide spelling; the *question* is the base.
+        let f = set("\\widehat{x}", 10.0, false, &mut m);
+        assert!(m.widened.is_empty(), "no wider drawing asked for a one-letter base");
+        assert!(grown(&f).is_empty(), "and so the mark that draws is the natural one");
     }
 
     #[test]

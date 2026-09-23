@@ -56,6 +56,15 @@ pub struct Stacked {
     pub width: Pt,
 }
 
+/// One glyph of a shape grown *sideways*, as the wide accents are.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Running {
+    pub index: u16,
+    /// Distance from the left edge of the assembled shape to this part's left edge.
+    pub x: Pt,
+    pub width: Pt,
+}
+
 /// A piece of a laid-out formula, positioned relative to the formula's origin.
 #[derive(Clone, Debug, PartialEq)]
 pub enum Shape {
@@ -99,6 +108,11 @@ pub trait MathMeasure {
     /// `ch` grown to `height`, as the glyphs to draw from bottom to top, or `None`
     /// when the face cannot stretch it.
     fn stretch(&mut self, ch: char, size: Pt, height: Pt) -> Option<Vec<Stacked>>;
+
+    /// `ch` grown to `width`, as the glyphs to draw from left to right, or `None` when
+    /// the face has no wider drawing of it. The other direction of the same table:
+    /// where a bracket keeps its taller heights, a hat keeps its wider ones.
+    fn widen(&mut self, ch: char, size: Pt, width: Pt) -> Option<Vec<Running>>;
 }
 
 /// The style a piece is set in: its size, and whether limits stack or ride as
@@ -224,7 +238,7 @@ impl Engine<'_> {
             Node::Fence { left, right, body } => self.fence(*left, *right, body, st),
             Node::BigOp { op, limits, sub, sup } =>
                 self.big_op(op, *limits, sub.as_deref(), sup.as_deref(), st),
-            Node::Accent { base, accent } => self.accent(base, *accent, st),
+            Node::Accent { base, accent, wide } => self.accent(base, *accent, *wide, st),
             Node::Bar { body, side } => self.bar(body, *side, st),
             Node::Stack { base, label, side } => self.stack(base, label, *side, st),
             Node::Boxed { body } => self.boxed(body, st),
@@ -860,20 +874,57 @@ impl Engine<'_> {
 
     /// Accents. `accentBaseHeight` is the tallest base that needs no *raising*, so a
     /// capital gets the accent lifted by the excess above it.
-    fn accent(&mut self, base: &Node, kind: AccentKind, st: Style) -> (Vec<Shape>, Mb) {
+    ///
+    /// A wide accent is the same mark taken from the face's wider drawings, which the
+    /// table lists in its horizontal direction exactly as it lists the taller drawings
+    /// of a bracket in its vertical one. `flattenedAccentBaseHeight` -- the one constant
+    /// that speaks only of the wide forms -- is where such a mark stops needing the
+    /// lift, and it is the larger of the two because a flattened accent tolerates a
+    /// taller base before it has to be moved.
+    fn accent(
+        &mut self,
+        base: &Node,
+        kind: AccentKind,
+        wide: bool,
+        st: Style,
+    ) -> (Vec<Shape>, Mb) {
         let (sb, bb) = self.lay(base, Style { cramped: true, ..st });
-        let glyph = kind.glyph().to_string();
+        let mark = kind.glyph();
+        let glyph = mark.to_string();
         let sa = self.ext(&glyph, st.size);
-        let base_h = self.c(constant::ACCENT_BASE_HEIGHT, st.size, 0.45);
-        let y = -bb.ascent - (bb.ascent - base_h).max(0.0);
+        let lift = if wide {
+            self.c(constant::FLATTENED_ACCENT_BASE_HEIGHT, st.size, 0.6)
+        } else {
+            self.c(constant::ACCENT_BASE_HEIGHT, st.size, 0.45)
+        };
+        let y = -bb.ascent - (bb.ascent - lift).max(0.0);
+        // The wider drawing is asked for only once the base is actually wider than the
+        // natural mark. Over a single letter the two are the same shape, and asking
+        // regardless would let a face that happens to have variants swap the design's
+        // own lettering into `\widehat{x}` without anything having been gained.
+        let grown = (wide && bb.ink_width() > sa.advance)
+            .then(|| self.m.widen(mark, st.size, bb.ink_width()))
+            .flatten();
         let mut out = Vec::new();
         translate(&sb, 0.0, 0.0, &mut out);
-        out.push(Shape::Run {
-            text: glyph,
-            x: ((bb.width - sa.advance) / 2.0).max(0.0),
-            y,
-            size: st.size,
-        });
+        match grown {
+            Some(parts) => {
+                // The box still reports the natural mark's height: a face's wider hat is
+                // its flatter one, so reserving the taller of the two can only ever make
+                // the line a little roomy above, never clip the ink.
+                let drawn = parts.last().map(|p| p.x + p.width).unwrap_or(sa.advance);
+                let at = ((bb.width - drawn) / 2.0).max(0.0);
+                for p in parts {
+                    out.push(Shape::Glyph { index: p.index, x: at + p.x, y, size: st.size });
+                }
+            }
+            None => out.push(Shape::Run {
+                text: glyph,
+                x: ((bb.width - sa.advance) / 2.0).max(0.0),
+                y,
+                size: st.size,
+            }),
+        }
         (
             out,
             Mb {

@@ -10,7 +10,7 @@
 //! A formula is laid out once per source, size and style and then cached, because
 //! two passes need it: line breaking wants its box, and painting wants its shapes.
 
-use rubrica_math::layout::{Extents, MathMeasure, Shape, Stacked};
+use rubrica_math::layout::{Extents, MathMeasure, Running, Shape, Stacked};
 use rubrica_math::table::MathTable;
 use rubrica_type::units::Pt;
 use windows::Win32::Graphics::DirectWrite::{
@@ -57,6 +57,7 @@ impl MathStore {
         &mut self,
         font: &FontEngine,
         req: &FaceRequest,
+        prose: &FaceRequest,
         source: &str,
         size: Pt,
         display: bool,
@@ -67,7 +68,7 @@ impl MathStore {
         }
         let face = font.open_face(&req.family, req.weight, req.italic);
         let (formula, from_table) = {
-            let mut adapter = Adapter::open(font, req, face);
+            let mut adapter = Adapter::open(font, req, prose, face);
             // Recorded here rather than inferred later, because it is the one fact the
             // report cannot get from the picture: a formula drawn from the face's own
             // `MATH` table and one drawn from fallback constants both look plausible.
@@ -82,7 +83,10 @@ impl MathStore {
                 // text and the sentence around it cannot be measured two different ways.
                 Shape::Run { text, x, y, size } => {
                     let mut at = *x;
-                    for r in font.shape_runs(text, 0..text.len(), req, *size, 0.0) {
+                    // The same choice `Adapter::measure` made, so the advance the formula
+                    // reserved is the advance the ink it draws actually takes.
+                    let who = if covers(font, face, text) { req } else { prose };
+                    for r in font.shape_runs(text, 0..text.len(), who, *size, 0.0) {
                         let w = r.width();
                         parts.push((r, at, *y));
                         at += w;
@@ -213,6 +217,8 @@ impl MathStore {
 struct Adapter<'a> {
     font: &'a FontEngine,
     req: &'a FaceRequest,
+    /// What `\text{其中}` is drawn in when the math face has nothing to draw it with.
+    prose: &'a FaceRequest,
     face: Option<usize>,
     /// The raw table, copied out so nothing depends on how long DirectWrite keeps its
     /// own pointer valid.
@@ -220,13 +226,30 @@ struct Adapter<'a> {
     upem: u16,
 }
 
+/// Whether `face` can shape every character of `text`.
+///
+/// A `MATH` face is a face for symbols: Cambria Math carries no ideographs at all, so a
+/// formula's `\text{其中}` in a Chinese document shapes to nothing but `.notdef` -- an
+/// empty box for every character, which is the one failure a formula can have that no
+/// amount of `MATH` table reading fixes. Those runs go to the prose face instead.
+fn covers(font: &FontEngine, face: Option<usize>, text: &str) -> bool {
+    face.is_some_and(|f| {
+        font.glyph_ids(f, text).is_some_and(|g| !g.is_empty() && g.iter().all(|&i| i != 0))
+    })
+}
+
 impl<'a> Adapter<'a> {
-    fn open(font: &'a FontEngine, req: &'a FaceRequest, face: Option<usize>) -> Adapter<'a> {
+    fn open(
+        font: &'a FontEngine,
+        req: &'a FaceRequest,
+        prose: &'a FaceRequest,
+        face: Option<usize>,
+    ) -> Adapter<'a> {
         let (bytes, upem) = face
             .and_then(|i| font.font_face(i))
             .and_then(|f| math_table_bytes(&f))
             .unwrap_or_default();
-        Adapter { font, req, face, bytes, upem: upem.max(1) }
+        Adapter { font, req, prose, face, bytes, upem: upem.max(1) }
     }
 
     fn table(&self) -> Option<MathTable<'_>> {
@@ -237,6 +260,14 @@ impl<'a> Adapter<'a> {
     fn scale(&self, size: Pt) -> Pt {
         size / self.upem as f32
     }
+
+    /// The request `text` is shaped with: the formula's own face when it can carry every
+    /// character, and the document's prose face when it cannot. Both the measuring here
+    /// and the drawing in [`MathStore::intern`] ask this, so the box a formula reserves
+    /// cannot disagree with the ink it later puts on the page.
+    fn shaped_as(&self, text: &str) -> &'a FaceRequest {
+        if covers(self.font, self.face, text) { self.req } else { self.prose }
+    }
 }
 
 impl MathMeasure for Adapter<'_> {
@@ -245,25 +276,26 @@ impl MathMeasure for Adapter<'_> {
         // width the painter draws. The ink comes from the glyph outlines instead,
         // because a fraction bar and an accent sit against the real top of their base
         // rather than against the face's tallest ascent.
-        let advance: Pt = self
-            .font
-            .shape_runs(text, 0..text.len(), self.req, size, 0.0)
-            .iter()
-            .map(|r| r.width())
-            .sum();
-        let Some(face) = self.face else {
-            return Extents { advance, ascent: 0.0, descent: 0.0, italic: 0.0 };
-        };
+        let runs = self.font.shape_runs(text, 0..text.len(), self.shaped_as(text), size, 0.0);
+        let advance: Pt = runs.iter().map(|r| r.width()).sum();
+        // Read per run rather than per character, because a run can itself have fallen
+        // back to another family -- and the italics correction is a `MATH` number, which
+        // only the formula's own face has to give.
+        let table = self.table();
         let mut ascent: Pt = 0.0;
         let mut descent: Pt = 0.0;
         let mut italic: Pt = 0.0;
-        let table = self.table();
-        for g in self.font.glyph_ids(face, text).unwrap_or_default() {
-            let (_, up, down) = self.font.glyph_extents(face, g, size);
-            ascent = ascent.max(up);
-            descent = descent.max(down);
-            if let Some(t) = &table {
-                italic = italic.max(t.italics_correction(g) as f32 * self.scale(size));
+        for r in &runs {
+            let from_math = self.face == Some(r.face);
+            for g in &r.glyphs {
+                let (_, up, down) = self.font.glyph_extents(r.face, *g, size);
+                ascent = ascent.max(up);
+                descent = descent.max(down);
+                if from_math {
+                    if let Some(t) = &table {
+                        italic = italic.max(t.italics_correction(*g) as f32 * self.scale(size));
+                    }
+                }
             }
         }
         Extents { advance, ascent, descent, italic }
@@ -309,6 +341,30 @@ impl MathMeasure for Adapter<'_> {
             })
             .collect();
         Some(out)
+    }
+
+    fn widen(&mut self, ch: char, size: Pt, width: Pt) -> Option<Vec<Running>> {
+        let t = self.table()?;
+        let face = self.face?;
+        let g = *self.font.glyph_ids(face, &ch.to_string())?.first()?;
+        if g == 0 {
+            return None;
+        }
+        let want = (width / self.scale(size)).clamp(0.0, u16::MAX as f32) as u16;
+        let s = self.scale(size);
+        // The face's wider drawings of the mark, from the horizontal direction of the
+        // same table that grows a bracket. Each piece keeps its own real advance rather
+        // than the band it was allotted, because a wide accent is placed by where its
+        // ink starts and not by where two parts would join.
+        Some(
+            t.widen(g, want)?
+                .iter()
+                .map(|p| {
+                    let (advance, _, _) = self.font.glyph_extents(face, p.glyph, size);
+                    Running { index: p.glyph, x: f32::from(p.offset) * s, width: advance }
+                })
+                .collect(),
+        )
     }
 }
 

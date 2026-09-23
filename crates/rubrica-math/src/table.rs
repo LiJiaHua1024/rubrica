@@ -297,18 +297,33 @@ impl<'a> MathTable<'a> {
         r.u16(self.variants)
     }
 
-    /// The parts to build `glyph` out of to reach `want` design units, ordered
+    /// The parts to build `glyph` out of to reach `want` design units tall, ordered
     /// bottom-up, or `None` when the font says nothing about growing this glyph.
-    ///
-    /// Three answers in order of preference. A ready-made variant at least as tall as
-    /// the target is the type designer's own drawing of the taller shape, so it wins.
-    /// Failing that, an assembly of parts is built out to the target. Failing *that* --
-    /// which is the ordinary case for a parenthesis, since a curve has no straight
-    /// section to repeat -- the tallest variant the font has comes back instead of
-    /// nothing. It is short of the target, but it is far closer than the natural glyph,
-    /// which would otherwise sit one em tall beside a grid four em high.
     pub fn grow(&self, glyph: u16, want: u16) -> Option<Vec<Placed>> {
-        let c = self.construction(glyph, true)?;
+        self.grown(glyph, want, true)
+    }
+
+    /// The parts to build `glyph` out of to reach `want` design units *wide*, ordered
+    /// left to right: the other direction of the same table, which is where a face
+    /// keeps the wider drawings of `\widehat` and `\widetilde`.
+    pub fn widen(&self, glyph: u16, want: u16) -> Option<Vec<Placed>> {
+        self.grown(glyph, want, false)
+    }
+
+    /// Three answers in order of preference, and the same three in either direction.
+    /// A ready-made variant at least as big as the target is the type designer's own
+    /// drawing of the bigger shape, so it wins. Failing that, an assembly of parts is
+    /// built out to the target. Failing *that* -- which is the ordinary case for a
+    /// parenthesis, since a curve has no straight section to repeat -- the largest
+    /// variant the font has comes back instead of nothing. It is short of the target,
+    /// but it is far closer than the natural glyph, which would otherwise sit one em
+    /// tall beside a grid four em high.
+    ///
+    /// One statement rather than two because a face that lists a glyph in one coverage
+    /// and not the other is ordinary, not an error: a parenthesis has heights and a hat
+    /// has widths, and the question asked of either list is the same question.
+    fn grown(&self, glyph: u16, want: u16, vertical: bool) -> Option<Vec<Placed>> {
+        let c = self.construction(glyph, vertical)?;
         let whole = |v: &Variant| {
             vec![Placed { glyph: v.glyph, offset: 0, full_advance: v.measurement }]
         };

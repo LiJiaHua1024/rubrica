@@ -60,6 +60,12 @@ pub enum Node {
     Accent {
         base: Box<Node>,
         accent: AccentKind,
+        /// Whether the author asked for the *wide* spelling. Which glyph is written
+        /// down is the same either way -- `\widehat` is `\hat` drawn from the face's
+        /// wider drawings -- so this is not a second kind of accent but a licence: only
+        /// the wide form may be stretched across its base, and `\hat` over a word is
+        /// meant to sit small on top of it.
+        wide: bool,
     },
     Bar {
         body: Box<Node>,
@@ -185,6 +191,14 @@ pub enum ArrayKind {
 pub struct Parser<'a> {
     src: &'a [u8],
     at: usize,
+    /// The lettering a switch command put the parser into, for as long as its argument
+    /// is being read: `\mathbb{R^n}` reaches the `n`, `\mathbb{R}^n` does not. `None`
+    /// is the state a formula is read in, where a written letter is math italic.
+    alphabet: Option<Alphabet>,
+    /// Whether the node just collected is a run of written letters, which is the only
+    /// thing a following written letter joins. A command's own text is not: welding
+    /// `\sin` onto the `x` after it would set the operator's name as a variable.
+    welding: bool,
 }
 
 /// What a run of nodes is being collected up to. Inside an environment the cell and
@@ -207,7 +221,7 @@ pub fn parse(src: &str) -> Node {
 
 impl<'a> Parser<'a> {
     pub fn new(s: &'a str) -> Parser<'a> {
-        Parser { src: s.as_bytes(), at: 0 }
+        Parser { src: s.as_bytes(), at: 0, alphabet: None, welding: false }
     }
 
     /// Parse the whole input as a row.
@@ -279,7 +293,7 @@ impl<'a> Parser<'a> {
                         // character. Truncating the rest of the formula over it would
                         // lose the part the reader still needs.
                         self.bump();
-                        out.push(Node::Atom("}".into()));
+                        self.push(&mut out, Node::Atom("}".into()));
                         continue;
                     }
                     self.bump();
@@ -308,41 +322,39 @@ impl<'a> Parser<'a> {
                     // ideograph typed straight into the formula arrives as itself
                     // rather than as its two or three UTF-8 bytes.
                     let Some(ch) = self.take_char() else { break };
-                    match out.last_mut() {
-                        // Letters run together into one atom; digits and operators
-                        // each stand alone, because their spacing differs.
-                        Some(Node::Atom(s))
-                            if letter_run(s) && ch.is_alphabetic() =>
-                        {
-                            s.push(ch)
+                    let text = self.letter(ch);
+                    if ch.is_alphabetic() && self.welding {
+                        if let Some(Node::Atom(s)) = out.last_mut() {
+                            s.push_str(&text);
+                            continue;
                         }
-                        _ => out.push(Node::Atom(ch.to_string())),
                     }
+                    // A digit or an operator breaks the run: `x1y` is two identifiers,
+                    // because the spacing of the three is not the same.
+                    self.welding = ch.is_alphabetic();
+                    out.push(Node::Atom(text));
                 }
             }
         }
         out
     }
 
-    /// Append a parsed node, merging plain atoms so runs of letters stay together.
+    /// Append a node that came from somewhere other than the characters being read: a
+    /// group, a command's text, a symbol name. None of them is ever welded to the
+    /// identifier before it, which is what keeps `\pi x` two atoms with an italic `x`
+    /// rather than one upright word.
     fn push(&mut self, out: &mut Vec<Node>, n: Node) {
         if matches!(n, Node::Atom(ref s) if s.is_empty()) {
             return;
         }
-        if let (Node::Atom(a), Some(Node::Atom(b))) = (&n, out.last()) {
-            if letter_run(b) && a.starts_with(char::is_alphabetic) {
-                if let Some(Node::Atom(b)) = out.last_mut() {
-                    b.push_str(a);
-                    return;
-                }
-            }
-        }
+        self.welding = false;
         out.push(n);
     }
 
     /// Attach a superscript or subscript to the node already parsed, which is the
     /// whole point: `x^2` is one atom with a script, not a row followed by a script.
     fn attach_script(&mut self, out: &mut Vec<Node>, is_sup: bool, arg: Node) {
+        self.welding = false;
         let prev = out.pop().unwrap_or(Node::Atom(String::new()));
         match (is_sup, prev) {
             (true, Node::BigOp { op, limits, sub, sup: None }) => {
@@ -389,14 +401,29 @@ impl<'a> Parser<'a> {
             }
             Some(b'\\') => self.command().unwrap_or(Node::Atom(String::new())),
             Some(b) => match self.take_char() {
-                Some(c) => Node::Atom(c.to_string()),
+                Some(c) => Node::Atom(self.letter(c)),
                 None => {
                     self.bump();
-                    Node::Atom((b as char).to_string())
+                    Node::Atom(self.letter(b as char))
                 }
             },
             None => Node::Atom(String::new()),
         }
+    }
+
+    /// The atom a character written in the source becomes.
+    ///
+    /// A letter is set in whatever alphabet the parser is inside of, which by default
+    /// is math italic: that is how a `MATH` face is drawn to be read, and spelling the
+    /// lettering as a codepoint rather than as a slant is what gives the glyph its own
+    /// italics correction from the table. Everything that is not an ASCII letter is
+    /// returned as written -- a hand-typed `α` is already the letter its author meant,
+    /// a Han ideograph has no italic form to reach, and a digit is upright in TeX too.
+    fn letter(&self, ch: char) -> String {
+        if !ch.is_ascii_alphabetic() {
+            return ch.to_string();
+        }
+        alphabetize(self.alphabet.unwrap_or(Alphabet::Italic), &ch.to_string())
     }
 
     /// A `\name` control sequence, or a single escaped character like `\,`.
@@ -536,12 +563,18 @@ impl<'a> Parser<'a> {
             "mathscr" => self.alphabetized(Alphabet::Script),
             "overline" => Node::Bar { body: Box::new(self.argument()), side: BarSide::Over },
             "underline" => Node::Bar { body: Box::new(self.argument()), side: BarSide::Under },
-            "hat" => self.accent(AccentKind::Hat),
-            "widehat" => self.accent(AccentKind::Hat),
-            "bar" | "overline_" => self.accent(AccentKind::Bar),
-            "tilde" | "widetilde" => self.accent(AccentKind::Tilde),
-            "dot" => self.accent(AccentKind::Dot),
-            "vec" => self.accent(AccentKind::Vec),
+            // The narrow and the wide spelling of the same mark. Which glyph to draw is
+            // not the difference -- `\widehat` is `\hat` taken from the face's wider
+            // drawings -- so the choice is carried to the layout as a licence to
+            // stretch rather than as a fifth kind of accent. `\hat{xy}` is a small hat
+            // sitting on a wide base because that is what its author asked for.
+            "hat" => self.accent(AccentKind::Hat, false),
+            "widehat" => self.accent(AccentKind::Hat, true),
+            "bar" | "overline_" => self.accent(AccentKind::Bar, false),
+            "tilde" => self.accent(AccentKind::Tilde, false),
+            "widetilde" => self.accent(AccentKind::Tilde, true),
+            "dot" => self.accent(AccentKind::Dot, false),
+            "vec" => self.accent(AccentKind::Vec, false),
             // A label over or under a base. `\stackrel` is the older spelling of
             // `\overset` and both are a forced `\limits` on their base, so they get the
             // same box here; which side the label goes is the only difference that shows.
@@ -555,8 +588,8 @@ impl<'a> Parser<'a> {
         }
     }
 
-    fn accent(&mut self, kind: AccentKind) -> Node {
-        Node::Accent { base: Box::new(self.argument()), accent: kind }
+    fn accent(&mut self, kind: AccentKind, wide: bool) -> Node {
+        Node::Accent { base: Box::new(self.argument()), accent: kind, wide }
     }
 
     /// A stacked label's two arguments, in the order they are written: the label comes
@@ -568,11 +601,17 @@ impl<'a> Parser<'a> {
         Node::Stack { base: Box::new(base), label: Box::new(label), side }
     }
 
-    /// The argument of an alphabet-switching command, with its letters moved into that
-    /// alphabet's codepoints. Nested switches keep the inner one: the outer has nothing
-    /// left to retarget once the inner has spent the letter's ASCII codepoint.
+    /// The argument of an alphabet-switching command, read *inside* that alphabet:
+    /// every written letter in it is retargeted as it is collected, which is why
+    /// `\mathbb{R^n}` doubles the `n` as well while `\mathbb{R}^n` leaves that `n` in
+    /// the alphabet the formula itself is set in. A nested switch keeps the inner one,
+    /// because the inner is the parser still reading when the letter arrives.
     fn alphabetized(&mut self, alphabet: Alphabet) -> Node {
-        retarget(alphabet, self.argument())
+        let outer = self.alphabet;
+        self.alphabet = Some(alphabet);
+        let n = self.argument();
+        self.alphabet = outer;
+        n
     }
 
     /// A brace group read as *words* rather than as tokens: its spaces are the author's
@@ -821,14 +860,6 @@ impl<'a> Parser<'a> {
     }
 }
 
-/// An atom that is a run of letters, and so may absorb the next letter. Testing the
-/// first character rather than the last matters: an unknown command falls back to its
-/// own text starting with a backslash, and that must not weld itself to the word
-/// after it.
-fn letter_run(s: &str) -> bool {
-    s.chars().next().is_some_and(|c| c.is_alphabetic())
-}
-
 /// A lettering style in math, spelled the way TeX and Unicode spell it: as a different
 /// codepoint rather than as a different face. That is what lets a blackboard-bold `ℝ`
 /// travel through the layout as one ordinary atom -- measured by the same shaper, drawn
@@ -926,57 +957,6 @@ impl Alphabet {
 /// Retarget every letter in `s`, leaving anything else alone.
 pub fn alphabetize(alphabet: Alphabet, s: &str) -> String {
     s.chars().map(|c| alphabet.of(c).unwrap_or(c)).collect()
-}
-
-/// Retarget the letters of a parsed argument, however deep they sit in it: a switch
-/// covers its whole argument, which is why `\mathbb{R^n}` doubles the `n` as well while
-/// `\mathbb{R}^n` leaves it in the plain alphabet.
-pub fn retarget(alphabet: Alphabet, node: Node) -> Node {
-    let go = |n: Node| retarget(alphabet, n);
-    let boxed = |n: Node| Box::new(go(n));
-    match node {
-        Node::Atom(s) => Node::Atom(alphabetize(alphabet, &s)),
-        Node::Row(v) => Node::Row(v.into_iter().map(go).collect()),
-        Node::Frac { num, den, has_bar, style } => Node::Frac {
-            num: boxed(*num),
-            den: boxed(*den),
-            has_bar,
-            style,
-        },
-        Node::Sup { base, sup } => Node::Sup { base: boxed(*base), sup: boxed(*sup) },
-        Node::Sub { base, sub } => Node::Sub { base: boxed(*base), sub: boxed(*sub) },
-        Node::SubSup { base, sub, sup } => Node::SubSup {
-            base: boxed(*base),
-            sub: boxed(*sub),
-            sup: boxed(*sup),
-        },
-        Node::Sqrt { body, degree } => Node::Sqrt {
-            body: boxed(*body),
-            degree: degree.map(|d| boxed(*d)),
-        },
-        Node::Fence { left, right, body } =>
-            Node::Fence { left, right, body: boxed(*body) },
-        Node::BigOp { op, limits, sub, sup } => Node::BigOp {
-            // The operator's own name is not lettered: a bold `\sum` is still the
-            // `\sum` glyph, and `\lim` is a word rather than a product of letters.
-            op,
-            limits,
-            sub: sub.map(|n| boxed(*n)),
-            sup: sup.map(|n| boxed(*n)),
-        },
-        Node::Accent { base, accent } => Node::Accent { base: boxed(*base), accent },
-        Node::Bar { body, side } => Node::Bar { body: boxed(*body), side },
-        Node::Stack { base, label, side } =>
-            Node::Stack { base: boxed(*base), label: boxed(*label), side },
-        Node::Boxed { body } => Node::Boxed { body: boxed(*body) },
-        Node::Array { rows, columns, kind, delimiters } => Node::Array {
-            rows: rows.into_iter().map(|r| r.into_iter().map(go).collect()).collect(),
-            columns,
-            kind,
-            delimiters,
-        },
-        s @ Node::Space(_) => s,
-    }
 }
 
 /// LaTeX command name to the text it denotes. Greek, the usual operators and
@@ -1261,7 +1241,11 @@ mod tests {
                 sub.as_ref().map_or_else(|| "-".into(), |s| sexp(s)),
                 sup.as_ref().map_or_else(|| "-".into(), |s| sexp(s)),
             ),
-            Node::Accent { base, accent } => format!("(accent {accent:?} {})", sexp(base)),
+            Node::Accent { base, accent, wide } => format!(
+                "(accent {accent:?}{} {})",
+                if *wide { " wide" } else { "" },
+                sexp(base)
+            ),
             Node::Bar { body, side } => format!("(bar {side:?} {})", sexp(body)),
             Node::Stack { base, label, side } =>
                 format!("(stack {side:?} {} {})", sexp(base), sexp(label)),
@@ -1302,8 +1286,40 @@ mod tests {
         }
     }
 
+    /// The tree as a compact string, in the letters the source spelled them with: a
+    /// written identifier reaches a node as math italic, and an expectation about which
+    /// brace became which box should not have to be written in codepoints. The lettering
+    /// itself is what [`a_written_identifier_is_italic_and_a_written_name_is_not`] is for.
     fn of(src: &str) -> String {
+        crate::plain(&sexp(&parse(src)))
+    }
+
+    /// How many letters of `src` came out in the face's own math italic.
+    fn italics(src: &str) -> usize {
         sexp(&parse(src))
+            .chars()
+            // The two italic rows are one block, capitals then lowercase; `h` is the
+            // letter the block leaves out and spells as U+210E instead.
+            .filter(|&c| matches!(c as u32, 0x1D434..=0x1D467 | 0x210E))
+            .count()
+    }
+
+    #[test]
+    fn a_written_identifier_is_italic_and_a_written_name_is_not() {
+        // TeX, CoreText and DirectWrite all draw `$x^2$` slanted, and the slant is a
+        // codepoint rather than a simulated oblique because only the face's italic letter
+        // carries the italics correction its `MATH` table gives -- which is what an
+        // accent, a bar and a superscript are placed against.
+        assert_eq!(italics("xy"), 2, "a written run of letters is one identifier");
+        assert_eq!(italics("XY"), 2, "in either row of the alphabet");
+        // Upright, exactly as TeX sets them: a number, an operator's name, and the prose
+        // `\text` brings into a formula.
+        assert_eq!(italics("12"), 0);
+        assert_eq!(italics("\\sin x"), 1, "the name keeps its letters, the `x` takes its");
+        assert_eq!(italics("\\text{in}"), 0);
+        // A switch replaces the default alphabet rather than doubling up on it.
+        assert_eq!(italics("\\mathbb{R}"), 0);
+        assert_eq!(of("\\mathbb{R}"), "\u{211D}", "the double-struck letter, not the italic one");
     }
 
     #[test]
@@ -1578,8 +1594,12 @@ mod tests {
         // The space is the author's: `list` treats one between atoms as a separator, so
         // a word group read through the ordinary path arrives missing its own gaps.
         assert_eq!(of("\\text{hello world}"), "hello world");
-        assert_eq!(of("\\text{as }x"), "as x");
-        assert_eq!(of("\\mathrm{d}x"), "dx");
+        // The word group and the identifier after it are two atoms, which is the point of
+        // the space being kept: `\text`'s prose is upright and the `x` beside it is a
+        // variable, so welding them into one word would set the name slanted. The double
+        // gap below is the author's space and the join between two atoms.
+        assert_eq!(of("\\text{as }x"), "(as  x)");
+        assert_eq!(of("\\mathrm{d}x"), "(d x)");
         assert_eq!(of("\\operatorname{arg min}"), "arg min");
         // Only the escapes that stand for a character are resolved; an inner group
         // contributes its words without the braces that set it off.
