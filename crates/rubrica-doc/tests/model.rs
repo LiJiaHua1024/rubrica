@@ -682,3 +682,63 @@ fn the_front_matter_reading_reaches_only_the_top_of_the_file() {
     );
 }
 
+
+#[test]
+fn a_term_and_the_lines_under_it_are_its_own_blocks() {
+    // The whole syntax is a colon and a space at the start of a line, and pulldown
+    // folds that line into the one above it as prose. What the reader has to get back
+    // is which line the author started where.
+    let doc = Document::parse("断行\n: 整段一起求解\n: 不是填满一行算一行\n悬挂缩进\n: 记号挂在页边\n");
+    let shape: Vec<(String, String)> = doc
+        .blocks
+        .iter()
+        .map(|b| (format!("{:?}", b.kind), b.text.clone()))
+        .collect();
+    assert_eq!(
+        shape,
+        vec![
+            ("Term".to_string(), "断行".to_string()),
+            ("Definition".to_string(), "整段一起求解".to_string()),
+            ("Definition".to_string(), "不是填满一行算一行".to_string()),
+            ("Term".to_string(), "悬挂缩进".to_string()),
+            ("Definition".to_string(), "记号挂在页边".to_string()),
+        ],
+        "the colon is syntax and does not reach the text"
+    );
+}
+
+#[test]
+fn a_loose_definition_still_belongs_to_its_term() {
+    // A blank line between the two makes pulldown close the paragraph, so the `: `
+    // line arrives as a block of its own with no fold to read it back from.
+    let doc = Document::parse("Term\n\n: def\n");
+    assert_eq!(doc.blocks.len(), 2);
+    assert_eq!(doc.blocks[1].kind, rubrica_doc::BlockKind::Definition);
+    assert_eq!(doc.blocks[1].text, "def");
+}
+
+#[test]
+fn a_definitions_styles_and_targets_survive_the_cut() {
+    let doc = Document::parse("*Term*\n: **bold** and [x](https://e/y)\n");
+    let (term, def) = (&doc.blocks[0], &doc.blocks[1]);
+    assert_eq!(term.kind, rubrica_doc::BlockKind::Term);
+    assert_eq!(term.text, "Term");
+    assert_eq!(def.text, "bold and x");
+    let strong = def.spans.iter().find(|s| s.style.contains(rubrica_doc::InlineStyle::STRONG)).expect("no strong span");
+    assert_eq!(&def.text[strong.range.clone()], "bold", "the span is re-based onto the slice");
+    let cite = def.actions.iter().find(|a| a.kind == rubrica_doc::ActionKind::Url("https://e/y".into())).expect("no link");
+    assert_eq!(&def.text[cite.range.clone()], "x");
+}
+
+#[test]
+fn prose_that_happens_to_wrap_is_not_a_definition_list() {
+    let doc = Document::parse("Some prose that wraps\nover the author's lines\n");
+    assert_eq!(doc.blocks.len(), 1, "a fold alone is not syntax: {:?}", doc.blocks);
+    assert_eq!(doc.blocks[0].kind, rubrica_doc::BlockKind::Paragraph);
+    // Nor is a colon in the middle of a line, nor a `: ` inside a list item, where the
+    // item's own marker already owns the margin.
+    let ratio = Document::parse("The ratio is 2: 3 and\nthe rest of the sentence\n");
+    assert_eq!(ratio.blocks.len(), 1);
+    let item = Document::parse("- item\n  : def\n");
+    assert_eq!(item.blocks[0].kind, rubrica_doc::BlockKind::Paragraph);
+}

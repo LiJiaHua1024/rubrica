@@ -86,6 +86,17 @@ pub enum BlockKind {
     /// A GFM table. Its text lives in [`Block::table`], not in [`Block::text`],
     /// because a cell is not a position in the document's reading order.
     Table,
+    /// One thing a definition list names, drawn out at the margin with its
+    /// definitions under it.
+    ///
+    /// Markdown has no syntax for this, and pulldown has no extension for it: a term
+    /// and the `: ` line beneath it reach us as one paragraph whose lines were joined
+    /// at a soft break. [`Builder`] marks where those joins fell and `close` cuts the
+    /// paragraph back along them.
+    Term,
+    /// One `: ` line under a [`BlockKind::Term`], drawn indented. The colon is syntax,
+    /// so it is gone from [`Block::text`] rather than hidden by the renderer.
+    Definition,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -452,6 +463,10 @@ struct Draft {
 struct Builder {
     blocks: Vec<Block>,
     cur: Option<Block>,
+    /// Where the current block's paragraph had its lines joined by a soft break.
+    /// A definition list reaches us as one wrapped paragraph, and these offsets are
+    /// the only trace of the line each `: ` actually began on.
+    breaks: Vec<usize>,
     inline: InlineStyle,
     quote_depth: u8,
     /// One entry per open list, holding its info and the next item number.
@@ -502,7 +517,17 @@ impl Builder {
                 st.insert(InlineStyle::CODE);
                 self.put(&t, st);
             }
-            Event::SoftBreak => self.put(" ", InlineStyle::EMPTY),
+            Event::SoftBreak => {
+                // Mark the join before making it: the space below is what the line
+                // break looked like once CommonMark had folded it, and a definition
+                // list is only recoverable if where the fold happened survived.
+                if let Some(b) = self.cur.as_mut() {
+                    if self.cell.is_none() {
+                        self.breaks.push(b.text.len());
+                    }
+                }
+                self.put(" ", InlineStyle::EMPTY)
+            }
             Event::HardBreak => self.put("\n", InlineStyle::EMPTY),
             Event::TaskListMarker(checked) => {
                 if let Some(b) = self.cur.as_mut() {
@@ -792,6 +817,7 @@ impl Builder {
         if self.cur.is_some() {
             return;
         }
+        self.breaks.clear();
         self.cur = Some(Block {
             kind,
             text: String::new(),
@@ -901,12 +927,18 @@ impl Builder {
                 }
             }
             if worth_setting(&b) {
+                let breaks = std::mem::take(&mut self.breaks);
                 // A definition's blocks belong to the definition, not to the page's
                 // reading order, so they leave `blocks` here rather than being
                 // filtered out of it later.
-                match self.note {
-                    Some(i) => self.notes[i].blocks.push(b),
-                    None => self.blocks.push(b),
+                for b in split_definitions(b, breaks) {
+                    if !worth_setting(&b) {
+                        continue;
+                    }
+                    match self.note {
+                        Some(i) => self.notes[i].blocks.push(b),
+                        None => self.blocks.push(b),
+                    }
                 }
             }
         }
@@ -958,6 +990,98 @@ fn push_action(actions: &mut Vec<Action>, range: std::ops::Range<usize>, kind: A
         Some(prev) if prev.kind == kind && prev.range.end == range.start => prev.range.end = range.end,
         _ => actions.push(Action { range, kind }),
     }
+}
+
+/// What opens a definition line: the colon and the space the author owed it.
+const DEFINITION_OPEN: &str = ": ";
+
+/// Cut a paragraph along the lines its author wrote, wherever one of them opens a
+/// definition.
+///
+/// A definition list is not Markdown syntax, so pulldown hands the whole thing over as
+/// one paragraph with its line breaks folded into spaces. `breaks` says where each fold
+/// sat, which is the only way back to the structure -- and the fold has to be undone
+/// here rather than by the reader, because the `: ` that marks a definition is syntax,
+/// and syntax a document model keeps is syntax the page then has to draw.
+fn split_definitions(b: Block, breaks: Vec<usize>) -> Vec<Block> {
+    if b.kind != BlockKind::Paragraph || b.list.is_some() || b.table.is_some() {
+        return vec![b];
+    }
+    let mut lines = Vec::with_capacity(breaks.len() + 1);
+    let mut start = 0usize;
+    for at in breaks {
+        lines.push(start..at);
+        start = at + 1; // the space the fold left behind
+    }
+    lines.push(start..b.text.len());
+    if !lines.iter().any(|r| opens_a_definition(&b.text, r)) {
+        return vec![b];
+    }
+    lines
+        .into_iter()
+        .filter_map(|r| {
+            let def = opens_a_definition(&b.text, &r);
+            let head = r.start + if def { leading_definition(&b.text, &r) } else { 0 };
+            piece(&b, head..r.end, if def { BlockKind::Definition } else { BlockKind::Term })
+        })
+        .collect()
+}
+
+/// True for a line that opens with a colon and a space, which is the whole syntax.
+fn opens_a_definition(text: &str, range: &std::ops::Range<usize>) -> bool {
+    let body = &text[range.clone()];
+    let t = body.trim_start_matches(' ');
+    t.starts_with(DEFINITION_OPEN) || t == ":"
+}
+
+/// How far into the line the definition's own text begins, past whatever indent the
+/// author left and past the colon.
+fn leading_definition(text: &str, range: &std::ops::Range<usize>) -> usize {
+    let body = &text[range.clone()];
+    let indent = body.len() - body.trim_start_matches(' ').len();
+    indent + DEFINITION_OPEN.len()
+}
+
+/// One line of a folded paragraph, standing on its own: its slice of the text, and
+/// every span, target and object that fell inside it re-based onto that slice.
+fn piece(base: &Block, range: std::ops::Range<usize>, kind: BlockKind) -> Option<Block> {
+    let end = base.text[..range.end].trim_end().len().max(range.start);
+    let range = range.start..end;
+    if range.start >= range.end {
+        return None;
+    }
+    let cut = |r: std::ops::Range<usize>| {
+        let a = r.start.max(range.start);
+        let b = r.end.min(range.end);
+        (a < b).then(|| (a - range.start)..(b - range.start))
+    };
+    Some(Block {
+        kind,
+        text: base.text[range.clone()].to_string(),
+        spans: base
+            .spans
+            .iter()
+            .filter_map(|s| cut(s.range.clone()).map(|range| Span { range, style: s.style }))
+            .collect(),
+        quote_depth: base.quote_depth,
+        list: None,
+        item_depth: base.item_depth,
+        task: None,
+        table: None,
+        objects: base
+            .objects
+            .iter()
+            .filter_map(|o| {
+                cut(o.range.clone()).map(|range| ObjectSpan { range, kind: o.kind.clone() })
+            })
+            .collect(),
+        actions: base
+            .actions
+            .iter()
+            .filter_map(|a| cut(a.range.clone()).map(|range| Action { range, kind: a.kind.clone() }))
+            .collect(),
+        lang: None,
+    })
 }
 
 /// Append text to a cell, merging with the previous span when the style matches.

@@ -351,7 +351,11 @@ impl Theme {
                 self.base * self.heading_scale[i]
             }
             BlockKind::Code => self.base * 0.92,
-            BlockKind::Paragraph | BlockKind::Rule | BlockKind::Table => self.base,
+            // A term and its definition are the page's own prose at the page's own
+            // size: what makes them a list is where they stand, not how heavy they are.
+            BlockKind::Paragraph | BlockKind::Rule | BlockKind::Table | BlockKind::Term | BlockKind::Definition => {
+                self.base
+            }
         }
     }
 
@@ -418,7 +422,7 @@ impl Theme {
             BlockKind::Heading(_) => 700,
             BlockKind::Rule => 400,
             BlockKind::Code => 400,
-            BlockKind::Paragraph | BlockKind::Table => 400,
+            BlockKind::Paragraph | BlockKind::Table | BlockKind::Term | BlockKind::Definition => 400,
         };
         if inline.contains(InlineStyle::STRONG) {
             weight = weight.max(700);
@@ -461,6 +465,10 @@ impl Theme {
             BlockKind::Rule => 1.4,
             BlockKind::Paragraph => self.space_before_body,
             BlockKind::Table => 1.2,
+            // A term is one more item of the list's prose; a definition is not prose
+            // after it but the answer to it, and belongs under the term's own line.
+            BlockKind::Term => self.space_before_body,
+            BlockKind::Definition => 0.15,
         };
         self.base * lines
     }
