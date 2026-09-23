@@ -217,6 +217,18 @@ pub struct Parser<'a> {
     /// thing a following written letter joins. A command's own text is not: welding
     /// `\sin` onto the `x` after it would set the operator's name as a variable.
     welding: bool,
+    /// An infix fraction command seen while collecting, waiting for the run around it to
+    /// be assembled into the two halves it asks for. See [`Parser::list`].
+    infix: Option<Infix>,
+}
+
+/// The two commands that sit *between* their operands instead of in front of them.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Infix {
+    /// `{a \over b}`: the stacked fraction, with its rule.
+    Over,
+    /// `{n \choose k}`: the same stack, in parentheses and without the rule.
+    Choose,
 }
 
 /// What a run of nodes is being collected up to. Inside an environment the cell and
@@ -239,7 +251,7 @@ pub fn parse(src: &str) -> Node {
 
 impl<'a> Parser<'a> {
     pub fn new(s: &'a str) -> Parser<'a> {
-        Parser { src: s.as_bytes(), at: 0, alphabet: None, welding: false }
+        Parser { src: s.as_bytes(), at: 0, alphabet: None, welding: false, infix: None }
     }
 
     /// Parse the whole input as a row.
@@ -296,6 +308,13 @@ impl<'a> Parser<'a> {
     /// matched up, and a cell ends at the separators that structure it.
     fn list(&mut self, ctx: Ctx) -> Vec<Node> {
         let mut out: Vec<Node> = Vec::new();
+        // What was collected before an `\over` or a `\choose`, which turns the whole run
+        // into a fraction: TeX takes everything before the command in this group as the
+        // numerator and everything after it as the denominator.
+        let mut above: Option<Vec<Node>> = None;
+        // Which of the two infix commands made that split, kept so the group can be
+        // closed with the rule and the parentheses the author's name asked for.
+        let mut stored: Option<Infix> = None;
         loop {
             if ctx != Ctx::Top && self.at_right() {
                 break;
@@ -325,6 +344,15 @@ impl<'a> Parser<'a> {
                 Some(b'\\') => {
                     if let Some(n) = self.command() {
                         self.push(&mut out, n);
+                        // The second one in a group is what TeX calls a double
+                        // denominator; keeping the first split is the reading that still
+                        // shows the author's fraction.
+                        if above.is_none() {
+                            if let Some(kind) = self.infix.take() {
+                                stored = Some(kind);
+                                above = Some(std::mem::take(&mut out));
+                            }
+                        }
                     }
                 }
                 Some(b'^') | Some(b'_') => {
@@ -353,6 +381,22 @@ impl<'a> Parser<'a> {
                     out.push(Node::Atom(text));
                 }
             }
+        }
+        if let Some(numerator) = above {
+            // The run closed: what was collected after the command is the denominator,
+            // and the two become the one node the group stands for.
+            let denominator = std::mem::take(&mut out);
+            let stack = Node::Frac {
+                num: Box::new(Node::Row(numerator)),
+                den: Box::new(Node::Row(denominator)),
+                has_bar: stored != Some(Infix::Choose),
+                style: FracStyle::Auto,
+            };
+            out.push(if stored == Some(Infix::Choose) {
+                Node::Fence { left: '(', right: ')', body: Box::new(stack) }
+            } else {
+                stack
+            });
         }
         out
     }
@@ -491,6 +535,18 @@ impl<'a> Parser<'a> {
                 has_bar: true,
                 style: FracStyle::Auto,
             },
+            // The infix pair, which is the one place in this subset where a command does
+            // not stand in front of its arguments: TeX takes the whole run before it as
+            // the numerator and the whole run after it as the denominator, so `list` is
+            // what closes the split when the group ends.
+            "over" => {
+                self.infix = Some(Infix::Over);
+                Node::Atom(String::new())
+            }
+            "choose" => {
+                self.infix = Some(Infix::Choose);
+                Node::Atom(String::new())
+            }
             "dfrac" | "tfrac" => {
                 let a = self.argument();
                 let b = self.argument();
@@ -1507,6 +1563,24 @@ mod tests {
         let bmod = of("a\\bmod b");
         assert!(bmod.contains(" mod ") && !bmod.contains("bmod"), "{bmod}");
         assert_eq!(of("x\\qed"), "(x ∎)", "the tombstone closes a proof, it does not name it");
+    }
+
+    #[test]
+    fn an_infix_fraction_splits_the_run_it_was_written_in() {
+        // `{a+b \over c}` is the old way of writing the stack: the command sits between
+        // its two operands, and everything on either side of it in the group belongs to
+        // the half it is on.
+        let over = of("{a+b \\over c}");
+        assert!(over.contains("frac (a + b) c"), "{over}");
+        assert!(!over.contains(" over "), "the name is not on the page: {over}");
+        // `\choose` is the same split with the parentheses and without the rule; `nob` is
+        // what the s-expression calls a barless stack, the one `\binom` draws.
+        let choose = of("{n \\choose k}");
+        assert_eq!(choose, "(fence () (nob n k))");
+        // The split stays inside its own group, and inside its own table cell.
+        assert_eq!(of("{1 \\over 2} + {3 \\over 4}").matches("frac").count(), 2);
+        let grid = of("\\begin{matrix}a \\over b\\\\c\\end{matrix}");
+        assert_eq!(grid.matches("frac").count(), 1, "one cell, one stack: {grid}");
     }
 
     #[test]
