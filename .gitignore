@@ -1,2 +1,8 @@
+# Build output.
 /target
 *.pdb
+
+# Agent and editor state, local to whoever's working on this.
+.qoder/
+.idea/
+.vscode/
