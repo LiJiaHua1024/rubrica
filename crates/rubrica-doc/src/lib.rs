@@ -269,6 +269,11 @@ impl Document {
         // `key: value` lines, and another rule, which is the top of every document that
         // comes out of a blog or a vault.
         let source = split_front_matter(source).map_or(source, |(_, body)| body);
+        // Pandoc's TeX delimiters, read out of the source before anything else touches
+        // it: `\(` is a CommonMark escape for a bracket, so the backslash is gone by
+        // the time an event carries the text and there is nothing left to recognise.
+        let rewritten = tex_delimiters(source);
+        let source = rewritten.as_deref().unwrap_or(source);
         let opts = Options::ENABLE_STRIKETHROUGH
             | Options::ENABLE_TASKLISTS
             | Options::ENABLE_TABLES
@@ -280,6 +285,101 @@ impl Document {
         }
         st.finish()
     }
+}
+
+/// Rewrite Pandoc's TeX math delimiters into the `$` form the parser already knows.
+///
+/// A LaTeX author writes `\(x^2\)` and puts a displayed equation between `\[` and `\]`
+/// on lines of their own. CommonMark reads the backslash as an escape for the bracket,
+/// so by the time any handler sees the text it is `(x^2)` with nothing left to
+/// recognise -- the rewrite has to happen on the source. Which is also why it has to
+/// keep its hands off code: a fenced block full of LaTeX is exactly the file that would
+/// otherwise be turned into nonsense.
+///
+/// `\(` and `\)` are read anywhere outside a code span, because nobody writes `\(` to
+/// mean a bracket -- `(` needs no escaping in prose. `\[` and `\]` are read only when
+/// they stand on a line of their own, because `\[1\]` really is how an escaped bracket
+/// looks mid-sentence, and a display delimiter is never written any other way.
+fn tex_delimiters(src: &str) -> Option<String> {
+    if !(src.contains("\\(") || src.contains("\\)") || src.contains("\\[") || src.contains("\\]")) {
+        return None;
+    }
+    let mut out = String::with_capacity(src.len());
+    // The character and run length of a code fence that is still open.
+    let mut fence: Option<(char, usize)> = None;
+    for line in src.split_inclusive('\n') {
+        let body = line.trim_end_matches(['\n', '\r']);
+        let text = body.trim_start();
+        let indent = body.len() - text.len();
+        let first = text.chars().next();
+        let run = text.chars().take_while(|c| Some(*c) == first).count();
+        let marker = indent < 4 && matches!(first, Some('`') | Some('~')) && run >= 3;
+        let ends_fence = fence.is_some_and(|(c, n)| {
+            marker && first == Some(c) && run >= n && text.chars().all(|x| x == c)
+        });
+        if ends_fence || marker && fence.is_none() {
+            // The fence's own lines are copied as written: opening or closing it.
+            fence = if ends_fence { None } else { Some((first.unwrap(), run)) };
+            out.push_str(body);
+            out.push_str(&line[body.len()..]);
+            continue;
+        }
+        let plain = fence.is_some() || indent >= 4;
+        let display = !plain && (text == "\\[" || text == "\\]");
+        if display {
+            out.push_str("$$");
+        } else if plain {
+            out.push_str(body);
+        } else {
+            out.push_str(&tex_inline(body));
+        }
+        out.push_str(&line[body.len()..]);
+    }
+    Some(out)
+}
+
+/// `\(x\)` to `$x$` across one line of prose, leaving anything inside a code span as
+/// its author typed it.
+fn tex_inline(line: &str) -> String {
+    let b = line.as_bytes();
+    let mut out = String::with_capacity(line.len());
+    let mut i = 0;
+    // Length of the backtick run a code span opened with, which is the only run long
+    // enough to close it.
+    let mut span = 0usize;
+    while i < b.len() {
+        match b[i] {
+            b'`' => {
+                let mut n = 0;
+                while i + n < b.len() && b[i + n] == b'`' {
+                    n += 1;
+                }
+                if span == 0 {
+                    span = n;
+                } else if span == n {
+                    span = 0;
+                }
+                out.push_str(&line[i..i + n]);
+                i += n;
+            }
+            // Two backslashes are one literal one, and it does not escape what comes
+            // after: `\\(` is a backslash and a bracket, not a delimiter.
+            b'\\' if b.get(i + 1) == Some(&b'\\') => {
+                out.push_str("\\\\");
+                i += 2;
+            }
+            b'\\' if span == 0 && matches!(b.get(i + 1), Some(b'(' | b')')) => {
+                out.push('$');
+                i += 2;
+            }
+            _ => {
+                let c = line[i..].chars().next().unwrap();
+                out.push(c);
+                i += c.len_utf8();
+            }
+        }
+    }
+    out
 }
 
 /// The source of a formula, with the line breaks it was wrapped on turned into the

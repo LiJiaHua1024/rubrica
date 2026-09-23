@@ -325,6 +325,51 @@ fn a_cells_object_is_registered_where_its_placeholder_stands() {
 }
 
 #[test]
+fn tex_delimiters_reach_the_formula_the_dollar_form_would_have() {
+    // A LaTeX author's `\(x\)` and a Markdown author's `$x$` are the same equation, and
+    // the backslash has to be read before CommonMark spends it as an escape.
+    let b = &Document::parse("Pythagoras: \\(a^2 + b^2 = c^2\\), same as $a^2 + b^2 = c^2$.\n").blocks[0];
+    let sources: Vec<&str> = b
+        .objects
+        .iter()
+        .map(|o| match &o.kind {
+            rubrica_doc::ObjectKind::Math { source, .. } => source.as_str(),
+            _ => "",
+        })
+        .collect();
+    assert_eq!(sources, vec!["a^2 + b^2 = c^2", "a^2 + b^2 = c^2"]);
+    for o in &b.objects {
+        assert_eq!(&b.text[o.range.clone()], "\u{FFFC}", "each one stands for its own placeholder");
+    }
+}
+
+#[test]
+fn a_display_pair_becomes_an_equation_of_its_own() {
+    let doc = Document::parse("\\[\n\\frac{1}{3}\n\\]\n");
+    let b = &doc.blocks[0];
+    assert!(
+        matches!(b.objects.first().map(|o| &o.kind), Some(rubrica_doc::ObjectKind::Math { display: true, .. })),
+        "the `\\[ \\]` pair is the display form: {:?}",
+        b.objects
+    );
+}
+
+#[test]
+fn code_keeps_every_backslash_it_was_written_with() {
+    // A document about LaTeX is full of delimiters that are not delimiters. An escaped
+    // bracket in prose is the other way round: `\[1\]` mid-sentence stays a bracket.
+    let doc = Document::parse("Use `\\(x\\)` or \\[1\\] here.\n\n```\n\\[x\\] and \\(y\\)\n```\n");
+    assert!(doc.blocks[0].objects.is_empty(), "a code span is not an equation");
+    assert_eq!(
+        doc.blocks[0].text, "Use \\(x\\) or [1] here.",
+        "a code span keeps its backslash; an escaped bracket loses its own, which is \
+         why a display delimiter is only read on a line of its own"
+    );
+    assert_eq!(doc.blocks[1].text, "\\[x\\] and \\(y\\)", "a fence is copied as written");
+    assert!(doc.blocks[1].objects.is_empty());
+}
+
+#[test]
 fn a_table_with_cjk_cells_keeps_its_grid() {
     let doc = Document::parse("| 名称 | 数量 |\n|---|---|\n| 苹果 | 三 |\n");
     let t = doc.blocks[0].table.as_ref().expect("no table");
