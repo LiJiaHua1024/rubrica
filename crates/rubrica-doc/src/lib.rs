@@ -257,6 +257,11 @@ pub struct Footnote {
 
 impl Document {
     pub fn parse(source: &str) -> Document {
+        // Front matter is the author's metadata for the tool that wrote the file, and
+        // nothing of it is prose: shown as itself it arrives as a rule, a paragraph of
+        // `key: value` lines, and another rule, which is the top of every document that
+        // comes out of a blog or a vault.
+        let source = split_front_matter(source).map_or(source, |(_, body)| body);
         let opts = Options::ENABLE_STRIKETHROUGH
             | Options::ENABLE_TASKLISTS
             | Options::ENABLE_TABLES
@@ -268,6 +273,51 @@ impl Document {
         }
         st.finish()
     }
+}
+
+/// The line `s` starts on, with its terminator, and what follows it. A final line with
+/// no terminator is still a line; an empty `s` has no line at all.
+fn line_of(s: &str) -> Option<(&str, &str)> {
+    let end = s.find('\n').map_or(s.len(), |i| i + 1);
+    (!s.is_empty()).then(|| s.split_at(end))
+}
+
+/// The document's front matter and the body to read after it, or `None` when there is
+/// no front matter to take.
+///
+/// The one spelling every authoring tool uses: a line that is `---` first, closed by a
+/// later line that is `---` or `...`. A document that opens the fence and never closes
+/// it is left exactly as written, because the author was sure about the rule and not
+/// about the metadata -- and a reader that swallowed the rest of the file looking for a
+/// closer would be a reader with a blank page in it.
+pub fn split_front_matter(source: &str) -> Option<(&str, &str)> {
+    let body = source.strip_prefix('\u{feff}').unwrap_or(source);
+    let (open, rest) = line_of(body)?;
+    if !is_marker(open, "---") {
+        return None;
+    }
+    let mut scanned = rest;
+    let after_close = loop {
+        let (line, after) = line_of(scanned)?;
+        if is_marker(line, "---") || is_marker(line, "...") {
+            break after;
+        }
+        scanned = after;
+    };
+    Some((&body[..body.len() - after_close.len()], after_close))
+}
+
+/// Whether `line` is one of the two markers on a line of its own: written with no more
+/// leading blanks than CommonMark allows a block marker to have, and with any trailing
+/// ones. `---   ` is the same fence as `---` to every tool that reads one.
+fn is_marker(line: &str, marker: &str) -> bool {
+    let body = line.trim_start_matches(' ');
+    line.len() - body.len() <= 3 && bare_line(body) == marker
+}
+
+/// A line without its terminator or its trailing blanks.
+fn bare_line(line: &str) -> &str {
+    line.trim_end_matches(['\r', '\n', ' ', '\t'])
 }
 
 /// A definition being collected, before its number is known.

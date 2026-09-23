@@ -538,3 +538,55 @@ fn a_comment_hides_nothing_else_and_a_loose_angle_bracket_stays() {
     assert_eq!(doc.blocks[0].text, "x < y");
 }
 
+#[test]
+fn a_documents_front_matter_is_not_set_as_prose() {
+    let src = "---\ntitle: Notes\ntags: [a, b]\n---\n\n# First real heading\n\nBody.\n";
+    let doc = Document::parse(src);
+    assert_eq!(
+        doc.blocks.iter().map(|b| b.kind).collect::<Vec<_>>(),
+        vec![BlockKind::Heading(1), BlockKind::Paragraph],
+        "the metadata block belongs to the tool that wrote the file, not to the page"
+    );
+    assert_eq!(doc.blocks[0].text, "First real heading");
+}
+
+#[test]
+fn front_matter_is_only_taken_when_it_is_written_as_one() {
+    let take = rubrica_doc::split_front_matter;
+    // The closer may be the three dots the YAML spec also allows, and a fence with the
+    // trailing blanks a careless editor leaves behind is the same fence.
+    assert_eq!(take("---\na: 1\n...\nbody\n"), Some(("---\na: 1\n...\n", "body\n")));
+    assert_eq!(
+        take("---   \na: 1\n   ---   \nbody\n"),
+        Some(("---   \na: 1\n   ---   \n", "body\n")),
+    );
+    // A byte-order mark is in front of the file, so it is also in front of the fence.
+    assert_eq!(
+        take("\u{feff}---\na: 1\n---\nbody\n"),
+        Some(("---\na: 1\n---\n", "body\n")),
+    );
+    // Nothing between the two fences is still a block: what is being hidden is the
+    // metadata, however little of it the author wrote down.
+    assert_eq!(take("---\n---\nbody\n"), Some(("---\n---\n", "body\n")));
+    // Three leading blanks is what CommonMark lets a block marker have; four would be
+    // an indented code block, which is a different thing the author meant.
+    assert_eq!(take("---\na: 1\n    ---\nbody\n"), None);
+    // And what is not front matter keeps every character it was written with.
+    assert_eq!(take("# Just a heading\n"), None);
+    assert_eq!(take("---\nnever closed\n"), None, "an unclosed fence is the rule it looks like");
+    assert_eq!(take("----\na: 1\n----\n"), None, "four dashes are a thicker rule");
+    assert_eq!(take("--- text\na: 1\n---\n"), None, "the fence is a line of its own");
+    assert_eq!(take("---\n"), None);
+    assert_eq!(take(""), None);
+}
+
+#[test]
+fn the_front_matter_reading_reaches_only_the_top_of_the_file() {
+    // A rule in the middle of a document is a rule the author asked for, and the only
+    // thing that makes the first `---` different is that nothing was read before it.
+    assert_eq!(
+        kinds("Prose.\n\n---\n\nMore.\n"),
+        vec![BlockKind::Paragraph, BlockKind::Rule, BlockKind::Paragraph],
+    );
+}
+
