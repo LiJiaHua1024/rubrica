@@ -220,10 +220,19 @@ pub fn report(source: &str, path: Option<&str>, o: &Options) -> Result<()> {
     // as a fact about the build, and a highlighter that was right about every token but
     // lost them between the layout and the display list would look perfect in the first
     // number and missing in the second.
+    // Every block the page shows, a footnote's body included: these last lines are
+    // about what the reader sees, and a formula or a fence inside a note is on the page
+    // exactly as much as one in a paragraph. Counting only `Document::blocks` made the
+    // two numbers below disagree and said nothing about why.
+    let shown: Vec<&rubrica_doc::Block> = doc
+        .blocks
+        .iter()
+        .chain(doc.footnotes.iter().flat_map(|f| f.blocks.iter()))
+        .collect();
     {
-        let code: Vec<&rubrica_doc::Block> = doc
-            .blocks
+        let code: Vec<&rubrica_doc::Block> = shown
             .iter()
+            .copied()
             .filter(|b| b.kind == rubrica_doc::BlockKind::Code)
             .collect();
         let named = code.iter().filter(|b| b.lang.is_some()).count();
@@ -268,8 +277,7 @@ pub fn report(source: &str, path: Option<&str>, o: &Options) -> Result<()> {
     // Counted from the source as well as from the cache: the two differ whenever a
     // formula repeats, and a formula that set from a face with no `MATH` table
     // still draws, just in the wrong shapes.
-    let asked = doc
-        .blocks
+    let asked = shown
         .iter()
         .flat_map(|b| b.objects.iter())
         .filter(|o| matches!(o.kind, rubrica_doc::ObjectKind::Math { .. }))
