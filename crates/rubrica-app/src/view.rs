@@ -3313,6 +3313,13 @@ fn layout_block(
     let spacing = if grid > 0.0 { Spacing::monospace(size, grid) } else { Spacing::for_size(size) };
     let mut opts = BreakOptions::new(column);
     opts.ragged = b.ragged();
+    // A heading that will not fit hangs, and that is the end of it: hyphenating a
+    // heading is an error, and a reader widens the window. A line of code has nowhere
+    // to hang *to* -- there is no horizontal scroll -- so the characters past the
+    // measure are not merely off the edge but unreadable. Code therefore asks to break
+    // rather than hang, which is what `tight_box` says, and gets a cut offered at
+    // every character to do it with.
+    opts.tight_box = b.kind == BlockKind::Code;
     opts.par_indent = theme.first_line_indent_em * size;
     // Every line but the first stands back by the marker's own width, so the marker
     // hangs in the margin it clears instead of shoving the body along.
@@ -3341,7 +3348,7 @@ fn layout_block(
     for line in &plan.lines {
         let top = y;
         let placed = place(&para, line);
-        if line.hyphen.is_some() {
+        if line.hyphen.is_some_and(|h| para.node(h).advance > 0.0) {
             hyphens.breaks += 1;
         }
         // Where this line starts. A line under a hanging marker begins at the marker's
@@ -3412,6 +3419,12 @@ fn layout_block(
                 continue;
             }
             let hyphen = node.kind == rubrica_type::paragraph::NodeKind::Hyphen;
+            if hyphen && node.advance == 0.0 {
+                // A code line cut because it would not fit: the solver charged nothing
+                // for it, so there is no mark to draw -- and a hyphen in the middle of
+                // an identifier would be a lie about its name.
+                continue;
+            }
             // The mark a discretionary break ends a line with is not in the source: the
             // solver charged the line its width and `place` gave it a slot, so the
             // painter is the only one who can supply the glyph -- and the only one who
@@ -4098,6 +4111,12 @@ fn layout_table(
                     // way the prose loop draws it: a cell's words hyphenate too, and the
                     // hyphen is no more in the cell's source than in a paragraph's.
                     let hyphen = node.kind == rubrica_type::paragraph::NodeKind::Hyphen;
+                    if hyphen && node.advance == 0.0 {
+                        // A code line cut because it would not fit: the solver charged
+                        // nothing for it, so there is no mark to draw -- and a hyphen in
+                        // the middle of an identifier would be a lie about its name.
+                        continue;
+                    }
                     let (from, range) = if hyphen {
                         (HYPHEN, HYPHEN_RANGE)
                     } else {
@@ -4576,13 +4595,34 @@ fn reaches(actions: &[Action], range: &std::ops::Range<usize>) -> bool {
 
 /// Where the words of `text` may split, and the advance of the hyphen glyph at the
 /// block's own base style.
+///
+/// A code block is the one kind of text that is *never* allowed to run past the measure
+/// unread: it has no horizontal scroll, its lines are the longest in a document, and a
+/// character cut off at the window edge is a character the reader cannot ask for. So
+/// every character boundary is offered as a break -- with no mark drawn, because a
+/// hyphen in the middle of an identifier would be a lie about its name. The solver
+/// charges a break's width, so a zero width is also what tells the painter to leave the
+/// line end alone.
 fn hyphenation_for(
     text: &str,
     styles: &[AppStyle],
     base: usize,
     hyphenator: Option<&Hyphenator>,
     font: &mut FontEngine,
+    code: bool,
 ) -> (Vec<usize>, Pt) {
+    if code {
+        let points: Vec<usize> = text
+            .char_indices()
+            .skip(1)
+            .map(|(at, _)| at)
+            .filter(|&at| {
+                !text[..at].ends_with(char::is_whitespace)
+                    && !text[at..].starts_with(char::is_whitespace)
+            })
+            .collect();
+        return (points, 0.0);
+    }
     let points: Vec<usize> = hyphenator.map(|h| h.points(text)).filter(|v| !v.is_empty()).unwrap_or_default();
     let width = if points.is_empty() {
         0.0
@@ -4721,7 +4761,8 @@ pub fn build_ops(
         let base_left = left;
         // Offsets are computed against the block's own text, which already carries
         // the list marker, so they need no shifting.
-        let (hyphens, hyphen_width) = hyphenation_for(&p.text, &styles, p.base, hyphenator, font);
+        let (hyphens, hyphen_width) =
+            hyphenation_for(&p.text, &styles, p.base, hyphenator, font, b.kind == BlockKind::Code);
         let size = theme.body_size(b.kind);
         y += theme.space_before(b.kind, first);
         first = false;
@@ -4816,7 +4857,7 @@ pub fn build_ops(
                     y += theme.note_space(false);
                 }
                 let (hyphens, hyphen_width) =
-                    hyphenation_for(&p.text, &styles, p.base, hyphenator, font);
+                    hyphenation_for(&p.text, &styles, p.base, hyphenator, font, nb.kind == BlockKind::Code);
                 let size = theme.note_body_size(nb.kind);
                 y = layout_block(
                     font,

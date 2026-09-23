@@ -8,7 +8,7 @@ use rubrica_type::classify::Role;
 use rubrica_type::justification::{line_width, place};
 use rubrica_type::paragraph::{Item, MonospaceMeasure, Spacing, StyleId, StyleSpan};
 use rubrica_type::units::{INFINITY, Pt};
-use rubrica_type::{Hyphenation, Paragraph, Plan, typeset};
+use rubrica_type::{Hyphenation, Paragraph, Plan, typeset, typeset_hyphenated};
 
 const SIZE: Pt = 16.0;
 
@@ -514,6 +514,63 @@ fn a_ragged_block_is_never_stretched_to_the_measure() {
     }
     // Ragged fill should approximate the greedy result: lines are as full as legal.
     assert!(plan.lines[0].natural > 0.85 * column, "ragged lines under-filled the measure");
+}
+
+/// A line of code the reader cannot scroll sideways to reach is not text that hangs a
+/// little -- it is text that does not exist. So a block that asked to break rather than
+/// hang must be able to, even when the only place to break is inside a token and the
+/// block is ragged, which is the case the pass loop used to concede without trying.
+#[test]
+fn a_tight_ragged_block_cuts_a_token_too_long_to_hang() {
+    // Ten characters at half an em each is five ems of ink against a four-em column,
+    // so there is no break the source offers and one line cannot be made to fit.
+    let src = "abcdefghij";
+    let spacing = Spacing::for_size(SIZE);
+    let mut measure = MonospaceMeasure { size: SIZE, factor: 0.5 };
+    let mut opts = BreakOptions::new(4.0 * SIZE);
+    opts.ragged = true;
+    opts.tight_box = true;
+    let cuts: Vec<usize> = (1..src.len()).collect();
+    let hyphenation = Hyphenation { points: &cuts, width: 0.0 };
+    let (para, plan) = typeset_hyphenated(
+        src,
+        &spacing,
+        StyleId(0),
+        &[],
+        &hyphenation,
+        &opts,
+        &mut measure,
+    );
+    assert!(plan.lines.len() >= 2, "the token was never cut: {} line(s)", plan.lines.len());
+    assert!(
+        plan.lines.iter().all(|l| !l.is_overfull()),
+        "a tight block hung anyway: {:?}",
+        plan.lines.iter().map(|l| l.natural).collect::<Vec<_>>()
+    );
+    // Nothing was charged for the cut, so nothing may be drawn for it: a hyphen in the
+    // middle of an identifier is a lie about its name.
+    assert!(
+        plan.lines.iter().all(|l| l.hyphen.is_none_or(|h| para.node(h).advance == 0.0)),
+        "a code cut grew a mark"
+    );
+}
+
+/// The other half of the gate. A heading that will not fit hangs, and that is the end
+/// of it -- escalating it would let the cuts through and hyphenate a title, which is an
+/// error rather than a fix.
+#[test]
+fn a_ragged_block_that_may_hang_is_not_escalated_into_cuts() {
+    let src = "abcdefghij";
+    let spacing = Spacing::for_size(SIZE);
+    let mut measure = MonospaceMeasure { size: SIZE, factor: 0.5 };
+    let mut opts = BreakOptions::new(4.0 * SIZE);
+    opts.ragged = true;
+    let cuts: Vec<usize> = (1..src.len()).collect();
+    let hyphenation = Hyphenation { points: &cuts, width: 0.0 };
+    let (_, plan) =
+        typeset_hyphenated(src, &spacing, StyleId(0), &[], &hyphenation, &opts, &mut measure);
+    assert_eq!(plan.lines.len(), 1, "a block that may hang was cut anyway");
+    assert!(plan.lines[0].is_overfull(), "the hang should still be reported as one");
 }
 
 #[test]

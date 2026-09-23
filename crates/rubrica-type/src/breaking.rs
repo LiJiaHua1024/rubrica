@@ -348,9 +348,13 @@ pub fn break_paragraph(para: &Paragraph, opts: &BreakOptions) -> Plan {
                 // paragraph whose last line cannot be made to fit is exactly the one
                 // that needs the looser pass -- and the hyphenation the looser pass
                 // unlocks. A block that opted out of justification is overfull by
-                // request, so it never escalates.
+                // request, so it never escalates -- unless it also asked not to hang,
+                // which is what [`BreakOptions::tight_box`] says: a cell whose ink has
+                // a neighbour, or a line of code the reader cannot scroll sideways to
+                // reach. For those, an overfull line is not an answer, and the cuts the
+                // later passes unlock are the only way to avoid one.
                 let overfull =
-                    !opts.ragged && out.0.iter().any(|l| l.is_overfull());
+                    (!opts.ragged || opts.tight_box) && out.0.iter().any(|l| l.is_overfull());
                 let last = n == attempts.len() - 1;
                 result = Some((out, n as u8 + 1));
                 if last || !overfull {
