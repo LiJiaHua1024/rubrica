@@ -361,6 +361,102 @@ mod tests {
         assert!(xs.iter().all(|x| *x > 4.0), "both limits sit beside the sign");
     }
 
+    /// The one run of `text` and where it was put, at what size: a stacked label and a
+    /// framed body are told apart by what they say, since that is all the mock's
+    /// uniform arithmetic leaves to go on.
+    fn one(f: &Formula, text: &str) -> (f32, f32, f32) {
+        let found: Vec<(f32, f32, f32)> = f
+            .shapes
+            .iter()
+            .filter_map(|s| match s {
+                Shape::Run { text: t, x, y, size } if t == text => Some((*x, *y, *size)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(found.len(), 1, "wanted one run of {text:?}, got {found:?}");
+        found[0]
+    }
+
+    /// Every rule, with all four of its numbers, because a frame is four of them and
+    /// which edge each one is has to be visible in the expectation.
+    fn frame(f: &Formula) -> Vec<(f32, f32, f32, f32)> {
+        f.shapes
+            .iter()
+            .filter_map(|s| match s {
+                Shape::Rule { x, y, width, thickness } => Some((*x, *y, *width, *thickness)),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn a_stacked_label_is_centred_over_its_base_and_lifts_the_box() {
+        let f = set("\\overset{nn}{=}", 10.0, false, &mut Mock::mathy());
+        let (x, y, size) = one(&f, "nn");
+        // A limit's positions, so the face's own script size and the baseline rise the
+        // layout falls back to when the table stays silent: seven rule thicknesses.
+        assert_eq!(size, 7.5);
+        near(y, -15.5, "the label's baseline, clear of the base's ink");
+        near(x, -1.25, "wider than its base, so over both ends equally");
+        near(f.ascent, 20.75, "the box reaches the label's ink");
+        near(f.descent, 2.0, "and nothing below the base");
+        near(f.width, 7.5, "the box is as wide as its widest part");
+        let (bx, by, _) = one(&f, "=");
+        assert_eq!((bx, by), (0.0, 0.0), "the base keeps its own place on the line");
+    }
+
+    #[test]
+    fn a_label_under_a_base_drops_below_it_instead_of_taking_its_place() {
+        let f = set("\\underset{nn}{=}", 10.0, false, &mut Mock::mathy());
+        let (x, y, _) = one(&f, "nn");
+        near(y, 14.25, "the label's baseline is below the base");
+        near(x, -1.25, "and centred on it, as the one above is");
+        near(f.descent, 15.75, "the box reaches the label's ink");
+        near(f.ascent, 7.0, "and nothing above the base");
+        let (bx, by, _) = one(&f, "=");
+        assert_eq!((bx, by), (0.0, 0.0), "the base is still what sits on the line");
+    }
+
+    #[test]
+    fn stackrel_and_overset_set_the_same_box() {
+        let mut m = Mock::mathy();
+        assert_eq!(
+            set("\\stackrel{nn}{=}", 10.0, false, &mut m),
+            set("\\overset{nn}{=}", 10.0, false, &mut m),
+            "two names for one construct, so one shape of output"
+        );
+    }
+
+    #[test]
+    fn a_stacked_relation_is_still_spaced_as_a_relation() {
+        let mut m = Mock::bare();
+        let stacked = set("\\overset{a}{=}b", 10.0, false, &mut m).width;
+        let plain = set("=b", 10.0, false, &mut m).width;
+        // The label takes the room of a limit, not of an atom, so the glue before `b`
+        // is the relation's own either way and the sentence does not tear open.
+        near(stacked - plain, 0.0, "space after a stacked relation");
+    }
+
+    #[test]
+    fn a_boxed_formula_is_framed_on_all_four_sides() {
+        let f = set("\\boxed{x}", 10.0, false, &mut Mock::mathy());
+        let edges = frame(&f);
+        assert_eq!(edges.len(), 4, "one rule per side");
+        // Three points of separation and a rule of 0.4 at this size, so the frame
+        // stands 3.4 clear of the body's ink on every side.
+        near(edges[0].1, -10.4, "the top edge is outside the body's ascent");
+        near(edges[0].2, 11.8, "and spans body, separation and both rules");
+        near(edges[1].1, 5.0, "the bottom edge is the frame's own bottom");
+        near(edges[2].3, 15.8, "the left rule reaches edge to edge");
+        near(edges[3].0, 11.4, "the right rule closes the corner");
+        near(f.width, 11.8, "the box is the frame, not the body");
+        near(f.ascent, 10.4, "the frame is the ink above the line");
+        near(f.descent, 5.4, "and below it");
+        let (x, y, _) = one(&f, "x");
+        near(x, 3.4, "the body starts inside the frame, not under it");
+        assert_eq!(y, 0.0, "and on the line it was on");
+    }
+
     #[test]
     fn relations_and_operators_take_tex_three_muskips() {
         let mut m = Mock::bare();
@@ -391,6 +487,8 @@ mod tests {
             "\\sum_{i=1}^{n} i = \\frac{n(n+1)}{2}",
             "\\int_0^\\infty x\\,dx",
             "\\hat{a} + \\overline{b}",
+            "\\overset{p}{=} q",
+            "\\boxed{\\frac{1}{2}}",
             "\\frobnicate{x}",
         ] {
             let f = set(src, 13.5, true, &mut m);
@@ -403,7 +501,16 @@ mod tests {
     fn malformed_input_degrades_instead_of_failing() {
         let mut m = Mock::bare();
         // Unbalanced, empty and nonsense all still draw something.
-        for src in ["\\frac{1}", "\\left(", "", "^2", "\\sqrt", "$not a command"] {
+        for src in [
+            "\\frac{1}",
+            "\\left(",
+            "",
+            "^2",
+            "\\sqrt",
+            "$not a command",
+            "\\overset{1}",
+            "\\boxed",
+        ] {
             let f = set(src, 12.0, false, &mut m);
             assert!(f.width >= 0.0);
         }

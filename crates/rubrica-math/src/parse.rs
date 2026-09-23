@@ -2,9 +2,10 @@
 //!
 //! Deliberately a subset, not a TeX implementation: the goal is the math people
 //! actually write in Markdown, so fractions, scripts, radicals, stretchy delimiters,
-//! big operators with limits, accents, lettering switches (`\mathbb`, `\mathbf`),
-//! multi-row environments and the common symbol names are handled, and anything else
-//! degrades to its literal characters rather than disappearing.
+//! big operators with limits, accents, stacked labels and framed boxes, lettering
+//! switches (`\mathbb`, `\mathbf`), multi-row environments and the common symbol names
+//! are handled, and anything else degrades to its literal characters rather than
+//! disappearing.
 //!
 //! Unbalanced braces or an unknown command never fail the parse. A reader that
 //! refuses to show a document because one formula is malformed is worse than one
@@ -64,6 +65,20 @@ pub enum Node {
         body: Box<Node>,
         side: BarSide,
     },
+    /// `\overset`, `\underset` and `\stackrel`: a label stacked over or under a base.
+    ///
+    /// All three are TeX's forced `\limits` on a base operator, so the label is a
+    /// script-sized box in the positions a display limit takes and the construct keeps
+    /// the spacing class of its base -- `\overset{?}{=}` is still a relation. `side`
+    /// names which side of the base the label goes, reusing the two sides a
+    /// [`Node::Bar`] already speaks of.
+    Stack {
+        base: Box<Node>,
+        label: Box<Node>,
+        side: BarSide,
+    },
+    /// `\boxed`, `\fbox`: the body inside a rectangle.
+    Boxed { body: Box<Node> },
     /// A fixed space, in mu (1/18 em).
     Space(i16),
     /// A grid of cells: the `matrix`, `cases`, `aligned` and `array` families, which
@@ -527,6 +542,12 @@ impl<'a> Parser<'a> {
             "tilde" | "widetilde" => self.accent(AccentKind::Tilde),
             "dot" => self.accent(AccentKind::Dot),
             "vec" => self.accent(AccentKind::Vec),
+            // A label over or under a base. `\stackrel` is the older spelling of
+            // `\overset` and both are a forced `\limits` on their base, so they get the
+            // same box here; which side the label goes is the only difference that shows.
+            "overset" | "stackrel" => self.stack(BarSide::Over),
+            "underset" => self.stack(BarSide::Under),
+            "boxed" | "fbox" => Node::Boxed { body: Box::new(self.argument()) },
             // A modifier on the preceding big operator, which the layout reads off
             // the node itself; emitting nothing keeps `a \lim\limits b` working.
             "limits" | "nolimits" => Node::Atom(String::new()),
@@ -536,6 +557,15 @@ impl<'a> Parser<'a> {
 
     fn accent(&mut self, kind: AccentKind) -> Node {
         Node::Accent { base: Box::new(self.argument()), accent: kind }
+    }
+
+    /// A stacked label's two arguments, in the order they are written: the label comes
+    /// first and the base second, which is the one place in this subset where the
+    /// reading order and the layout's names for the two boxes run against each other.
+    fn stack(&mut self, side: BarSide) -> Node {
+        let label = self.argument();
+        let base = self.argument();
+        Node::Stack { base: Box::new(base), label: Box::new(label), side }
     }
 
     /// The argument of an alphabet-switching command, with its letters moved into that
@@ -936,6 +966,9 @@ pub fn retarget(alphabet: Alphabet, node: Node) -> Node {
         },
         Node::Accent { base, accent } => Node::Accent { base: boxed(*base), accent },
         Node::Bar { body, side } => Node::Bar { body: boxed(*body), side },
+        Node::Stack { base, label, side } =>
+            Node::Stack { base: boxed(*base), label: boxed(*label), side },
+        Node::Boxed { body } => Node::Boxed { body: boxed(*body) },
         Node::Array { rows, columns, kind, delimiters } => Node::Array {
             rows: rows.into_iter().map(|r| r.into_iter().map(go).collect()).collect(),
             columns,
@@ -1230,6 +1263,9 @@ mod tests {
             ),
             Node::Accent { base, accent } => format!("(accent {accent:?} {})", sexp(base)),
             Node::Bar { body, side } => format!("(bar {side:?} {})", sexp(body)),
+            Node::Stack { base, label, side } =>
+                format!("(stack {side:?} {} {})", sexp(base), sexp(label)),
+            Node::Boxed { body } => format!("(boxed {})", sexp(body)),
             Node::Space(mu) => format!("(space {mu})"),
             // Columns print as the `l`/`c`/`r` letters they were written with, rows
             // separated by ` / ` and cells by ` & `, which is the shape of the source.
@@ -1300,6 +1336,19 @@ mod tests {
         assert_eq!(of("\\frac12"), "(frac 1 2)");
         assert_eq!(of("\\dfrac12"), "(dfrac 1 2)");
         assert_eq!(of("\\tfrac12"), "(tfrac 1 2)");
+    }
+
+    #[test]
+    fn a_stacked_label_and_a_frame_take_their_arguments_in_order() {
+        // The label is written first and laid out second, which is the one place in this
+        // subset where the source's order and the construct's two names run against each
+        // other -- so an expectation says which of the braces became which box.
+        assert_eq!(of("\\overset{n}{=}"), "(stack Over = n)");
+        assert_eq!(of("\\underset{n}{=}"), "(stack Under = n)");
+        assert_eq!(of("\\stackrel{n}{\\to}"), "(stack Over → n)");
+        assert_eq!(of("\\boxed{x+1}"), "(boxed (x + 1))");
+        // An unbraced argument is still one token, in both of them.
+        assert_eq!(of("\\overset n="), "(stack Over = n)");
     }
 
     #[test]

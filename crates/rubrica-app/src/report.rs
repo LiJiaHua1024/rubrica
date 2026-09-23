@@ -7,7 +7,7 @@
 //! what is actually painted rather than what a second implementation would have
 //! produced -- and it never touches the desktop.
 //!
-//! Run: `rubrica-app --report [file.md] [--width 1080] [--dpi 96] [--zoom 120] [--face 1] [--measure 0]`
+//! Run: `rubrica-app --report [file.md] [--width 1080] [--dpi 96] [--zoom 120] [--face 1] [--measure 0] [--shapes]`
 
 use std::collections::BTreeMap;
 
@@ -33,12 +33,15 @@ pub struct Options {
     pub zoom: Zoom,
     pub face: usize,
     pub measure: usize,
+    /// Print every piece of every formula with the coordinates it is drawn at. Off by
+    /// default because it is a page of numbers per formula, not a summary.
+    pub shapes: bool,
 }
 
 pub fn report(source: &str, path: Option<&str>, o: &Options) -> Result<()> {
     // Unpacked at the top so the rest reads as the numbers themselves rather than as a
     // struct named in front of every one.
-    let Options { width, dpi, hyphenate, zoom, face, measure } = *o;
+    let Options { width, dpi, hyphenate, zoom, face, measure, shapes } = *o;
     let mut font = FontEngine::new().map_err(|e| -> Error { format!("DirectWrite: {e}").into() })?;
     if !font.probe() {
         return Err("no usable font face".into());
@@ -279,6 +282,12 @@ pub fn report(source: &str, path: Option<&str>, o: &Options) -> Result<()> {
             "math         : {asked} formulae, {set} set from [{}], {bars} rules drawn, {measured} measured from a MATH table",
             families.join(", ")
         );
+    }
+    // A formula's arithmetic is invisible in a summary: a brace that was grown to its
+    // grid and a brace drawn as one natural-size glyph are the same one line of the
+    // census and a screen apart on the page. This prints the display list itself.
+    if shapes {
+        math.dump(&font);
     }
     // Counted two ways on purpose: the marks in the text are what the reader can
     // follow, the entries in `footnotes` are what the author defined, and a document

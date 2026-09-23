@@ -11,7 +11,7 @@
 //! two passes need it: line breaking wants its box, and painting wants its shapes.
 
 use rubrica_math::layout::{Extents, MathMeasure, Shape, Stacked};
-use rubrica_math::table::{assemble, MathTable};
+use rubrica_math::table::MathTable;
 use rubrica_type::units::Pt;
 use windows::Win32::Graphics::DirectWrite::{
     DWRITE_FONT_METRICS, DWRITE_GLYPH_OFFSET, IDWriteFontFace,
@@ -170,6 +170,42 @@ impl MathStore {
             self.entries.iter().filter(|e| e.from_table).count(),
         )
     }
+
+    /// Every piece of every formula, at the coordinates it is painted at, in the
+    /// formula's own space: `x` from its left edge and `y` below its baseline.
+    ///
+    /// A summary cannot tell the two ways a delimiter goes wrong apart. One that was
+    /// never grown and one grown to the wrong height both put a brace near the text and
+    /// both count as one line of the census; what separates them is a number per part,
+    /// which is what this prints. A `part` is a piece of a grown shape, addressed by
+    /// glyph id, where a `run` is shaped text.
+    pub fn dump(&self, font: &FontEngine) {
+        for (i, e) in self.entries.iter().enumerate() {
+            let (source, size, display) = &e.key;
+            println!(
+                "  [{i}] {source:?}  {:.2}pt {}  box {:.1} wide, {:.1}+{:.1} tall",
+                *size as f32 / 64.0,
+                if *display { "display" } else { "inline" },
+                e.object.advance,
+                e.object.ascent,
+                e.object.descent
+            );
+            for (r, x, y) in &e.parts {
+                let glyphs: Vec<String> = r.glyphs.iter().map(|g| g.to_string()).collect();
+                println!(
+                    "      {} x={x:>7.2} y={y:>6.2}  {:>4.1}pt {:>2}g {:<16} {}",
+                    if r.text.is_empty() { "part" } else { "run " },
+                    r.size,
+                    r.glyphs.len(),
+                    font.face_family(r.face),
+                    glyphs.join(",")
+                );
+            }
+            for (x, top, w, t) in &e.rules {
+                println!("      rule x={x:>7.2} y={top:>6.2}  {w:>6.2} x {t:.2}");
+            }
+        }
+    }
 }
 
 /// The face a formula is set from: its `MATH` table for the numbers, and its glyph
@@ -255,18 +291,10 @@ impl MathMeasure for Adapter<'_> {
             return None;
         }
         let want = (height / self.scale(size)).clamp(0.0, u16::MAX as f32) as u16;
-        // A ready-made variant tall enough is the font's own drawing of the taller
-        // shape, so it wins; only when the font has none is one built from parts.
-        let placed = match t.pick_variant(g, want) {
-            Some(v) => vec![rubrica_math::Placed { glyph: v, offset: 0, full_advance: want }],
-            None => {
-                let c = t.construction(g, true)?;
-                if c.assembly.is_empty() {
-                    return None;
-                }
-                assemble(&c.assembly, t.min_connector_overlap(), want)
-            }
-        };
+        // Which variant, or which built shape, is the table's decision -- see
+        // [`MathTable::grow`]. What is left here is the part only this process can do:
+        // look the real ink of each piece up in the face.
+        let placed = t.grow(g, want)?;
         let s = self.scale(size);
         let out = placed
             .iter()

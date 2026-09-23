@@ -188,16 +188,17 @@ impl<'a> MathTable<'a> {
                 (0..n).find(|&i| r.u16(cov + 4 + i * 2) == glyph).map(|i| i as u32)
             }
             2 => {
+                // Each range carries its own starting index, so the answer is that
+                // index plus the glyph's distance into the range -- and the ranges
+                // before it are none of the arithmetic.
                 let n = r.u16(cov + 2) as usize;
-                let mut acc = 0u32;
                 for i in 0..n {
-                    let base = r.u16(cov + 4 + i * 6);
-                    let last = r.u16(cov + 4 + i * 6 + 2);
-                    let cnt = r.u16(cov + 4 + i * 6 + 4);
+                    let at = cov + 4 + i * 6;
+                    let base = r.u16(at);
+                    let last = r.u16(at + 2);
                     if glyph >= base && glyph <= last {
-                        return Some(acc + (glyph - base) as u32);
+                        return Some(r.u16(at + 4) as u32 + (glyph - base) as u32);
                     }
-                    acc += cnt as u32 + 1;
                 }
                 None
             }
@@ -233,7 +234,11 @@ impl<'a> MathTable<'a> {
         if mv + 10 > self.data.len() {
             return None;
         }
-        let cov = r.u16(mv + if vertical { 2 } else { 4 }) as usize;
+        // Both coverage offsets, and every offset below them, are measured from the
+        // start of the GlyphVariation table. Read as positions in the file they point
+        // into the constants instead, and no glyph in any font is ever found -- which
+        // is silent, because the caller's fallback is to draw the delimiter small.
+        let cov = mv + r.u16(mv + if vertical { 2 } else { 4 }) as usize;
         let vert_count = r.u16(mv + 6) as usize;
         let count = r.u16(mv + if vertical { 6 } else { 8 }) as usize;
         let idx = self.coverage_index(cov, glyph)? as usize;
@@ -292,15 +297,36 @@ impl<'a> MathTable<'a> {
         r.u16(self.variants)
     }
 
-    /// The smallest ready-made variant at least `want` design units tall, or `None`
-    /// when the caller must build the shape from an assembly instead.
-    pub fn pick_variant(&self, glyph: u16, want: u16) -> Option<u16> {
+    /// The parts to build `glyph` out of to reach `want` design units, ordered
+    /// bottom-up, or `None` when the font says nothing about growing this glyph.
+    ///
+    /// Three answers in order of preference. A ready-made variant at least as tall as
+    /// the target is the type designer's own drawing of the taller shape, so it wins.
+    /// Failing that, an assembly of parts is built out to the target. Failing *that* --
+    /// which is the ordinary case for a parenthesis, since a curve has no straight
+    /// section to repeat -- the tallest variant the font has comes back instead of
+    /// nothing. It is short of the target, but it is far closer than the natural glyph,
+    /// which would otherwise sit one em tall beside a grid four em high.
+    pub fn grow(&self, glyph: u16, want: u16) -> Option<Vec<Placed>> {
         let c = self.construction(glyph, true)?;
-        c.variants
+        let whole = |v: &Variant| {
+            vec![Placed { glyph: v.glyph, offset: 0, full_advance: v.measurement }]
+        };
+        if let Some(v) = c
+            .variants
             .iter()
             .filter(|v| v.measurement >= want)
             .min_by_key(|v| v.measurement)
-            .map(|v| v.glyph)
+        {
+            return Some(whole(v));
+        }
+        if !c.assembly.is_empty() {
+            let built = assemble(&c.assembly, self.min_connector_overlap(), want);
+            if !built.is_empty() {
+                return Some(built);
+            }
+        }
+        c.variants.iter().max_by_key(|v| v.measurement).map(whole)
     }
 }
 
@@ -426,5 +452,176 @@ impl<'a> Reader<'a> {
     #[inline]
     fn i16(&self, at: usize) -> i16 {
         self.u16(at) as i16
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Append one 16-bit field, in the order the specification writes them.
+    fn put(t: &mut Vec<u8>, v: u16) {
+        t.extend_from_slice(&v.to_be_bytes());
+    }
+
+    /// The constants are not read by these tests, but a table whose declared constant
+    /// block would run past its own end is refused at parse time -- so it is here.
+    const CONSTANTS: usize = 10;
+    const VARIANTS: usize = 234;
+
+    /// A `MATH` table for two growable glyphs: one with three ready-made variants and
+    /// no assembly, one with a single short variant and a bottom/extender/top assembly.
+    ///
+    /// Handwritten rather than lifted from a system font because the whole point is the
+    /// offsets. A real font cannot tell a reader bug from an absent feature, which is
+    /// exactly the confusion that let every delimiter in the reader draw at its natural
+    /// size while the face it was read from had tall ones.
+    fn two_glyphs() -> Vec<u8> {
+        let mut t = Vec::new();
+        put(&mut t, 1); // major version
+        put(&mut t, 0); // minor version
+        put(&mut t, CONSTANTS as u16);
+        put(&mut t, 0); // no MathGlyphInfo, so no italics corrections either
+        put(&mut t, VARIANTS as u16);
+        t.resize(VARIANTS, 0);
+        // ---- GlyphVariation, whose every offset is measured from here.
+        put(&mut t, 40); // MinConnectorOverlap
+        put(&mut t, 20); // VertCoverage -> 254
+        put(&mut t, 0); // no horizontal direction in this fixture
+        put(&mut t, 2); // VertGlyphCount
+        put(&mut t, 0); // HorzGlyphCount
+        put(&mut t, 28); // glyph 100's construction -> 262
+        put(&mut t, 44); // glyph 200's construction -> 278
+        t.resize(254, 0);
+        // ---- Coverage format 1: a plain list of the two glyphs.
+        put(&mut t, 1);
+        put(&mut t, 2);
+        put(&mut t, 100);
+        put(&mut t, 200);
+        // ---- Glyph 100: three heights, and nothing to build with.
+        put(&mut t, 0); // no GlyphAssembly
+        put(&mut t, 3);
+        put(&mut t, 101); put(&mut t, 500);
+        put(&mut t, 102); put(&mut t, 900);
+        put(&mut t, 103); put(&mut t, 1400);
+        // ---- Glyph 200: one short height and an assembly of three parts.
+        put(&mut t, 8); // GlyphAssembly -> 286
+        put(&mut t, 1);
+        put(&mut t, 201); put(&mut t, 300);
+        put(&mut t, 0); // the assembly's italics correction
+        put(&mut t, 3); // partCount
+        for (glyph, start, end, advance, extender) in
+            [(210u16, 0u16, 40, 300, 0), (211, 40, 40, 200, 1), (212, 40, 0, 300, 0)]
+        {
+            put(&mut t, glyph);
+            put(&mut t, start);
+            put(&mut t, end);
+            put(&mut t, advance);
+            put(&mut t, extender);
+        }
+        t
+    }
+
+    #[test]
+    fn a_glyph_that_can_grow_is_found_by_its_own_number() {
+        let bytes = two_glyphs();
+        let t = MathTable::parse(&bytes, 2048).expect("the fixture is a version 1 table");
+        let c = t.construction(100, true).expect("coverage lists glyph 100");
+        assert_eq!(c.variants.len(), 3, "the variant records were not walked");
+        assert!(c.assembly.is_empty(), "this one has no assembly to find");
+        // Between the two covered glyphs, and above both: absent, which is the answer a
+        // caller can fall back on -- but only if it is not also the answer for glyphs
+        // the font *does* list.
+        assert!(t.construction(150, true).is_none());
+        assert!(t.construction(300, true).is_none());
+        assert!(t.construction(200, false).is_none(), "the horizontal coverage is empty");
+    }
+
+    #[test]
+    fn a_variant_already_tall_enough_is_used_rather_than_built() {
+        let bytes = two_glyphs();
+        let t = MathTable::parse(&bytes, 2048).unwrap();
+        let grown = t.grow(100, 800).expect("three variants to choose between");
+        assert_eq!(grown.len(), 1, "a ready-made height is one glyph");
+        // 900 is the variant's own measurement, not the 800 that was asked for: the
+        // caller places the part by the band it actually occupies, so reporting the
+        // target instead would leave the shape floating inside a space it does not fill.
+        assert_eq!((grown[0].glyph, grown[0].full_advance), (102, 900));
+        assert_eq!(grown[0].offset, 0);
+    }
+
+    #[test]
+    fn the_tallest_height_a_font_has_beats_its_smallest() {
+        let bytes = two_glyphs();
+        let t = MathTable::parse(&bytes, 2048).unwrap();
+        // Past every height the font offers, and with no assembly to build from: the
+        // answer is still 1400 units of brace rather than the 500-unit natural glyph,
+        // which is the difference between a parenthesis that reads as enclosing the
+        // grid above it and one that sits on the baseline inside it.
+        let grown = t.grow(100, 5000).expect("the tallest variant stands in");
+        assert_eq!((grown[0].glyph, grown[0].full_advance), (103, 1400));
+    }
+
+    #[test]
+    fn an_assembly_is_built_out_to_the_height_asked() {
+        let bytes = two_glyphs();
+        let t = MathTable::parse(&bytes, 2048).unwrap();
+        let grown = t.grow(200, 1000).expect("three parts to build with");
+        assert_eq!(grown.first().map(|p| p.glyph), Some(210), "the bottom part goes first");
+        assert_eq!(grown.last().map(|p| p.glyph), Some(212), "and the top part last");
+        assert!(grown.len() > 3, "the extender was never repeated: {grown:?}");
+        assert!(
+            grown.windows(2).all(|w| w[1].offset > w[0].offset),
+            "parts must climb: {grown:?}"
+        );
+        let last = grown.last().unwrap();
+        let reach = u32::from(last.offset) + u32::from(last.full_advance);
+        assert!(reach >= 1000, "assembled only {reach} units for a target of 1000");
+    }
+
+    /// The same kind of constructions, reached through a coverage written as ranges --
+    /// the format that carries a starting index per range rather than one glyph per
+    /// entry. Four constructions, three glyphs in the first range and one in the second.
+    fn ranged() -> Vec<u8> {
+        let mut t = Vec::new();
+        put(&mut t, 1);
+        put(&mut t, 0);
+        put(&mut t, CONSTANTS as u16);
+        put(&mut t, 0);
+        put(&mut t, VARIANTS as u16);
+        t.resize(VARIANTS, 0);
+        put(&mut t, 40);
+        put(&mut t, 18); // VertCoverage -> 252
+        put(&mut t, 0);
+        put(&mut t, 4); // VertGlyphCount
+        put(&mut t, 0);
+        for i in 0..4u16 {
+            put(&mut t, 34 + i * 8); // -> 268, 276, 284, 292
+        }
+        // ---- Coverage format 2: 100..=102 at index 0, then 300..=302 at index 3.
+        put(&mut t, 2);
+        put(&mut t, 2);
+        put(&mut t, 100); put(&mut t, 102); put(&mut t, 0);
+        put(&mut t, 300); put(&mut t, 302); put(&mut t, 3);
+        for glyph in [111u16, 112, 113, 311] {
+            put(&mut t, 0); // no assembly
+            put(&mut t, 1);
+            put(&mut t, glyph);
+            put(&mut t, 700);
+        }
+        t
+    }
+
+    #[test]
+    fn a_range_in_a_coverage_points_at_its_own_index() {
+        let bytes = ranged();
+        let t = MathTable::parse(&bytes, 2048).unwrap();
+        assert_eq!(t.grow(100, 100).map(|g| g[0].glyph), Some(111));
+        assert_eq!(t.grow(102, 100).map(|g| g[0].glyph), Some(113));
+        // Each range says where its own indices start, so glyph 300 is the fourth
+        // construction -- and summing one per range before it instead lands on the
+        // second, which is a different delimiter's height on the page.
+        assert_eq!(t.grow(300, 100).map(|g| g[0].glyph), Some(311));
+        assert_eq!(t.grow(302, 100).map(|g| g[0].glyph), None, "past the listed ranges");
     }
 }

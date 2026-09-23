@@ -36,7 +36,15 @@ fn main() -> Result<()> {
         let (path, source) = load(file.as_deref())?;
         let shown = path.and_then(|p| p.to_str().map(str::to_string));
         let hyphenate = !argv.iter().any(|a| a == "--no-hyphenate");
-        let options = report::Options { width, dpi, hyphenate, zoom, face, measure };
+        let options = report::Options {
+            width,
+            dpi,
+            hyphenate,
+            zoom,
+            face,
+            measure,
+            shapes: argv.iter().any(|a| a == "--shapes"),
+        };
         return report::report(&source, shown.as_deref(), &options);
     }
     // A file named on the command line is what the reader asked for, and one that cannot

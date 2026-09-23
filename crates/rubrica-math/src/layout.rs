@@ -142,6 +142,14 @@ const CASES_COND_GAP: Pt = 8.0 / 18.0;
 /// table is present enough to give those.
 const FALLBACK_ARRAY_LEADING: Pt = 0.2;
 
+/// TeX's `\fboxsep` and `\fboxrule` for `\boxed`: 3pt of separation and a 0.4pt rule
+/// at a 10pt base, which is what both of them are as ratios of the type size here.
+/// `MATH` has nothing to say about a box -- it is not a construct the table describes,
+/// and the frame is deliberately thinner than a fraction bar because it is a frame and
+/// not an operator.
+const BOX_SEPARATION: Pt = 0.3;
+const BOX_RULE: Pt = 0.04;
+
 /// A metrics-only box: what a sub-layout reports to its caller.
 #[derive(Clone, Copy, Debug, Default)]
 struct Mb {
@@ -218,6 +226,8 @@ impl Engine<'_> {
                 self.big_op(op, *limits, sub.as_deref(), sup.as_deref(), st),
             Node::Accent { base, accent } => self.accent(base, *accent, st),
             Node::Bar { body, side } => self.bar(body, *side, st),
+            Node::Stack { base, label, side } => self.stack(base, label, *side, st),
+            Node::Boxed { body } => self.boxed(body, st),
             Node::Array { rows, columns, kind, delimiters } =>
                 self.array(rows, columns, *kind, *delimiters, st),
             Node::Space(mu) => (
@@ -775,24 +785,47 @@ impl Engine<'_> {
             descent: e.descent * k,
             italic: e.italic * k,
         };
-        self.stacked(op, st.size * k, sub, sup, ob, st)
+        let (a_shapes, _) = self.atom(op, Style { size: st.size * k, ..st });
+        self.stacked(a_shapes, ob, sub, sup, st)
     }
 
-    /// Limits above and below an operator, centred on its width.
+    /// A label over or under a base: `\overset`, `\underset`, `\stackrel`.
+    ///
+    /// TeX writes all three as a forced `\limits` on a math operator, so the label is
+    /// given the same script size and the same two gaps a display limit gets, and the
+    /// base keeps its own style -- `\overset{?}{=}` in a sentence has to stay the
+    /// relation it was.
+    fn stack(
+        &mut self,
+        base: &Node,
+        label: &Node,
+        side: BarSide,
+        st: Style,
+    ) -> (Vec<Shape>, Mb) {
+        let (b_shapes, bb) = self.lay(base, st);
+        let (above, below) = match side {
+            BarSide::Over => (Some(label), None),
+            BarSide::Under => (None, Some(label)),
+        };
+        self.stacked(b_shapes, bb, below, above, st)
+    }
+
+    /// Limits above and below an already-laid-out base, centred on its width. The base
+    /// comes in as shapes because both of this file's callers have one: a big operator
+    /// measures its own glyph, while a stacked label keeps whatever its base turned out
+    /// to be -- a word, a relation, a whole fraction.
     fn stacked(
         &mut self,
-        op: &str,
-        op_size: Pt,
+        base: Vec<Shape>,
+        ob: Mb,
         sub: Option<&Node>,
         sup: Option<&Node>,
-        ob: Mb,
         st: Style,
     ) -> (Vec<Shape>, Mb) {
         let level1 = Style { size: self.script_size(st, 1), display: false, cramped: true };
         let sup_box = sup.map(|n| self.lay(n, level1));
         let sub_box = sub.map(|n| self.lay(n, level1));
         let mut out = Vec::new();
-        let (a_shapes, _) = self.atom(op, Style { size: op_size, ..st });
         let mut width = ob.ink_width();
         let mut ascent = ob.ascent;
         let mut descent = ob.descent;
@@ -809,7 +842,7 @@ impl Engine<'_> {
             width = width.max(sb.ink_width());
             ascent = ascent.max(u + sb.ascent);
         }
-        translate(&a_shapes, 0.0, 0.0, &mut out);
+        translate(&base, 0.0, 0.0, &mut out);
         if let Some((s, sb)) = sub_box {
             let gap = self.c(constant::LOWER_LIMIT_GAP_MIN, st.size, 0.0);
             let drop = self.c(constant::LOWER_LIMIT_BASELINE_DROP_MIN, st.size, 0.0);
@@ -885,6 +918,30 @@ impl Engine<'_> {
             }
         };
         (out, Mb { width: w, ascent, descent, italic: 0.0 })
+    }
+
+    /// `\boxed` / `\fbox`: four rules around the body, [`BOX_SEPARATION`] clear of its
+    /// ink and [`BOX_RULE`] thick.
+    ///
+    /// The body is moved right by the frame's own so that the box starts exactly where
+    /// the formula says it does: a delimiter is read as hanging off what it encloses,
+    /// but a frame is the thing the reader points at, and ink left of the origin would
+    /// put the equation outside the margin.
+    fn boxed(&mut self, body: &Node, st: Style) -> (Vec<Shape>, Mb) {
+        let (sb, bb) = self.lay(body, Style { cramped: true, ..st });
+        let t = BOX_RULE * st.size;
+        let off = BOX_SEPARATION * st.size + t;
+        let (w, h) = (bb.ink_width() + 2.0 * off, bb.height() + 2.0 * off);
+        let top = -(bb.ascent + off);
+        let mut out = Vec::new();
+        translate(&sb, off, 0.0, &mut out);
+        out.extend([
+            Shape::Rule { x: 0.0, y: top, width: w, thickness: t },
+            Shape::Rule { x: 0.0, y: top + h - t, width: w, thickness: t },
+            Shape::Rule { x: 0.0, y: top, width: t, thickness: h },
+            Shape::Rule { x: w - t, y: top, width: t, thickness: h },
+        ]);
+        (out, Mb { width: w, ascent: bb.ascent + off, descent: bb.descent + off, italic: 0.0 })
     }
 }
 
@@ -1007,11 +1064,33 @@ impl Class {
                 Some(ch) if is_close(ch) => Class::Close,
                 _ => Class::Ord,
             },
+            // A group of one presents the atom it holds, which is what makes
+            // `\overset{a}{=}` a relation: `{=}` is the group the parser hands over as
+            // the base, and both of a one-atom group's ends are that same atom. A wider
+            // group reads as ordinary, because one class cannot say what both of its
+            // ends are and TeX's own spacing at a brace comes from the atoms inside it.
+            Node::Row(v) => match v.as_slice() {
+                [only] => Class::of(only),
+                _ => Class::Ord,
+            },
             // Only an integral behaves like an operator that wants a thin space after
             // it; a `\sum` with its limits is already spaced by its own box.
             Node::BigOp { limits: Limits::Never, .. } => Class::Big,
+            // A stacked label is spaced as its base is, because that is what TeX's
+            // forced `\limits` on it means: `\overset{a}{=} b` reads as a relation.
+            Node::Stack { base, .. } => Class::of(sole(base)),
             _ => Class::Ord,
         }
+    }
+}
+
+/// The node a construct's spacing class is read from. A brace group of one is that one
+/// atom -- which is why `\overset{a}{=}` keeps a relation's glue while
+/// `\overset{a}{x = y}` is a box of its own, as it is in TeX.
+fn sole(n: &Node) -> &Node {
+    match n {
+        Node::Row(v) if v.len() == 1 => sole(&v[0]),
+        _ => n,
     }
 }
 
