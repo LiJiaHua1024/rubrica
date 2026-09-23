@@ -43,8 +43,17 @@ pub struct Options {
 pub fn report(source: &str, path: Option<&str>, o: &Options) -> Result<()> {
     // Unpacked at the top so the rest reads as the numbers themselves rather than as a
     // struct named in front of every one.
-    let Options { width, dpi, hyphenate, zoom, face, measure, shapes } = *o;
-    let mut font = FontEngine::new().map_err(|e| -> Error { format!("DirectWrite: {e}").into() })?;
+    let Options {
+        width,
+        dpi,
+        hyphenate,
+        zoom,
+        face,
+        measure,
+        shapes,
+    } = *o;
+    let mut font =
+        FontEngine::new().map_err(|e| -> Error { format!("DirectWrite: {e}").into() })?;
     if !font.probe() {
         return Err("no usable font face".into());
     }
@@ -55,12 +64,21 @@ pub fn report(source: &str, path: Option<&str>, o: &Options) -> Result<()> {
     let doc = rubrica_doc::Document::parse(source);
     // No render target exists here, so figures are measured from their files
     // through WIC but not decoded to bitmaps -- enough to lay out and report.
-    let _ = unsafe { windows::Win32::System::Com::CoInitializeEx(None, windows::Win32::System::Com::COINIT_MULTITHREADED) };
+    let _ = unsafe {
+        windows::Win32::System::Com::CoInitializeEx(
+            None,
+            windows::Win32::System::Com::COINIT_MULTITHREADED,
+        )
+    };
     let store = crate::images::ImageStore::new().ok();
     let base = path.map(std::path::Path::new).and_then(|p| p.parent());
     let mut math = crate::math::MathStore::new();
     let mut objects = crate::view::Objects::new(store.as_ref(), base, &mut math);
-    let hyphenator = if hyphenate { crate::hyphen::Hyphenator::english() } else { None };
+    let hyphenator = if hyphenate {
+        crate::hyphen::Hyphenator::english()
+    } else {
+        None
+    };
     let page = build_ops(
         &mut font,
         &theme,
@@ -81,7 +99,9 @@ pub fn report(source: &str, path: Option<&str>, o: &Options) -> Result<()> {
     // bites first, because a change of lettering style there is a change of codepoint.
     let mut notdef: BTreeMap<String, usize> = BTreeMap::new();
     for op in ops {
-        let crate::view::Op::Runs(runs) = op else { continue };
+        let crate::view::Op::Runs(runs) = op else {
+            continue;
+        };
         if runs.is_empty() {
             continue;
         }
@@ -114,13 +134,20 @@ pub fn report(source: &str, path: Option<&str>, o: &Options) -> Result<()> {
     // whatever its own left happens to be.
     let edge = (left_pt + column_pt) * k;
     println!("document   : {}", path.unwrap_or("(built-in sample)"));
-    println!("size       : {:.2}pt body  ({}% of the design's)", theme.base, zoom.percent());
+    println!(
+        "size       : {:.2}pt body  ({}% of the design's)",
+        theme.base,
+        zoom.percent()
+    );
     // Which pairing the page is set in, and which ones this machine could have set it in
     // -- so a face that came back as somebody else's substitute is visible here rather
     // than only on a screen.
     let f = &TextFace::ALL[theme.face];
-    let installed: Vec<&str> =
-        TextFace::ALL.iter().filter(|t| crate::view::face_drawable(&font, t)).map(|t| t.label).collect();
+    let installed: Vec<&str> = TextFace::ALL
+        .iter()
+        .filter(|t| crate::view::face_drawable(&font, t))
+        .map(|t| t.label)
+        .collect();
     println!("face       : {}  ({} + {})", f.label, f.body, f.heading);
     println!("             installed: {}", installed.join(", "));
     println!(
@@ -129,7 +156,12 @@ pub fn report(source: &str, path: Option<&str>, o: &Options) -> Result<()> {
         column_pt,
         column_pt / theme.base
     );
-    println!("blocks     : {}   lines: {}   height {:.0}pt", doc.blocks.len(), lines.len(), height);
+    println!(
+        "blocks     : {}   lines: {}   height {:.0}pt",
+        doc.blocks.len(),
+        lines.len(),
+        height
+    );
     println!();
     println!("  #      left    right    fill  faces                      the line");
 
@@ -164,23 +196,49 @@ pub fn report(source: &str, path: Option<&str>, o: &Options) -> Result<()> {
             .find(|s| {
                 s.y <= l.baseline
                     && l.baseline < s.y + s.h
-                    && s.xs.iter().any(|x| *x >= l.left - 1.0 && *x <= l.right + 1.0)
+                    && s.xs
+                        .iter()
+                        .any(|x| *x >= l.left - 1.0 && *x <= l.right + 1.0)
             })
             .map_or_else(String::new, |s| {
-            let t: String = s.chars.iter().collect();
-            let t = t.trim();
-            match t.char_indices().nth(18) {
-                Some((at, _)) => format!("{}...", &t[..at]),
-                None => t.to_string(),
-            }
-        });
+                let t: String = s.chars.iter().collect();
+                let t = t.trim();
+                match t.char_indices().nth(18) {
+                    Some((at, _)) => format!("{}...", &t[..at]),
+                    None => t.to_string(),
+                }
+            });
         println!(
             "{i:>3}  {:>8.1} {:>8.1} {:>6.3}{} {:<26} {excerpt}",
             l.left,
             l.right,
             fill,
-            if short { " ragged" } else if over > 0.6 { " OVER" } else { "      " },
+            if short {
+                " ragged"
+            } else if over > 0.6 {
+                " OVER"
+            } else {
+                "      "
+            },
             l.families.join("+")
+        );
+    }
+
+    // Every character on the page that reads the other way. The engine has no bidi, so
+    // this is not a count of what works -- it is the size of the hole, per document, and
+    // the number to look at before claiming an Arabic page is merely laid out badly.
+    let rtl: Vec<usize> = page
+        .sel
+        .iter()
+        .map(|s| count_rtl(&s.chars))
+        .filter(|n| *n > 0)
+        .collect();
+    if !rtl.is_empty() {
+        println!(
+            "right-to-left: {} char(s) on {} line(s), all of them laid out left to \
+             right -- `bidiLevel` is fixed at 0",
+            rtl.iter().sum::<usize>(),
+            rtl.len()
         );
     }
 
@@ -217,7 +275,10 @@ pub fn report(source: &str, path: Option<&str>, o: &Options) -> Result<()> {
             .iter()
             .map(|(t, c)| format!("{:.1}pt x{c}", *t as f32 / 10.0))
             .collect();
-        println!("hang         : {n} line(s) stand back from the margin at {}", steps.join(", "));
+        println!(
+            "hang         : {n} line(s) stand back from the margin at {}",
+            steps.join(", ")
+        );
     }
     println!("glyph census:");
     for (fam, n) in &census {
@@ -225,10 +286,17 @@ pub fn report(source: &str, path: Option<&str>, o: &Options) -> Result<()> {
     }
     if !notdef.is_empty() {
         let n: usize = notdef.values().sum();
-        let who = notdef.iter().map(|(f, c)| format!("{f} x{c}")).collect::<Vec<_>>().join(", ");
+        let who = notdef
+            .iter()
+            .map(|(f, c)| format!("{f} x{c}"))
+            .collect::<Vec<_>>()
+            .join(", ");
         println!("notdef       : {n} drawn glyph(s) no face here has -- {who}");
     }
-    let han: usize = source.chars().filter(|c| matches!(*c as u32, 0x4E00..=0x9FFF)).count();
+    let han: usize = source
+        .chars()
+        .filter(|c| matches!(*c as u32, 0x4E00..=0x9FFF))
+        .count();
     let latin: usize = source.chars().filter(|c| c.is_ascii_alphabetic()).count();
     println!("source has {han} ideographs and {latin} latin letters");
     // Which of the page's code was read as a language, and how much of it the page then
@@ -259,7 +327,9 @@ pub fn report(source: &str, path: Option<&str>, o: &Options) -> Result<()> {
             .count();
         let mut inks: BTreeMap<&'static str, usize> = BTreeMap::new();
         for op in ops {
-            let crate::view::Op::Runs(runs) = op else { continue };
+            let crate::view::Op::Runs(runs) = op else {
+                continue;
+            };
             for r in runs {
                 let name = match r.color {
                     ColorRole::Keyword => "keyword",
@@ -287,7 +357,11 @@ pub fn report(source: &str, path: Option<&str>, o: &Options) -> Result<()> {
                 .map(|b| b.lang.as_deref().unwrap_or("(no language)"))
                 .collect();
             if !blind.is_empty() {
-                println!("  !! {} block(s) set plain: {}", blind.len(), blind.join(", "));
+                println!(
+                    "  !! {} block(s) set plain: {}",
+                    blind.len(),
+                    blind.join(", ")
+                );
             }
         }
     }
@@ -362,18 +436,34 @@ pub fn report(source: &str, path: Option<&str>, o: &Options) -> Result<()> {
                 _ => false,
             })
             .count();
-        let links = page.hotspots.iter().filter(|h| matches!(h.kind, crate::view::HotKind::Url(_))).count();
-        let jumps = page.hotspots.iter().filter(|h| matches!(h.kind, crate::view::HotKind::Cite(_))).count();
-        let headings = page.hotspots.iter().filter(|h| matches!(h.kind, crate::view::HotKind::Heading(_))).count();
-        let files = page.hotspots.iter().filter(|h| matches!(h.kind, crate::view::HotKind::Document(_))).count();
+        let links = page
+            .hotspots
+            .iter()
+            .filter(|h| matches!(h.kind, crate::view::HotKind::Url(_)))
+            .count();
+        let jumps = page
+            .hotspots
+            .iter()
+            .filter(|h| matches!(h.kind, crate::view::HotKind::Cite(_)))
+            .count();
+        let headings = page
+            .hotspots
+            .iter()
+            .filter(|h| matches!(h.kind, crate::view::HotKind::Heading(_)))
+            .count();
+        let files = page
+            .hotspots
+            .iter()
+            .filter(|h| matches!(h.kind, crate::view::HotKind::Document(_)))
+            .count();
         // A fragment that names no heading is the interesting kind of dead link: the
         // address was spelled out by hand from a heading's own words, and one of the two
         // has since changed. Nothing on the page says so, so this does.
         let dead = all_actions(&doc)
             .filter(|a| match &a.kind {
-                rubrica_doc::ActionKind::Url(u) => {
-                    u.strip_prefix('#').is_some_and(|f| !slugs.contains(&crate::view::slug(f)))
-                }
+                rubrica_doc::ActionKind::Url(u) => u
+                    .strip_prefix('#')
+                    .is_some_and(|f| !slugs.contains(&crate::view::slug(f))),
                 _ => false,
             })
             .count();
@@ -400,7 +490,11 @@ pub fn report(source: &str, path: Option<&str>, o: &Options) -> Result<()> {
         let rules: Vec<f32> = ops
             .iter()
             .filter_map(|op| match op {
-                crate::view::Op::Rect { color: ColorRole::Faint, h, .. } => Some(*h / k),
+                crate::view::Op::Rect {
+                    color: ColorRole::Faint,
+                    h,
+                    ..
+                } => Some(*h / k),
                 _ => None,
             })
             .collect();
@@ -430,7 +524,10 @@ pub fn report(source: &str, path: Option<&str>, o: &Options) -> Result<()> {
     if breaks > 0 || marks > 0 {
         println!("hyphenation  : {breaks} break(s) taken, {marks} mark(s) drawn");
         if breaks != marks {
-            println!("  !! {breaks} split word(s) and {} mark(s): the split is not shown", marks);
+            println!(
+                "  !! {breaks} split word(s) and {} mark(s): the split is not shown",
+                marks
+            );
         }
     }
     // The selectable text of the page, counted against the ink it is meant to describe.
@@ -509,4 +606,54 @@ fn all_blocks(doc: &rubrica_doc::Document) -> impl Iterator<Item = &rubrica_doc:
     doc.blocks
         .iter()
         .chain(doc.footnotes.iter().flat_map(|f| &f.blocks))
+}
+
+/// How many of these characters belong to a script that reads right to left.
+fn count_rtl(chars: &[char]) -> usize {
+    chars.iter().filter(|c| is_rtl(**c)).count()
+}
+
+/// True for the Unicode blocks whose default direction is right to left: Hebrew,
+/// Arabic and its two supplements, Syriac, Thaana, NKo, Samaritan, Mandaic, and the
+/// presentation forms of the first two.
+///
+/// Blocks rather than the generated `Bidi_Class` property, because the question this
+/// answers is how much of a page the missing feature would have to carry. A property
+/// file bought for that is a dependency nobody reads and everybody has to trust.
+fn is_rtl(c: char) -> bool {
+    matches!(
+        c as u32,
+        0x0590..=0x05FF
+            | 0x0600..=0x06FF
+            | 0x0700..=0x074F
+            | 0x0780..=0x08FF
+            | 0xFB1D..=0xFDFF
+            | 0xFE70..=0xFEFF
+    )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{count_rtl, is_rtl};
+
+    #[test]
+    fn the_census_counts_the_scripts_that_read_backwards() {
+        for c in [
+            '\u{5D0}', '\u{627}', '\u{710}', '\u{7CA}', '\u{840}', '\u{FB4F}',
+        ] {
+            assert!(is_rtl(c), "{c:?} (U+{:04X}) reads right to left", c as u32);
+        }
+        // The scripts that already work, and the punctuation between them: a census
+        // that counted a comma would report every English page as carrying the gap.
+        for c in ['\u{4E2D}', 'a', '1', ' ', '-', '\u{2014}'] {
+            assert!(!is_rtl(c), "{c:?} does not");
+        }
+    }
+
+    #[test]
+    fn a_line_counts_only_the_characters_it_holds() {
+        let mixed: Vec<char> = "\u{627}\u{644}m".chars().collect();
+        assert_eq!(count_rtl(&mixed), 2, "two Arabic letters and a Latin one");
+        assert_eq!(count_rtl(&"plain".chars().collect::<Vec<_>>()), 0);
+    }
 }
