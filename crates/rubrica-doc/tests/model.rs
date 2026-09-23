@@ -295,6 +295,36 @@ fn a_gfm_table_becomes_a_grid_not_prose() {
 }
 
 #[test]
+fn a_cells_object_is_registered_where_its_placeholder_stands() {
+    // A figure and a formula inside a grid. The placeholder is one character of the
+    // *cell's* text, so an object recorded against the block's text is a box measured
+    // in one string and painted in another -- which is how a cell came to hold exactly
+    // a formula's width of nothing.
+    let src = "| a | ![p](x.png) and $y^2$ |\n|---|---|\n";
+    let b = &Document::parse(src).blocks[0];
+    let t = b.table.as_ref().expect("no table");
+    assert!(b.objects.is_empty(), "an object in a cell belongs to the cell, not the block");
+
+    let cell = &t.head[1];
+    assert_eq!(
+        cell.objects.iter().map(|o| o.kind.clone()).collect::<Vec<_>>(),
+        vec![
+            rubrica_doc::ObjectKind::Image { src: "x.png".into(), alt: "p".into() },
+            rubrica_doc::ObjectKind::Math { source: "y^2".into(), display: false },
+        ],
+        "both objects reach the cell, in the order the author wrote them"
+    );
+    for o in &cell.objects {
+        assert_eq!(
+            &cell.text[o.range.clone()],
+            "\u{FFFC}",
+            "every object's range points at its own placeholder"
+        );
+    }
+    assert!(cell.spans.iter().any(|s| s.style.contains(rubrica_doc::InlineStyle::OBJECT)));
+}
+
+#[test]
 fn a_table_with_cjk_cells_keeps_its_grid() {
     let doc = Document::parse("| 名称 | 数量 |\n|---|---|\n| 苹果 | 三 |\n");
     let t = doc.blocks[0].table.as_ref().expect("no table");

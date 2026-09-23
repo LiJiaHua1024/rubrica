@@ -3975,7 +3975,7 @@ fn layout_table(
     mut y: Pt,
 ) -> Pt {
     let Out { ops, hots, sel, hyphens } = out;
-    let Ctx { theme, styles, k, .. } = *ctx;
+    let Ctx { theme, styles, k, math, .. } = *ctx;
     let Blk { left, column, .. } = *blk;
     let size = theme.base;
     let spacing = Spacing::for_size(size);
@@ -4067,6 +4067,11 @@ fn layout_table(
     let mut paint_row = |cells: &[PreparedCell], top: Pt, head: bool, ops: &mut Vec<Op>, hots: &mut Vec<Hot>, sel: &mut Vec<SelLine>| -> Pt {
         // Measure every cell first: the row is as tall as its tallest cell.
         let mut heights = vec![0.0f32; cols];
+        // How far one line of each cell steps down. Normally the body leading, but an
+        // inline object brings a box the leading was never asked about -- a fraction
+        // stands taller than the text around it -- and a cell whose step is fixed
+        // would otherwise walk that ink into the row underneath.
+        let mut step = vec![size * leading; cols];
         // Which column reaches each line of the row first. A cell that wraps down is
         // not starting a new row, and the separator a copy uses has to answer to the
         // row's shape -- one tab-separated line per line the reader sees -- rather than
@@ -4075,7 +4080,14 @@ fn layout_table(
         for (i, c) in cells.iter().enumerate().take(cols) {
             let (_, plan) = set_cell(font, c, &spacing, inner_of(widths[i]));
             let n = plan.lines.len();
-            heights[i] = n.max(1) as Pt * size * leading;
+            step[i] = (size * leading).max(
+                c.spans
+                    .iter()
+                    .filter_map(|s| styles[s.style.0 as usize].object)
+                    .map(|o| o.ascent + o.descent)
+                    .fold(0.0f32, f32::max),
+            );
+            heights[i] = n.max(1) as Pt * step[i];
             for j in 0..n {
                 if j >= opens.len() {
                     opens.push(i);
@@ -4110,6 +4122,9 @@ fn layout_table(
                 let mut marks: Vec<(usize, Pt)> = Vec::new();
                 let mut hit: Vec<Option<(Pt, Pt)>> = vec![None; c.actions.len()];
                 let mut bars: Vec<(Pt, Pt, Pt, Pt, ColorRole)> = Vec::new();
+                // An image's box, waiting for the line's baseline: file, x and width
+                // already in device pixels, ascent and descent still in points.
+                let mut pics: Vec<(std::path::PathBuf, f32, f32, Pt, Pt)> = Vec::new();
                 let mut ruled: Option<Rule> = None;
                 for slot in placed {
                     let Some(node_id) = slot.node else { continue };
@@ -4119,6 +4134,37 @@ fn layout_table(
                         end_rule(&mut ruled, &mut bars);
                     }
                     let mut at = x + pad + shift + slot.x;
+                    if let Some(o) = st.object {
+                        // A formula or a picture inside a cell. The line already gave it
+                        // room -- the box was measured when the span was interned, which
+                        // is why a cell with a formula in it used to hold exactly that
+                        // formula's width of nothing: the cell loop shaped text and only
+                        // text, so the ink had nowhere to come from.
+                        ascent = ascent.max(o.ascent);
+                        match &st.source {
+                            Some(ObjectSource::Image(file)) => {
+                                pics.push((file.clone(), at * k, o.advance * k, o.ascent, o.descent));
+                            }
+                            Some(ObjectSource::Math(index)) => {
+                                if let Some(entry) = math.get(*index) {
+                                    for (r, dx, dy) in &entry.parts {
+                                        if let Some(p) =
+                                            paint_run(font, r, at + dx, *dy, k, st.color)
+                                        {
+                                            runs.push(p);
+                                        }
+                                    }
+                                    bars.extend(
+                                        entry.rules.iter().map(|(rx, top, w, h)| (*rx + at, *top, *w, *h, st.color)),
+                                    );
+                                }
+                            }
+                            None => {}
+                        }
+                        merge_hot(&mut hit, &c.actions, &node.text, at, at + o.advance);
+                        segs.push((node.text.clone(), at, at + o.advance));
+                        continue;
+                    }
                     // The mark a discretionary break ends a line with, drawn the same
                     // way the prose loop draws it: a cell's words hyphenate too, and the
                     // hyphen is no more in the cell's source than in a paragraph's.
@@ -4184,6 +4230,15 @@ fn layout_table(
                 }
                 end_rule(&mut ruled, &mut bars);
                 seat(&mut runs, ly + ascent, k);
+                for (file, px, w, a, d) in pics.drain(..) {
+                    ops.push(Op::Image {
+                        path: file,
+                        x: px,
+                        y: (ly + ascent - a) * k,
+                        w,
+                        h: (a + d) * k,
+                    });
+                }
                 if !runs.is_empty() {
                     ops.push(Op::Runs(runs));
                 }
@@ -4196,7 +4251,7 @@ fn layout_table(
                         color,
                     });
                 }
-                emit_hots(hots, &c.actions, &hit, ctx, ly, size * leading);
+                emit_hots(hots, &c.actions, &hit, ctx, ly, step[i]);
                 marks.sort_unstable_by_key(|m| m.0);
                 let join = if opens[lines_out] == i {
                     // The first cell of a line the row has reached: a new line of the
@@ -4214,14 +4269,14 @@ fn layout_table(
                 lines_out += 1;
                 if let Some(l) = mark_line(
                     &c.text,
-                    Band { top: ly, h: size * leading, k, join },
+                    Band { top: ly, h: step[i], k, join },
                     &segs,
                     &marks,
                     &mut consumed,
                 ) {
                     sel.push(l);
                 }
-                ly += size * leading;
+                ly += step[i];
             }
             x += widths[i];
         }
@@ -4567,10 +4622,25 @@ fn prepare_block(
                             if style.contains(InlineStyle::LINK) && !reaches(&c.actions, &sp.range) {
                                 style.remove(InlineStyle::LINK);
                             }
-                            StyleSpan {
-                                range: sp.range.clone(),
-                                style: intern(styles, &theme.fonts.fallback, r(b.kind, style)),
-                            }
+                            // And the same object arm as prose. A cell's formula is
+                            // interned here rather than painted there, because a cell is
+                            // measured at the block's width and drawn at its column's,
+                            // and only this loop has both the cell's own ranges and the
+                            // cache to hand.
+                            let id = if style.contains(InlineStyle::OBJECT) {
+                                match c.objects.iter().find(|o| o.range == sp.range) {
+                                    Some(obj) => {
+                                        let prose = styles[base.0 as usize].clone();
+                                        objects
+                                            .intern(font, styles, theme, obj, column, prose)
+                                            .unwrap_or(base)
+                                    }
+                                    None => base,
+                                }
+                            } else {
+                                intern(styles, &theme.fonts.fallback, r(b.kind, style))
+                            };
+                            StyleSpan { range: sp.range.clone(), style: id }
                         })
                         .collect(),
                     align: t.aligns.get(i).copied().unwrap_or_default(),

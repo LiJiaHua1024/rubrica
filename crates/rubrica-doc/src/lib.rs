@@ -191,6 +191,13 @@ pub struct Cell {
     /// What a click on this cell's text would do. A cell is laid out by the grid rather
     /// than as prose, so its targets are recorded here and not on the block.
     pub actions: Vec<Action>,
+    /// The images and formulas this cell holds, ranged against [`Cell::text`] the same
+    /// way [`Block::objects`] is ranged against a block's text.
+    ///
+    /// They have to travel with the cell: a grid lays its cells out on their own, so an
+    /// object registered on the block is a placeholder in one text and an ink box in
+    /// another, and the cell that owns it paints nothing where its width was measured.
+    pub objects: Vec<ObjectSpan>,
 }
 
 /// Where a cell's content sits within its column.
@@ -751,6 +758,20 @@ impl Builder {
 
     /// Append an object-replacement character and register what it stands for.
     fn push_object(&mut self, kind: ObjectKind) {
+        if let Some(c) = self.cell.as_mut() {
+            // In a grid the cell is the text this object will be laid out in, so the
+            // placeholder and its record both belong there and not on the block: a
+            // range into the block's text means nothing to a cell that has its own.
+            let start = c.text.len();
+            c.text.push('\u{FFFC}');
+            let end = c.text.len();
+            c.objects.push(ObjectSpan { range: start..end, kind });
+            c.spans.push(Span { range: start..end, style: InlineStyle::OBJECT });
+            if let Some(url) = self.link.clone() {
+                push_action(&mut c.actions, start..end, ActionKind::Url(url));
+            }
+            return;
+        }
         if self.cur.is_none() {
             self.open(BlockKind::Paragraph);
         }
