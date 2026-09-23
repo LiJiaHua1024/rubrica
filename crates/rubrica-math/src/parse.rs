@@ -546,6 +546,43 @@ impl<'a> Parser<'a> {
             // `\text{as } x` loses a word when the space is treated as a separator.
             "text" | "textrm" | "mbox" => Node::Atom(self.text_argument()),
             "mathrm" | "operatorname" => Node::Atom(self.text_argument()),
+            // Invisible in TeX, and the worst thing a reader can do with them is print
+            // them: `\label{eq:one}` at the end of every displayed formula would put
+            // `label(𝑒𝑞:𝑜𝑛𝑒)` on the page, which is why emitting nothing is the fix
+            // rather than a fallback. `\input`-like bookkeeping commands belong here too.
+            "label" | "notag" | "nonumber" | "ignorespaces" => {
+                // Read the argument and drop it: leaving it on the stream would put the
+                // name of the label on the page as a group of atoms.
+                if name == "label" {
+                    let _ = self.text_argument();
+                }
+                Node::Atom(String::new())
+            }
+            // A numbered display's number. Reaching the right margin is the reader's
+            // layout, not this engine's, so it is set one em after the formula in the
+            // author's own upright text rather than as letters of the alphabet.
+            "tag" => Node::Row(vec![
+                Node::Space(18),
+                Node::Atom(format!("({})", self.text_argument())),
+            ]),
+            // `\pmod` and `\bmod` spell a word, and a word in a formula is upright: both
+            // are the roman `(mod …)` of number theory, not the product of the letters
+            // `m`, `o`, `d`.
+            "pmod" => Node::Row(vec![
+                Node::Space(5),
+                Node::Atom("(mod".into()),
+                Node::Space(3),
+                self.argument(),
+                Node::Space(3),
+                Node::Atom(")".into()),
+            ]),
+            "bmod" | "mod" => Node::Row(vec![
+                Node::Space(4),
+                Node::Atom("mod".into()),
+                Node::Space(4),
+            ]),
+            // The tombstone that closes a proof.
+            "qed" | "qedsymbol" | "tombstone" => Node::Atom("\u{220e}".into()),
             "textbf" => Node::Atom(alphabetize(Alphabet::Bold, &self.text_argument())),
             "textit" => Node::Atom(alphabetize(Alphabet::Italic, &self.text_argument())),
             "textsf" => Node::Atom(alphabetize(Alphabet::Sans, &self.text_argument())),
@@ -1365,6 +1402,23 @@ mod tests {
         assert_eq!(of("\\boxed{x+1}"), "(boxed (x + 1))");
         // An unbraced argument is still one token, in both of them.
         assert_eq!(of("\\overset n="), "(stack Over = n)");
+    }
+
+    #[test]
+    fn a_numbered_equations_furniture_is_read_rather_than_spelled() {
+        // Invisible in TeX, so invisible here: the alternative is a line of italic
+        // `label` letters at the end of every formula an author cross-references.
+        assert_eq!(of("\\label{eq:one}x"), "x");
+        assert_eq!(of("x\\notag\\nonumber"), "x");
+        // A tag is the author's own text, set apart -- not the word "tag" in the
+        // alphabet of a variable.
+        assert_eq!(of("a\\tag{7}"), "(a ((space 18) (7)))");
+        // `(mod m)` is roman, and the word is one name rather than three letters.
+        let pmod = of("a\\pmod{p}");
+        assert!(pmod.contains("(mod") && !pmod.contains("pmod"), "{pmod}");
+        let bmod = of("a\\bmod b");
+        assert!(bmod.contains(" mod ") && !bmod.contains("bmod"), "{bmod}");
+        assert_eq!(of("x\\qed"), "(x ∎)", "the tombstone closes a proof, it does not name it");
     }
 
     #[test]
