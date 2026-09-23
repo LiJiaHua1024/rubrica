@@ -65,10 +65,13 @@ impl GlyphRun {
 }
 
 /// A family pair plus the properties that pick a face within it.
-#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+#[derive(Clone, Debug, Default, PartialEq, Eq, Hash)]
 pub struct FaceRequest {
     pub family: String,
     pub cjk_family: String,
+    pub japanese_family: String,
+    pub korean_family: String,
+    pub cjk_italic: Option<bool>,
     /// Tried only when neither named family covers the run, so a rare glyph still
     /// renders instead of being dropped.
     pub fallback: Vec<String>,
@@ -128,6 +131,7 @@ struct ShapeKey {
 struct TextRun {
     range: Range<usize>,
     level: u8,
+    language: u8,
     script: DWRITE_SCRIPT_ANALYSIS,
 }
 
@@ -166,6 +170,7 @@ impl FontEngine {
                     fallback: vec![],
                     weight: 400,
                     italic: false,
+                    ..Default::default()
                 },
                 size: 13.5,
                 tracking: 0.0,
@@ -273,10 +278,14 @@ impl FontEngine {
         } else {
             vec![req.family.as_str(), req.cjk_family.as_str()]
         };
+        let script = text.chars().next().map_or(0, east_asian_script);
+        let preferred = match script { 1 => &req.japanese_family, 2 => &req.korean_family, _ => "" };
+        if !preferred.is_empty() { order.insert(0, preferred); }
         order.extend(req.fallback.iter().map(String::as_str));
         let mut partial = None;
         for family in order {
-            let Some(idx) = self.face_for(family, req.weight, req.italic) else { continue };
+            let italic = if cjk { req.cjk_italic.unwrap_or(req.italic) } else { req.italic };
+            let Some(idx) = self.face_for(family, req.weight, italic) else { continue };
             if self.covers(idx, text) {
                 return Some(idx);
             }
@@ -299,6 +308,7 @@ impl FontEngine {
         tracking: f32,
     ) -> Vec<GlyphRun> {
         if !self.analyzed.borrow().contains_key(text) {
+            let language = east_asian_language(text);
             let bidi = rubrica_type::BidiInfo::new(text, None);
             let scripts = analysis::scripts(&self.analyzer, text).unwrap_or_default();
             let mut runs: Vec<TextRun> = Vec::new();
@@ -310,7 +320,7 @@ impl FontEngine {
                 if let Some(last) = runs.last_mut().filter(|r| r.level == level && r.script == script) {
                     last.range.end = at + c.len_utf8();
                 } else {
-                    runs.push(TextRun { range: at..at + c.len_utf8(), level, script });
+                    runs.push(TextRun { range: at..at + c.len_utf8(), level, script, language });
                 }
             }
             self.analyzed.borrow_mut().insert(text.to_owned(), runs);
@@ -320,6 +330,14 @@ impl FontEngine {
             let end = r.range.end.min(range.end);
             (start < end).then(|| TextRun { range: start..end, ..r.clone() })
         }).collect();
+        // Cache the paragraph language with its script analysis: measuring each
+        // ideograph must not scan a whole book paragraph again.
+        let mut localized = req.clone();
+        let family = match analysis.first().map(|r| r.language) {
+            Some(1) => &req.japanese_family, Some(2) => &req.korean_family, _ => &req.cjk_family,
+        };
+        if !family.is_empty() { localized.cjk_family = family.clone(); }
+        let req = &localized;
         let mut out = Vec::new();
         for item in analysis {
             let slice = &text[item.range.clone()];
@@ -589,11 +607,41 @@ impl FontEngine {
             fallback: vec![],
             weight: 400,
             italic: false,
+            ..Default::default()
         };
         let latin = "Ag";
         let han = "\u{4e2d}\u{6587}";
         !self.shape_runs(latin, 0..latin.len(), &req, 13.5, 0.0).is_empty()
             && !self.shape_runs(han, 0..han.len(), &req, 13.5, 0.0).is_empty()
+    }
+}
+
+fn east_asian_language(text: &str) -> u8 {
+    if text.chars().any(|c| east_asian_script(c) == 1) { 1 }
+    else if text.chars().any(|c| east_asian_script(c) == 2) { 2 }
+    else { 0 }
+}
+
+fn east_asian_script(c: char) -> u8 {
+    match c as u32 {
+        0x3040..=0x30ff | 0x31f0..=0x31ff | 0xff66..=0xff9d => 1,
+        0x1100..=0x11ff | 0x3130..=0x318f | 0xa960..=0xa97f | 0xac00..=0xd7ff => 2,
+        _ => 0,
+    }
+}
+
+#[cfg(test)]
+mod language_tests {
+    use super::*;
+    #[test]
+    fn paragraph_context_selects_han_forms_without_misclassifying_latin() {
+        assert_eq!(east_asian_language("中文，with Latin"), 0);
+        assert_eq!(east_asian_language("漢字とかな"), 1);
+        assert_eq!(east_asian_language("漢字 한글"), 2);
+        assert_eq!(east_asian_script('한'), 2);
+        assert_eq!(east_asian_script('あ'), 1);
+        assert!(cjk_char('한'));
+        assert!(!cjk_char('A'));
     }
 }
 
@@ -629,7 +677,7 @@ fn first_char_len(s: &str) -> usize {
 /// them, which is what decides both the face it is shaped in and how a double-click
 /// finds its extent.
 pub fn cjk_char(c: char) -> bool {
-    matches!(c as u32,
+    east_asian_script(c) != 0 || matches!(c as u32,
         0x2E80..=0x2EFF | 0x3000..=0x303F | 0x3040..=0x30FF | 0x3400..=0x4DBF
         | 0x4E00..=0x9FFF | 0xF900..=0xFAFF | 0xFF00..=0xFFEF | 0x20000..=0x2FA1F)
 }

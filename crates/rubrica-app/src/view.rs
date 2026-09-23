@@ -2936,6 +2936,7 @@ impl View {
             fallback: self.theme.fonts.fallback.clone(),
             weight: 400,
             italic: false,
+            ..Default::default()
         };
         let runs = self.font.shape_runs(&text, 0..text.len(), &req, size, 0.02);
         let width: f32 = runs.iter().map(|r| r.width() * k).sum();
@@ -4458,6 +4459,7 @@ fn intern_object(styles: &mut Vec<AppStyle>, source: ObjectSource, color: ColorR
             fallback: vec![],
             weight: 400,
             italic: false,
+            ..Default::default()
         },
         size: 0.0,
         tracking: 0.0,
@@ -4483,6 +4485,7 @@ fn intern(styles: &mut Vec<AppStyle>, fallback: &[String], r: crate::theme::Reso
             fallback: fallback.to_vec(),
             weight: r.weight,
             italic: r.italic,
+            ..Default::default()
         },
         size: r.size,
         tracking: r.tracking,
@@ -4591,6 +4594,7 @@ impl<'a> Objects<'a> {
                     fallback: vec![names[1].clone()],
                     weight: 400,
                     italic: false,
+                    ..Default::default()
                 };
                 let index = self.math.intern(font, &req, &prose.face, source, size, *display)?;
                 let box_ = self.math.get(index)?.object;

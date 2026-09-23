@@ -16,6 +16,8 @@ mod images;
 mod math;
 mod report;
 mod reading;
+mod profiles;
+mod typography;
 mod sample;
 mod settings;
 mod tables;

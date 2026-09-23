@@ -26,6 +26,10 @@ pub enum Role {
 pub struct Fonts {
     pub latin: [String; 3],
     pub cjk: [String; 3],
+    pub japanese: [String; 3],
+    pub korean: [String; 3],
+    /// Latin, Chinese, Japanese and Korean emphasis; empty means the normal family.
+    pub emphasis: [String; 4],
     /// Tried when a family is missing or a face lacks a glyph.
     pub fallback: Vec<String>,
     /// The face formulas are set from, then a substitute.
@@ -44,6 +48,9 @@ impl Default for Fonts {
         Self {
             latin: [pair.body.to_string(), pair.heading.to_string(), "Consolas".into()],
             cjk: ["Microsoft YaHei".into(), "Microsoft YaHei".into(), "Consolas".into()],
+            japanese: ["Yu Gothic".into(), "Yu Gothic".into(), "MS Gothic".into()],
+            korean: ["Malgun Gothic".into(), "Malgun Gothic".into(), "GulimChe".into()],
+            emphasis: [String::new(), "KaiTi".into(), String::new(), String::new()],
             fallback: vec!["Segoe UI".into(), "Microsoft YaHei".into(), "Segoe UI Symbol".into()],
             math: ["Cambria Math".into(), "Segoe UI Symbol".into()],
         }
@@ -62,6 +69,9 @@ impl Fonts {
 pub struct ResolvedStyle {
     pub family: String,
     pub cjk_family: String,
+    pub japanese_family: String,
+    pub korean_family: String,
+    pub cjk_italic: Option<bool>,
     pub size: Pt,
     pub weight: u16,
     pub italic: bool,
@@ -244,6 +254,8 @@ pub struct Theme {
     /// [`Theme::zoom`]. Written only by [`Theme::set_zoom`], because everything else
     /// here is stated in ems of it.
     pub base: Pt,
+    pub design_base: Pt,
+    pub tracking_em: f32,
     /// Heading sizes as a multiple of `base`, index 0 = h1.
     pub heading_scale: [f32; 6],
     pub heading_leading: Leading,
@@ -263,6 +275,9 @@ pub struct Theme {
     /// [`Theme::measure`] index the menu reads.
     pub max_measure_em: Pt,
     pub first_line_indent_em: Pt,
+    pub keep_korean_words: bool,
+    /// Stop justifying short columns where stretching overwhelms word spacing.
+    pub ragged_below_em: Pt,
     pub quote_indent_em: Pt,
     pub list_indent_em: Pt,
     /// The reader's size preference, applied to [`Theme::base`] by [`Theme::set_zoom`].
@@ -282,6 +297,8 @@ impl Default for Theme {
         Self {
             fonts: Fonts::default(),
             base: Self::DESIGN_BASE,
+            design_base: Self::DESIGN_BASE,
+            tracking_em: 0.0,
             heading_scale: [2.0, 1.6, 1.32, 1.15, 1.0, 0.92],
             heading_leading: Leading { latin: 1.3, cjk: 1.5 },
             body_leading: Leading { latin: 1.7, cjk: 1.95 },
@@ -293,6 +310,8 @@ impl Default for Theme {
             // Latin prose does not indent at all when paragraphs are separated by
             // space, so this stays small.
             first_line_indent_em: 0.0,
+            keep_korean_words: true,
+            ragged_below_em: 16.0,
             quote_indent_em: 1.2,
             list_indent_em: 1.6,
             zoom: Zoom::DESIGN,
@@ -317,7 +336,7 @@ impl Theme {
     /// the body size, so the page grows as a design rather than as text in a frame.
     pub fn set_zoom(&mut self, zoom: Zoom) {
         self.zoom = zoom;
-        self.base = Self::DESIGN_BASE * zoom.factor();
+        self.base = self.design_base * zoom.factor();
     }
 
     /// Set the page in one of the offered pairings, by its index in [`TextFace::ALL`].
@@ -427,7 +446,9 @@ impl Theme {
         if inline.contains(InlineStyle::STRONG) {
             weight = weight.max(700);
         }
-        let color = if inline.contains(InlineStyle::LINK) {
+        let color = if inline.contains(InlineStyle::DELIMITER) {
+            ColorRole::Muted
+        } else if inline.contains(InlineStyle::LINK) {
             ColorRole::Accent
         } else if role == Role::Mono {
             ColorRole::Code
@@ -439,10 +460,18 @@ impl Theme {
             ColorRole::Text
         };
         // Display sizes lose their natural looseness, so tracking goes negative.
-        let tracking = if size > self.base * 1.4 { -0.015 } else { 0.0 };
+        let tracking = self.tracking_em + if size > self.base * 1.4 { -0.015 } else { 0.0 };
+        let emphasis = inline.contains(InlineStyle::EMPHASIS) && role != Role::Mono;
+        let family = |normal: &str, script: usize| {
+            let alternative = &self.fonts.emphasis[script];
+            if emphasis && !alternative.is_empty() { alternative.clone() } else { normal.to_string() }
+        };
         ResolvedStyle {
-            family: self.fonts.family(role, false).to_string(),
-            cjk_family: self.fonts.family(role, true).to_string(),
+            family: family(self.fonts.family(role, false), 0),
+            cjk_family: family(self.fonts.family(role, true), 1),
+            japanese_family: family(&self.fonts.japanese[role as usize], 2),
+            korean_family: family(&self.fonts.korean[role as usize], 3),
+            cjk_italic: Some(false),
             size,
             weight,
             italic: inline.contains(InlineStyle::EMPHASIS),
