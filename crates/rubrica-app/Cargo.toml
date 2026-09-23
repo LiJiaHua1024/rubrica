@@ -2,7 +2,10 @@
 name = "rubrica-app"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 license.workspace = true
+repository.workspace = true
+description = "Native Windows Markdown reader using Direct2D, DirectWrite, and OpenType math"
 
 [dependencies]
 rubrica-type.workspace = true

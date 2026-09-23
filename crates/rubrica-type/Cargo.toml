@@ -2,7 +2,9 @@
 name = "rubrica-type"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 license.workspace = true
+repository.workspace = true
 description = "Headless typesetting core: CJK-aware paragraph model, Knuth-Plass line breaking, justification"
 
 [dependencies]

@@ -2,7 +2,10 @@
 name = "rubrica-doc"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 license.workspace = true
+repository.workspace = true
+description = "Markdown parsing into structured blocks, tables, footnotes, and inline objects"
 
 [dependencies]
 pulldown-cmark = "0.13.4"

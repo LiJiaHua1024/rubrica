@@ -742,3 +742,38 @@ fn prose_that_happens_to_wrap_is_not_a_definition_list() {
     let item = Document::parse("- item\n  : def\n");
     assert_eq!(item.blocks[0].kind, rubrica_doc::BlockKind::Paragraph);
 }
+#[test]
+fn tracked_definition_fixture_keeps_its_structure() {
+    let doc = Document::parse(include_str!("../../../fixtures/defs.md"));
+    assert_eq!(doc.blocks.iter().filter(|b| b.kind == BlockKind::Term).count(), 3);
+    assert_eq!(doc.blocks.iter().filter(|b| b.kind == BlockKind::Definition).count(), 4);
+    assert!(doc.blocks.iter().any(|b| {
+        b.kind == BlockKind::Paragraph && b.text.contains("普通的一段话")
+    }));
+}
+
+#[test]
+fn tracked_delimiter_fixture_only_turns_prose_into_math() {
+    let doc = Document::parse(include_str!("../../../fixtures/delims.md"));
+    let math: Vec<_> = doc.blocks.iter().flat_map(|b| &b.objects).filter(|o| {
+        matches!(&o.kind, rubrica_doc::ObjectKind::Math { .. })
+    }).collect();
+    assert_eq!(math.len(), 3);
+    assert!(math.iter().any(|o| {
+        matches!(&o.kind, rubrica_doc::ObjectKind::Math { display: true, .. })
+    }));
+    assert!(doc.blocks.last().is_some_and(|b| {
+        b.objects.is_empty() && b.spans.iter().any(|s| s.style.contains(InlineStyle::CODE))
+    }));
+}
+
+#[test]
+fn tracked_note_fixture_keeps_cell_math_and_footnotes() {
+    let doc = Document::parse(include_str!("../../../fixtures/notes.md"));
+    assert_eq!(doc.footnotes.len(), 2);
+    let table = doc.blocks.iter().find_map(|b| b.table.as_ref()).expect("fixture table");
+    let math = table.rows.iter().flatten().flat_map(|cell| &cell.objects).filter(|o| {
+        matches!(&o.kind, rubrica_doc::ObjectKind::Math { .. })
+    }).count();
+    assert_eq!(math, 2, "formulas in cells must stay attached to their cells");
+}
