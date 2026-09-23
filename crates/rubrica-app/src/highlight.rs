@@ -478,6 +478,21 @@ const SPECS: &[(&str, &Spec)] = &[
     ("yaml", &YAML),
     ("yml", &YAML),
     ("zsh", &SHELL),
+    // The names that arrive from a tool rather than from a person: the long form of a
+    // two-letter alias, which Pandoc and an editor's modeline write out, and the
+    // scripting languages a reader on this platform pastes -- batch and PowerShell,
+    // whose fences used to be set plain because only `sh` and `bash` were known.
+    ("bat", &SHELL),
+    ("cc", &CPP),
+    ("cmd", &SHELL),
+    ("cxx", &CPP),
+    ("docker", &SHELL),
+    ("golang", &GO),
+    ("javascript", &JS),
+    ("powershell", &SHELL),
+    ("ps1", &SHELL),
+    ("pwsh", &SHELL),
+    ("ruby", &RUBY),
 ];
 
 fn spec(lang: &str) -> Option<&'static Spec> {
@@ -993,5 +1008,27 @@ mod tests {
         assert_eq!(role_of("cpp", "namespace"), Some(ColorRole::Keyword));
         assert_eq!(role_of("hpp", "class"), Some(ColorRole::Keyword));
         assert_eq!(role_of("htm", "<p>"), Some(ColorRole::Type));
+        // The long form of an alias is the name a tool writes, so it has to reach the
+        // same family as the short one a person writes.
+        for name in ["js", "javascript"] {
+            assert_eq!(role_of(name, "const"), Some(ColorRole::Keyword), "{name}");
+        }
+        for name in ["go", "golang"] {
+            assert_eq!(role_of(name, "func"), Some(ColorRole::Keyword), "{name}");
+        }
+        for name in ["rb", "ruby"] {
+            assert_eq!(role_of(name, "def"), Some(ColorRole::Keyword), "{name}");
+        }
+        for name in ["c", "cc", "cpp", "cxx"] {
+            assert_eq!(role_of(name, "int"), Some(ColorRole::Type), "{name}");
+        }
+        // Batch and PowerShell are shells on this platform, and a fence naming them was
+        // set in the plain face. What they are read as is checked here rather than what
+        // each token means: they share the shell's rules, and `rem` is not a comment in
+        // a `#`-commenting family.
+        for name in ["bat", "cmd", "ps1", "pwsh", "powershell", "docker"] {
+            assert!(super::knows(name), "{name} is not a language this build reads");
+        }
+        assert_eq!(role_of("pwsh", "'a string'"), Some(ColorRole::String));
     }
 }
