@@ -3390,7 +3390,18 @@ fn layout_block(
                 segs.push((node.text.clone(), line_left + slot.x, line_left + slot.x + o.advance));
                 continue;
             }
-            let shaped = font.shape_runs(text, node.text.clone(), &st.face, st.size, st.tracking);
+            let hyphen = node.kind == rubrica_type::paragraph::NodeKind::Hyphen;
+            // The mark a discretionary break ends a line with is not in the source: the
+            // solver charged the line its width and `place` gave it a slot, so the
+            // painter is the only one who can supply the glyph -- and the only one who
+            // should, since copying a hyphenated word must not hand back a hyphen its
+            // author never wrote, and the selectable index must not point at a character
+            // that is not there.
+            let shaped = if hyphen {
+                font.shape_runs(HYPHEN, HYPHEN_RANGE, &st.face, st.size, st.tracking)
+            } else {
+                font.shape_runs(text, node.text.clone(), &st.face, st.size, st.tracking)
+            };
             // A raised run hangs above this line's baseline, so its ink joins the
             // ascent and its own descent is measured from where it now stands: the
             // line grows upwards to make room for it, and a superscript never
@@ -3401,7 +3412,9 @@ fn layout_block(
             // stopped, since only the whole span's width is what the line broke on.
             let mut at = line_left + slot.x;
             for r in shaped {
-                mark_run(text, &r, at, &mut marks);
+                if !hyphen {
+                    mark_run(text, &r, at, &mut marks);
+                }
                 ascent = ascent.max(r.ascent - dy);
                 descent = descent.max((r.descent + dy).max(0.0));
                 if let Some(p) = paint_run(font, &r, at, dy, k, st.color) {
@@ -3426,6 +3439,11 @@ fn layout_block(
                     );
                 }
                 at += r.width();
+            }
+            if hyphen {
+                // Ink on the line, not text in it: no clickable range and no selectable
+                // segment, because there is no character for either to name.
+                continue;
             }
             merge_hot(&mut hit, actions, &node.text, line_left + slot.x, at);
             segs.push((node.text.clone(), line_left + slot.x, at));
@@ -4049,8 +4067,19 @@ fn layout_table(
                         end_rule(&mut ruled, &mut bars);
                     }
                     let mut at = x + pad + shift + slot.x;
-                    for r in font.shape_runs(&c.text, node.text.clone(), &st.face, st.size, st.tracking) {
-                        mark_run(&c.text, &r, at, &mut marks);
+                    // The mark a discretionary break ends a line with, drawn the same
+                    // way the prose loop draws it: a cell's words hyphenate too, and the
+                    // hyphen is no more in the cell's source than in a paragraph's.
+                    let hyphen = node.kind == rubrica_type::paragraph::NodeKind::Hyphen;
+                    let (from, range) = if hyphen {
+                        (HYPHEN, HYPHEN_RANGE)
+                    } else {
+                        (c.text.as_str(), node.text.clone())
+                    };
+                    for r in font.shape_runs(from, range, &st.face, st.size, st.tracking) {
+                        if !hyphen {
+                            mark_run(&c.text, &r, at, &mut marks);
+                        }
                         // A citation inside a cell is raised like one inside prose.
                         ascent = ascent.max(r.ascent + st.raise);
                         let Some(face) = font.font_face(r.face) else { continue };
@@ -4084,6 +4113,10 @@ fn layout_table(
                             color: st.color,
                         });
                         at += width;
+                    }
+                    if hyphen {
+                        // Ink on the line, not text in the cell.
+                        continue;
                     }
                     merge_hot(&mut hit, &c.actions, &node.text, x + pad + shift + slot.x, at);
                     segs.push((node.text.clone(), x + pad + shift + slot.x, at));
