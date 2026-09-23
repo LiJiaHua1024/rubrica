@@ -24,7 +24,7 @@
 //! stands in, so a formula still sets acceptably in a font like Consolas instead of
 //! collapsing.
 
-use crate::parse::{AccentKind, ArrayKind, BarSide, ColAlign, FracStyle, Limits, Node};
+use crate::parse::{AccentKind, ArrayKind, BarSide, BigRole, ColAlign, FracStyle, Limits, Node};
 use crate::table::constant;
 
 pub type Pt = f32;
@@ -255,6 +255,7 @@ impl Engine<'_> {
             Node::Accent { base, accent, wide } => self.accent(base, *accent, *wide, st),
             Node::Bar { body, side } => self.bar(body, *side, st),
             Node::Brace { body, side } => self.brace(body, *side, st),
+            Node::Big { delim, step, role } => self.big(*delim, *step, *role, st),
             Node::Stack { base, label, side } => self.stack(base, label, *side, st),
             Node::Boxed { body } => self.boxed(body, st),
             Node::Array { rows, columns, kind, delimiters, rules, col_rules } => self.array(
@@ -1096,6 +1097,31 @@ impl Engine<'_> {
                     italic: bb.italic,
                 })
             }
+        }
+    }
+
+    /// A delimiter the author sized by hand. `\left ... \right` asks the body how tall it
+    /// needs to be; these ask for a height instead, and the only honest way to answer in
+    /// a `MATH`-driven layout is to consult the table's list of taller drawings of the
+    /// glyph -- because scaling the character's own font size would draw the same small
+    /// paren bigger, which is the mistake this whole pillar exists to avoid.
+    ///
+    /// So the request goes through the same code a grown fence uses, around a body of
+    /// exactly the height asked for.
+    fn big(&mut self, delim: char, step: u8, role: BigRole, st: Style) -> (Vec<Shape>, Mb) {
+        if delim == '\0' {
+            // `\bigl.` asks for nothing and gets it, with no advance, exactly as
+            // `\left.` contributes none.
+            return (Vec::new(), Mb::default());
+        }
+        // TeX's four steps as multiples of the size the delimiter stands at: `\big`
+        // lifts about one unit of ex, and each step adds another 0.6 of them.
+        let want = st.size * (1.2 + 0.6 * f32::from(step.saturating_sub(1)));
+        let half = want / 2.0;
+        let b = Mb { width: 0.0, ascent: half, descent: half, italic: 0.0 };
+        match role {
+            BigRole::Close => self.fenced('\0', delim, &[], b, st),
+            _ => self.fenced(delim, '\0', &[], b, st),
         }
     }
 

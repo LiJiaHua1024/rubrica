@@ -67,6 +67,15 @@ pub enum Node {
         /// meant to sit small on top of it.
         wide: bool,
     },
+    /// `\bigl`, `\Big`, `\biggr` and the rest: one delimiter, sized by the author
+    /// rather than by the body around it.
+    Big {
+        delim: char,
+        /// Which of the four heights was asked for, 1 through 4.
+        step: u8,
+        role: BigRole,
+    },
+    /// `\overline` / `\underline`: a rule the width of the body.
     Bar {
         body: Box<Node>,
         side: BarSide,
@@ -196,6 +205,17 @@ pub enum BarSide {
     Under,
 }
 
+/// What spacing a hand-sized delimiter stands as, which is the one thing the four
+/// spellings of each height differ by: `\bigl(` opens, `\bigr)` closes, `\bigm|` relates
+/// and a bare `\big(` is ordinary.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BigRole {
+    Open,
+    Close,
+    Rel,
+    Ord,
+}
+
 /// Where a cell sits inside the width its column was measured to.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ColAlign {
@@ -253,6 +273,15 @@ enum Infix {
     Over,
     /// `{n \choose k}`: the same stack, in parentheses and without the rule.
     Choose,
+    /// `{a \atop b}`: the stack with no rule and nothing around it.
+    Atop,
+    /// `{a \brace b}` and `{a \brack b}`: the stack in the author's own braces or
+    /// brackets, which is how `\begin{Bmatrix}` looks when it is written the old way.
+    Brace,
+    Brack,
+    /// `{a \above 4pt b}`: `\over` with the rule's gap asked for. The gap is the
+    /// layout's own business, so the dimension is read and dropped.
+    Above,
 }
 
 /// What a run of nodes is being collected up to. Inside an environment the cell and
@@ -416,19 +445,25 @@ impl<'a> Parser<'a> {
         }
         if let Some(numerator) = above {
             // The run closed: what was collected after the command is the denominator,
-            // and the two become the one node the group stands for.
+            // and the two become the one node the group stands for. Which of the names
+            // was written decides only the rule and the pair around the stack.
             let denominator = std::mem::take(&mut out);
             let stack = Node::Frac {
                 num: Box::new(Node::Row(numerator)),
                 den: Box::new(Node::Row(denominator)),
-                has_bar: stored != Some(Infix::Choose),
+                has_bar: matches!(stored, Some(Infix::Over) | Some(Infix::Above)),
                 style: FracStyle::Auto,
             };
-            out.push(if stored == Some(Infix::Choose) {
-                Node::Fence { left: '(', right: ')', body: Box::new(stack) }
-            } else {
-                stack
+            out.push(match stored {
+                Some(Infix::Choose) => fence('(', ')', stack),
+                Some(Infix::Brace) => fence('{', '}', stack),
+                Some(Infix::Brack) => fence('[', ']', stack),
+                _ => stack,
             });
+
+            fn fence(left: char, right: char, body: Node) -> Node {
+                Node::Fence { left, right, body: Box::new(body) }
+            }
         }
         out
     }
@@ -580,6 +615,23 @@ impl<'a> Parser<'a> {
             // what closes the split when the group ends.
             "over" => {
                 self.infix = Some(Infix::Over);
+                Node::Atom(String::new())
+            }
+            "atop" => {
+                self.infix = Some(Infix::Atop);
+                Node::Atom(String::new())
+            }
+            "brace" => {
+                self.infix = Some(Infix::Brace);
+                Node::Atom(String::new())
+            }
+            "brack" => {
+                self.infix = Some(Infix::Brack);
+                Node::Atom(String::new())
+            }
+            "above" => {
+                self.infix = Some(Infix::Above);
+                self.skip_dimension();
                 Node::Atom(String::new())
             }
             "choose" => {
@@ -765,6 +817,26 @@ impl<'a> Parser<'a> {
                     col_rules: Vec::new(),
                 }
             }
+            // A delimiter sized by hand rather than by what it encloses. The four
+            // heights are the only difference between the twelve names; which side of a
+            // pair each one is written on decides the spacing the layout keeps around
+            // it, and that is the role the name carries.
+            "big" => self.big(1, BigRole::Ord),
+            "bigl" => self.big(1, BigRole::Open),
+            "bigr" => self.big(1, BigRole::Close),
+            "bigm" => self.big(1, BigRole::Rel),
+            "Big" => self.big(2, BigRole::Ord),
+            "Bigl" => self.big(2, BigRole::Open),
+            "Bigr" => self.big(2, BigRole::Close),
+            "Bigm" => self.big(2, BigRole::Rel),
+            "bigg" => self.big(3, BigRole::Ord),
+            "biggl" => self.big(3, BigRole::Open),
+            "biggr" => self.big(3, BigRole::Close),
+            "biggm" => self.big(3, BigRole::Rel),
+            "Bigg" => self.big(4, BigRole::Ord),
+            "Biggl" => self.big(4, BigRole::Open),
+            "Biggr" => self.big(4, BigRole::Close),
+            "Biggm" => self.big(4, BigRole::Rel),
             // A modifier on the preceding big operator, which the layout reads off
             // the node itself; emitting nothing keeps `a \lim\limits b` working.
             "limits" | "nolimits" => Node::Atom(String::new()),
@@ -886,6 +958,22 @@ impl<'a> Parser<'a> {
             delimiters: env_delimiters(&name),
             rules: std::mem::take(&mut self.row_rules),
             col_rules,
+        }
+    }
+
+    /// Consume a TeX dimension -- `4pt`, `1.5em`, `\mu 3` -- leaving nothing of it in
+    /// the cell after it. Only `\above` uses this: how far a fraction's halves sit
+    /// apart is read from the face's `MATH` table here, so the author's number is
+    /// honoured by dropping it rather than by a second, competing source of truth.
+    fn skip_dimension(&mut self) {
+        while self.peek() == Some(b' ') {
+            self.bump();
+        }
+        while self
+            .peek()
+            .is_some_and(|c| c.is_ascii_digit() || c == b'.' || c.is_ascii_alphabetic() || c == b'\\')
+        {
+            self.bump();
         }
     }
 
@@ -1042,6 +1130,13 @@ impl<'a> Parser<'a> {
             // Unknown: show what was written rather than swallow it.
             None => Node::Atom(format!("\\{name}")),
         }
+    }
+
+    /// The one token after a size command: a delimiter character, `\{`, `\langle`, or
+    /// the `.` that means "nothing here" -- which `delim` already reads for `\left`, and
+    /// is read the same way here so the two spellings cannot drift apart.
+    fn big(&mut self, step: u8, role: BigRole) -> Node {
+        Node::Big { delim: self.delim(), step, role }
     }
 
     fn delim(&mut self) -> char {
@@ -1379,6 +1474,37 @@ fn symbol(name: &str) -> Option<&'static str> {
         "bigodot" => "\u{2a00}",
         "biguplus" => "\u{2a04}",
         "Angstrom" | "angstrom" => "\u{212b}",
+        // The rest of the arrow and order names a proof is written with, and the two
+        // reduced-planck forms -- `\hbar` is the one symbol in this table that Unicode
+        // spells twice, and the hand-written ℏ is the one a face draws narrow.
+        "mho" => "\u{2127}",
+        "hslash" => "\u{210f}",
+        "smallsetminus" => "\u{2216}",
+        "measuredangle" => "\u{221f}",
+        "sphericalangle" => "\u{2221}",
+        "proportionality" => "\u{221d}",
+        "twoheadrightarrow" => "\u{21a0}",
+        "twoheadleftarrow" => "\u{219e}",
+        "hookleftarrow" => "\u{21a9}",
+        "multimap" => "\u{22b8}",
+        "longmapsto" => "\u{27fc}",
+        "preccurlyeq" => "\u{2ab0}",
+        "succcurlyeq" => "\u{2ab1}",
+        "trianglelefteq" => "\u{22b4}",
+        "trianglerighteq" => "\u{22b5}",
+        "bigtriangleup" => "\u{25b3}",
+        "bigtriangledown" => "\u{25bd}",
+        // A function named by a word rather than a letter: upright, with the room of an
+        // operator, exactly as `\log` and `\max` are set.
+        "hom" => "hom",
+        "rank" => "rank",
+        "argmax" => "argmax",
+        "argmin" => "argmin",
+        "col" => "col",
+        "coker" => "coker",
+        "tr" => "tr",
+        "triangleleft" | "vartriangleleft" => "\u{22b2}",
+        "triangleright" | "vartriangleright" => "\u{22b3}",
         "dagger" => "†",
         "ddagger" => "‡",
         "S" => "§",
@@ -1510,6 +1636,7 @@ mod tests {
             ),
             Node::Bar { body, side } => format!("(bar {side:?} {})", sexp(body)),
             Node::Brace { body, side } => format!("(brace {side:?} {})", sexp(body)),
+            Node::Big { delim, step, role } => format!("(big {step} {role:?} {delim:?})"),
             Node::Stack { base, label, side } =>
                 format!("(stack {side:?} {} {})", sexp(base), sexp(label)),
             Node::Boxed { body } => format!("(boxed {})", sexp(body)),
@@ -1702,8 +1829,18 @@ mod tests {
         assert_eq!(choose, "(fence () (nob n k))");
         // The split stays inside its own group, and inside its own table cell.
         assert_eq!(of("{1 \\over 2} + {3 \\over 4}").matches("frac").count(), 2);
-        let grid = of("\\begin{matrix}a \\over b\\\\c\\end{matrix}");
-        assert_eq!(grid.matches("frac").count(), 1, "one cell, one stack: {grid}");
+        let cell = of("\\begin{matrix}a \\over b\\\\c\\end{matrix}");
+        assert_eq!(cell.matches("frac").count(), 1, "one cell, one stack: {cell}");
+        // The rest of the infix family, which differs only in the rule and what stands
+        // around the stack: `\atop` has neither, `\brace` and `\brack` bring their own.
+        assert!(of("{a \\atop b}").contains("(nob a b)"), "no rule, no fence");
+        assert!(of("{a \\brace b}").contains("(fence {}"), "the author's own braces");
+        assert!(of("{a \\brack b}").contains("(fence []"), "and brackets");
+        // `\above` asks for a gap the layout reads from the face instead, so the
+        // dimension is taken off the stream rather than drawn or left in the cell.
+        let above = of("{a \\above 4pt b}");
+        assert!(above.contains("(frac a b)"), "{above}");
+        assert!(!above.contains("pt"), "the dimension is gone: {above}");
     }
 
     #[test]
