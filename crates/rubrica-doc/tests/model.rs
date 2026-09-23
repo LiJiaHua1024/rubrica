@@ -1,5 +1,32 @@
 use rubrica_doc::{BlockKind, Document, InlineStyle};
 
+#[test]
+fn source_positions_survive_metadata_delimiter_rewrites_and_definition_splits() {
+    let src = "---\ntitle: book\n---\n\n# 标题\n\nRepeated **word** &amp; \\(x\\) after.\n\nTerm\n: definition here\n\n  \\[\nx^2\n  \\]\n\nFinal target.\n";
+    let doc = Document::parse(src);
+    for word in ["标题", "word", "after", "definition", "Final"] {
+        let block = doc.blocks.iter().find(|b| b.text.contains(word)).unwrap();
+        let at = rubrica_doc::source_at(&block.sources, block.text.find(word).unwrap()).unwrap();
+        assert_eq!(at, src.find(word).unwrap(), "{word}");
+    }
+    let block = doc.blocks.iter().find(|b| b.text.contains('&')).unwrap();
+    assert_eq!(rubrica_doc::source_at(&block.sources, block.text.find('&').unwrap()), src.find("&amp;"));
+}
+
+#[test]
+fn source_positions_cover_plain_text_and_table_cells() {
+    let src = "前言\r\n  中文行\r\n 下一行\r\n\r\nEnglish\r\n wraps\r\n";
+    let doc = rubrica_doc::plain::parse(src, Default::default());
+    for word in ["中文行", "下一行", "wraps"] {
+        let block = doc.blocks.iter().find(|b| b.text.contains(word)).unwrap();
+        assert_eq!(rubrica_doc::source_at(&block.sources, block.text.find(word).unwrap()), src.find(word));
+    }
+    let src = "| label | value |\n| --- | --- |\n| **target** | $x$ |\n";
+    let doc = Document::parse(src);
+    let cell = &doc.blocks[0].table.as_ref().unwrap().rows[0][0];
+    assert_eq!(rubrica_doc::source_at(&cell.sources, 0), src.find("target"));
+}
+
 fn kinds(src: &str) -> Vec<BlockKind> {
     Document::parse(src).blocks.iter().map(|b| b.kind).collect()
 }
@@ -705,6 +732,46 @@ fn a_term_and_the_lines_under_it_are_its_own_blocks() {
         ],
         "the colon is syntax and does not reach the text"
     );
+}
+
+#[test]
+fn reader_newline_policy_preserves_breaks_without_changing_block_structure() {
+    use rubrica_doc::ParseOptions;
+    let source = "# Title\n\nfirst **bold**\nsecond\n\n- one\n  continuation\n\n```txt\na\nb\n```";
+    let merged = Document::parse(source);
+    let kept = Document::parse_with(source, ParseOptions { keep_line_breaks: true });
+    assert_eq!(merged.blocks.len(), kept.blocks.len());
+    assert_eq!(merged.blocks[1].text, "first bold second");
+    assert_eq!(kept.blocks[1].text, "first bold\nsecond");
+    assert_eq!(kept.blocks[2].text, "one\ncontinuation");
+    assert_eq!(kept.blocks.last().unwrap().text, "a\nb");
+    assert!(kept.blocks[1].spans.iter().any(|s|
+        s.style.contains(InlineStyle::STRONG) && &kept.blocks[1].text[s.range.clone()] == "bold"));
+}
+
+#[test]
+fn kept_newlines_still_allow_definition_lists() {
+    let doc = Document::parse_with("A term\n: its definition\n", rubrica_doc::ParseOptions { keep_line_breaks: true });
+    assert_eq!(doc.blocks[0].kind, BlockKind::Term);
+    assert_eq!(doc.blocks[1].kind, BlockKind::Definition);
+    assert_eq!(doc.blocks[1].text, "its definition");
+}
+
+#[test]
+fn source_reading_preserves_bytes_while_styling_markdown() {
+    let source = "# Title\r\n\r\n**bold** and *italic* [link](file.md) `code`\r\n\r\n| a | b |\r\n";
+    let doc = Document::source(source);
+    assert_eq!(doc.blocks.len(), 1);
+    let b = &doc.blocks[0];
+    assert_eq!(b.text, source);
+    assert_eq!(b.spans.iter().map(|s| &b.text[s.range.clone()]).collect::<String>(), source);
+    let styled = |word: &str, flag| b.spans.iter().any(|s|
+        s.style.contains(flag) && b.text[s.range.clone()].contains(word));
+    assert!(styled("Title", InlineStyle::STRONG));
+    assert!(styled("bold", InlineStyle::STRONG));
+    assert!(styled("italic", InlineStyle::EMPHASIS));
+    assert!(styled("link", InlineStyle::LINK));
+    assert!(b.objects.is_empty());
 }
 
 #[test]

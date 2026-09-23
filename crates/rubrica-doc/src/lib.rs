@@ -20,11 +20,25 @@ use pulldown_cmark::{
     CodeBlockKind, Event, HeadingLevel, Options, Parser, Tag, TagEnd,
 };
 
+pub mod plain;
+
 /// Byte range into [`Block::text`], plus the style it carries.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Span {
     pub range: std::ops::Range<usize>,
     pub style: InlineStyle,
+}
+
+/// A linear mapping from displayed UTF-8 bytes back to original source bytes.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SourceSpan {
+    pub range: std::ops::Range<usize>,
+    pub source: usize,
+}
+
+pub fn source_at(spans: &[SourceSpan], byte: usize) -> Option<usize> {
+    let span = spans.iter().rev().find(|s| s.range.start <= byte)?;
+    Some(span.source + (byte.min(span.range.end) - span.range.start))
 }
 
 /// Character-level decoration. Block-level scale and colour come from
@@ -47,6 +61,7 @@ impl InlineStyle {
     /// A position rather than an emphasis, which is why it is its own bit: nothing
     /// about the *voice* of the digits changes, only where they sit on the line.
     pub const SUPERSCRIPT: InlineStyle = InlineStyle(1 << 6);
+    pub const DELIMITER: InlineStyle = InlineStyle(1 << 7);
 
     #[inline]
     pub const fn bits(self) -> u8 {
@@ -113,6 +128,7 @@ pub struct Block {
     pub kind: BlockKind,
     pub text: String,
     pub spans: Vec<Span>,
+    pub sources: Vec<SourceSpan>,
     /// How many block quotes contain this block.
     pub quote_depth: u8,
     pub list: Option<ListInfo>,
@@ -199,6 +215,7 @@ impl Table {
 pub struct Cell {
     pub text: String,
     pub spans: Vec<Span>,
+    pub sources: Vec<SourceSpan>,
     /// What a click on this cell's text would do. A cell is laid out by the grid rather
     /// than as prose, so its targets are recorded here and not on the block.
     pub actions: Vec<Action>,
@@ -235,6 +252,13 @@ pub enum ObjectKind {
 }
 
 impl Block {
+    pub fn literal(kind: BlockKind, text: String) -> Self {
+        Self { kind, spans: vec![Span { range: 0..text.len(), style: InlineStyle::EMPTY }],
+            sources: vec![SourceSpan { range: 0..text.len(), source: 0 }],
+            text, quote_depth: 0, list: None, item_depth: None, task: None, table: None,
+            objects: Vec::new(), actions: Vec::new(), lang: None }
+    }
+
     /// Headings and code are set ragged-right; justifying them is a defect.
     /// Headings and code are set ragged-right; a table is laid out per cell.
     pub fn ragged(&self) -> bool {
@@ -274,27 +298,83 @@ pub struct Footnote {
 }
 
 impl Document {
+    /// Source reading uses the original bytes as text, with Markdown style spans only.
+    /// Parsing supplies highlights; no event is allowed to replace the original text.
+    pub fn source(source: &str) -> Document {
+        let mut marked = Vec::new();
+        for (event, range) in Parser::new_ext(source, Options::ENABLE_TABLES | Options::ENABLE_STRIKETHROUGH).into_offset_iter() {
+            let style = match event {
+                Event::Start(Tag::Heading { .. } | Tag::Strong) => InlineStyle::STRONG,
+                Event::Start(Tag::Emphasis) => InlineStyle::EMPHASIS,
+                Event::Start(Tag::Link { .. }) => InlineStyle::LINK,
+                Event::Code(_) => InlineStyle::DELIMITER,
+                Event::Html(_) | Event::InlineHtml(_) => InlineStyle::DELIMITER,
+                _ => continue,
+            };
+            marked.push((range, style));
+        }
+        let mut boundaries = vec![0, source.len()];
+        for (r, _) in &marked { boundaries.extend([r.start, r.end]); }
+        boundaries.sort_unstable();
+        boundaries.dedup();
+        let mut b = Block::literal(BlockKind::Code, source.to_string());
+        b.lang = Some("markdown-source".into());
+        b.spans = boundaries.windows(2).filter(|r| r[0] < r[1]).map(|r| {
+            let style = marked.iter().filter(|(m, _)| m.start <= r[0] && m.end >= r[1])
+                .fold(InlineStyle::EMPTY, |style, (_, add)| style | *add);
+            Span { range: r[0]..r[1], style }
+        }).collect();
+        Document { blocks: vec![b], footnotes: Vec::new() }
+    }
+
     pub fn parse(source: &str) -> Document {
+        Self::parse_with(source, ParseOptions::default())
+    }
+
+    pub fn parse_with(source: &str, options: ParseOptions) -> Document {
+        let original_len = source.len();
         // Front matter is the author's metadata for the tool that wrote the file, and
         // nothing of it is prose: shown as itself it arrives as a rule, a paragraph of
         // `key: value` lines, and another rule, which is the top of every document that
         // comes out of a blog or a vault.
         let source = split_front_matter(source).map_or(source, |(_, body)| body);
+        let base = original_len - source.len();
         // Pandoc's TeX delimiters, read out of the source before anything else touches
         // it: `\(` is a CommonMark escape for a bracket, so the backslash is gone by
         // the time an event carries the text and there is nothing left to recognise.
         let rewritten = tex_delimiters(source);
+        let original = source;
         let source = rewritten.as_deref().unwrap_or(source);
         let opts = Options::ENABLE_STRIKETHROUGH
             | Options::ENABLE_TASKLISTS
             | Options::ENABLE_TABLES
             | Options::ENABLE_MATH
             | Options::ENABLE_FOOTNOTES;
-        let mut st = Builder::default();
-        for ev in Parser::new_ext(source, opts) {
+        let mut st = Builder { options, input: source, origins: rewrite_origins(original, source, base), ..Builder::default() };
+        for (ev, range) in Parser::new_ext(source, opts).into_offset_iter() {
+            st.event_range = range;
             st.event(ev);
         }
         st.finish()
+    }
+}
+
+/// Reader preferences that change Markdown's interpretation without changing the file.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct ParseOptions {
+    pub keep_line_breaks: bool,
+}
+
+impl ObjectKind {
+    /// A selected object remains useful when pasted into another Markdown document.
+    pub fn markdown(&self) -> String {
+        match self {
+            Self::Math { source, display } => {
+                let fence = if *display { "$$" } else { "$" };
+                format!("{fence}{source}{fence}")
+            }
+            Self::Image { src, alt } => format!("![{alt}]({src})"),
+        }
     }
 }
 
@@ -393,6 +473,40 @@ fn tex_inline(line: &str) -> String {
     out
 }
 
+/// Sparse offsets for the only source edits made before parsing: TeX delimiter
+/// replacement and indentation removed from standalone display delimiters.
+fn rewrite_origins(original: &str, rewritten: &str, base: usize) -> Vec<(usize, usize)> {
+    let mut points = vec![(0, base)];
+    let (mut from, mut to) = (0, 0);
+    while to < rewritten.len() && from < original.len() {
+        if original.as_bytes()[from] == rewritten.as_bytes()[to] { from += 1; to += 1; continue; }
+        let tail = &original[from..];
+        if rewritten.as_bytes()[to] == b'$' && (tail.starts_with("\\(") || tail.starts_with("\\)")) {
+            from += 2; to += 1;
+        } else {
+            let trimmed = tail.trim_start_matches([' ', '\t']);
+            let skipped = tail.len() - trimmed.len();
+            if rewritten[to..].starts_with("$$") && (trimmed.starts_with("\\[") || trimmed.starts_with("\\]")) {
+                from += skipped;
+                points.push((to, base + from));
+                from += 2; to += 2;
+            } else {
+                // No other edit is part of the rewrite contract.
+                debug_assert!(false, "unmapped Markdown source rewrite");
+                from += 1; to += 1;
+            }
+        }
+        points.push((to, base + from));
+    }
+    points
+}
+
+fn original_at(points: &[(usize, usize)], byte: usize) -> usize {
+    let index = points.partition_point(|(at, _)| *at <= byte).saturating_sub(1);
+    let (at, original) = points.get(index).copied().unwrap_or((0, 0));
+    original + byte - at
+}
+
 /// The source of a formula, with the line breaks it was wrapped on turned into the
 /// spaces they were written for.
 ///
@@ -460,7 +574,11 @@ struct Draft {
 }
 
 #[derive(Default)]
-struct Builder {
+struct Builder<'a> {
+    input: &'a str,
+    origins: Vec<(usize, usize)>,
+    event_range: std::ops::Range<usize>,
+    options: ParseOptions,
     blocks: Vec<Block>,
     cur: Option<Block>,
     /// Where the current block's paragraph had its lines joined by a soft break.
@@ -500,7 +618,21 @@ struct Builder {
     html: Option<String>,
 }
 
-impl Builder {
+impl Builder<'_> {
+    fn sources(&self, text: &str, start: usize) -> Vec<SourceSpan> {
+        let raw = &self.input[self.event_range.clone()];
+        let exact = raw.find(text).map(|at| self.event_range.start + at);
+        let mut spans: Vec<SourceSpan> = Vec::new();
+        for (at, c) in text.char_indices() {
+            let source = original_at(&self.origins, exact.map_or(self.event_range.start, |base| base + at));
+            let range = start + at..start + at + c.len_utf8();
+            if let Some(last) = spans.last_mut().filter(|s| s.range.end == range.start
+                && s.source + s.range.len() == source) { last.range.end = range.end; }
+            else { spans.push(SourceSpan { range, source }); }
+        }
+        spans
+    }
+
     fn event(&mut self, ev: Event<'_>) {
         match ev {
             Event::Start(tag) => self.start(tag),
@@ -526,7 +658,7 @@ impl Builder {
                         self.breaks.push(b.text.len());
                     }
                 }
-                self.put(" ", InlineStyle::EMPTY)
+                self.put(if self.options.keep_line_breaks { "\n" } else { " " }, InlineStyle::EMPTY)
             }
             Event::HardBreak => self.put("\n", InlineStyle::EMPTY),
             Event::TaskListMarker(checked) => {
@@ -576,7 +708,9 @@ impl Builder {
                 let style = self.inline | InlineStyle::SUPERSCRIPT;
                 let cite = ActionKind::Cite(label.to_string());
                 let digits = n.to_string();
+                let sources = self.cell.as_ref().map(|c| self.sources(&digits, c.text.len()));
                 if let Some(c) = self.cell.as_mut() {
+                    c.sources.extend(sources.unwrap_or_default());
                     // A cell has no paragraph to append to -- the block being built is the
                     // table's, and text landing there is never drawn -- so the number goes
                     // into the cell, where it at least gets its column's width.
@@ -822,6 +956,7 @@ impl Builder {
             kind,
             text: String::new(),
             spans: Vec::new(),
+            sources: Vec::new(),
             quote_depth: self.quote_depth,
             list: None,
             // The innermost open list, if an item of it is open: the level a block
@@ -846,8 +981,9 @@ impl Builder {
     /// there, and it is a real break only if it reaches the cell.
     fn put(&mut self, s: &str, style: InlineStyle) {
         let link = self.link.clone().map(ActionKind::Url);
+        let sources = self.cell.as_ref().map(|c| self.sources(s, c.text.len()));
         match self.cell.as_mut() {
-            Some(c) => push_cell(c, s, style, link),
+            Some(c) => { c.sources.extend(sources.unwrap_or_default()); push_cell(c, s, style, link); }
             None => {
                 self.push(s, style);
             }
@@ -866,7 +1002,9 @@ impl Builder {
         // Taken before `cur` is borrowed: the link and the block are both fields of
         // the builder, and a run of text belongs to both.
         let linked = self.link.clone();
+        let sources = self.sources(s, self.cur.as_ref().unwrap().text.len());
         let b = self.cur.as_mut().unwrap();
+        b.sources.extend(sources);
         let start = b.text.len();
         b.text.push_str(s);
         let end = b.text.len();
@@ -884,7 +1022,10 @@ impl Builder {
 
     /// Append an object-replacement character and register what it stands for.
     fn push_object(&mut self, kind: ObjectKind) {
+        let start = self.cell.as_ref().map(|c| c.text.len()).or_else(|| self.cur.as_ref().map(|b| b.text.len())).unwrap_or(0);
+        let sources = self.sources("\u{fffc}", start);
         if let Some(c) = self.cell.as_mut() {
+            c.sources.extend(sources);
             // In a grid the cell is the text this object will be laid out in, so the
             // placeholder and its record both belong there and not on the block: a
             // range into the block's text means nothing to a cell that has its own.
@@ -902,6 +1043,7 @@ impl Builder {
             self.open(BlockKind::Paragraph);
         }
         let b = self.cur.as_mut().unwrap();
+        b.sources.extend(sources);
         let start = b.text.len();
         b.text.push('\u{FFFC}');
         let end = b.text.len();
@@ -1081,6 +1223,9 @@ fn piece(base: &Block, range: std::ops::Range<usize>, kind: BlockKind) -> Option
             .iter()
             .filter_map(|s| cut(s.range.clone()).map(|range| Span { range, style: s.style }))
             .collect(),
+        sources: base.sources.iter().filter_map(|s| cut(s.range.clone()).map(|part| SourceSpan {
+            source: s.source + range.start.max(s.range.start) - s.range.start, range: part,
+        })).collect(),
         quote_depth: base.quote_depth,
         list: None,
         item_depth: base.item_depth,

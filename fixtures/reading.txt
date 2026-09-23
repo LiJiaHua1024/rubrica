@@ -1,0 +1,18 @@
+前言
+
+# This is literal text.
+* These are literal stars * and $money$.
+
+第一章
+
+中文的软换行
+可以连成一个段落。
+
+第二章
+
+English wrapped text
+keeps a separating space.
+
+Chapter IV
+
+1. This is ordinary text, not a Markdown list.
