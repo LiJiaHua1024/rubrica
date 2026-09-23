@@ -5,6 +5,8 @@
 //! architectural premise: fine typography requires the break decisions and the
 //! glyph advances to come from the same place.
 
+#![windows_subsystem = "windows"]
+
 mod clipboard;
 mod font;
 mod find;
