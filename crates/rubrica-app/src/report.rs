@@ -38,6 +38,9 @@ pub struct Options {
     /// Print every piece of every formula with the coordinates it is drawn at. Off by
     /// default because it is a page of numbers per formula, not a summary.
     pub shapes: bool,
+    pub keep_line_breaks: bool,
+    pub source_view: bool,
+    pub plain: Option<bool>,
 }
 
 pub fn report(source: &str, path: Option<&str>, o: &Options) -> Result<()> {
@@ -51,6 +54,9 @@ pub fn report(source: &str, path: Option<&str>, o: &Options) -> Result<()> {
         face,
         measure,
         shapes,
+        keep_line_breaks,
+        source_view,
+        plain,
     } = *o;
     let mut font =
         FontEngine::new().map_err(|e| -> Error { format!("DirectWrite: {e}").into() })?;
@@ -61,7 +67,10 @@ pub fn report(source: &str, path: Option<&str>, o: &Options) -> Result<()> {
     theme.set_zoom(zoom);
     theme.set_face(face);
     theme.set_measure(measure);
-    let doc = rubrica_doc::Document::parse(source);
+    let doc = if source_view { rubrica_doc::Document::source(source) }
+        else if plain.unwrap_or_else(|| crate::reading::is_plain(path.map(std::path::Path::new))) {
+            rubrica_doc::plain::parse(source, rubrica_doc::plain::TextOptions::default())
+        } else { rubrica_doc::Document::parse_with(source, rubrica_doc::ParseOptions { keep_line_breaks }) };
     // No render target exists here, so figures are measured from their files
     // through WIC but not decoded to bitmaps -- enough to lay out and report.
     let _ = unsafe {
@@ -582,6 +591,9 @@ pub fn report(source: &str, path: Option<&str>, o: &Options) -> Result<()> {
             "  whole page : {} char(s) copied in {bands} band(s), {lines} line break(s), {tabs} tab(s)",
             copied.chars().count()
         );
+        let objects: usize = page.sel.iter().map(|l| l.copies.len()).sum();
+        let placeholders = copied.chars().filter(|c| *c == '\u{fffc}').count();
+        println!("  copy source: {objects} object(s) restored, {placeholders} unresolved placeholder(s)");
     }
     Ok(())
 }

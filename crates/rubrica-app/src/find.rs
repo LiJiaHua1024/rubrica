@@ -126,10 +126,12 @@ mod tests {
     fn line(text: &str, y: f32, join: Join) -> SelLine {
         let chars: Vec<char> = text.chars().collect();
         SelLine {
+            source: None,
             y,
             h: CHAR * 1.5,
             join,
             chars,
+            copies: Vec::new(),
             xs: (0..=text.chars().count()).map(|i| i as f32 * CHAR).collect(),
             ends: (1..=text.chars().count()).map(|i| i as f32 * CHAR).collect(),
         }

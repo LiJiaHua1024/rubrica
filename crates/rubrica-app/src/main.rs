@@ -49,6 +49,10 @@ fn main() -> Result<()> {
             face,
             measure,
             shapes: argv.iter().any(|a| a == "--shapes"),
+            keep_line_breaks: argv.iter().any(|a| a == "--keep-line-breaks"),
+            source_view: argv.iter().any(|a| a == "--source"),
+            plain: if argv.iter().any(|a| a == "--plain") { Some(true) }
+                else if argv.iter().any(|a| a == "--markdown") { Some(false) } else { None },
         };
         return report::report(&source, shown.as_deref(), &options);
     }
@@ -58,7 +62,11 @@ fn main() -> Result<()> {
     // to.
     let arg = std::env::args_os().nth(1).map(PathBuf::from);
     let (path, source) = match arg.as_ref().and_then(|p| p.to_str()) {
-        Some(p) => load(Some(p))?,
+        Some(p) => {
+            let path = PathBuf::from(p);
+            let source = reading::read(&path, settings::document(&path).encoding)?.text;
+            (Some(path), source)
+        }
         None => reopen(),
     };
     view::run(source, path)
@@ -74,7 +82,7 @@ fn main() -> Result<()> {
 /// document named on the command line gets the same treatment.
 fn reopen() -> (Option<PathBuf>, String) {
     if let Some((path, _)) = settings::reading() {
-        if let Ok(source) = std::fs::read_to_string(&path) {
+        if let Ok(source) = reading::read(&path, settings::document(&path).encoding).map(|d| d.text) {
             return (Some(path), source);
         }
     }
@@ -85,7 +93,7 @@ fn reopen() -> (Option<PathBuf>, String) {
 fn load(file: Option<&str>) -> Result<(Option<PathBuf>, String)> {
     match file {
         None => Ok((None, sample::DOCUMENT.to_string())),
-        Some(p) => match std::fs::read_to_string(p) {
+        Some(p) => match reading::read(std::path::Path::new(p), reading::Encoding::Auto).map(|d| d.text) {
             Ok(s) => Ok((Some(PathBuf::from(p)), s)),
             Err(e) => Err(format!("cannot read {p}: {e}").into()),
         },

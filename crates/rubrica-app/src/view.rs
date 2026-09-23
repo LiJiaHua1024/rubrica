@@ -79,6 +79,8 @@ use windows::Win32::UI::WindowsAndMessaging::{
 use windows_numerics::Vector2;
 
 use crate::clipboard;
+use crate::reading::{self, Encoding};
+use rubrica_doc::plain::{ParagraphRule, TextOptions};
 use crate::find::Needle;
 use crate::font::{FaceRequest, FontEngine, GlyphRun, ObjectBox, Style as RunStyle};
 use crate::hyphen::Hyphenator;
@@ -290,7 +292,23 @@ pub enum HotKind {
     /// A link to another Markdown file beside this one, already resolved to a path that
     /// exists. The reader is a document reader, so the answer to such a link is to read
     /// that document rather than to hand the path to some other program.
-    Document(PathBuf),
+    Document(DocumentTarget),
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DocumentTarget {
+    pub path: PathBuf,
+    pub fragment: Option<String>,
+}
+
+fn fragment_slug(fragment: &str) -> String {
+    slug(&crate::images::percent_decode(fragment))
+}
+
+fn heading_index(doc: &Document, fragment: &str) -> Option<usize> {
+    let name = fragment_slug(fragment);
+    doc.blocks.iter().filter(|b| matches!(b.kind, BlockKind::Heading(_)))
+        .position(|b| slug(&b.text) == name)
 }
 
 /// A rectangle of the document a click can land on, in the same device independent
@@ -327,6 +345,7 @@ pub enum Join {
 /// shaping artefact: it splits where the script changes, so a word of one language
 /// can be drawn in two pieces while still being one word to select.
 pub struct SelLine {
+    pub source: Option<std::ops::Range<usize>>,
     /// Top edge and height, in the same device independent pixels as [`Hot`] and
     /// measured from the top of the document.
     pub y: f32,
@@ -334,6 +353,8 @@ pub struct SelLine {
     /// What separates this line from the one before it in the text a copy hands back.
     pub join: Join,
     pub chars: Vec<char>,
+    /// Markdown to copy in place of an atomic object, indexed in logical characters.
+    pub copies: Vec<(usize, String)>,
     /// Logical leading edges; bidi text can run in either direction.
     /// A step of no width is a character the source has and this line does not paint,
     /// which is what a wrapped line's space between two of its words looks like.
@@ -470,7 +491,13 @@ pub fn selection_text(sel: &[SelLine], s: Selection) -> String {
                 Join::Blank => out.push_str("\n\n"),
             }
         }
-        out.extend(l.chars[lo..hi].iter().copied());
+        for (i, c) in l.chars.iter().enumerate().take(hi).skip(lo) {
+            if let Some((_, text)) = l.copies.iter().find(|(at, _)| *at == i) {
+                out.push_str(text);
+            } else {
+                out.push(*c);
+            }
+        }
     }
     out
 }
@@ -756,7 +783,17 @@ pub struct View {
     hwnd_target: Option<ID2D1HwndRenderTarget>,
     font: FontEngine,
     theme: Theme,
+    profile: String,
     doc: Document,
+    source: String,
+    source_view: bool,
+    text_options: TextOptions,
+    plain_override: Option<bool>,
+    encoding: Encoding,
+    decoded_encoding: Encoding,
+    encoding_guessed: bool,
+    keep_line_breaks: bool,
+    line_break_override: Option<bool>,
     ops: Vec<Op>,
     palette: Palette,
     /// The palette the reader asked for with `Ctrl`+`D`. `None` follows the system,
@@ -1057,6 +1094,8 @@ fn cref(c: Rgb) -> COLORREF {
 /// can test, and the window is not open in a test.
 #[derive(Clone, Debug, PartialEq)]
 enum Command {
+    Typography,
+    Profile(String),
     /// Step to the page the reader came from, and to the one they came from it to.
     GoBack,
     GoForward,
@@ -1083,6 +1122,16 @@ enum Command {
     OpenFile,
     /// Read the file this page came from again, from disk.
     Reload,
+    DefaultLineBreaks(bool),
+    DocumentLineBreaks(Option<bool>),
+    SourceView,
+    PlainText(Option<bool>),
+    TextParagraphs(ParagraphRule),
+    DetectChapters(bool),
+    TextEncoding(Encoding),
+    Neighbor(bool),
+    OpenEditor,
+    ChooseEditor,
 }
 
 /// One row of that menu.
@@ -1110,7 +1159,19 @@ fn check(cmd: Command, label: impl Into<String>, on: bool) -> MenuRow {
 /// menu has to say true things about the moment it is opened in: an item that offers to
 /// copy nothing, or checks a palette that is not on the screen, teaches the reader to
 /// distrust the whole list.
+#[derive(Default)]
 struct MenuState {
+    profiles: Vec<String>,
+    profile: String,
+    source_view: bool,
+    plain_override: Option<bool>,
+    text_options: TextOptions,
+    encoding: Encoding,
+    encoding_notice: Option<String>,
+    previous: bool,
+    next: bool,
+    keep_line_breaks: bool,
+    line_break_override: Option<bool>,
     /// Whether a step back or forward has a page to land on. A reader who has opened one
     /// document and never followed a link out of it has no road behind them, and a `Back`
     /// that does nothing when pressed teaches them the menu is not to be believed.
@@ -1176,8 +1237,11 @@ fn menu_items(s: &MenuState) -> Vec<MenuRow> {
         row(Command::ZoomOut, "Decrease Text\tCtrl+-", true),
         row(Command::ZoomReset, "Actual Size\tCtrl+0", true),
     ]);
+    let mut typography = vec![row(Command::Typography, "Edit / Save Preset...", true), MenuRow::Gap];
+    typography.extend(s.profiles.iter().map(|name| check(Command::Profile(name.clone()), name, *name == s.profile)));
+    v.push(MenuRow::Sub { label: "Typography", items: typography });
     v.push(MenuRow::Gap);
-    for (i, f) in TextFace::ALL.iter().enumerate() {
+    for (i, f) in TextFace::ALL.iter().enumerate().filter(|_| s.profile.is_empty() || s.profile == "Default") {
         let on = i == s.face;
         let ok = s.offered.get(i).copied().unwrap_or(false);
         // The face in use is always clickable: a machine that has lost a family since it
@@ -1185,7 +1249,7 @@ fn menu_items(s: &MenuState) -> Vec<MenuRow> {
         v.push(if on { check(Command::Face(i), f.label, true) } else { row(Command::Face(i), f.label, ok) });
     }
     v.push(MenuRow::Gap);
-    for (i, m) in Measure::ALL.iter().enumerate() {
+    for (i, m) in Measure::ALL.iter().enumerate().filter(|_| s.profile.is_empty() || s.profile == "Default") {
         v.push(check(Command::Measure(i), m.label, i == s.measure));
     }
     v.push(MenuRow::Gap);
@@ -1199,6 +1263,38 @@ fn menu_items(s: &MenuState) -> Vec<MenuRow> {
         row(Command::OpenFile, "Open\u{2026}\tCtrl+O", true),
         row(Command::Reload, "Reload\tCtrl+R", s.from_file),
     ]);
+    v.insert(v.len() - 3, MenuRow::Sub { label: "Single newlines", items: vec![
+        check(Command::DefaultLineBreaks(false), "Default: Merge into paragraph", !s.keep_line_breaks),
+        check(Command::DefaultLineBreaks(true), "Default: Keep line breaks", s.keep_line_breaks),
+        MenuRow::Gap,
+        check(Command::DocumentLineBreaks(None), "This document: Follow default", s.line_break_override.is_none()),
+        check(Command::DocumentLineBreaks(Some(false)), "This document: Merge", s.line_break_override == Some(false)),
+        check(Command::DocumentLineBreaks(Some(true)), "This document: Keep", s.line_break_override == Some(true)),
+    ] });
+    v.insert(v.len() - 3, check(Command::SourceView, "Read Source\tCtrl+3", s.source_view));
+    v.insert(v.len() - 3, MenuRow::Sub { label: "External editor", items: vec![
+        row(Command::OpenEditor, "Open in Editor\tCtrl+Shift+O", s.from_file),
+        row(Command::ChooseEditor, "Choose Editor\u{2026}", true),
+    ] });
+    v.insert(v.len() - 3, MenuRow::Sub { label: "Text reading", items: vec![
+        check(Command::PlainText(None), "Format: From file extension", s.plain_override.is_none()),
+        check(Command::PlainText(Some(true)), "Format: Plain text", s.plain_override == Some(true)),
+        check(Command::PlainText(Some(false)), "Format: Markdown", s.plain_override == Some(false)),
+        MenuRow::Gap,
+        check(Command::TextParagraphs(ParagraphRule::Auto), "Paragraphs: Automatic", s.text_options.paragraphs == ParagraphRule::Auto),
+        check(Command::TextParagraphs(ParagraphRule::Lines), "Paragraphs: Each line", s.text_options.paragraphs == ParagraphRule::Lines),
+        check(Command::TextParagraphs(ParagraphRule::BlankLines), "Paragraphs: Blank lines", s.text_options.paragraphs == ParagraphRule::BlankLines),
+        check(Command::DetectChapters(!s.text_options.chapters), "Detect chapter headings", s.text_options.chapters),
+        MenuRow::Gap,
+        row(Command::Neighbor(false), "Previous file\tCtrl+Alt+Left", s.previous),
+        row(Command::Neighbor(true), "Next file\tCtrl+Alt+Right", s.next),
+    ] });
+    let mut encodings: Vec<_> = Encoding::ALL.into_iter().map(|e|
+        check(Command::TextEncoding(e), e.label(), e == s.encoding)).collect();
+    if let Some(notice) = &s.encoding_notice {
+        encodings.insert(0, row(Command::TextEncoding(s.encoding), notice, false));
+    }
+    v.insert(v.len() - 3, MenuRow::Sub { label: "Text encoding", items: encodings });
     v
 }
 
@@ -1371,6 +1467,13 @@ fn open_url(url: &str) {
     }
 }
 
+fn show_error(hwnd: HWND, message: &str) {
+    use windows::Win32::UI::WindowsAndMessaging::{MessageBoxW, MB_ICONERROR, MB_OK};
+    let message = utf16(message);
+    let title = utf16("Rubrica");
+    unsafe { MessageBoxW(Some(hwnd), PCWSTR(message.as_ptr()), PCWSTR(title.as_ptr()), MB_OK | MB_ICONERROR); }
+}
+
 /// Whether a modifier is down. Read from the keyboard state rather than from the
 /// message: `WM_KEYDOWN` carries no modifier flags of its own, and a key that only
 /// means something with `Ctrl` has to ask.
@@ -1432,15 +1535,26 @@ pub fn run(source: String, path: Option<PathBuf>) -> Result<()> {
     // than the route here: a document named on the command line comes back to its place
     // too, which is what double-clicking it in Explorer is. A sample page has no path, and
     // so no place.
-    let restore = crate::settings::reading()
+    let restore = path.as_deref().and_then(crate::settings::document_anchor).or_else(|| crate::settings::reading()
         .filter(|(left, _)| Some(left.as_path()) == path.as_deref())
-        .map(|(_, anchor)| anchor);
+        .map(|(_, anchor)| anchor));
 
     // The file the text above came out of, as it stands at this moment. `main` has already
     // read it, so this is the stamp of the page on the screen rather than of some text that
     // arrived afterwards -- and if a save did land in between, the first poll finds it a
     // fraction of a second later.
     let stamp = path.as_deref().and_then(stamp_of);
+    let keep_line_breaks = crate::settings::keep_line_breaks();
+    let preferences = path.as_deref().map(crate::settings::document).unwrap_or_default();
+    let profile = crate::profiles::selected(preferences.plain.unwrap_or_else(|| reading::is_plain(path.as_deref())));
+    if profile != "Default" { crate::profiles::load(&profile).apply(&mut theme); }
+    let decoded = path.as_deref().and_then(|p| reading::read(p, preferences.encoding).ok());
+    let doc = if preferences.source { Document::source(&source) }
+        else if preferences.plain.unwrap_or_else(|| reading::is_plain(path.as_deref())) {
+            rubrica_doc::plain::parse(&source, preferences.text)
+        } else { Document::parse_with(&source, rubrica_doc::ParseOptions {
+            keep_line_breaks: preferences.line_breaks.unwrap_or(keep_line_breaks),
+        }) };
 
     let mut view = Box::new(View {
         d2d,
@@ -1448,7 +1562,17 @@ pub fn run(source: String, path: Option<PathBuf>) -> Result<()> {
         hwnd_target: None,
         font,
         theme,
-        doc: Document::parse(&source),
+        profile,
+        doc,
+        source,
+        source_view: preferences.source,
+        text_options: preferences.text,
+        plain_override: preferences.plain,
+        encoding: preferences.encoding,
+        decoded_encoding: decoded.as_ref().map_or(Encoding::Utf8, |d| d.encoding),
+        encoding_guessed: decoded.is_some_and(|d| d.guessed),
+        keep_line_breaks,
+        line_break_override: preferences.line_breaks,
         ops: Vec::new(),
         palette: Palette::of(dark),
         dark_override: saved.dark,
@@ -1527,6 +1651,7 @@ pub fn run(source: String, path: Option<PathBuf>) -> Result<()> {
         .map_err(|e| -> Error { format!("CreateWindowExW: {e}").into() })?;
 
         view.attach(hwnd);
+        view.update_title(hwnd);
         // Straight to the maximised frame rather than to the normal one and then a state
         // change, because the second way shows the reader the window they did not leave.
         let _ = ShowWindow(hwnd, if frame.maximised { SW_SHOWMAXIMIZED } else { SW_SHOWNORMAL });
@@ -1546,6 +1671,7 @@ pub fn run(source: String, path: Option<PathBuf>) -> Result<()> {
 
         let mut msg = MSG::default();
         while GetMessageW(&mut msg, None, 0, 0).as_bool() {
+            if crate::typography::route(&msg) { continue; }
             let _ = TranslateMessage(&msg);
             DispatchMessageW(&msg);
         }
@@ -1617,6 +1743,25 @@ fn scroll_for_anchor(sel: &[SelLine], anchor: usize, k: f32) -> Option<f32> {
         seen += line.chars.len();
     }
     None
+}
+
+fn scroll_for_source(sel: &[SelLine], byte: usize, k: f32) -> Option<f32> {
+    if byte == 0 { return Some(0.0); }
+    sel.iter().filter_map(|line| {
+        let range = line.source.as_ref()?;
+        let distance = if byte < range.start { range.start - byte }
+            else { byte.saturating_sub(range.end.saturating_sub(1)) };
+        Some((distance, line.y / k))
+    }).min_by_key(|(distance, _)| *distance).map(|(_, y)| y)
+}
+
+fn relocated_source(old: &str, new: &str, byte: usize) -> usize {
+    if byte == 0 || old == new { return byte.min(new.len()); }
+    let Some(tail) = old.get(byte..) else { return byte.min(new.len()) };
+    let context: String = tail.chars().take(80).collect();
+    if context.is_empty() { return byte.min(new.len()); }
+    new.match_indices(&context).min_by_key(|(at, _)| at.abs_diff(byte))
+        .map_or(byte.min(new.len()), |(at, _)| at)
 }
 
 /// Reads the same registry value the Settings app writes. There is no window
@@ -2010,6 +2155,10 @@ impl View {
                 let page = self.page_height();
                 let ctrl = held(VK_CONTROL);
                 let shift = held(VK_SHIFT);
+                if ctrl && wp.0 == 0x33 {
+                    self.apply_command(Command::SourceView, hwnd);
+                    return LRESULT(0);
+                }
                 // Once the reader has put a caret on the page -- by a click or by an
                 // arrow -- the arrows belong to it, up and down included, because that
                 // is what they mean on every text surface they have ever used. Before
@@ -2045,6 +2194,7 @@ impl View {
                     // Both of these go through the menu's own command, so the key and the
                     // row it repeats cannot drift apart -- one of them is written in terms
                     // of the other.
+                    k if k == VK_O.0 as u32 && ctrl && shift => self.apply_command(Command::OpenEditor, hwnd),
                     k if k == VK_O.0 as u32 && ctrl => self.apply_command(Command::OpenFile, hwnd),
                     // A document with no file behind it has nothing to read again, which is
                     // the same condition that dims the row.
@@ -2117,7 +2267,10 @@ impl View {
             WM_SYSKEYDOWN => {
                 let k = wp.0 as u32;
                 let alt = held(VK_MENU);
-                if alt && k == VK_LEFT.0 as u32 {
+                if alt && held(VK_CONTROL) && (k == VK_LEFT.0 as u32 || k == VK_RIGHT.0 as u32) {
+                    self.apply_command(Command::Neighbor(k == VK_RIGHT.0 as u32), hwnd);
+                    LRESULT(0)
+                } else if alt && k == VK_LEFT.0 as u32 {
                     self.apply_command(Command::GoBack, hwnd);
                     LRESULT(0)
                 } else if alt && k == VK_RIGHT.0 as u32 {
@@ -2130,6 +2283,11 @@ impl View {
             // The find box has new words in it. Asked about on every keystroke rather than
             // when `Enter` is pressed, because a search that waits is a reader pressing
             // `Enter` to find out whether the word they meant is on the page at all.
+            crate::typography::APPLIED => {
+                let plain = self.plain_override.unwrap_or_else(|| reading::is_plain(self.path.as_deref()));
+                self.apply_profile(crate::profiles::selected(plain), hwnd);
+                LRESULT(0)
+            }
             WM_COMMAND => {
                 let (id, code) = (wp.0 & 0xFFFF, ((wp.0 >> 16) & 0xFFFF) as u32);
                 if id == FIND_EDIT_ID && code == EN_CHANGE {
@@ -2416,8 +2574,20 @@ impl View {
             HotKind::Url(url) => open_url(&url),
             HotKind::Cite(note) => self.jump_to(self.note_tops.get(note).copied(), hwnd),
             HotKind::Heading(at) => self.jump_to(self.anchor_tops.get(at).copied(), hwnd),
-            HotKind::Document(path) => {
-                self.load_document(&path, hwnd);
+            HotKind::Document(target) => {
+                let from = self.here();
+                let same = self.path.as_deref() == Some(target.path.as_path());
+                if !same && !self.show_document(&target.path, hwnd) { return; }
+                if let Some(at) = target.fragment.as_deref().and_then(|f| heading_index(&self.doc, f)) {
+                    if let Some(top) = self.anchor_tops.get(at) {
+                        self.scroll = (*top - self.theme.base).max(0.0);
+                    }
+                }
+                self.clamp_scroll();
+                if !same || (self.scroll - from.scroll).abs() > 0.5 {
+                    self.history.leave(from);
+                }
+                self.remember_reading();
                 let _ = unsafe { InvalidateRect(Some(hwnd), None, false) };
             }
         }
@@ -2465,6 +2635,18 @@ impl View {
         let mut pt = POINT { x, y };
         let _ = unsafe { ScreenToClient(hwnd, &mut pt) };
         let state = MenuState {
+            profiles: crate::profiles::names(),
+            profile: self.profile.clone(),
+            source_view: self.source_view,
+            plain_override: self.plain_override,
+            text_options: self.text_options,
+            encoding: self.encoding,
+            encoding_notice: Some(format!("{}{}", self.decoded_encoding.label(),
+                if self.encoding_guessed { " (detected by guess; choose if incorrect)" } else { "" })),
+            previous: self.path.as_deref().and_then(|p| reading::neighbor(p, false)).is_some(),
+            next: self.path.as_deref().and_then(|p| reading::neighbor(p, true)).is_some(),
+            keep_line_breaks: self.keep_line_breaks,
+            line_break_override: self.line_break_override,
             can_back: self.history.leads(true),
             can_forward: self.history.leads(false),
             link: self.pointer_link(pt.x as f32, pt.y as f32),
@@ -2548,8 +2730,74 @@ impl View {
             }
             Command::Reload => {
                 if let Some(path) = self.path.clone() {
+                    if let Ok(decoded) = reading::read(&path, self.encoding) {
+                        self.reload_text(decoded, hwnd);
+                        self.stamp = stamp_of(&path);
+                    }
+                }
+            }
+            Command::DefaultLineBreaks(keep) => {
+                self.keep_line_breaks = keep;
+                crate::settings::record_line_breaks(keep);
+                self.reparse(hwnd);
+            }
+            Command::DocumentLineBreaks(keep) => {
+                self.line_break_override = keep;
+                self.reparse(hwnd);
+            }
+            Command::SourceView => {
+                self.source_view = !self.source_view;
+                self.reparse(hwnd);
+            }
+            Command::PlainText(plain) => {
+                self.plain_override = plain;
+                self.reparse(hwnd);
+            }
+            Command::TextParagraphs(rule) => {
+                self.text_options.paragraphs = rule;
+                self.reparse(hwnd);
+            }
+            Command::DetectChapters(detect) => {
+                self.text_options.chapters = detect;
+                self.reparse(hwnd);
+            }
+            Command::TextEncoding(encoding) => {
+                if let Some(path) = self.path.as_deref() {
+                    match reading::read(path, encoding) {
+                        Ok(decoded) => {
+                            self.encoding = encoding;
+                            self.reload_text(decoded, hwnd);
+                        }
+                        Err(error) => show_error(hwnd, &error.to_string()),
+                    }
+                }
+            }
+            Command::Neighbor(forward) => {
+                if let Some(path) = self.path.as_deref().and_then(|p| reading::neighbor(p, forward)) {
                     self.load_document(&path, hwnd);
                 }
+            }
+            Command::OpenEditor => {
+                if let Some(path) = self.path.as_deref() {
+                    use std::os::windows::process::CommandExt;
+                    if let Err(error) = std::process::Command::new(crate::settings::editor())
+                        .arg(path).creation_flags(0x08000000).spawn()
+                    { show_error(hwnd, &format!("Cannot start editor: {error}")); }
+                }
+            }
+            Command::ChooseEditor => {
+                if let Some(path) = unsafe { self.prompt_file(hwnd, "Applications\0*.exe\0All files\0*.*\0\0") } {
+                    crate::settings::record_editor(&path);
+                }
+            }
+            Command::Typography => {
+                let plain = self.plain_override.unwrap_or_else(|| reading::is_plain(self.path.as_deref()));
+                if let Err(error) = crate::typography::show(hwnd, &self.theme, plain) { show_error(hwnd, &error.to_string()); }
+            }
+            Command::Profile(name) => {
+                let plain = self.plain_override.unwrap_or_else(|| reading::is_plain(self.path.as_deref()));
+                crate::profiles::select(&name, plain);
+                self.apply_profile(name, hwnd);
             }
         }
         let _ = unsafe { InvalidateRect(Some(hwnd), None, false) };
@@ -2563,6 +2811,82 @@ impl View {
             self.theme.face,
             self.theme.measure,
         );
+    }
+
+    fn parse_source(&self) -> Document {
+        if self.source_view { return Document::source(&self.source); }
+        if self.plain_override.unwrap_or_else(|| reading::is_plain(self.path.as_deref())) {
+            return rubrica_doc::plain::parse(&self.source, self.text_options);
+        }
+        Document::parse_with(&self.source, rubrica_doc::ParseOptions {
+            keep_line_breaks: self.line_break_override.unwrap_or(self.keep_line_breaks),
+        })
+    }
+
+    fn reparse(&mut self, hwnd: HWND) {
+        let source = self.source_anchor();
+        let profile = crate::profiles::selected(self.plain_override.unwrap_or_else(|| reading::is_plain(self.path.as_deref())));
+        if profile != self.profile {
+            crate::profiles::load(&profile).apply(&mut self.theme);
+            self.profile = profile;
+            self.math = MathStore::new();
+        }
+        self.doc = self.parse_source();
+        self.relayout_in_place(hwnd);
+        if let Some(byte) = source { self.restore_source(byte); }
+        self.update_title(hwnd);
+        self.remember_document();
+        self.remember_reading();
+    }
+
+    fn source_anchor(&self) -> Option<usize> {
+        if self.scroll == 0.0 { return Some(0); }
+        self.sel_index.iter().find(|line| line.y + line.h > self.scroll * scale_of(self.dpi))
+            .and_then(|line| line.source.as_ref().map(|range| range.start))
+    }
+
+    fn restore_source(&mut self, byte: usize) {
+        if let Some(scroll) = scroll_for_source(&self.sel_index, byte, scale_of(self.dpi)) { self.scroll = scroll; }
+        self.clamp_scroll();
+    }
+
+    fn reload_text(&mut self, decoded: reading::Decoded, hwnd: HWND) {
+        let source = self.source_anchor().map(|byte| relocated_source(&self.source, &decoded.text, byte));
+        self.accept_decoded(decoded);
+        self.reparse(hwnd);
+        if let Some(byte) = source { self.restore_source(byte); }
+        self.remember_reading();
+    }
+
+    fn remember_document(&self) {
+        if let Some(path) = self.path.as_deref() {
+            crate::settings::record_document(path, crate::settings::DocumentSettings {
+                line_breaks: self.line_break_override, plain: self.plain_override,
+                source: self.source_view, text: self.text_options, encoding: self.encoding,
+            });
+        }
+    }
+
+    fn apply_profile(&mut self, name: String, hwnd: HWND) {
+        crate::profiles::load(&name).apply(&mut self.theme);
+        self.profile = name;
+        self.math = MathStore::new();
+        self.relayout_in_place(hwnd);
+        self.remember();
+    }
+
+    fn update_title(&self, hwnd: HWND) {
+        let mut title = window_title(self.path.as_deref());
+        if self.source_view { title.push_str(" [Source]"); }
+        if self.encoding_guessed { title.push_str(&format!(" [{}?]", self.decoded_encoding.label())); }
+        let title = utf16(&title);
+        let _ = unsafe { SetWindowTextW(hwnd, PCWSTR(title.as_ptr())) };
+    }
+
+    fn accept_decoded(&mut self, decoded: reading::Decoded) {
+        self.source = decoded.text;
+        self.decoded_encoding = decoded.encoding;
+        self.encoding_guessed = decoded.guessed;
     }
 
     /// Set the page in another face pairing.
@@ -2641,7 +2965,11 @@ impl View {
     /// the clipboard alone.
     fn copy_selection(&self, hwnd: HWND) {
         let Some(s) = self.selection else { return };
-        let text = selection_text(&self.sel_index, s);
+        let ordered = s.ordered();
+        let all = ordered.from == (Caret { line: 0, ch: 0 }) && self.sel_index.last().is_some_and(|l|
+            ordered.to == (Caret { line: self.sel_index.len() - 1, ch: l.chars.len() }));
+        let text = if self.source_view && all { self.source.clone() }
+            else { selection_text(&self.sel_index, s) };
         if let Err(e) = clipboard::copy_text(hwnd, &text) {
             eprintln!("clipboard: {e}");
         }
@@ -2933,10 +3261,12 @@ impl View {
         let req = FaceRequest {
             family: self.theme.fonts.family(Role::Body, false).to_string(),
             cjk_family: self.theme.fonts.family(Role::Body, true).to_string(),
+            japanese_family: self.theme.fonts.japanese[Role::Body as usize].clone(),
+            korean_family: self.theme.fonts.korean[Role::Body as usize].clone(),
+            cjk_italic: Some(false),
             fallback: self.theme.fonts.fallback.clone(),
             weight: 400,
             italic: false,
-            ..Default::default()
         };
         let runs = self.font.shape_runs(&text, 0..text.len(), &req, size, 0.02);
         let width: f32 = runs.iter().map(|r| r.width() * k).sum();
@@ -3050,12 +3380,14 @@ struct Prepared {
 /// A table cell with its styles already resolved to ids, so column sizing and
 /// word wrapping measure exactly what prose measures.
 pub struct PreparedCell {
+    pub sources: Vec<rubrica_doc::SourceSpan>,
     pub text: String,
     pub spans: Vec<StyleSpan>,
     pub align: Align,
     /// What a click on this cell's ink would do. A cell is laid out by the grid, so
     /// its targets ride along with the cell rather than with the block's prose.
     pub actions: Vec<Action>,
+    pub objects: Vec<rubrica_doc::ObjectSpan>,
 }
 
 pub struct PreparedTable {
@@ -3198,11 +3530,14 @@ fn hot_kind(kind: &ActionKind, ctx: &Ctx) -> Option<HotKind> {
         // so what they wrote goes through the same rule the heading was indexed by.
         ActionKind::Url(u) => match u.strip_prefix('#') {
             Some(fragment) => {
-                ctx.anchors.get(&slug(fragment)).copied().map(HotKind::Heading)
+                ctx.anchors.get(&fragment_slug(fragment)).copied().map(HotKind::Heading)
             }
             // A path is a request for another file, and this one reads them: it becomes
             // a target only when the file is actually on disk beside the open document.
-            None => document_link(ctx.base, u).map(HotKind::Document),
+            None => document_link(ctx.base, u).map(|path| HotKind::Document(DocumentTarget {
+                path,
+                fragment: u.split_once('#').map(|(_, f)| f.to_string()).filter(|f| !f.is_empty()),
+            })),
         },
         ActionKind::Cite(label) => ctx.notes.get(label.as_str()).copied().map(HotKind::Cite),
     }
@@ -3327,8 +3662,9 @@ fn mark_line(
     segs.sort_by_key(|s| s.0.start);
     let first = segs.first()?;
     let mut l = SelLine {
+        source: None,
         y: top * k, h: h * k, join,
-        chars: Vec::new(), xs: Vec::new(), ends: Vec::new(),
+        chars: Vec::new(), copies: Vec::new(), xs: Vec::new(), ends: Vec::new(),
     };
     let edge = |byte: usize| marks.binary_search_by_key(&byte, |m| m.0).ok().map(|i| marks[i]);
     let mut at = edge(first.0.start).map_or(first.1, |m| m.1);
@@ -3358,6 +3694,32 @@ fn mark_line(
     }
     l.xs.push(at * k);
     (!l.chars.is_empty()).then_some(l)
+}
+
+/// Link object source to logical positions after shaping. Objects still occupy one
+/// selectable slot; their source length never changes caret or bidi geometry.
+fn copy_objects(line: &mut SelLine, text: &str, start: usize,
+    objects: &[rubrica_doc::ObjectSpan], shift: usize)
+{
+    for object in objects {
+        let at = object.range.start + shift;
+        if at < start || at > text.len() { continue; }
+        let ch = text[start..at].chars().count();
+        if line.chars.get(ch) == Some(&'\u{fffc}') {
+            line.copies.push((ch, object.kind.markdown()));
+        }
+    }
+}
+
+fn source_line(line: &mut SelLine, text: &str, start: usize, sources: &[rubrica_doc::SourceSpan], shift: usize) {
+    let mut positions = text[start..].char_indices().take(line.chars.len()).filter_map(|(at, c)| {
+        let byte = (start + at).checked_sub(shift)?;
+        rubrica_doc::source_at(sources, byte).map(|source| source..source + c.len_utf8())
+    });
+    if let Some(first) = positions.next() {
+        let end = positions.last().map_or(first.end, |last| last.end);
+        line.source = Some(first.start..end.max(first.end));
+    }
 }
 
 /// Typeset one block into the display list and return the new document y.
@@ -3407,9 +3769,10 @@ fn layout_block(
     } else {
         0.0
     };
-    let spacing = if grid > 0.0 { Spacing::monospace(size, grid) } else { Spacing::for_size(size) };
+    let mut spacing = if grid > 0.0 { Spacing::monospace(size, grid) } else { Spacing::for_size(size) };
+    spacing.keep_korean_words = grid == 0.0 && theme.keep_korean_words;
     let mut opts = BreakOptions::new(column);
-    opts.ragged = b.ragged();
+    opts.ragged = b.ragged() || column < size * theme.ragged_below_em;
     // A heading that will not fit hangs, and that is the end of it: hyphenating a
     // heading is an error, and a reader widens the window. A line of code has nowhere
     // to hang *to* -- there is no horizontal scroll -- so the characters past the
@@ -3417,7 +3780,9 @@ fn layout_block(
     // rather than hang, which is what `tight_box` says, and gets a cut offered at
     // every character to do it with.
     opts.tight_box = b.kind == BlockKind::Code;
-    opts.par_indent = theme.first_line_indent_em * size;
+    opts.par_indent = if b.kind == BlockKind::Paragraph && hang == 0.0 {
+        theme.first_line_indent_em * size
+    } else { 0.0 };
     // Every line but the first stands back by the marker's own width, so the marker
     // hangs in the margin it clears instead of shoving the body along.
     opts.hang_indent = hang;
@@ -3435,7 +3800,9 @@ fn layout_block(
         return y;
     }
 
-    let bg_role = if b.kind == BlockKind::Code { Some(ColorRole::Surface) } else { None };
+    let bg_role = if b.kind == BlockKind::Code && b.lang.as_deref() != Some("markdown-source") {
+        Some(ColorRole::Surface)
+    } else { None };
     let panel_top = y;
     let mut panel_bottom = y;
     // How far into this block's text the selection index has reached, which is shared
@@ -3606,9 +3973,12 @@ fn layout_block(
         // block, wherever on the page it ended up: that line takes the blank line the
         // block before it left off with.
         let join = if consumed == 0 { Join::Blank } else { Join::None };
-        if let Some(l) =
+        let start = consumed;
+        if let Some(mut l) =
             mark_line(text, Band { top, h: line_h, k, join }, &segs, &marks, &mut consumed)
         {
+            copy_objects(&mut l, text, start, &b.objects, text.len() - b.text.len());
+            source_line(&mut l, text, start, &b.sources, text.len() - b.text.len());
             sel.push(l);
         }
         panel_bottom = y + line_h;
@@ -3699,12 +4069,9 @@ impl View {
         if !self.show_document(path, hwnd) {
             return;
         }
-        // Written here rather than at each place that asks for a document, so that opening
-        // one by dialog, by dropping it on the window, or by following a link to it all
-        // leave the same thing behind -- and so that a step back to an older page does not
-        // write that older page as the one the reader chose last. The new page starts at
-        // its top, and says so in the same breath: a page and a place are one pair.
-        crate::settings::record_reading(path, 0);
+        // Remember the restored position, including when a dialog or file drop reopens
+        // a previously read document.
+        self.remember_reading();
         // Reading the page already open again is not a step: the reader did not go
         // anywhere, so there is nothing to come back from. `Reload` is this call with the
         // same path, and a history that grew on every `Ctrl`+`R` would be a `Back` that
@@ -3716,13 +4083,16 @@ impl View {
 
     /// Read a file and make it the page, saying whether that worked.
     fn show_document(&mut self, path: &std::path::Path, hwnd: HWND) -> bool {
-        match std::fs::read_to_string(path) {
-            Ok(src) => {
-                self.set_page(src, Some(path.to_path_buf()), hwnd);
+        let preferences = crate::settings::document(path);
+        match reading::read(path, preferences.encoding) {
+            Ok(decoded) => {
+                self.decoded_encoding = decoded.encoding;
+                self.encoding_guessed = decoded.guessed;
+                self.set_page(decoded.text, Some(path.to_path_buf()), hwnd);
                 true
             }
             Err(e) => {
-                eprintln!("cannot open {}: {e}", path.display());
+                show_error(hwnd, &format!("Cannot open {}: {e}", path.display()));
                 false
             }
         }
@@ -3748,18 +4118,17 @@ impl View {
         if !is_written(self.stamp, now) {
             return;
         }
-        let Ok(source) = std::fs::read_to_string(&path) else {
+        let Ok(decoded) = reading::read(&path, self.encoding) else {
             // Half way through being written, or locked by whatever is writing it. The
             // stamp is left as it was, so the next tick asks again rather than assuming
             // this file has already been read.
             return;
         };
-        self.doc = rubrica_doc::Document::parse(&source);
+        self.reload_text(decoded, hwnd);
         // The age polled *before* the read, not the one taken after it: if the file was
         // written again in between, the older stamp makes the next tick notice, where the
         // newer one would let a change go unread until the save after it.
         self.stamp = now;
-        self.relayout_in_place(hwnd);
     }
 
     /// Make this text the page, from its top, and name it on the title bar. The title is
@@ -3768,16 +4137,33 @@ impl View {
     /// stepped back to a document of the same name as this one needs to see which is
     /// which.
     fn set_page(&mut self, source: String, path: Option<PathBuf>, hwnd: HWND) {
-        self.doc = rubrica_doc::Document::parse(&source);
+        self.remember_reading();
+        self.remember_document();
+        let preferences = path.as_deref().map(crate::settings::document).unwrap_or_default();
+        self.line_break_override = preferences.line_breaks;
+        self.plain_override = preferences.plain;
+        self.source_view = preferences.source;
+        self.text_options = preferences.text;
+        self.encoding = preferences.encoding;
+        self.source = source;
         self.path = path;
+        let profile = crate::profiles::selected(self.plain_override.unwrap_or_else(|| reading::is_plain(self.path.as_deref())));
+        if profile != self.profile {
+            crate::profiles::load(&profile).apply(&mut self.theme);
+            self.profile = profile;
+            self.math = MathStore::new();
+        }
+        self.doc = self.parse_source();
         // Filed at the same moment as the text that came out of it, so that the next tick
         // of the poll compares the page on screen against the file it was read from rather
         // than against whatever the last page's file was.
         self.stamp = self.path.as_deref().and_then(stamp_of);
         self.scroll = 0.0;
         self.relayout();
-        let title = utf16(&window_title(self.path.as_deref()));
-        let _ = unsafe { SetWindowTextW(hwnd, PCWSTR(title.as_ptr())) };
+        if let Some(anchor) = self.path.as_deref().and_then(crate::settings::document_anchor) {
+            self.restore_to(anchor);
+        }
+        self.update_title(hwnd);
     }
 
     /// Step back, or forward again after a step back.
@@ -3833,8 +4219,12 @@ impl View {
 
     /// The common dialog. Returns the chosen path, if the user did not cancel.
     unsafe fn prompt_for_file(&self, hwnd: HWND) -> Option<PathBuf> {
+        self.prompt_file(hwnd, "Documents\0*.md;*.markdown;*.txt\0All files\0*.*\0\0")
+    }
+
+    unsafe fn prompt_file(&self, hwnd: HWND, filter: &str) -> Option<PathBuf> {
         let mut buf = [0u16; 1024];
-        let filter = utf16("Markdown\0*.md;*.markdown;*.txt\0All files\0*.*\0\0");
+        let filter = utf16(filter);
         let mut ofn = OPENFILENAMEW {
             lStructSize: std::mem::size_of::<OPENFILENAMEW>() as u32,
             hwndOwner: hwnd,
@@ -4067,7 +4457,8 @@ fn layout_table(
     let Ctx { theme, styles, k, math, .. } = *ctx;
     let Blk { left, column, .. } = *blk;
     let size = theme.base;
-    let spacing = Spacing::for_size(size);
+    let mut spacing = Spacing::for_size(size);
+    spacing.keep_korean_words = theme.keep_korean_words;
     let leading = theme.body_leading.for_mixed(true);
     let pad = size * CELL_PAD_EM;
     let cols = t.head.len().max(t.rows.iter().map(|r| r.len()).max().unwrap_or(0));
@@ -4366,13 +4757,16 @@ fn layout_table(
                     Join::Tab
                 };
                 lines_out += 1;
-                if let Some(l) = mark_line(
+                let start = consumed;
+                if let Some(mut l) = mark_line(
                     &c.text,
                     Band { top: ly, h: step[i], k, join },
                     &segs,
                     &marks,
                     &mut consumed,
                 ) {
+                    copy_objects(&mut l, &c.text, start, &c.objects, 0);
+                    source_line(&mut l, &c.text, start, &c.sources, 0);
                     sel.push(l);
                 }
                 ly += step[i];
@@ -4482,10 +4876,12 @@ fn intern(styles: &mut Vec<AppStyle>, fallback: &[String], r: crate::theme::Reso
         face: FaceRequest {
             family: r.family,
             cjk_family: r.cjk_family,
+            japanese_family: r.japanese_family,
+            korean_family: r.korean_family,
+            cjk_italic: r.cjk_italic,
             fallback: fallback.to_vec(),
             weight: r.weight,
             italic: r.italic,
-            ..Default::default()
         },
         size: r.size,
         tracking: r.tracking,
@@ -4713,6 +5109,7 @@ fn prepare_block(
                 .iter()
                 .enumerate()
                 .map(|(i, c)| PreparedCell {
+                    sources: c.sources.clone(),
                     text: c.text.clone(),
                     spans: c
                         .spans
@@ -4747,6 +5144,7 @@ fn prepare_block(
                         .collect(),
                     align: t.aligns.get(i).copied().unwrap_or_default(),
                     actions: c.actions.clone(),
+                    objects: c.objects.clone(),
                 })
                 .collect()
         };
@@ -5355,7 +5753,7 @@ mod tests {
         let chars: Vec<char> = text.chars().collect();
         let xs: Vec<_> = (0..=chars.len()).map(|i| i as f32 * CHAR).collect();
         let ends = xs[1..].to_vec();
-        SelLine { y, h: CHAR * 1.5, join, chars, xs, ends }
+        SelLine { source: None, y, h: CHAR * 1.5, join, chars, copies: Vec::new(), xs, ends }
     }
 
     /// A line whose character at `squeezed_at` was given no width by the break that
@@ -5366,7 +5764,7 @@ mod tests {
             .map(|i| (i - (i > squeezed_at) as usize) as f32 * CHAR)
             .collect();
         let ends = xs[1..].to_vec();
-        SelLine { y, h: CHAR * 1.5, join: Join::None, chars, xs, ends }
+        SelLine { source: None, y, h: CHAR * 1.5, join: Join::None, chars, copies: Vec::new(), xs, ends }
     }
 
     #[test]
@@ -5604,13 +6002,14 @@ mod tests {
         let clicked = hot_kind(&ActionKind::Url("other.md".into()), &ctx);
         let _ = std::fs::remove_dir_all(&dir);
 
-        assert_eq!(clicked, Some(HotKind::Document(dir.join("other.md"))));
+        assert_eq!(clicked, Some(HotKind::Document(DocumentTarget {
+            path: dir.join("other.md"), fragment: None,
+        })));
         assert_eq!(found, Some(dir.join("other.md")));
         // An author names a space with `%20` because a link cannot carry the space
         // itself; the file on disk has the space.
         assert_eq!(escaped, Some(dir.join("a chapter.markdown")));
-        // A destination may ask for a place inside the other file as well. The file is
-        // still the half this reader can answer, and the reader lands at its top.
+        // Resolution identifies the file; the hotspot retains the fragment separately.
         assert_eq!(with_fragment, Some(dir.join("other.md")));
         assert_eq!(elsewhere, None, "a file that is not there is not a target");
         assert_eq!(pdf, None, "not a document this reader reads");
@@ -5735,6 +6134,8 @@ mod tests {
     /// did this page come off a disk, is there any text at all.
     fn state(selected: bool, link: Option<&str>, dark: Option<bool>, from_file: bool, text: bool) -> MenuState {
         MenuState {
+            keep_line_breaks: false,
+            line_break_override: None,
             // A page with no road behind it, which is what a menu asked about the sample
             // after a fresh start reports.
             can_back: false,
@@ -5748,6 +6149,7 @@ mod tests {
             offered: vec![true; TextFace::ALL.len()],
             measure: Measure::DESIGN,
             headings: Vec::new(),
+            ..MenuState::default()
         }
     }
 
@@ -5769,9 +6171,11 @@ mod tests {
         // The document came from nowhere, so there is nothing on disk to read again.
         assert_eq!(got.last().map(|(c, e, _)| (c.clone(), *e)), Some((Command::Reload, false)));
         assert_eq!(
-            got.iter().filter(|(_, _, c)| *c).count(),
-            3,
-            "exactly one palette row, one face row and one measure row are on"
+            got.iter().filter(|(cmd, _, c)| *c && matches!(cmd,
+                Command::Palette(_) | Command::FollowSystem | Command::Face(_) | Command::Measure(_)
+                | Command::DefaultLineBreaks(_) | Command::DocumentLineBreaks(_))).count(),
+            5,
+            "palette, face, measure, newline default and document override each select one row"
         );
         assert!(got.iter().any(|(c, _, c2)| *c2 && c == &Command::FollowSystem));
         assert!(got.iter().any(|(c, _, c2)| *c2 && c == &Command::Face(0)));
@@ -6094,6 +6498,8 @@ mod tests {
     #[test]
     fn a_menu_opened_over_a_link_carries_its_address() {
         let s = MenuState {
+            keep_line_breaks: false,
+            line_break_override: None,
             can_back: false,
             can_forward: false,
             link: Some("https://example.com/x".into()),
@@ -6105,6 +6511,7 @@ mod tests {
             offered: vec![true; TextFace::ALL.len()],
             measure: Measure::DESIGN,
             headings: Vec::new(),
+            ..MenuState::default()
         };
         let got = rows(&s);
         // Two items, in this order: follow it, and take only the address. Both enabled,
@@ -6232,5 +6639,64 @@ mod bidi_tests {
         let rects = selection_rects(&sel, all);
         assert_eq!(rects.len(), 1);
         assert_eq!(rects[0].2, sel[0].xs[5] - sel[0].xs[0]);
+    }
+}
+
+#[cfg(test)]
+mod document_interaction_tests {
+    use super::*;
+
+    fn indexed(text: &str, start: usize, objects: &[rubrica_doc::ObjectSpan], shift: usize) -> SelLine {
+        let mut consumed = start;
+        let mut line = mark_line(text,
+            Band { top: 0.0, h: 20.0, k: 1.0, join: Join::None },
+            &[(start..text.len(), 0.0, 100.0)], &[], &mut consumed).unwrap();
+        copy_objects(&mut line, text, start, objects, shift);
+        line
+    }
+
+    fn copy(lines: &[SelLine], from: usize, to: usize) -> String {
+        selection_text(lines, Selection {
+            from: Caret { line: 0, ch: from }, to: Caret { line: 0, ch: to },
+        })
+    }
+
+    #[test]
+    fn formula_copy_restores_delimiters_without_expanding_caret_geometry() {
+        let doc = Document::parse("中 $x^2$ שלום $y$ end");
+        let b = &doc.blocks[0];
+        let l = indexed(&b.text, 0, &b.objects, 0);
+        assert_eq!(l.chars.len() + 1, l.xs.len());
+        let len = l.chars.len();
+        let sel = [l];
+        assert_eq!(copy(&sel, 0, len), "中 $x^2$ שלום $y$ end");
+        assert_eq!(copy(&sel, 2, 3), "$x^2$");
+        assert_eq!(copy(&sel, 0, 1), "中");
+    }
+
+    #[test]
+    fn object_copy_survives_list_prefixes_wrapping_and_table_cells() {
+        let doc = Document::parse("- 前文 $a$ after\n\n| Value |\n| --- |\n| $b$ |\n\n$$c=d$$\n");
+        let b = &doc.blocks[0];
+        let prefix = "1. ";
+        let text = format!("{prefix}{}", b.text);
+        let start = prefix.len() + b.objects[0].range.start;
+        let l = indexed(&text, start, &b.objects, prefix.len());
+        let len = l.chars.len();
+        assert_eq!(copy(&[l], 0, len), "$a$ after");
+        let c = &doc.blocks[1].table.as_ref().unwrap().rows[0][0];
+        let l = indexed(&c.text, 0, &c.objects, 0);
+        assert_eq!(copy(&[l], 0, 1), "$b$");
+        let b = doc.blocks.last().unwrap();
+        let l = indexed(&b.text, 0, &b.objects, 0);
+        assert_eq!(copy(&[l], 0, 1), "$$c=d$$");
+    }
+
+    #[test]
+    fn encoded_fragments_find_the_same_heading_as_local_jumps() {
+        let doc = Document::parse("# Start\n\n## 第二章\n\n## A *bold* heading\n");
+        assert_eq!(heading_index(&doc, "%E7%AC%AC%E4%BA%8C%E7%AB%A0"), Some(1));
+        assert_eq!(heading_index(&doc, "a-bold-heading"), Some(2));
+        assert_eq!(heading_index(&doc, "missing"), None);
     }
 }
