@@ -20,6 +20,8 @@ use crate::{Error, Result};
 struct Line {
     left: f32,
     right: f32,
+    /// The baseline the line was drawn on, which is what its text is found by.
+    baseline: f32,
     families: Vec<String>,
 }
 
@@ -86,12 +88,14 @@ pub fn report(source: &str, path: Option<&str>, o: &Options) -> Result<()> {
         let mut l = Line {
             left: f32::INFINITY,
             right: f32::NEG_INFINITY,
+            baseline: f32::INFINITY,
             families: Vec::new(),
         };
         for r in runs {
             let w: f32 = r.advances.iter().sum();
             l.left = l.left.min(r.x);
             l.right = l.right.max(r.x + w);
+            l.baseline = l.baseline.min(r.baseline);
             let fam = r.family.clone();
             *census.entry(fam.clone()).or_default() += r.glyphs.len();
             let holes = r.glyphs.iter().filter(|g| **g == 0).count();
@@ -149,7 +153,20 @@ pub fn report(source: &str, path: Option<&str>, o: &Options) -> Result<()> {
         }
         // The line's own words, so a row means something on its own: which heading
         // went long, which fence came up short, without a second run to find out.
-        let excerpt = page.sel.get(i).map_or_else(String::new, |s| {
+        //
+        // Found by where the line sits rather than by the order it was drawn in. A grid
+        // paints one column at a time, so the nth line drawn is not the nth line the
+        // reader reads, and zipping the two orders printed a table's figures beside
+        // somebody else's sentence.
+        let excerpt = page
+            .sel
+            .iter()
+            .find(|s| {
+                s.y <= l.baseline
+                    && l.baseline < s.y + s.h
+                    && s.xs.iter().any(|x| *x >= l.left - 1.0 && *x <= l.right + 1.0)
+            })
+            .map_or_else(String::new, |s| {
             let t: String = s.chars.iter().collect();
             let t = t.trim();
             match t.char_indices().nth(18) {
