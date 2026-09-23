@@ -1,0 +1,21 @@
+# The whole engine is testable from a console -- no window, no desktop, no document on
+# disk -- so CI runs exactly the two commands that gate a change locally. Clippy is a
+# gate rather than a report: `-D warnings` is what keeps `--all-targets` clean.
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  check:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo test --workspace
+      - run: cargo clippy --workspace --all-targets -- -D warnings

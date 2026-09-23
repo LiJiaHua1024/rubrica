@@ -157,8 +157,8 @@ mod tests {
 
     #[test]
     fn a_search_does_not_care_who_shifted() {
-        let lines = [line("Telari 和 Rubrica", 0.0, Join::None)];
-        assert_eq!(needle(&lines).hits("TELARI").len(), 1);
+        let lines = [line("Kerning 和 Rubrica", 0.0, Join::None)];
+        assert_eq!(needle(&lines).hits("KERNING").len(), 1);
         assert_eq!(needle(&lines).hits("rubrica").len(), 1);
         // The Han characters have no case to give up, and none to lose either.
         assert_eq!(needle(&lines).hits("和").len(), 1);
