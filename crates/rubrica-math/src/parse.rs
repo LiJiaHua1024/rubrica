@@ -139,6 +139,8 @@ pub enum AccentKind {
     Tilde,
     Dot,
     Vec,
+    /// `\overleftarrow`: a direction is not a decoration one way only.
+    Backvec,
 }
 
 impl AccentKind {
@@ -151,6 +153,7 @@ impl AccentKind {
             AccentKind::Tilde => '\u{303}',
             AccentKind::Dot => '\u{307}',
             AccentKind::Vec => '\u{20d7}',
+            AccentKind::Backvec => '\u{20d6}',
         }
     }
 }
@@ -612,6 +615,11 @@ impl<'a> Parser<'a> {
             "widetilde" => self.accent(AccentKind::Tilde, true),
             "dot" => self.accent(AccentKind::Dot, false),
             "vec" => self.accent(AccentKind::Vec, false),
+            // The named arrows. `\overrightarrow{AB}` is the vector mark a course actually
+            // writes, and it is the wide form: an arrow over two letters has to reach
+            // both of them or it points at the space between.
+            "overrightarrow" => self.accent(AccentKind::Vec, true),
+            "overleftarrow" => self.accent(AccentKind::Backvec, true),
             // A label over or under a base. `\stackrel` is the older spelling of
             // `\overset` and both are a forced `\limits` on their base, so they get the
             // same box here; which side the label goes is the only difference that shows.
@@ -1155,6 +1163,41 @@ fn symbol(name: &str) -> Option<&'static str> {
         "Vert" | "lVert" | "rVert" => "\u{2016}",
         "surd" => "√",
         "checkmark" => "✓",
+        // The names a logic, lattice or type-theory text is written with: each of these
+        // was a word spelled out in variables on the page, because an unknown command
+        // falls back to its own letters.
+        "top" => "\u{22a4}",
+        "bot" => "\u{22a5}",
+        "vdash" => "\u{22a2}",
+        "dashv" => "\u{22a3}",
+        "models" => "\u{22a8}",
+        "doteq" => "\u{2250}",
+        "ominus" => "\u{2296}",
+        "oslash" => "\u{2298}",
+        "odot" => "\u{2299}",
+        "triangle" => "\u{25b7}",
+        "triangledown" => "\u{25bd}",
+        "square" => "\u{25a1}",
+        "Diamond" => "\u{25c7}",
+        "uparrow" => "\u{2191}",
+        "downarrow" => "\u{2193}",
+        "updownarrow" => "\u{2195}",
+        "Uparrow" => "\u{21d1}",
+        "Downarrow" => "\u{21d3}",
+        "longrightarrow" => "\u{27f6}",
+        "longleftarrow" => "\u{27f5}",
+        "longleftrightarrow" => "\u{27f7}",
+        "Longrightarrow" => "\u{27f9}",
+        "Longleftarrow" => "\u{27f8}",
+        "Longleftrightarrow" => "\u{27fa}",
+        "bigwedge" => "\u{22c0}",
+        "bigvee" => "\u{22c1}",
+        "bigsqcup" => "\u{2a06}",
+        "bigoplus" => "\u{2a01}",
+        "bigotimes" => "\u{2a02}",
+        "bigodot" => "\u{2a00}",
+        "biguplus" => "\u{2a04}",
+        "Angstrom" | "angstrom" => "\u{212b}",
         "dagger" => "†",
         "ddagger" => "‡",
         "S" => "§",
@@ -1175,7 +1218,8 @@ pub fn big_operator(name: &str) -> Option<(String, Limits)> {
     let limits = match name {
         "int" | "iint" | "iiint" | "oint" => Limits::Never,
         "lim" | "max" | "min" | "sup" | "inf" | "gcd" => Limits::Always,
-        "sum" | "prod" | "coprod" | "bigcup" | "bigcap" => Limits::Default,
+        "sum" | "prod" | "coprod" | "bigcup" | "bigcap" | "bigvee" | "bigwedge"
+        | "bigsqcup" | "bigoplus" | "bigotimes" | "bigodot" | "biguplus" => Limits::Default,
         _ => return None,
     };
     Some((text.to_string(), limits))
@@ -1419,6 +1463,39 @@ mod tests {
         let bmod = of("a\\bmod b");
         assert!(bmod.contains(" mod ") && !bmod.contains("bmod"), "{bmod}");
         assert_eq!(of("x\\qed"), "(x ∎)", "the tombstone closes a proof, it does not name it");
+    }
+
+    #[test]
+    fn the_names_a_logic_or_vector_text_is_written_with_are_not_spelled_out() {
+        // Each of these was a word in variables on the page, which is what an unknown
+        // command degrades to: `A \vdash B` read as `A vdash B`.
+        assert_eq!(of("A\\vdash B"), "(A ⊢ B)");
+        assert_eq!(of("\\top \\land \\bot"), "(⊤ ∧ ⊥)");
+        assert_eq!(of("x\\mapsto y"), "(x ↦ y)");
+        assert_eq!(of("X\\cong Y\\doteq Z"), "(X ≅ Y ≐ Z)");
+        // The named big operators take limits exactly as `\sum` does.
+        assert_eq!(big_operator("bigwedge").unwrap(), ("⋀".into(), Limits::Default));
+        assert_eq!(of("\\bigoplus_{i} V"), "((big ⨁ i -) V)");
+        // An arrow over two letters is the arrow itself, asked of the face's wider
+        // drawings; `\vec` stays the small mark it always was.
+        let wide = parse("\\overrightarrow{AB}");
+        assert!(
+            matches!(&wide, Node::Row(v) if matches!(&v[..],
+                [Node::Accent { accent: AccentKind::Vec, wide: true, .. }])),
+            "{wide:?}"
+        );
+        let back = parse("\\overleftarrow{AB}");
+        assert!(
+            matches!(&back, Node::Row(v) if matches!(&v[..],
+                [Node::Accent { accent: AccentKind::Backvec, wide: true, .. }])),
+            "{back:?}"
+        );
+        let small = parse("\\vec{v}");
+        assert!(
+            matches!(&small, Node::Row(v) if matches!(&v[..],
+                [Node::Accent { accent: AccentKind::Vec, wide: false, .. }])),
+            "{small:?}"
+        );
     }
 
     #[test]
