@@ -3029,6 +3029,20 @@ fn paint_run(font: &FontEngine, r: &GlyphRun, x: Pt, dy: Pt, k: f32, color: Colo
     })
 }
 
+/// Seat a line's runs on its baseline, in device pixels: each run's own lift comes
+/// off the line it belongs to, so a raised mark leaves the baseline of its word
+/// rather than standing on it.
+///
+/// A prose line and a table cell seat through here because they would otherwise
+/// agree by hand-copying, and the cell has already been caught drawing its citations
+/// on the baseline -- the ascent grew to make room for the lift, and the lift itself
+/// never arrived, so the mark read as a stray digit in the middle of the line.
+fn seat(runs: &mut [PaintRun], baseline: Pt, k: f32) {
+    for run in runs.iter_mut() {
+        run.baseline = (baseline + run.dy) * k;
+    }
+}
+
 /// A strike rule still being grown, with the style it belongs to.
 struct Rule {
     style: StyleId,
@@ -3489,9 +3503,7 @@ fn layout_block(
         let natural = ascent + descent;
         let line_h = (size * leading.for_mixed(mixed)).max(natural * 1.02);
         let baseline = y + (line_h - natural) * 0.5 + ascent;
-        for run in runs.iter_mut() {
-            run.baseline = (baseline + run.dy) * k;
-        }
+        seat(&mut runs, baseline, k);
         ops.push(Op::Runs(runs));
         for (x, top, w, h, color) in bars {
             ops.push(Op::Rect { x: x * k, y: (baseline + top) * k, w: w * k, h: h * k, color });
@@ -4171,9 +4183,7 @@ fn layout_table(
                     segs.push((node.text.clone(), x + pad + shift + slot.x, at));
                 }
                 end_rule(&mut ruled, &mut bars);
-                for run in runs.iter_mut() {
-                    run.baseline = (ly + ascent) * k;
-                }
+                seat(&mut runs, ly + ascent, k);
                 if !runs.is_empty() {
                     ops.push(Op::Runs(runs));
                 }
