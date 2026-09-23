@@ -361,8 +361,8 @@ impl Selection {
     }
 }
 
-/// Where a pointer at `x`, `y` (device independent pixels from the top of the document)
-/// lands in the page's text. Above the first line and below the last both clamp rather
+/// Where a pointer at `x`, `y` (device pixels from the top of the document) lands in the
+/// page's text. Above the first line and below the last both clamp rather
 /// than miss: a drag thrown past the top of the page means all of it from the start.
 pub fn caret_at(sel: &[SelLine], x: f32, y: f32) -> Caret {
     let Some(_) = sel.first() else {
@@ -3177,7 +3177,7 @@ fn mark_run(text: &str, run: &GlyphRun, base: Pt, out: &mut Vec<(usize, Pt)>) {
 struct Band {
     top: Pt,
     h: Pt,
-    /// Points to device independent pixels.
+    /// Points to device pixels.
     k: f32,
     join: Join,
 }
@@ -3234,6 +3234,14 @@ fn mark_line(
         *consumed = range.end;
     }
     l.xs.push(at);
+    // The boundaries are measured in the points the layout works in, but the index is
+    // read against a pointer, whose coordinates arrive in the scaled space `y` and `h`
+    // were converted into just above. Leaving `xs` in points put every click a third of
+    // the way between the margin and the pointer at 144 dpi -- and the band the reader
+    // then saw for the selection was drawn from the same wrong numbers.
+    for x in l.xs.iter_mut() {
+        *x *= k;
+    }
     (!l.chars.is_empty()).then_some(l)
 }
 
@@ -4129,21 +4137,59 @@ fn layout_table(
     };
 
     let grid_w = total.min(column);
+    let grid_top = y;
     ops.push(Op::Rect { x: left * k, y: y * k, w: grid_w * k, h: 0.0, color: ColorRole::Surface });
     let panel = ops.len() - 1;
 
     let head_h = paint_row(&t.head, y, true, ops, hots, sel);
     y += head_h;
+    // The header's rule is the one line a grid cannot do without, so it is the darkest
+    // of them; the rules between rows only have to say where a row ends, and are drawn
+    // lighter so that a page of tables reads as text with structure rather than as a
+    // spreadsheet. Both are fractions of the type size, since neither is a device
+    // pixel: at 200% dpi a hairline set in pixels is a bar.
+    let rule = size * 0.05;
     ops.push(Op::Line {
         x0: left * k,
         y0: y * k,
         x1: (left + grid_w) * k,
         y1: y * k,
-        thickness: size * 0.05 * k,
+        thickness: rule * k,
         color: ColorRole::Muted,
     });
     for r in &t.rows {
         y += paint_row(r, y, false, ops, hots, sel);
+        // A cell that wraps has no other ending. Without a rule under each row, the
+        // second line of one cell reads as the first line of the cell below it -- which
+        // is exactly the failure a grid of narrow columns produces on every row, and the
+        // reason the lines are drawn rather than left to the space between rows.
+        ops.push(Op::Line {
+            x0: left * k,
+            y0: y * k,
+            x1: (left + grid_w) * k,
+            y1: y * k,
+            thickness: rule * 0.6 * k,
+            color: ColorRole::Faint,
+        });
+    }
+    // Last, because a column rule spans a height the rows have only just told. The
+    // boundaries are the widths themselves rather than `grid_w` divided up: a cell is
+    // laid out at its column's measured width, and a rule between two other numbers
+    // would sit on top of somebody's ink.
+    let mut x = left;
+    for (i, w) in widths.iter().enumerate() {
+        x += w;
+        if i + 1 == cols {
+            break;
+        }
+        ops.push(Op::Line {
+            x0: x * k,
+            y0: grid_top * k,
+            x1: x * k,
+            y1: y * k,
+            thickness: rule * 0.6 * k,
+            color: ColorRole::Faint,
+        });
     }
     // The header panel is drawn before its text, so its height can only be filled
     // in once the first row has been measured.
@@ -5038,6 +5084,24 @@ mod tests {
             to: Caret { line: 2, ch: 2 },
         };
         assert_eq!(selection_text(&sel, all), "构件\n中间再加一段\t混排");
+    }
+
+    /// The pointer arrives in device pixels, so an index whose boundaries are still in
+    /// points answers a third of the way in from the margin at 144 dpi: a click lands on
+    /// the wrong word, and the band drawn for the selection lies beside the text it is
+    /// meant to be under. `y` and `h` were always converted; this is the other half.
+    #[test]
+    fn a_lines_boundaries_are_stated_in_the_units_a_pointer_arrives_in() {
+        let segs = [(0..2, 10.0f32, 30.0f32)];
+        let marks = [(0usize, 10.0f32), (1usize, 20.0f32)];
+        let mut consumed = 0usize;
+        let band = Band { top: 4.0, h: 12.0, k: 1.5, join: Join::None };
+        let l = mark_line("ab", band, &segs, &marks, &mut consumed).expect("two characters");
+        assert_eq!((l.y, l.h), (6.0, 18.0), "the line's own box is in device pixels");
+        assert_eq!(l.xs, vec![15.0, 30.0, 45.0], "and so are its boundaries");
+        // Read back the way a click reads it: the pointer over the second character's
+        // ink has to name that character, not the one a third of the line before it.
+        assert_eq!(caret_at(&[l], 32.0, 8.0).ch, 1);
     }
 
     #[test]
