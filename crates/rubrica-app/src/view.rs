@@ -686,6 +686,9 @@ pub struct Page {
     /// Every line of text the page drew, in the order a drag crosses them, which is
     /// what makes the page selectable.
     pub sel: Vec<SelLine>,
+    /// Hyphenated breaks taken against hyphen marks drawn, which is the one number that
+    /// says whether a split word shows the split.
+    pub hyphens: HyphenCount,
 }
 
 pub struct View {
@@ -2950,6 +2953,21 @@ struct Out<'a> {
     ops: &'a mut Vec<Op>,
     hots: &'a mut Vec<Hot>,
     sel: &'a mut Vec<SelLine>,
+    hyphens: &'a mut HyphenCount,
+}
+
+/// How many lines the solver broke on a discretionary hyphen, and how many hyphen marks
+/// the painter drew for them.
+///
+/// Counted apart because they are decided apart -- one in the break plan, one in the
+/// display list -- and a page where the first is 17 and the second is 0 is a page of
+/// words split apart with nothing to show where they were cut. That is the whole
+/// failure mode of a glyph that is measured and laid but never drawn, and it is
+/// invisible to every other number on the page because both halves look reasonable.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct HyphenCount {
+    pub breaks: usize,
+    pub marks: usize,
 }
 
 /// A block readied for layout: its text with the marker already in front of it, and
@@ -3253,7 +3271,7 @@ fn layout_block(
     out: &mut Out<'_>,
     mut y: Pt,
 ) -> Pt {
-    let Out { ops, hots, sel } = out;
+    let Out { ops, hots, sel, hyphens } = out;
     let Ctx { theme, styles, math, k, .. } = *ctx;
     let Blk { b, text, spans, base, left, column, hyphenation, size, hang, actions, .. } = *blk;
     let leading = &blk.leading;
@@ -3271,7 +3289,7 @@ fn layout_block(
         return y + theme.base * 0.6;
     }
     if let Some(t) = blk.table {
-        return layout_table(font, ctx, blk, t, &mut Out { ops, hots, sel }, y);
+        return layout_table(font, ctx, blk, t, &mut Out { ops, hots, sel, hyphens }, y);
     }
     if text.trim().is_empty() {
         return y;
@@ -3323,6 +3341,9 @@ fn layout_block(
     for line in &plan.lines {
         let top = y;
         let placed = place(&para, line);
+        if line.hyphen.is_some() {
+            hyphens.breaks += 1;
+        }
         // Where this line starts. A line under a hanging marker begins at the marker's
         // right edge, which is the space [`Blk::hang`] bought it; the first line begins
         // at the block's own left, where the marker sits.
@@ -3419,6 +3440,9 @@ fn layout_block(
                 descent = descent.max((r.descent + dy).max(0.0));
                 if let Some(p) = paint_run(font, &r, at, dy, k, st.color) {
                     runs.push(p);
+                    if hyphen {
+                        hyphens.marks += 1;
+                    }
                 }
                 if st.strike && r.width() > 0.0 {
                     // Read from the face carrying these glyphs, because that is where
@@ -3925,7 +3949,7 @@ fn layout_table(
     out: &mut Out<'_>,
     mut y: Pt,
 ) -> Pt {
-    let Out { ops, hots, sel } = out;
+    let Out { ops, hots, sel, hyphens } = out;
     let Ctx { theme, styles, k, .. } = *ctx;
     let Blk { left, column, .. } = *blk;
     let size = theme.base;
@@ -4046,6 +4070,9 @@ fn layout_table(
             let mut ly = top + pad * 0.5;
             for line in &plan.lines {
                 let placed = place(&para, line);
+                if line.hyphen.is_some() {
+                    hyphens.breaks += 1;
+                }
                 let w = placed.last().map(|p| p.x + p.w).unwrap_or(0.0);
                 let shift = match c.align {
                     Align::Left => 0.0,
@@ -4112,6 +4139,9 @@ fn layout_table(
                             dy: -st.raise,
                             color: st.color,
                         });
+                        if hyphen {
+                            hyphens.marks += 1;
+                        }
                         at += width;
                     }
                     if hyphen {
@@ -4597,6 +4627,7 @@ pub fn build_ops(
     let mut ops = Vec::new();
     let mut hots = Vec::new();
     let mut sel: Vec<SelLine> = Vec::new();
+    let mut breaks = HyphenCount::default();
     let mut note_tops: Vec<Pt> = Vec::with_capacity(doc.footnotes.len());
     // A citation names its note by the author's own label, while the page knows notes
     // only by where they ended up. This is the bridge, and it is built before any
@@ -4752,7 +4783,7 @@ pub fn build_ops(
                 hang: if b.list.is_some() { level } else { 0.0 },
                 actions: &p.actions,
             },
-            &mut Out { ops: &mut ops, hots: &mut hots, sel: &mut sel },
+            &mut Out { ops: &mut ops, hots: &mut hots, sel: &mut sel, hyphens: &mut breaks },
             y,
         );
     }
@@ -4804,7 +4835,7 @@ pub fn build_ops(
                         hang: note_hang,
                         actions: &p.actions,
                     },
-                    &mut Out { ops: &mut ops, hots: &mut hots, sel: &mut sel },
+                    &mut Out { ops: &mut ops, hots: &mut hots, sel: &mut sel, hyphens: &mut breaks },
                     y,
                 );
             }
@@ -4831,6 +4862,7 @@ pub fn build_ops(
         note_tops,
         anchor_tops,
         sel,
+        hyphens: breaks,
     }
 }
 

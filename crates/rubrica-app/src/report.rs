@@ -405,6 +405,17 @@ pub fn report(source: &str, path: Option<&str>, o: &Options) -> Result<()> {
             .collect::<Vec<_>>();
         println!("  heights    : {}", heights.join(", "));
     }
+    // The two numbers are printed side by side because the failure is a disagreement
+    // between them: a page whose solver took seventeen hyphenated breaks while its
+    // painter drew no marks is a page of words cut in half with nothing to show where
+    // they were cut, and every other number on this report reads as healthy.
+    let crate::view::HyphenCount { breaks, marks } = page.hyphens;
+    if breaks > 0 || marks > 0 {
+        println!("hyphenation  : {breaks} break(s) taken, {marks} mark(s) drawn");
+        if breaks != marks {
+            println!("  !! {breaks} split word(s) and {} mark(s): the split is not shown", marks);
+        }
+    }
     // The selectable text of the page, counted against the ink it is meant to describe.
     // A block that lays out without recording its lines is selectable everywhere except
     // where it was just laid out, which is invisible in a screenshot and shows up here
