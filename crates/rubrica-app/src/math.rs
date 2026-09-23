@@ -360,8 +360,14 @@ impl MathMeasure for Adapter<'_> {
             t.widen(g, want)?
                 .iter()
                 .map(|p| {
-                    let (advance, _, _) = self.font.glyph_extents(face, p.glyph, size);
-                    Running { index: p.glyph, x: f32::from(p.offset) * s, width: advance }
+                    let (advance, up, down) = self.font.glyph_extents(face, p.glyph, size);
+                    Running {
+                        index: p.glyph,
+                        x: f32::from(p.offset) * s,
+                        width: advance,
+                        ascent: up,
+                        descent: down,
+                    }
                 })
                 .collect(),
         )

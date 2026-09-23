@@ -144,17 +144,17 @@ mod tests {
             ])
         }
 
-        /// The wider drawings of a hat only, and only past the natural mark's own
-        /// width -- which is the mock's half-em advance -- so a test can tell "the face
-        /// has none" from "the base was never wide enough to ask".
+        /// The wider drawings of a hat or a brace only, and only past the natural mark's
+        /// own width -- which is the mock's half-em advance -- so a test can tell "the
+        /// face has none" from "the base was never wide enough to ask".
         fn widen(&mut self, ch: char, size: f32, width: f32) -> Option<Vec<Running>> {
             self.widened.push((ch, width));
-            if ch != '\u{302}' || width <= 0.5 * size {
+            if !matches!(ch, '\u{302}' | '\u{23de}' | '\u{23df}') || width <= 0.5 * size {
                 return None;
             }
             Some(vec![
-                Running { index: 21, x: 0.0, width: 0.4 * size },
-                Running { index: 22, x: 0.4 * size, width: 0.4 * size },
+                Running { index: 21, x: 0.0, width: 0.4 * size, ascent: 0.2 * size, descent: 0.1 * size },
+                Running { index: 22, x: 0.4 * size, width: 0.4 * size, ascent: 0.2 * size, descent: 0.1 * size },
             ])
         }
     }
@@ -456,6 +456,34 @@ mod tests {
     }
 
     #[test]
+    fn a_ruled_grid_stands_its_column_rules_up() {
+        let f =
+            set("\\begin{array}{|c|c|}a&b\\\\\\hline c&d\\end{array}", 10.0, true, &mut Mock::mathy());
+        // One rule across under the first row, and one standing at each of the three
+        // boundaries the spec's `|` named -- so four, of which three are thin in x.
+        let edges = frame(&f);
+        assert_eq!(edges.len(), 4, "{edges:?}");
+        let mut vertical: Vec<(f32, f32, f32, f32)> =
+            edges.iter().copied().filter(|(_, _, w, _)| *w < 2.0).collect();
+        vertical.sort_by(|a, b| a.0.total_cmp(&b.0));
+        assert_eq!(vertical.len(), 3, "left, middle, right: {edges:?}");
+        for (_, _, w, h) in &vertical {
+            near(*w, 1.0, "a standing rule is one default thickness wide");
+            near(*h, f.height(), "and reaches the box's own ink, top edge to bottom");
+        }
+        near(vertical[0].0, 0.0, "the left rule is flush with the grid, not outside it");
+        near(vertical[2].0, f.width - 1.0, "and the right one closes the last column flush");
+        near(
+            vertical[1].0 + 0.5,
+            f.width / 2.0,
+            "the middle rule stands in the gap between its two columns",
+        );
+        // A spec with no `|` draws nothing but the cells, whatever its rows do.
+        let plain = set("\\begin{array}{cc}a&b\\end{array}", 10.0, true, &mut Mock::mathy());
+        assert!(rules(&plain).is_empty(), "{:?}", rules(&plain));
+    }
+
+    #[test]
     fn a_stacked_label_is_centred_over_its_base_and_lifts_the_box() {
         let f = set("\\overset{nn}{=}", 10.0, false, &mut Mock::mathy());
         let (x, y, size) = one(&f, "nn");
@@ -514,6 +542,54 @@ mod tests {
                 _ => None,
             })
             .collect()
+    }
+
+    /// `\overbrace` asks the table for the top curled brace form and places what comes
+    /// back by where its ink ends: a brace's own baseline sits anywhere inside it, so
+    /// placing that baseline against the body would bury the curl.
+    #[test]
+    fn a_brace_is_grown_across_the_body_it_covers() {
+        let mut m = Mock::mathy();
+        let body = set("a+b", 10.0, false, &mut m).width;
+        let f = set("\\overbrace{a+b}", 10.0, false, &mut m);
+        assert_eq!(m.widened.len(), 1, "asked once, for the brace form");
+        assert_eq!(m.widened[0].0, '\u{23de}', "the top form, not the bottom one");
+        near(m.widened[0].1, body, "asked to reach the body's own ink");
+        let g = grown(&f);
+        assert_eq!(g.len(), 2, "the assembled brace rather than one glyph");
+        near(g[0].1, (body - 8.0) / 2.0, "centred on the body it covers");
+        // gap 3 (three rule thicknesses, the mock not stating one) and the brace's own
+        // descent 1, above a body whose ink tops out at 7.
+        near(g[0].2, -11.0, "the brace's baseline clears the body by gap and descent");
+        near(f.ascent, 13.0, "the box reaches the top of the brace, not of the body");
+        near(f.descent, 2.0, "and nothing below where the body already ended");
+    }
+
+    #[test]
+    fn a_brace_under_a_body_hangs_by_its_own_top_edge() {
+        let mut m = Mock::mathy();
+        let f = set("\\underbrace{a+b}", 10.0, false, &mut m);
+        assert_eq!(m.widened[0].0, '\u{23df}', "the bottom form");
+        let g = grown(&f);
+        // Baseline = body's descent 2 + gap 3 + the brace's own ascent 2, so its top
+        // edge lands exactly `gap` under the body rather than its baseline.
+        near(g[0].2, 7.0, "the brace hangs by its top edge");
+        near(f.descent, 8.0, "the box reaches the bottom of the brace");
+    }
+
+    /// A face with no brace to grow still has to say *something* across the body. A
+    /// natural-size brace centred over an expression is a mark that has failed; the rule
+    /// `\overline` draws is a different mark, but it is a true one at the right width.
+    #[test]
+    fn a_face_with_no_brace_falls_back_to_the_bar() {
+        let mut m = Mock::mathy();
+        // The mock only grows past its own half-em mark, so a one-letter body asks for
+        // nothing and gets the bar.
+        let f = set("\\overbrace{x}", 10.0, false, &mut m);
+        assert!(grown(&f).is_empty(), "no assembled brace was drawn");
+        assert_eq!(rules(&f).len(), 1, "the bar stands in for the brace");
+        let (x, _, _) = one(&f, "x");
+        near(x, 0.0, "the body is where it was");
     }
 
     #[test]

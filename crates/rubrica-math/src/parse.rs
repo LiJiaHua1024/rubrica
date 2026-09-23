@@ -71,6 +71,13 @@ pub enum Node {
         body: Box<Node>,
         side: BarSide,
     },
+    /// `\overbrace` and `\underbrace`: the same geometry as a [`Node::Bar`], but the
+    /// mark is a brace grown across the whole body from the face's horizontal
+    /// coverage -- the same half of the `MATH` table a wide accent is read from.
+    Brace {
+        body: Box<Node>,
+        side: BarSide,
+    },
     /// `\overset`, `\underset` and `\stackrel`: a label stacked over or under a base.
     ///
     /// All three are TeX's forced `\limits` on a base operator, so the label is a
@@ -107,6 +114,10 @@ pub enum Node {
         /// always one more than `rows.len()` -- `\hline` twice in a row is one rule,
         /// because two adjacent rules would be drawn on top of each other.
         rules: Vec<bool>,
+        /// The column rules the spec's `|` asked for, one entry per boundary: before each
+        /// column and one after the last, so its length is the column count plus one. An
+        /// environment that names none leaves this empty, which is read as none.
+        col_rules: Vec<bool>,
     },
 }
 
@@ -702,6 +713,9 @@ impl<'a> Parser<'a> {
             "mathscr" => self.alphabetized(Alphabet::Script),
             "overline" => Node::Bar { body: Box::new(self.argument()), side: BarSide::Over },
             "underline" => Node::Bar { body: Box::new(self.argument()), side: BarSide::Under },
+            "overbrace" => Node::Brace { body: Box::new(self.argument()), side: BarSide::Over },
+            "underbrace" =>
+                Node::Brace { body: Box::new(self.argument()), side: BarSide::Under },
             // The narrow and the wide spelling of the same mark. Which glyph to draw is
             // not the difference -- `\widehat` is `\hat` taken from the face's wider
             // drawings -- so the choice is carried to the layout as a licence to
@@ -748,6 +762,7 @@ impl<'a> Parser<'a> {
                     kind: ArrayKind::Gathered,
                     delimiters: None,
                     rules: std::mem::take(&mut self.row_rules),
+                    col_rules: Vec::new(),
                 }
             }
             // A modifier on the preceding big operator, which the layout reads off
@@ -855,7 +870,8 @@ impl<'a> Parser<'a> {
         };
         // `array` is the one environment whose columns are written out, and the
         // argument has to be taken here or its braces land in the first cell.
-        let spec = if kind == ArrayKind::Array { self.column_spec() } else { Vec::new() };
+        let (spec, col_rules) =
+            if kind == ArrayKind::Array { self.column_spec() } else { (Vec::new(), Vec::new()) };
         let (rows, end) = self.env_rows();
         if end.as_deref() != Some(name.as_str()) {
             return Self::degraded(&name, rows, end.as_deref());
@@ -869,6 +885,7 @@ impl<'a> Parser<'a> {
             kind,
             delimiters: env_delimiters(&name),
             rules: std::mem::take(&mut self.row_rules),
+            col_rules,
         }
     }
 
@@ -974,18 +991,33 @@ impl<'a> Parser<'a> {
     /// The `{ccc}` / `{l|l}` argument an `array` takes. Only `l`, `c` and `r` choose an
     /// alignment; the vertical rules and anything else are consumed and dropped, since
     /// a rule between columns is not something the layout draws yet.
-    fn column_spec(&mut self) -> Vec<ColAlign> {
+    fn column_spec(&mut self) -> (Vec<ColAlign>, Vec<bool>) {
         let Some(spec) = self.braced_text() else {
-            return Vec::new();
+            return (Vec::new(), Vec::new());
         };
-        spec.chars()
-            .filter_map(|c| match c {
-                'l' => Some(ColAlign::Left),
-                'c' => Some(ColAlign::Center),
-                'r' => Some(ColAlign::Right),
-                _ => None,
-            })
-            .collect()
+        let mut cols: Vec<ColAlign> = Vec::new();
+        let mut rules: Vec<bool> = Vec::new();
+        // A `|` is read as a rule at the boundary it sits on rather than as a column of
+        // its own, which is what let it be dropped before: `{l|r}` asked for a line
+        // between two columns, and silence was the only wrong answer left.
+        let mut pending = false;
+        for c in spec.chars() {
+            match c {
+                'l' | 'c' | 'r' => {
+                    rules.push(pending);
+                    pending = false;
+                    cols.push(match c {
+                        'l' => ColAlign::Left,
+                        'r' => ColAlign::Right,
+                        _ => ColAlign::Center,
+                    });
+                }
+                '|' => pending = true,
+                _ => {}
+            }
+        }
+        rules.push(pending);
+        (cols, rules)
     }
 
     /// A `[...]` option, skipped. Nothing is consumed unless the closer is there, so an
@@ -1477,6 +1509,7 @@ mod tests {
                 sexp(base)
             ),
             Node::Bar { body, side } => format!("(bar {side:?} {})", sexp(body)),
+            Node::Brace { body, side } => format!("(brace {side:?} {})", sexp(body)),
             Node::Stack { base, label, side } =>
                 format!("(stack {side:?} {} {})", sexp(base), sexp(label)),
             Node::Boxed { body } => format!("(boxed {})", sexp(body)),

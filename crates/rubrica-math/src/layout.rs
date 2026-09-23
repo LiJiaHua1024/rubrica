@@ -56,13 +56,18 @@ pub struct Stacked {
     pub width: Pt,
 }
 
-/// One glyph of a shape grown *sideways*, as the wide accents are.
+/// One glyph of a shape grown *sideways*, as the wide accents and braces are.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Running {
     pub index: u16,
     /// Distance from the left edge of the assembled shape to this part's left edge.
     pub x: Pt,
     pub width: Pt,
+    /// The part's own ink around its baseline. A wider drawing of a brace is also a
+    /// shallower one, so the caller cannot borrow these from the natural glyph -- and
+    /// a brace is placed by where its ink ends, not by where its baseline is.
+    pub ascent: Pt,
+    pub descent: Pt,
 }
 
 /// A piece of a laid-out formula, positioned relative to the formula's origin.
@@ -164,6 +169,15 @@ const FALLBACK_ARRAY_LEADING: Pt = 0.2;
 const BOX_SEPARATION: Pt = 0.3;
 const BOX_RULE: Pt = 0.04;
 
+/// The rulings an author asked a grid to be drawn with, in both directions: `rows` is one
+/// entry per row boundary (each `\hline`) and `columns` one per column boundary (each `|`
+/// of an `array` spec). Either can be empty, which is read as no rule that way.
+#[derive(Clone, Copy)]
+struct Rulings<'a> {
+    rows: &'a [bool],
+    columns: &'a [bool],
+}
+
 /// A metrics-only box: what a sub-layout reports to its caller.
 #[derive(Clone, Copy, Debug, Default)]
 struct Mb {
@@ -240,14 +254,15 @@ impl Engine<'_> {
                 self.big_op(op, *limits, sub.as_deref(), sup.as_deref(), st),
             Node::Accent { base, accent, wide } => self.accent(base, *accent, *wide, st),
             Node::Bar { body, side } => self.bar(body, *side, st),
+            Node::Brace { body, side } => self.brace(body, *side, st),
             Node::Stack { base, label, side } => self.stack(base, label, *side, st),
             Node::Boxed { body } => self.boxed(body, st),
-            Node::Array { rows, columns, kind, delimiters, rules } => self.array(
+            Node::Array { rows, columns, kind, delimiters, rules, col_rules } => self.array(
                 rows,
                 columns,
                 *kind,
                 *delimiters,
-                rules,
+                Rulings { rows: rules, columns: col_rules },
                 st,
             ),
             Node::Space(mu) => (
@@ -433,9 +448,10 @@ impl Engine<'_> {
         columns: &[ColAlign],
         kind: ArrayKind,
         delimiters: Option<(char, char)>,
-        rules: &[bool],
+        rules: Rulings<'_>,
         st: Style,
     ) -> (Vec<Shape>, Mb) {
+        let Rulings { rows: row_rules, columns: col_rules } = rules;
         // Cells are dependent material, so text style and cramped exactly as a
         // fraction's halves are. `smallmatrix` is the one that is also a script size.
         let mut inner = Style { display: false, cramped: st.cramped, ..st };
@@ -525,7 +541,7 @@ impl Engine<'_> {
         // three rule thicknesses, so a rule never touches the ink above or under it,
         // and the grid does not have to grow for one.
         let t = self.rules(1.0, inner.size);
-        for i in rules.iter().enumerate().filter(|(_, r)| **r).map(|(i, _)| i) {
+        for i in row_rules.iter().enumerate().filter(|(_, r)| **r).map(|(i, _)| i) {
             let line = if i == 0 {
                 baselines.first().map_or(0.0, |b0| b0 - rises[0] - gap / 2.0)
             } else if i >= laid.len() {
@@ -540,6 +556,32 @@ impl Engine<'_> {
             } else if i >= laid.len() {
                 b.descent = b.descent.max(line + t / 2.0);
             }
+        }
+        // The spec's `|`: the same rule, stood up. An interior one is centred in the gap
+        // between its two columns and an outer one is set flush with the grid's edge, so
+        // neither costs the block any width -- which is the difference between a rule and
+        // a border: the column it belongs to keeps the room it already had.
+        // Each reaches the box's own ink top and bottom, so where an `\hline` meets it
+        // the two corners are the same point rather than a gap.
+        let last = cols;
+        for i in 0..=last {
+            if !col_rules.get(i).copied().unwrap_or(false) {
+                continue;
+            }
+            let x = if i == 0 {
+                0.0
+            } else if i >= last {
+                (grid_w - t).max(0.0)
+            } else {
+                let previous = lefts[i - 1] + widths[i - 1];
+                (previous + lefts[i]) / 2.0 - t / 2.0
+            };
+            out.push(Shape::Rule {
+                x,
+                y: -b.ascent,
+                width: t,
+                thickness: b.ascent + b.descent,
+            });
         }
         match delimiters {
             Some((left, right)) => self.fenced(left, right, &out, b, st),
@@ -997,6 +1039,64 @@ impl Engine<'_> {
             }
         };
         (out, Mb { width: w, ascent, descent, italic: 0.0 })
+    }
+
+    /// `\overbrace` and `\underbrace`: a brace grown across the whole body.
+    ///
+    /// The mark comes from the horizontal half of the GlyphVariation table -- the same
+    /// list a wide accent is read from -- and it is placed by where its *ink* ends
+    /// rather than by where its baseline is, because a curled brace form sits with its
+    /// baseline anywhere inside itself. A face with nothing to grow gets the rule
+    /// `\overline` draws instead: a different mark, but a brace the width of one letter
+    /// centred over an expression is a mark that has failed.
+    fn brace(&mut self, body: &Node, side: BarSide, st: Style) -> (Vec<Shape>, Mb) {
+        let (sb, bb) = self.lay(body, Style { cramped: true, ..st });
+        let mark = if side == BarSide::Over { '\u{23de}' } else { '\u{23df}' };
+        let Some(parts) = self.m.widen(mark, st.size, bb.ink_width()) else {
+            return self.bar(body, side, st);
+        };
+        // The clearance the table gives an over- or under-bar, because what has to be
+        // kept clear of is the body's ink either way.
+        let gap_c = match side {
+            BarSide::Over => constant::OVERBAR_VERTICAL_GAP,
+            BarSide::Under => constant::UNDERBAR_VERTICAL_GAP,
+        };
+        let gap = self.c(gap_c, st.size, 0.0);
+        let gap = if gap > 0.0 { gap } else { self.rules(3.0, st.size) };
+        let ink: Pt = parts.last().map(|p| p.x + p.width).unwrap_or(0.0);
+        let tall = parts.iter().map(|p| p.ascent).fold(0.0f32, f32::max);
+        let deep = parts.iter().map(|p| p.descent).fold(0.0f32, f32::max);
+        let mut out = Vec::new();
+        translate(&sb, 0.0, 0.0, &mut out);
+        let at = ((bb.width - ink) / 2.0).max(0.0);
+        match side {
+            // The bottom edge of the brace -- its baseline less its own descent -- is
+            // what stands `gap` above the body, not its baseline.
+            BarSide::Over => {
+                let y = -(bb.ascent + gap + deep);
+                for p in &parts {
+                    out.push(Shape::Glyph { index: p.index, x: at + p.x, y, size: st.size });
+                }
+                (out, Mb {
+                    width: bb.width.max(ink),
+                    ascent: bb.ascent + gap + deep + tall,
+                    descent: bb.descent,
+                    italic: bb.italic,
+                })
+            }
+            BarSide::Under => {
+                let y = bb.descent + gap + tall;
+                for p in &parts {
+                    out.push(Shape::Glyph { index: p.index, x: at + p.x, y, size: st.size });
+                }
+                (out, Mb {
+                    width: bb.width.max(ink),
+                    ascent: bb.ascent,
+                    descent: bb.descent + gap + tall + deep,
+                    italic: bb.italic,
+                })
+            }
+        }
     }
 
     /// `\boxed` / `\fbox`: four rules around the body, [`BOX_SEPARATION`] clear of its
