@@ -138,9 +138,18 @@ pub enum AccentKind {
     Bar,
     Tilde,
     Dot,
+    /// `\ddot`: two dots, which is a second derivative and not two `\dot`s.
+    Ddot,
     Vec,
     /// `\overleftarrow`: a direction is not a decoration one way only.
     Backvec,
+    /// The marks of the phonetic and the accented-Latin alphabet, none of which a
+    /// reader can reach any other way.
+    Check,
+    Breve,
+    Acute,
+    Grave,
+    Mathring,
 }
 
 impl AccentKind {
@@ -152,8 +161,14 @@ impl AccentKind {
             AccentKind::Bar => '\u{305}',
             AccentKind::Tilde => '\u{303}',
             AccentKind::Dot => '\u{307}',
+            AccentKind::Ddot => '\u{308}',
             AccentKind::Vec => '\u{20d7}',
             AccentKind::Backvec => '\u{20d6}',
+            AccentKind::Check => '\u{30c}',
+            AccentKind::Breve => '\u{306}',
+            AccentKind::Acute => '\u{301}',
+            AccentKind::Grave => '\u{300}',
+            AccentKind::Mathring => '\u{30a}',
         }
     }
 }
@@ -614,6 +629,15 @@ impl<'a> Parser<'a> {
             "tilde" => self.accent(AccentKind::Tilde, false),
             "widetilde" => self.accent(AccentKind::Tilde, true),
             "dot" => self.accent(AccentKind::Dot, false),
+            // The rest of the marks over a letter. Each is one glyph of the face, not a
+            // pair of the ones above it: `\ddot{x}` is one mark of two dots, and two
+            // `\dot`s stacked would sit at two different heights.
+            "ddot" | "dotdot" => self.accent(AccentKind::Ddot, false),
+            "check" => self.accent(AccentKind::Check, false),
+            "breve" => self.accent(AccentKind::Breve, false),
+            "acute" => self.accent(AccentKind::Acute, false),
+            "grave" => self.accent(AccentKind::Grave, false),
+            "mathring" => self.accent(AccentKind::Mathring, false),
             "vec" => self.accent(AccentKind::Vec, false),
             // The named arrows. `\overrightarrow{AB}` is the vector mark a course actually
             // writes, and it is the wide form: an arrow over two letters has to reach
@@ -1166,6 +1190,11 @@ fn symbol(name: &str) -> Option<&'static str> {
         // The names a logic, lattice or type-theory text is written with: each of these
         // was a word spelled out in variables on the page, because an unknown command
         // falls back to its own letters.
+        // `amsmath`'s dotted ellipses, which differ only in what stands around them and
+        // so differ in spacing: the binary and the integral forms are the centred row of
+        // dots, the ordinary one sits on the baseline.
+        "dotsb" | "dotsm" | "dotsi" => "\u{22ef}",
+        "dotso" => "…",
         "top" => "\u{22a4}",
         "bot" => "\u{22a5}",
         "vdash" => "\u{22a2}",
@@ -1463,6 +1492,29 @@ mod tests {
         let bmod = of("a\\bmod b");
         assert!(bmod.contains(" mod ") && !bmod.contains("bmod"), "{bmod}");
         assert_eq!(of("x\\qed"), "(x ∎)", "the tombstone closes a proof, it does not name it");
+    }
+
+    #[test]
+    fn the_marks_over_a_letter_are_each_one_glyph_of_the_face() {
+        // `\ddot` was the one that mattered: a second derivative wrote itself out as
+        // `ddot`. None of these is a pair of the marks above it -- two `\dot`s stack at
+        // two heights, which is not the same drawing.
+        for (src, kind) in [
+            ("\\ddot{x}", "Ddot"),
+            ("\\dotdot{x}", "Ddot"),
+            ("\\check{a}", "Check"),
+            ("\\breve{a}", "Breve"),
+            ("\\acute{e}", "Acute"),
+            ("\\grave{e}", "Grave"),
+            ("\\mathring{a}", "Mathring"),
+        ] {
+            let want: String = kind.into();
+            let got = sexp(&parse(src));
+            assert!(got.starts_with(&format!("(accent {want}")), "{src} -> {got}");
+        }
+        // The dotted ellipses take the room of the operator they stand in for.
+        assert_eq!(of("a\\dotsb b"), "(a ⋯ b)");
+        assert_eq!(of("a\\dotso b"), "(a … b)");
     }
 
     #[test]

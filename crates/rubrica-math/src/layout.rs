@@ -1101,6 +1101,9 @@ fn is_bin(ch: char) -> bool {
             | '\u{2297}'
             | '\u{2298}'
             | '\u{2299}'
+            // `\cdots` and `amsmath`'s binary dot forms: a row of centred dots stands in
+            // for the operator it is named after, so it takes that operator's room.
+            | '\u{22ef}'
             | '\u{222a}'
             | '\u{2229}'
             | '\u{2227}'
