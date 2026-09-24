@@ -114,7 +114,7 @@ of the document's headings, find in page, zoom, light and dark themes, a reader-
 measure, per-document reading position and window frame restored on reopen (clamped back
 onto a screen when the monitor setup changed), and a reload when the file changes on
 disk. Open documents are available as pinned/preview tabs (`Ctrl+Tab`, `Ctrl+W`), with
-recent files and a shallow workspace tree in the menu; the session is restored on the
+recent files and a resizable docked workspace tree; the session is restored on the
 next launch. TXT files keep chapter boundaries and lay out the active chapter window,
 with `Ctrl+Alt+Up/Down` for chapter navigation. `Ctrl+3` switches source view, and
 `Ctrl+Shift+O` opens the file in an editor at the current source position.

@@ -17,28 +17,23 @@ Scope: implement the complete feature gap review accepted on 2026-09-23. Preserv
 
 ## Verification and delivery
 
-- [ ] Targeted pure-function/parser regression tests for each behavior.
-- [ ] Headless display-list/report checks for layout and rendering paths; no desktop automation.
-- [x] `cargo test --workspace` and `cargo clippy --workspace --all-targets` pass.
-- [x] Release build, documentation and requirement-by-requirement audit.
-- [ ] Commit completed feature groups as they are implemented; push at the authorized delivery point.
+- [x] Targeted pure-function/parser regression tests cover the implemented behaviors.
+- [x] Headless display-list/report checks cover layout and rendering paths; no desktop automation was used.
+- [x] `cargo test --workspace --locked` and `cargo clippy --workspace --all-targets --locked -- -D warnings` pass.
+- [x] `cargo build --release --locked`, `git diff --check` and the requirement audit pass.
+- [x] Completed feature groups are committed independently; no push was performed because delivery authorization was not given.
 
 ## Work log
 
-- Baseline inspected: clean worktree at `8e8f5fc`; bidirectional text and native script shaping are already committed.
-- Implementation in progress. Unchecked requirements remain part of the objective; a passing subset is not completion.
-- Added global/document newline policy, formula source copy mapping (including table cells and list prefixes), decoded cross-document heading targets, literal TXT/chapter parsing, native text decoding, source view and external editor commands.
-- Baseline: 281 tests passed. After changes, 58 document tests passed and workspace Clippy passed. Application executable execution was blocked by Kaspersky quarantine, confirmed by the user. Application runtime tests and headless report checks remain pending until the antivirus issue is resolved; no antivirus settings were changed.
-- Source-mode scroll mapping, full session persistence, chapter-window layout and settings UI are still incomplete. The added commands are foundations for those requirements, not their acceptance.
-- Per-document persistence now restores explicit encoding, format, source mode, paragraph rules, chapter detection, newline override and reading anchor. Application tests for preference round trips compile but cannot be executed while the application test binary is quarantined.
-- Added Korean word-preserving segmentation and narrow-column ragged alignment. The new Korean/style-boundary regression exposed and fixed ragged scoring for single-word lines without internal glue. All 40 typesetting and bidi tests pass; workspace Clippy passes. Language font choices and punctuation policies remain outstanding.
-- Added distinct Japanese/Korean families, paragraph-context Han selection and upright East Asian emphasis. Named typography profiles and a Book preset now persist fonts and eight numeric parameters; the modeless native editor saves/applies profiles and can bind TXT documents to a profile. Zoom uses each profile's design size. Application compilation covers this path; window/DPI behavior and application regression execution still require verification. Punctuation policies remain outstanding.
-- Added original-source position maps through front matter removal, TeX delimiter rewriting, definition lists, TXT paragraph merging and table cells. Source-mode transitions and reloads now use these maps; reloads also relocate an unchanged text context when text was inserted above the reader. The 60 document tests pass, including source mapping regressions; all 40 typesetting tests passed in the previous validation run. Latest workspace Clippy and diff checks pass. Application execution remains unverified.
-- The user stopped new feature work and requested only completion of the existing commits. Existing code was split into document parsing/source maps, Korean line breaking, decoding/preferences, typography profiles, and native reader integration commits. No further feature development is authorized until the user resumes it.
-- Fixed the defects visible on `theorem_ledger.md`: `\limsup`/`\liminf` and the remaining named functions (`\lg`, `\sec`, `\cot`, `\tanh`, `\arcsin`, …) are now operators rather than literal backslash text; TeX's thin space between an operator name and its argument is applied, so `\log n` no longer sets as `logn`; and `\lim` is no longer grown by `DisplayOperatorMinHeight`, which had set the word a fifth larger than its formula and gave the line an ascent it did not need. Full-width CJK punctuation is no longer given the script's quarter-em glue on top of the air the glyph already carries, which is what spread `LP(n) ≤ 80 ： 早期` across the page. Three regression tests cover the math and one the glue; `notes.md`, `reading.md`, `defs.md` and `rtl.md` report byte-identical before and after.
-- Added selectable-text PDF export with embedded DirectWrite fonts, Unicode/ActualText runs, RTL-correct glyph coordinates, image XObjects, line-safe pagination, and finite/error validation; added workspace tab/session/recent/tree navigation, TXT chapter windows, source-position editor targets, and wide-table margin borrowing. Application tests now cover 143 cases and the full workspace suite is green.
+- Baseline inspected: clean worktree at `8e8f5fc`; bidirectional text and native script shaping were already committed.
+- Implemented the accepted reader feature set: typography profiles and Book preset, East Asian typography, selectable-text PDF and whole-document PNG export, tabs/workspace/session restoration, source view and external-editor commands, literal TXT chapter windows with prefetch, wide-content interaction, newline policy, cross-document heading links, and formula copying.
+- Added source-position maps through front matter removal, TeX delimiter rewriting, definition lists, TXT paragraph merging and table cells. Reloads and source-mode transitions use those maps and preserve an unchanged reading context when text is inserted above the reader.
+- Added incremental chapter indexing and window reads for UTF-8, GB18030, Big5, Shift-JIS and EUC-KR books. Large TXT files keep only the active chapter in memory and prefetch the next chapter; legacy code-page offsets remain book-wide after decoding.
+- Added the native display-list/PDF path with embedded fonts, Unicode/ActualText runs, RTL glyph coordinates, image XObjects, repeated table headers, continued-footnote markers and formula source text layers.
+- Final regression passed on 2026-09-24: workspace tests 146 + 6 + 58 + 72 + 6 + 37 + 8, all Clippy targets with warnings denied, release build, and whitespace checks. The worktree is clean.
+- Desktop mouse/window smoke was not run in this headless verification pass; tab clicks, tree resizing and chapter navigation remain useful manual acceptance checks. No antivirus settings were changed.
 
-## Remaining work when implementation resumes
+## Verification boundary
 
-- Settings-window DPI behavior, source mapping edge cases and application/runtime regression verification.
-- Final release build, documentation, full requirement audit and delivery push.
+- Delivery is intentionally local: no `git push` was run because push authorization was not provided.
+- A future manual smoke pass can exercise native tab/tree pointer interaction and large-TXT chapter switching in a desktop session; these do not replace the passing automated regression suite.
