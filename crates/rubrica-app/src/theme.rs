@@ -284,6 +284,7 @@ pub struct Theme {
     pub ragged_below_em: Pt,
     pub quote_indent_em: Pt,
     pub list_indent_em: Pt,
+    pub definition_indent_em: Pt,
     /// The reader's size preference, applied to [`Theme::base`] by [`Theme::set_zoom`].
     /// Carried by the theme so a relayout needs only the theme it is already handed.
     pub zoom: Zoom,
@@ -320,6 +321,7 @@ impl Default for Theme {
             ragged_below_em: 16.0,
             quote_indent_em: 1.2,
             list_indent_em: 1.6,
+            definition_indent_em: 1.5,
             zoom: Zoom::DESIGN,
             face: 0,
             measure: Measure::DESIGN,

@@ -44,7 +44,7 @@ pub fn show(owner: HWND, theme: &Theme, plain: bool) -> crate::Result<()> {
         };
         RegisterClassExW(&wc);
         let hwnd = CreateWindowExW(WS_EX_CONTROLPARENT, PCWSTR(class.as_ptr()), PCWSTR(title.as_ptr()),
-            WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU, CW_USEDEFAULT, CW_USEDEFAULT, 720, 660,
+            WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU, CW_USEDEFAULT, CW_USEDEFAULT, 900, 820,
             Some(owner), None, Some(instance.into()), None)?;
         let mut state = Box::new(Form { owner, name: HWND::default(), fields: Vec::new(),
             korean: HWND::default(), bind: HWND::default() });
@@ -55,27 +55,30 @@ pub fn show(owner: HWND, theme: &Theme, plain: bool) -> crate::Result<()> {
                 [178, 14, 504, 25], 100, WS_BORDER | WS_TABSTOP | WINDOW_STYLE(ES_AUTOHSCROLL as u32))?;
             let p = Profile::from_theme(theme);
             for (i, (name, value)) in FONT_LABELS.iter().zip(&p.fonts).enumerate() {
-                let y = 54 + i as i32 * 29;
-                label(hwnd, name, 18, y + 3, 150)?;
-                state.fields.push(child(hwnd, "EDIT", value, [178, y, 504, 25], 110 + i,
+                let column = i / 10;
+                let row = i % 10;
+                let x = 18 + column as i32 * 436;
+                let y = 54 + row as i32 * 29;
+                label(hwnd, name, x, y + 3, 170)?;
+                state.fields.push(child(hwnd, "EDIT", value, [x + 178, y, 246, 25], 110 + i,
                     WS_BORDER | WS_TABSTOP | WINDOW_STYLE(ES_AUTOHSCROLL as u32))?);
             }
             for (i, (name, value)) in NUMBER_LABELS.iter().zip(p.numbers).enumerate() {
-                let x = 18 + (i % 2) as i32 * 344;
-                let y = 298 + (i / 2) as i32 * 32;
+                let x = 18 + (i % 2) as i32 * 436;
+                let y = 370 + (i / 2) as i32 * 30;
                 label(hwnd, name, x, y + 3, 190)?;
                 state.fields.push(child(hwnd, "EDIT", &value.to_string(), [x + 198, y, 118, 25], 120 + i,
                     WS_BORDER | WS_TABSTOP | WINDOW_STYLE(ES_AUTOHSCROLL as u32))?);
             }
-            state.korean = child(hwnd, "BUTTON", "Keep Korean words together", [18, 436, 330, 26], 130,
+            state.korean = child(hwnd, "BUTTON", "Keep Korean words together", [18, 640, 330, 26], 130,
                 WS_TABSTOP | WINDOW_STYLE(BS_AUTOCHECKBOX as u32))?;
             SendMessageW(state.korean, BM_SETCHECK, Some(WPARAM(usize::from(p.keep_korean_words))), None);
-            state.bind = child(hwnd, "BUTTON", "Use this preset for TXT documents", [362, 436, 330, 26], 131,
+            state.bind = child(hwnd, "BUTTON", "Use this preset for TXT documents", [454, 640, 330, 26], 131,
                 WS_TABSTOP | WINDOW_STYLE(BS_AUTOCHECKBOX as u32))?;
             SendMessageW(state.bind, BM_SETCHECK, Some(WPARAM(usize::from(plain))), None);
-            label(hwnd, "Use installed font family names. Missing fonts use the fallback families.", 18, 477, 666)?;
-            child(hwnd, "BUTTON", "Save and apply", [428, 514, 130, 30], 1, WS_TABSTOP | WINDOW_STYLE(BS_DEFPUSHBUTTON as u32))?;
-            child(hwnd, "BUTTON", "Cancel", [570, 514, 112, 30], 2, WS_TABSTOP)?;
+            label(hwnd, "Use installed font family names. Missing fonts use the fallback families.", 18, 682, 820)?;
+            child(hwnd, "BUTTON", "Save and apply", [628, 720, 130, 30], 1, WS_TABSTOP | WINDOW_STYLE(BS_DEFPUSHBUTTON as u32))?;
+            child(hwnd, "BUTTON", "Cancel", [770, 720, 112, 30], 2, WS_TABSTOP)?;
             Ok(())
         })();
         if let Err(error) = build { let _ = DestroyWindow(hwnd); return Err(error.into()); }
@@ -116,14 +119,20 @@ unsafe extern "system" fn proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> 
                 let mut p = Profile::default();
                 for (i, value) in p.fonts.iter_mut().enumerate() { *value = text(state.fields[i]); }
                 for (i, value) in p.numbers.iter_mut().enumerate() {
-                    *value = text(state.fields[i + 8]).parse().unwrap_or(f32::NAN);
+                    *value = text(state.fields[i + FONT_LABELS.len()]).parse().unwrap_or(f32::NAN);
                 }
                 p.keep_korean_words = unsafe { SendMessageW(state.korean, BM_GETCHECK, None, None) }.0 == 1;
                 let name = text(state.name);
                 match profiles::save(&name, &p) {
                     Ok(()) => {
-                        profiles::select(&name, false);
-                        if unsafe { SendMessageW(state.bind, BM_GETCHECK, None, None) }.0 == 1 { profiles::select(&name, true); }
+                        if let Err(error) = profiles::select(&name, false) {
+                            eprintln!("typography: {error}");
+                        }
+                        if unsafe { SendMessageW(state.bind, BM_GETCHECK, None, None) }.0 == 1 {
+                            if let Err(error) = profiles::select(&name, true) {
+                                eprintln!("typography: {error}");
+                            }
+                        }
                         let _ = unsafe { PostMessageW(Some(state.owner), APPLIED, WPARAM(0), LPARAM(0)) };
                         let _ = unsafe { DestroyWindow(hwnd) };
                     }

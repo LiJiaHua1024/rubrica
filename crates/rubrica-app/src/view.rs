@@ -2796,7 +2796,9 @@ impl View {
             }
             Command::Profile(name) => {
                 let plain = self.plain_override.unwrap_or_else(|| reading::is_plain(self.path.as_deref()));
-                crate::profiles::select(&name, plain);
+                if let Err(error) = crate::profiles::select(&name, plain) {
+                    eprintln!("typography: {error}");
+                }
                 self.apply_profile(name, hwnd);
             }
         }
@@ -3397,10 +3399,6 @@ pub struct PreparedTable {
 
 /// Horizontal padding inside a table cell, in ems of the body size.
 const CELL_PAD_EM: Pt = 0.6;
-/// How far a definition runs in from the margin, in ems of the body size: enough to
-/// sit clearly under its term, and less than one list level so a definition inside a
-/// list item does not read as a deeper list.
-const DEF_INDENT_EM: Pt = 1.5;
 /// The narrowest a column may be squeezed to before it is left to overflow.
 const CELL_MIN_EM: Pt = 3.0;
 
@@ -5392,7 +5390,7 @@ pub fn build_ops(
             // A definition stands under its term, which is the one thing the syntax
             // said and the page has to keep saying: run at the margin it is the term
             // again, and the reader has nothing left to tell the two apart.
-            + if b.kind == BlockKind::Definition { theme.base * DEF_INDENT_EM } else { 0.0 };
+            + if b.kind == BlockKind::Definition { theme.base * theme.definition_indent_em } else { 0.0 };
         // Every point a block is run in from the margin is a point it has to give back
         // at the right: a nested list or a quotation that kept the page's whole measure
         // would end its lines out past the text standing beside it.

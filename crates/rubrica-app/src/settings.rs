@@ -140,8 +140,8 @@ fn write_words(sub: &str, w: &[u32; 4]) {
     }
 }
 
-/// One number, put under `name`.
-pub(crate) fn write_word(sub: &str, name: &str, value: u32) {
+/// One number, put under `name`, reporting whether Windows accepted it.
+pub(crate) fn try_write_word(sub: &str, name: &str, value: u32) -> Result<(), String> {
     let sub = utf16(sub);
     let wide = utf16(name);
     let r = unsafe {
@@ -155,9 +155,16 @@ pub(crate) fn write_word(sub: &str, name: &str, value: u32) {
         )
     };
     if r.is_err() {
-        // A settings write that fails costs the reader their next start-up, which is
-        // worth one line on the console even though nothing else can be done about it.
-        eprintln!("settings: cannot write {name}: {r:?}");
+        Err(format!("cannot write {name}: {r:?}"))
+    } else {
+        Ok(())
+    }
+}
+
+/// Compatibility wrapper for fire-and-forget settings writes.
+pub(crate) fn write_word(sub: &str, name: &str, value: u32) {
+    if let Err(error) = try_write_word(sub, name, value) {
+        eprintln!("settings: {error}");
     }
 }
 
@@ -299,11 +306,11 @@ pub(crate) fn text(sub: &str, name: &str) -> Option<String> {
     Some(String::from_utf16_lossy(&units[..taken]).trim_end_matches('\0').to_string())
 }
 
-/// One string, put under `name`.
+/// One string, put under `name`, reporting whether Windows accepted it.
 ///
 /// `RegSetKeyValueW` rather than the value-only call, because it also brings the key into
 /// being -- which a first run has no other way of getting.
-pub(crate) fn write_text(sub: &str, name: &str, raw: &str) {
+pub(crate) fn try_write_text(sub: &str, name: &str, raw: &str) -> Result<(), String> {
     let sub = utf16(sub);
     let value = utf16(name);
     // [`utf16`] appends the terminator the registry expects, and the byte count is taken
@@ -320,7 +327,16 @@ pub(crate) fn write_text(sub: &str, name: &str, raw: &str) {
         )
     };
     if r.is_err() {
-        eprintln!("settings: cannot write {name}: {r:?}");
+        Err(format!("cannot write {name}: {r:?}"))
+    } else {
+        Ok(())
+    }
+}
+
+/// Compatibility wrapper for fire-and-forget settings writes.
+pub(crate) fn write_text(sub: &str, name: &str, raw: &str) {
+    if let Err(error) = try_write_text(sub, name, raw) {
+        eprintln!("settings: {error}");
     }
 }
 
