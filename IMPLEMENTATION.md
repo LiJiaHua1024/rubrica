@@ -9,7 +9,7 @@ Scope: implement the complete feature gap review accepted on 2026-09-23. Preserv
 - [x] Export: whole-document PNG with width/scale controls and native selectable-text PDF; pagination with heading/paragraph protection, repeated table headers and continued footnotes; reading typography and colours retained.
 - [x] Multiple documents: tabs with preview/pinned behavior, a visible tab strip, workspace tree, recent documents, per-document positions and restored session. (The tree remains a shallow menu-driven navigation surface.)
 - [x] Source reading: syntax-coloured source view preserving the original text, position-preserving reload and mode switching; configurable external editor command. (The editor executable and `{file}`/`{line}`/`{column}` argument template are configurable.)
-- [x] Plain text: literal TXT parsing, automatic/manual encoding selection, paragraph rules, chapter outline, chapter-window layout for large files, previous/next document navigation and TXT typography binding. (The complete decoded file is still read before the active chapter is laid out.)
+- [x] Plain text: literal TXT parsing, automatic/manual encoding selection, paragraph rules, chapter outline, chapter-window layout for large files, background chapter prefetch, previous/next document navigation and TXT typography binding. (Large UTF-8 books are indexed and read by chapter; legacy code-page books still use the full decoded path.)
 - [x] Wide content: overflow indication and horizontal formula panning/full preview, wide tables extending into available margins, and full-size image viewing; the table margin-borrow control is available in the text menu.
 - [x] Markdown single-newline policy: global preference and per-document override, preserved across reload.
 - [x] Cross-document heading links: retain and decode the fragment, open/reuse the document and jump to the heading.
@@ -41,6 +41,6 @@ Scope: implement the complete feature gap review accepted on 2026-09-23. Preserv
 ## Remaining work when implementation resumes
 
 - A docked, resizable workspace tree; the current tree is a shallow menu-driven navigation surface.
-- Streaming/background decoding for very large TXT files; chapter windows currently reduce layout work after the full decoded source is available.
+- Legacy-code-page TXT files still use the full decoded path; only large UTF-8 books use the indexed chapter reader.
 - Settings-window DPI behavior, source mapping edge cases and application/runtime regression verification.
 - Final release build, documentation, full requirement audit and delivery push.
