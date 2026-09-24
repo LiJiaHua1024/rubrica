@@ -10,7 +10,7 @@ Scope: implement the complete feature gap review accepted on 2026-09-23. Preserv
 - [x] Multiple documents: tabs with preview/pinned behavior, workspace tree, recent documents, per-document positions and restored session. (The tree is menu-driven and shallow.)
 - [x] Source reading: syntax-coloured source view preserving the original text, position-preserving reload and mode switching; configurable external editor command. (The editor executable and `{file}`/`{line}`/`{column}` argument template are configurable.)
 - [x] Plain text: literal TXT parsing, automatic/manual encoding selection, paragraph rules, chapter outline, chapter-window layout for large files, previous/next document navigation and TXT typography binding. (The complete decoded file is still read before the active chapter is laid out.)
-- [x] Wide content: overflow indication and horizontal formula panning/full preview, wide tables extending into available margins, and full-size image viewing. (A separate width-control UI is not present.)
+- [x] Wide content: overflow indication and horizontal formula panning/full preview, wide tables extending into available margins, and full-size image viewing; the table margin-borrow control is available in the text menu.
 - [x] Markdown single-newline policy: global preference and per-document override, preserved across reload.
 - [x] Cross-document heading links: retain and decode the fragment, open/reuse the document and jump to the heading.
 - [x] Formula copying: copy selected inline/display math with delimiters, including inside paragraphs and table cells.
