@@ -825,6 +825,16 @@ pub(crate) struct NoteSpan {
     pub height: Pt,
 }
 
+pub(crate) struct MathTextFragment {
+    pub source: String,
+    pub x: Pt,
+    pub y: Pt,
+    pub w: Pt,
+    pub h: Pt,
+    pub face_index: usize,
+    pub em: Pt,
+}
+
 /// Everything one typesetting pass produced.
 pub struct Page {
     pub ops: Vec<Op>,
@@ -852,6 +862,7 @@ pub struct Page {
     pub(crate) table_headers: Vec<TableHeaderFragment>,
     pub(crate) table_spans: Vec<TableSpan>,
     pub(crate) note_spans: Vec<NoteSpan>,
+    pub(crate) math_texts: Vec<MathTextFragment>,
 }
 
 pub struct View {
@@ -3764,6 +3775,7 @@ struct Out<'a> {
     table_headers: &'a mut Vec<TableHeaderFragment>,
     table_spans: &'a mut Vec<TableSpan>,
     note_spans: &'a mut Vec<NoteSpan>,
+    math_texts: &'a mut Vec<MathTextFragment>,
 }
 
 /// How many lines the solver broke on a discretionary hyphen, and how many hyphen marks
@@ -4200,7 +4212,7 @@ fn layout_block(
     out: &mut Out<'_>,
     mut y: Pt,
 ) -> Pt {
-    let Out { ops, hots, sel, hyphens, wide, table_headers, table_spans, note_spans } = out;
+    let Out { ops, hots, sel, hyphens, wide, table_headers, table_spans, note_spans, math_texts } = out;
     let Ctx { theme, styles, math, k, .. } = *ctx;
     let Blk { b, text, spans, base, left, column, hyphenation, size, hang, actions, .. } = *blk;
     let leading = &blk.leading;
@@ -4218,7 +4230,7 @@ fn layout_block(
         return y + theme.base * 0.6;
     }
     if let Some(t) = blk.table {
-        return layout_table(font, ctx, blk, t, &mut Out { ops, hots, sel, hyphens, wide, table_headers, table_spans, note_spans }, y);
+        return layout_table(font, ctx, blk, t, &mut Out { ops, hots, sel, hyphens, wide, table_headers, table_spans, note_spans, math_texts }, y);
     }
     if text.trim().is_empty() {
         return y;
@@ -4299,6 +4311,7 @@ fn layout_block(
         // Bars of a formula, as x, top edge, width, thickness and ink, all still
         // relative to this line's baseline because the line has no position yet.
         let mut bars: Vec<(Pt, Pt, Pt, Pt, ColorRole)> = Vec::new();
+        let mut line_math_texts: Vec<MathTextFragment> = Vec::new();
         let mut ascent = 0.0f32;
         let mut descent = 0.0f32;
         // This line's ink, in the order it was drawn: the source range each segment
@@ -4351,6 +4364,17 @@ fn layout_block(
                                 if let Some(p) = paint_run(font, r, line_left + slot.x + dx, *dy, k, st.color, None) {
                                     runs.push(p);
                                 }
+                            }
+                            if let Some((first, _, _)) = entry.parts.first() {
+                                line_math_texts.push(MathTextFragment {
+                                    source: entry.source.clone(),
+                                    x: line_left + slot.x,
+                                    y: 0.0,
+                                    w: o.advance,
+                                    h: o.ascent + o.descent,
+                                    face_index: first.face,
+                                    em: first.size,
+                                });
                             }
                             bars.extend(entry.rules.iter().map(|(x, top, w, h)| {
                                 (line_left + slot.x + x, *top, *w, *h, st.color)
@@ -4438,6 +4462,10 @@ fn layout_block(
         let line_h = (size * leading.for_mixed(mixed)).max(natural * 1.02);
         let baseline = y + (line_h - natural) * 0.5 + ascent;
         seat(&mut runs, baseline, k);
+        for mut text in line_math_texts.drain(..) {
+            text.y = baseline;
+            math_texts.push(text);
+        }
         ops.push(Op::Runs(runs));
         if let Some((kind, x, content_w, visible_w)) = line_wide {
             let index = wide.len();
@@ -5079,7 +5107,7 @@ fn layout_table(
     out: &mut Out<'_>,
     mut y: Pt,
 ) -> Pt {
-    let Out { ops, hots, sel, hyphens, wide, table_headers, table_spans, note_spans: _ } = out;
+    let Out { ops, hots, sel, hyphens, wide, table_headers, table_spans, note_spans: _, math_texts } = out;
     let Ctx { theme, styles, k, math, wide_limit, .. } = *ctx;
     let Blk { left: block_left, column, .. } = *blk;
     let mut left = block_left;
@@ -5241,6 +5269,7 @@ fn layout_table(
                 let mut marks: Vec<(usize, Pt, Pt)> = Vec::new();
                 let mut hit: Vec<Vec<(Pt, Pt)>> = vec![Vec::new(); c.actions.len()];
                 let mut bars: Vec<(Pt, Pt, Pt, Pt, ColorRole)> = Vec::new();
+                let mut line_math_texts: Vec<MathTextFragment> = Vec::new();
                 // An image's box, waiting for the line's baseline: file, x and width
                 // already in device pixels, ascent and descent still in points.
                 let mut pics: Vec<(std::path::PathBuf, f32, f32, Pt, Pt)> = Vec::new();
@@ -5279,6 +5308,17 @@ fn layout_table(
                                         {
                                             runs.push(p);
                                         }
+                                    }
+                                    if let Some((first, _, _)) = entry.parts.first() {
+                                        line_math_texts.push(MathTextFragment {
+                                            source: entry.source.clone(),
+                                            x: at,
+                                            y: 0.0,
+                                            w: o.advance,
+                                            h: o.ascent + o.descent,
+                                            face_index: first.face,
+                                            em: first.size,
+                                        });
                                     }
                                     bars.extend(
                                         entry.rules.iter().map(|(rx, top, w, h)| (*rx + at, *top, *w, *h, st.color)),
@@ -5372,6 +5412,10 @@ fn layout_table(
                 }
                 end_rule(&mut ruled, &mut bars);
                 seat(&mut runs, ly + ascent, k);
+                for mut text in line_math_texts.drain(..) {
+                    text.y = ly + ascent;
+                    math_texts.push(text);
+                }
                 for (file, px, w, a, d) in pics.drain(..) {
                     ops.push(Op::Image {
                         path: file,
@@ -6164,6 +6208,21 @@ fn pdf_point(x: f32, y: f32) -> PdfPoint {
     PdfPoint { x: printpdf::Pt(x), y: printpdf::Pt(y) }
 }
 
+fn pdf_text_face(font: &FontEngine, preferred: usize, source: &str) -> usize {
+    let mut candidates = vec![preferred];
+    for name in ["Segoe UI", "Microsoft YaHei", "Arial", "Cambria Math"] {
+        if let Some(index) = font.open_face(name, 400, false) {
+            if !candidates.contains(&index) { candidates.push(index); }
+        }
+    }
+    candidates.into_iter().find(|index| {
+        source.chars().all(|ch| {
+            font.glyph_ids(*index, &ch.to_string())
+                .is_some_and(|glyphs| glyphs.first().is_some_and(|glyph| *glyph != 0))
+        })
+    }).unwrap_or(preferred)
+}
+
 fn translate_pdf_op(op: &Op, dy: f32) -> Op {
     let mut translated = op.clone();
     match &mut translated {
@@ -6309,6 +6368,39 @@ fn write_pdf(
                 ops.push(PdfOp::EndTextSection);
                 content_shift += 18.0;
             }
+        }
+        for text in &page.math_texts {
+            let local_y = text.y + content_shift - top;
+            let local_top = local_y - text.h;
+            if local_y <= 0.0 || local_top >= content_height || text.w <= 0.0 {
+                continue;
+            }
+            let face = pdf_text_face(font, text.face_index, &text.source);
+            let font_id = if let Some(id) = fonts.get(&face) {
+                id.clone()
+            } else {
+                let Some((bytes, file_face_index)) = font.font_file(face) else { continue };
+                let mut font_warnings = Vec::new();
+                let Some(parsed) = ParsedFont::from_bytes(&bytes, file_face_index, &mut font_warnings) else { continue };
+                let id = pdf.add_font(&parsed);
+                fonts.insert(face, id.clone());
+                id
+            };
+            let items = text.source.chars().map(|ch| {
+                let glyph = font.glyph_ids(face, &ch.to_string())
+                    .and_then(|glyphs| glyphs.first().copied()).unwrap_or(0);
+                Codepoint::with_cid(glyph, 0.0, ch.to_string())
+            }).collect();
+            ops.push(PdfOp::SetFillColor { col: pdf_rgb(palette.bg) });
+            ops.push(PdfOp::SetFont { font: PdfFontHandle::External(font_id), size: printpdf::Pt(text.em) });
+            ops.push(PdfOp::SetTextMatrix {
+                matrix: PdfTextMatrix::Raw([1.0, 0.0, 0.0, 1.0, text.x, height - local_y]),
+            });
+            ops.push(PdfOp::StartTextSection);
+            ops.push(actual_text_span(&text.source));
+            ops.push(PdfOp::ShowText { items: vec![TextItem::GlyphIds(items)] });
+            ops.push(PdfOp::EndMarkedContent);
+            ops.push(PdfOp::EndTextSection);
         }
         source_ops.extend(page.ops.iter().map(|op| translate_pdf_op(op, content_shift)));
         for op in &source_ops {
@@ -6523,6 +6615,7 @@ pub fn build_ops(
     let mut table_headers: Vec<TableHeaderFragment> = Vec::new();
     let mut table_spans: Vec<TableSpan> = Vec::new();
     let mut note_spans: Vec<NoteSpan> = Vec::new();
+    let mut math_texts: Vec<MathTextFragment> = Vec::new();
     let mut breaks = HyphenCount::default();
     let mut note_tops: Vec<Pt> = Vec::with_capacity(doc.footnotes.len());
     // A citation names its note by the author's own label, while the page knows notes
@@ -6685,7 +6778,7 @@ pub fn build_ops(
                 hang: if b.list.is_some() { level } else { 0.0 },
                 actions: &p.actions,
             },
-            &mut Out { ops: &mut ops, hots: &mut hots, sel: &mut sel, hyphens: &mut breaks, wide: &mut wide, table_headers: &mut table_headers, table_spans: &mut table_spans, note_spans: &mut note_spans },
+            &mut Out { ops: &mut ops, hots: &mut hots, sel: &mut sel, hyphens: &mut breaks, wide: &mut wide, table_headers: &mut table_headers, table_spans: &mut table_spans, note_spans: &mut note_spans, math_texts: &mut math_texts },
             y,
         );
     }
@@ -6738,7 +6831,7 @@ pub fn build_ops(
                         hang: note_hang,
                         actions: &p.actions,
                     },
-                    &mut Out { ops: &mut ops, hots: &mut hots, sel: &mut sel, hyphens: &mut breaks, wide: &mut wide, table_headers: &mut table_headers, table_spans: &mut table_spans, note_spans: &mut note_spans },
+                    &mut Out { ops: &mut ops, hots: &mut hots, sel: &mut sel, hyphens: &mut breaks, wide: &mut wide, table_headers: &mut table_headers, table_spans: &mut table_spans, note_spans: &mut note_spans, math_texts: &mut math_texts },
                     y,
                 );
             }
@@ -6771,6 +6864,7 @@ pub fn build_ops(
         table_headers,
         table_spans,
         note_spans,
+        math_texts,
     }
 }
 
@@ -6927,6 +7021,7 @@ mod tests {
             table_headers: Vec::new(),
             table_spans: Vec::new(),
             note_spans: Vec::new(),
+            math_texts: Vec::new(),
         };
         let starts = pdf_page_starts(&page, 800.0);
         assert_eq!(starts, vec![0.0, 780.0]);

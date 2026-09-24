@@ -23,6 +23,8 @@ use crate::font::{FaceRequest, FontEngine, GlyphRun, ObjectBox};
 /// draw, all relative to the formula's own origin at its left edge and baseline.
 pub struct Entry {
     key: (String, i32, bool),
+    /// Original formula source, used by the PDF accessibility text layer.
+    pub source: String,
     pub object: ObjectBox,
     /// Whether this formula was measured from the face's `MATH` table rather than from
     /// the layout's fallback constants.
@@ -142,6 +144,7 @@ impl MathStore {
             .fold(0.0f32, f32::max);
         self.entries.push(Entry {
             key,
+            source: source.to_string(),
             object: ObjectBox {
                 advance: formula.width.max(ink),
                 ascent: formula.ascent,
