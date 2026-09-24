@@ -30,7 +30,7 @@ Scope: implement the complete feature gap review accepted on 2026-09-23. Preserv
 - Added source-position maps through front matter removal, TeX delimiter rewriting, definition lists, TXT paragraph merging and table cells. Reloads and source-mode transitions use those maps and preserve an unchanged reading context when text is inserted above the reader.
 - Added incremental chapter indexing and window reads for UTF-8, GB18030, Big5, Shift-JIS and EUC-KR books. Large TXT files keep only the active chapter in memory and prefetch the next chapter; legacy code-page offsets remain book-wide after decoding.
 - Added the native display-list/PDF path with embedded fonts, Unicode/ActualText runs, RTL glyph coordinates, image XObjects, repeated table headers, continued-footnote markers and formula source text layers.
-- Final regression passed on 2026-09-24: workspace tests 146 + 6 + 58 + 72 + 6 + 37 + 8, all Clippy targets with warnings denied, release build, and whitespace checks. The worktree is clean.
+- Final regression passed on 2026-09-24: workspace tests 148 + 7 + 58 + 72 + 6 + 37 + 9, all Clippy targets with warnings denied, release build, and whitespace checks. The worktree is clean.
 - Desktop mouse/window smoke was not run in this headless verification pass; tab clicks, tree resizing and chapter navigation remain useful manual acceptance checks. No antivirus settings were changed.
 
 ## Verification boundary
