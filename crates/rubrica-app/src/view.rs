@@ -8,7 +8,7 @@
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 use rubrica_doc::{Action, ActionKind, Align, Block, BlockKind, Document, InlineStyle};
@@ -890,6 +890,8 @@ pub struct View {
     chapter_index: Option<ChapterIndex>,
     chapter: usize,
     chapter_cache: ChapterCache,
+    /// Invalidates prefetched windows when the document, encoding, or chapter index changes.
+    chapter_generation: Arc<AtomicU64>,
     /// Large UTF-8 TXT files keep only the active chapter text in `source`; the file
     /// remains the authority and is reread when another chapter is selected.
     lazy_text: bool,
@@ -1768,15 +1770,29 @@ pub fn run(mut source: String, path: Option<PathBuf>) -> Result<()> {
         preferences.text.chapters && reading::can_window_text(p, preferences.encoding)
     });
     let mut lazy_text = false;
+    let mut initial_chapter = path
+        .as_deref()
+        .and_then(crate::settings::document_chapter)
+        .unwrap_or(0);
+    let mut lazy_decoded: Option<reading::Decoded> = None;
     let chapter_index = if plain && preferences.text.chapters {
         if can_window {
             let path = path.as_deref().expect("window path");
             match reading::scan_chapters(path, preferences.encoding, true) {
                 Ok(index) => {
-                    lazy_text = true;
-                    source = reading::read_chapter_source(path, &index, 0, preferences.encoding)
-                        .map(|decoded| decoded.text).unwrap_or_default();
-                    Some(index)
+                    initial_chapter = initial_chapter.min(index.chapters().len().saturating_sub(1));
+                    match reading::read_chapter_source(path, &index, initial_chapter, preferences.encoding) {
+                        Ok(decoded) => {
+                            lazy_text = true;
+                            source = decoded.text.clone();
+                            lazy_decoded = Some(decoded);
+                        }
+                        Err(_) => {
+                            initial_chapter = 0;
+                            source = reading::read(path, preferences.encoding)?.text;
+                        }
+                    }
+                    if lazy_text { Some(index) } else { Some(ChapterIndex::new(&source, true)) }
                 }
                 Err(_) => {
                     source = reading::read(path, preferences.encoding)?.text;
@@ -1788,22 +1804,14 @@ pub fn run(mut source: String, path: Option<PathBuf>) -> Result<()> {
         }
     } else { None };
     let decoded = if lazy_text {
-        Some(reading::Decoded { text: source.clone(), encoding: preferences.encoding, guessed: false })
+        lazy_decoded
     } else {
         path.as_deref().and_then(|p| reading::read(p, preferences.encoding).ok())
     };
     let doc = if preferences.source { Document::source(&source) }
         else if let Some(index) = chapter_index.as_ref() {
             if lazy_text {
-                reading::read_chapter(
-                    path.as_deref().expect("window path"),
-                    index,
-                    0,
-                    preferences.encoding,
-                    preferences.text,
-                )
-                .map(|(_, document)| document)
-                .unwrap_or_else(|_| Document { blocks: Vec::new(), footnotes: Vec::new() })
+                index.window_text(&source, initial_chapter, preferences.text)
             } else {
                 index.window(&source, 0, preferences.text)
             }
@@ -1831,8 +1839,9 @@ pub fn run(mut source: String, path: Option<PathBuf>) -> Result<()> {
         source_view: preferences.source,
         text_options: preferences.text,
         chapter_index,
-        chapter: 0,
+        chapter: initial_chapter,
         chapter_cache: Arc::new(Mutex::new(HashMap::new())),
+        chapter_generation: Arc::new(AtomicU64::new(0)),
         lazy_text,
         plain_override: preferences.plain,
         encoding: preferences.encoding,
@@ -1887,6 +1896,9 @@ pub fn run(mut source: String, path: Option<PathBuf>) -> Result<()> {
         focus_brush: None,
     });
 
+    if view.lazy_text {
+        view.cache_window(view.chapter, view.source.clone());
+    }
     view.prefetch_next_chapter();
 
     const CLASS: &str = "Rubrica.Main";
@@ -3355,41 +3367,60 @@ impl View {
         if count == 0 { return; }
         let next = (self.chapter as isize + delta).clamp(0, count as isize - 1) as usize;
         if next == self.chapter { return; }
-        self.chapter = next;
         if self.lazy_text {
-            if let (Some(path), Some(index)) = (self.path.as_deref(), self.chapter_index.as_ref()) {
-                let source = self.cached_window(self.chapter)
-                    .map(Ok)
-                    .unwrap_or_else(|| reading::read_chapter_source(path, index, self.chapter, self.encoding)
-                        .map(|decoded| decoded.text));
-                if let Ok(source) = source {
-                    self.cache_window(self.chapter, source.clone());
-                    self.source = source;
+            let Some(path) = self.path.as_deref() else { return };
+            let source = if let Some(source) = self.cached_window(next) {
+                source
+            } else {
+                match reading::read_chapter_source(path, index, next, self.encoding) {
+                    Ok(decoded) => {
+                        self.decoded_encoding = decoded.encoding;
+                        self.encoding_guessed = decoded.guessed;
+                        decoded.text
+                    }
+                    Err(error) => {
+                        show_error(hwnd, &format!("Cannot read chapter: {error}"));
+                        return;
+                    }
                 }
-            }
-            self.prefetch_next_chapter();
+            };
+            self.cache_window(next, source.clone());
+            self.chapter = next;
+            self.source = source;
+            self.doc = index.window_text(&self.source, next, self.text_options);
+        } else {
+            self.chapter = next;
+            self.doc = self.parse_source();
         }
-        self.doc = self.parse_source();
         self.scroll = 0.0;
         self.relayout();
-        if let Some(chapter) = self.chapter_index.as_ref().and_then(|i| i.chapters().get(self.chapter)) {
-            if let Some(scroll) = scroll_for_source(&self.sel_index, chapter.range.start, scale_of(self.dpi)) {
+        if let Some(chapter_start) = self.chapter_index.as_ref().map(|index| index.decoded_start(self.chapter)) {
+            if let Some(scroll) = scroll_for_source(&self.sel_index, chapter_start, scale_of(self.dpi)) {
                 self.scroll = scroll;
             }
         }
         self.clamp_scroll();
+        self.prefetch_next_chapter();
         self.update_title(hwnd);
         let _ = unsafe { InvalidateRect(Some(hwnd), None, false) };
     }
 
     fn reparse(&mut self, hwnd: HWND) {
+        self.reset_chapter_cache();
+        let plain = self.plain_override.unwrap_or_else(|| reading::is_plain(self.path.as_deref()));
         if self.lazy_text
-            && (self.source_view || !self.plain_override.unwrap_or_else(|| reading::is_plain(self.path.as_deref())))
+            && (self.source_view || !plain || !self.text_options.chapters || self.chapter_index.is_none())
         {
             if let Some(path) = self.path.as_deref() {
-                if let Ok(decoded) = reading::read(path, self.encoding) {
-                    self.source = decoded.text;
-                    self.lazy_text = false;
+                match reading::read(path, self.encoding) {
+                    Ok(decoded) => {
+                        self.accept_decoded(decoded);
+                        self.lazy_text = false;
+                    }
+                    Err(error) => {
+                        show_error(hwnd, &error.to_string());
+                        return;
+                    }
                 }
             }
         }
@@ -3401,20 +3432,67 @@ impl View {
             self.math = MathStore::new();
         }
         self.refresh_chapter_index();
+        if self.lazy_text && plain && self.text_options.chapters && self.chapter_index.is_none() {
+            show_error(hwnd, "Cannot index the TXT chapters after the file changed.");
+            return;
+        }
+        if self.lazy_text {
+            if let Some(byte) = source {
+                let target = self.chapter_index.as_ref().map(|index| index.chapter_at(byte));
+                if let Some(target) = target.filter(|target| *target != self.chapter) {
+                    let Some(path) = self.path.as_deref() else { return };
+                    let Some(index) = self.chapter_index.as_ref() else { return };
+                    match reading::read_chapter_source(path, index, target, self.encoding) {
+                        Ok(decoded) => {
+                            self.chapter = target;
+                            self.decoded_encoding = decoded.encoding;
+                            self.encoding_guessed = decoded.guessed;
+                            self.source = decoded.text.clone();
+                            self.cache_window(target, decoded.text);
+                        }
+                        Err(error) => {
+                            show_error(hwnd, &format!("Cannot read the changed TXT chapter: {error}"));
+                            return;
+                        }
+                    }
+                }
+            }
+        }
+        if self.lazy_text {
+            let Some(path) = self.path.as_deref() else { return };
+            let Some(index) = self.chapter_index.as_ref() else { return };
+            match reading::read_chapter_source(path, index, self.chapter, self.encoding) {
+                Ok(decoded) => {
+                    self.decoded_encoding = decoded.encoding;
+                    self.encoding_guessed = decoded.guessed;
+                    self.source = decoded.text.clone();
+                    self.cache_window(self.chapter, decoded.text);
+                }
+                Err(error) => {
+                    show_error(hwnd, &format!("Cannot read the TXT chapter: {error}"));
+                    return;
+                }
+            }
+        }
         self.doc = self.parse_source();
         self.relayout_in_place(hwnd);
         if let Some(byte) = source { self.restore_source(byte); }
         self.update_title(hwnd);
         self.remember_document();
         self.remember_reading();
+        self.prefetch_next_chapter();
     }
 
     fn source_anchor(&self) -> Option<usize> {
         if self.scroll == 0.0 {
-            return Some(self.chapter_index.as_ref()
-                .and_then(|index| index.chapters().get(self.chapter))
-                .map(|chapter| chapter.range.start)
-                .unwrap_or(0));
+            if self.source_view {
+                return Some(0);
+            }
+            if self.lazy_text {
+                return Some(self.chapter_index.as_ref()
+                    .map(|index| index.decoded_start(self.chapter))
+                    .unwrap_or(0));
+            }
         }
         self.sel_index.iter().find(|line| line.y + line.h > self.scroll * scale_of(self.dpi))
             .and_then(|line| line.source.as_ref().map(|range| range.start))
@@ -3554,7 +3632,8 @@ impl View {
     fn remember_reading(&self) {
         let Some(path) = self.path.as_deref() else { return };
         let anchor = anchor_at(&self.sel_index, self.scroll, scale_of(self.dpi));
-        crate::settings::record_reading(path, anchor.unwrap_or(0));
+        let chapter = self.lazy_text.then_some(self.chapter);
+        crate::settings::record_reading_at(path, anchor.unwrap_or(0), chapter);
     }
 
     /// Put what the reader has marked on the clipboard. A copy with nothing marked leaves
@@ -4849,17 +4928,23 @@ impl View {
     }
 
     fn switch_to_tab(&mut self, id: TabId, hwnd: HWND) -> bool {
+        let previous = self.workspace.tabs.active().id;
+        if previous == id { return true; }
         if !self.workspace.activate(id) {
             return false;
         }
         self.remember_reading();
-        match self.workspace.tabs.active().document.clone() {
+        let loaded = match self.workspace.tabs.active().document.clone() {
             DocumentRef::File(file) => self.show_document(&file.path, hwnd),
             DocumentRef::Sample => {
                 self.set_page(crate::sample::DOCUMENT.to_string(), None, hwnd);
                 true
             }
+        };
+        if !loaded {
+            self.workspace.activate(previous);
         }
+        loaded
     }
 
     fn switch_relative_tab(&mut self, delta: isize, hwnd: HWND) {
@@ -4874,16 +4959,27 @@ impl View {
     }
 
     fn close_active_tab(&mut self, hwnd: HWND) {
-        let id = self.workspace.tabs.active().id;
+        let index = self.workspace.tabs.active_index();
+        let active = self.workspace.tabs.active().clone();
+        let next = if self.workspace.tabs.items().len() == 1 {
+            Some(DocumentRef::Sample)
+        } else if index + 1 < self.workspace.tabs.items().len() {
+            Some(self.workspace.tabs.items()[index + 1].document.clone())
+        } else {
+            Some(self.workspace.tabs.items()[index - 1].document.clone())
+        };
         self.remember_reading();
-        if !self.workspace.close(id) {
+        let loaded = match next {
+            Some(DocumentRef::File(file)) => self.show_document(&file.path, hwnd),
+            Some(DocumentRef::Sample) | None => {
+                self.set_page(crate::sample::DOCUMENT.to_string(), None, hwnd);
+                true
+            }
+        };
+        if !loaded {
             return;
         }
-        let next = self.workspace.tabs.active().document.clone();
-        match next {
-            DocumentRef::File(file) => { self.show_document(&file.path, hwnd); }
-            DocumentRef::Sample => { self.set_page(crate::sample::DOCUMENT.to_string(), None, hwnd); }
-        }
+        self.workspace.close(active.id);
         self.update_title(hwnd);
     }
 
@@ -4922,13 +5018,18 @@ impl View {
             && reading::can_window_text(path, preferences.encoding)
         {
             if let Ok(index) = reading::scan_chapters(path, preferences.encoding, true) {
-                if let Ok(source) = reading::read_chapter_source(path, &index, 0, preferences.encoding) {
+                let chapter = crate::settings::document_chapter(path)
+                    .filter(|value| *value < index.chapters().len())
+                    .unwrap_or(0);
+                if let Ok(source) = reading::read_chapter_source(path, &index, chapter, preferences.encoding) {
                     self.lazy_text = true;
-                    self.decoded_encoding = preferences.encoding;
-                    self.encoding_guessed = false;
-                    self.set_page(source.text, Some(path.to_path_buf()), hwnd);
-                    self.cache_window(0, self.source.clone());
+                    let text = source.text.clone();
+                    self.set_page_at(text, Some(path.to_path_buf()), hwnd, chapter);
+                    self.decoded_encoding = source.encoding;
+                    self.encoding_guessed = source.guessed;
+                    self.cache_window(chapter, self.source.clone());
                     self.prefetch_next_chapter();
+                    self.update_title(hwnd);
                     return true;
                 }
             }
@@ -4945,6 +5046,13 @@ impl View {
                 show_error(hwnd, &format!("Cannot open {}: {e}", path.display()));
                 false
             }
+        }
+    }
+
+    fn reset_chapter_cache(&self) {
+        self.chapter_generation.fetch_add(1, Ordering::AcqRel);
+        if let Ok(mut cache) = self.chapter_cache.lock() {
+            cache.clear();
         }
     }
 
@@ -4965,12 +5073,19 @@ impl View {
         let next = self.chapter.saturating_add(1);
         if next >= index.chapters().len() || self.cached_window(next).is_some() { return; }
         let cache = Arc::clone(&self.chapter_cache);
+        let generation = Arc::clone(&self.chapter_generation);
+        let expected_generation = generation.load(Ordering::Acquire);
         let encoding = self.encoding;
         std::thread::spawn(move || {
             if let Ok(decoded) = reading::read_chapter_source(&path, &index, next, encoding) {
+                if generation.load(Ordering::Acquire) != expected_generation {
+                    return;
+                }
                 let text = decoded.text;
                 if let Ok(mut cache) = cache.lock() {
-                    cache.insert(next, text);
+                    if generation.load(Ordering::Acquire) == expected_generation {
+                        cache.insert(next, text);
+                    }
                 }
             }
         });
@@ -4980,12 +5095,7 @@ impl View {
         let path = self.path.as_deref().ok_or_else(|| std::io::Error::new(std::io::ErrorKind::NotFound, "no document path"))?;
         if self.lazy_text {
             let index = self.chapter_index.as_ref().ok_or_else(|| std::io::Error::new(std::io::ErrorKind::InvalidData, "missing TXT chapter index"))?;
-            let text = reading::read_chapter_source(path, index, self.chapter, self.encoding)?.text;
-            Ok(reading::Decoded {
-                text,
-                encoding: self.encoding,
-                guessed: false,
-            })
+            reading::read_chapter_source(path, index, self.chapter, self.encoding)
         } else {
             reading::read(path, self.encoding)
         }
@@ -5030,7 +5140,12 @@ impl View {
     /// stepped back to a document of the same name as this one needs to see which is
     /// which.
     fn set_page(&mut self, source: String, path: Option<PathBuf>, hwnd: HWND) {
+        self.set_page_at(source, path, hwnd, 0);
+    }
+
+    fn set_page_at(&mut self, source: String, path: Option<PathBuf>, hwnd: HWND, chapter: usize) {
         self.remember_reading();
+        self.reset_chapter_cache();
         self.remember_document();
         let preferences = path.as_deref().map(crate::settings::document).unwrap_or_default();
         self.line_break_override = preferences.line_breaks;
@@ -5040,6 +5155,9 @@ impl View {
         self.encoding = preferences.encoding;
         self.source = source;
         self.path = path;
+        if self.path.is_none() {
+            crate::settings::clear_reading();
+        }
         if let Some(path) = self.path.as_deref() {
             self.workspace.open_file(Self::workspace_file(path), TabKind::Pinned);
         }
@@ -5052,8 +5170,12 @@ impl View {
             self.profile = profile;
             self.math = MathStore::new();
         }
-        self.chapter = 0;
         self.refresh_chapter_index();
+        self.chapter = self
+            .chapter_index
+            .as_ref()
+            .map(|index| chapter.min(index.chapters().len().saturating_sub(1)))
+            .unwrap_or(0);
         self.doc = self.parse_source();
         // Filed at the same moment as the text that came out of it, so that the next tick
         // of the poll compares the page on screen against the file it was read from rather

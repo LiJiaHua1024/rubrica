@@ -41,6 +41,10 @@ const OPENED: &str = "Document";
 /// reader's place with across a measure change, and a place worth keeping mid-window is
 /// worth keeping across a session.
 const ANCHOR: &str = "Anchor";
+/// The active chapter for a windowed TXT document. `u32::MAX` means that the document
+/// is being read as one continuous page, so a stale chapter cannot survive a mode change.
+const CHAPTER: &str = "Chapter";
+const NO_CHAPTER: u32 = u32::MAX;
 /// What `Dark` holds when the reader asked for the system's own setting to decide. The
 /// same answer as no value at all, which is why nothing has to be deleted to get back
 /// there: a reader who chooses `Follow System` is not asking for a different number, they
@@ -273,6 +277,14 @@ pub fn document_anchor(path: &std::path::Path) -> Option<usize> {
     word(&sub, ANCHOR).map(|v| v as usize)
 }
 
+/// The chapter remembered for a windowed TXT document. Older settings have no value,
+/// which correctly falls back to the first chapter.
+pub fn document_chapter(path: &std::path::Path) -> Option<usize> {
+    let (sub, raw) = document_key(path);
+    if text(&sub, "Path").as_deref() != Some(raw.as_str()) { return None; }
+    word(&sub, CHAPTER).and_then(|value| (value != NO_CHAPTER).then_some(value as usize))
+}
+
 /// One string, or `None` when this machine has nothing of that name to give.
 pub(crate) fn text(sub: &str, name: &str) -> Option<String> {
     let sub = utf16(sub);
@@ -414,7 +426,7 @@ fn write_reading(sub: &str, path: &std::path::Path, anchor: usize) {
     // the registry would only make the next start read it back wrong.
     if let Some(raw) = path.to_str() {
         write_text(sub, OPENED, raw);
-        write_word(sub, ANCHOR, anchor as u32);
+        write_word(sub, ANCHOR, anchor.min(u32::MAX as usize) as u32);
     }
 }
 
@@ -434,12 +446,15 @@ fn read_reading(sub: &str) -> Option<(PathBuf, usize)> {
 ///
 /// The two go together in one breath because one without the other is a wrong answer: a
 /// place kept against a different document is a jump into a paragraph nobody chose, and a
-/// page that comes back at its top says the reader never got further than they did.
-pub fn record_reading(path: &std::path::Path, anchor: usize) {
+/// page that comes back at its top says the reader never got further than they did. For a
+/// chapter-windowed TXT book, the chapter is stored beside the local character anchor; the
+/// explicit sentinel clears a chapter left by an earlier mode of the same file.
+pub fn record_reading_at(path: &std::path::Path, anchor: usize, chapter: Option<usize>) {
     write_reading(SUBKEY, path, anchor);
     let (sub, raw) = document_key(path);
     write_text(&sub, "Path", &raw);
     write_word(&sub, ANCHOR, anchor.min(u32::MAX as usize) as u32);
+    write_word(&sub, CHAPTER, chapter.map_or(NO_CHAPTER, |value| value.min(NO_CHAPTER as usize - 1) as u32));
 }
 
 /// The document to open again and the place in it, if there is one and it is still where
@@ -450,6 +465,12 @@ pub fn record_reading(path: &std::path::Path, anchor: usize) {
 /// moved is nothing to start the program over.
 pub fn reading() -> Option<(PathBuf, usize)> {
     read_reading(SUBKEY)
+}
+
+/// Forget the last file when the reader explicitly moves to the built-in sample.
+pub fn clear_reading() {
+    write_text(SUBKEY, OPENED, "");
+    write_word(SUBKEY, ANCHOR, 0);
 }
 
 /// Where the window was standing when the reader last moved it, and whether it was
@@ -885,6 +906,22 @@ mod tests {    use super::*;
 
         let _ = std::fs::remove_dir_all(&dir);
         clear(sub);
+    }
+
+    #[test]
+    fn a_windowed_document_remembers_its_chapter_and_can_clear_it() {
+        let path = std::env::temp_dir().join(format!("rubrica-chapter-{}.txt", std::process::id()));
+        std::fs::write(&path, "Chapter 3\ntext\n").expect("write document");
+        let (sub, _) = document_key(&path);
+        clear(&sub);
+        record_reading_at(&path, 27, Some(3));
+        assert_eq!(document_anchor(&path), Some(27));
+        assert_eq!(document_chapter(&path), Some(3));
+        record_reading_at(&path, 4, None);
+        assert_eq!(document_anchor(&path), Some(4));
+        assert_eq!(document_chapter(&path), None);
+        let _ = std::fs::remove_file(path);
+        clear(&sub);
     }
 
     /// The window's own numbers, which are signed and have to travel as unsigned ones.

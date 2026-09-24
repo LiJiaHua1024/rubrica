@@ -161,10 +161,7 @@ fn main() -> Result<()> {
         Some(p) => {
             let path = PathBuf::from(p);
             let prefs = settings::document(&path);
-            let source = if reading::is_plain(Some(&path))
-                && prefs.text.chapters
-                && reading::can_window_text(&path, prefs.encoding)
-            {
+            let source = if should_window(&path, &prefs) {
                 String::new()
             } else {
                 reading::read(&path, prefs.encoding)?.text
@@ -185,11 +182,27 @@ fn main() -> Result<()> {
 /// taken from here: the window asks for it against the path it ended up with, so that a
 /// document named on the command line gets the same treatment.
 fn reopen() -> (Option<PathBuf>, String) {
-    if let Some((path, _)) = settings::reading() {
+    if let Some(snapshot) = settings::workspace() {
+        match snapshot.session.active {
+            Some(rubrica_workspace::DocumentRef::Sample) => {
+                return (None, sample::DOCUMENT.to_string());
+            }
+            Some(rubrica_workspace::DocumentRef::File(file)) if file.path.is_file() => {
+                let path = file.path;
+                let prefs = settings::document(&path);
+                if should_window(&path, &prefs) {
+                    return (Some(path), String::new());
+                }
+                if let Ok(source) = reading::read(&path, prefs.encoding).map(|d| d.text) {
+                    return (Some(path), source);
+                }
+            }
+            _ => {}
+        }
+    }
+    if let Some((path, _)) = settings::reading().filter(|(path, _)| path.is_file()) {
         let prefs = settings::document(&path);
-        if reading::is_plain(Some(&path)) && prefs.text.chapters
-            && reading::can_window_text(&path, prefs.encoding)
-        {
+        if should_window(&path, &prefs) {
             return (Some(path), String::new());
         }
         if let Ok(source) = reading::read(&path, prefs.encoding).map(|d| d.text) {
@@ -197,6 +210,11 @@ fn reopen() -> (Option<PathBuf>, String) {
         }
     }
     (None, sample::DOCUMENT.to_string())
+}
+
+fn should_window(path: &std::path::Path, prefs: &settings::DocumentSettings) -> bool {
+    let plain = prefs.plain.unwrap_or_else(|| reading::is_plain(Some(path)));
+    plain && !prefs.source && prefs.text.chapters && reading::can_window_text(path, prefs.encoding)
 }
 
 /// Read a document, falling back to the built-in sample.
