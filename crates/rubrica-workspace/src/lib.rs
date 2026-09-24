@@ -15,6 +15,12 @@ impl FileRef {
     pub fn new(path: impl Into<PathBuf>, fingerprint: u64) -> Self {
         Self { fingerprint, path: path.into() }
     }
+
+    /// File identity for tabs and recent history. The fingerprint is a version stamp,
+    /// not an identity: a save must not make the same path become a second tab.
+    pub fn same_file(&self, other: &Self) -> bool {
+        self.path == other.path
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -56,7 +62,10 @@ impl TabSet {
     pub fn active_index(&self) -> usize { self.active }
     pub fn find(&self, id: TabId) -> Option<usize> { self.items.iter().position(|tab| tab.id == id) }
     pub fn find_file(&self, file: &FileRef) -> Option<TabId> {
-        self.items.iter().find(|tab| matches!(&tab.document, DocumentRef::File(existing) if existing == file)).map(|tab| tab.id)
+        self.items
+            .iter()
+            .find(|tab| matches!(&tab.document, DocumentRef::File(existing) if existing.same_file(file)))
+            .map(|tab| tab.id)
     }
 
     pub fn open_file(&mut self, file: FileRef, kind: TabKind) -> (TabId, bool) {
@@ -83,6 +92,12 @@ impl TabSet {
         self.items.insert(index, Tab { id, document: DocumentRef::File(file), kind });
         self.active = index;
         (id, true)
+    }
+
+    pub fn replace_document(&mut self, id: TabId, document: DocumentRef) -> bool {
+        let Some(index) = self.find(id) else { return false };
+        self.items[index].document = document;
+        true
     }
 
     pub fn activate(&mut self, id: TabId) -> bool {
@@ -135,11 +150,11 @@ impl Default for RecentFiles {
 impl RecentFiles {
     pub fn items(&self) -> &[FileRef] { &self.items }
     pub fn touch(&mut self, file: FileRef) {
-        self.items.retain(|item| item != &file);
+        self.items.retain(|item| !item.same_file(&file));
         self.items.insert(0, file);
         self.items.truncate(self.limit);
     }
-    pub fn remove(&mut self, file: &FileRef) { self.items.retain(|item| item != file); }
+    pub fn remove(&mut self, file: &FileRef) { self.items.retain(|item| !item.same_file(file)); }
     pub fn clear(&mut self) { self.items.clear(); }
 }
 
@@ -147,7 +162,7 @@ impl RecentFiles {
 pub struct SessionTab { pub document: FileRef, pub kind: TabKind }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct SessionSnapshot { pub tabs: Vec<SessionTab>, pub active: usize }
+pub struct SessionSnapshot { pub tabs: Vec<SessionTab>, pub active: Option<DocumentRef> }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct WorkspaceSnapshot { pub session: SessionSnapshot, pub recent: Vec<FileRef> }
@@ -162,6 +177,9 @@ impl Workspace {
         result
     }
     pub fn activate(&mut self, id: TabId) -> bool { self.tabs.activate(id) }
+    pub fn replace_document(&mut self, id: TabId, document: DocumentRef) -> bool {
+        self.tabs.replace_document(id, document)
+    }
     pub fn close(&mut self, id: TabId) -> bool { self.tabs.close(id) }
     pub fn pin(&mut self, id: TabId) -> bool { self.tabs.pin(id) }
     pub fn move_tab(&mut self, id: TabId, to: usize) -> bool { self.tabs.move_tab(id, to) }
@@ -173,17 +191,27 @@ impl Workspace {
             DocumentRef::File(file) => Some(SessionTab { document: file.clone(), kind: tab.kind }),
             DocumentRef::Sample => None,
         }).collect();
-        WorkspaceSnapshot { session: SessionSnapshot { tabs, active: self.tabs.active_index().min(self.tabs.items.len().saturating_sub(1)) }, recent: self.recent.items.clone() }
+        WorkspaceSnapshot {
+            session: SessionSnapshot {
+                tabs,
+                active: Some(self.tabs.active().document.clone()),
+            },
+            recent: self.recent.items.clone(),
+        }
     }
 
     pub fn restore(snapshot: WorkspaceSnapshot) -> Self {
         let mut workspace = Self::default();
-        workspace.recent.items = snapshot.recent.into_iter().take(workspace.recent.limit).collect();
+        for file in snapshot.recent {
+            workspace.recent.touch(file);
+        }
         for tab in snapshot.session.tabs {
             workspace.tabs.open_file(tab.document, tab.kind);
         }
-        if !workspace.tabs.items.is_empty() {
-            workspace.tabs.active = snapshot.session.active.min(workspace.tabs.items.len() - 1);
+        if let Some(active) = snapshot.session.active {
+            if let Some(index) = workspace.tabs.items().iter().position(|tab| tab.document == active) {
+                workspace.tabs.active = index;
+            }
         }
         workspace
     }
@@ -208,6 +236,25 @@ mod tests {
         let (second, opened_again) = workspace.open_file(file("a.md"), TabKind::Pinned);
         assert!(opened && !opened_again && first == second);
         assert_eq!(workspace.tabs.items().len(), 2);
+    }
+
+    #[test]
+    fn a_new_file_stamp_does_not_create_a_second_tab() {
+        let mut workspace = Workspace::default();
+        let (first, _) = workspace.open_file(FileRef::new("book.md", 1), TabKind::Pinned);
+        let (second, opened) = workspace.open_file(FileRef::new("book.md", 2), TabKind::Pinned);
+        assert!(!opened);
+        assert_eq!(first, second);
+        assert_eq!(workspace.tabs.items().len(), 2);
+    }
+
+    #[test]
+    fn replacing_a_document_keeps_the_tab_identity() {
+        let mut workspace = Workspace::default();
+        let (id, _) = workspace.open_file(file("old.md"), TabKind::Pinned);
+        assert!(workspace.replace_document(id, DocumentRef::File(file("new.md"))));
+        assert_eq!(workspace.tabs.active().document, DocumentRef::File(file("new.md")));
+        assert!(workspace.tabs.find(id).is_some());
     }
 
     #[test]
