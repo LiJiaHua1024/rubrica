@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-members = ["crates/rubrica-type", "crates/rubrica-app", "crates/rubrica-doc", "crates/rubrica-math"]
+members = ["crates/rubrica-type", "crates/rubrica-app", "crates/rubrica-doc", "crates/rubrica-math", "crates/rubrica-workspace"]
 
 [workspace.package]
 version = "0.1.0"

@@ -1,0 +1,10 @@
+[package]
+name = "rubrica-workspace"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Pure tab and recent-document state for Rubrica"
+
+[dependencies]
