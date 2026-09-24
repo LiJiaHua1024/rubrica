@@ -269,10 +269,11 @@ pub struct PaintRun {
     /// PDF export needs it to give each glyph a Unicode value; a formula's synthetic
     /// assembly has no one-to-one source range and leaves it empty.
     pub(crate) source: Option<String>,
-    /// DirectWrite's first UTF-16 cluster for every glyph, retained with the source slice
-    /// so a ligature still extracts as the characters it replaced. The raw
-    /// `GlyphRun::clusters` is the opposite direction (one entry per input code unit).
-    pub(crate) clusters: Vec<u16>,
+    /// Unicode values for every glyph, derived from DirectWrite's input-unit → glyph
+    /// cluster map. This is deliberately a per-glyph value rather than a second cluster
+    /// index: RTL shaping can return cluster starts in visual order, while the source
+    /// substring must still be attached by the original UTF-16 map.
+    pub(crate) unicode: Vec<Option<String>>,
     pub x: f32,
     pub baseline: f32,
     /// Extra drop below the line's baseline, positive downwards. Zero for prose; a
@@ -3643,24 +3644,20 @@ fn fit_punctuation_runs(runs: &mut [GlyphRun], width: Pt) {
     }
 }
 
-fn glyph_clusters(r: &GlyphRun) -> Vec<u16> {
-    let mut out = vec![u16::MAX; r.glyphs.len()];
-    for (input, glyph) in r.clusters.iter().copied().enumerate() {
-        let index = glyph as usize;
-        if index < out.len() {
-            out[index] = out[index].min(input as u16);
+fn unicode_by_glyph(source: &str, clusters: &[u16], glyph_count: usize) -> Vec<Option<String>> {
+    let mut out = vec![None; glyph_count];
+    let mut unit = 0usize;
+    for c in source.chars() {
+        let end = unit + c.len_utf16();
+        let mut seen = Vec::new();
+        for glyph in clusters.iter().take(end).skip(unit).copied() {
+            let index = glyph as usize;
+            if index < out.len() && !seen.contains(&index) {
+                seen.push(index);
+                out[index].get_or_insert_with(String::new).push(c);
+            }
         }
-    }
-    // A shaping implementation may leave a generated mark without a direct cluster
-    // entry. Keep it attached to the nearest preceding input rather than dropping its
-    // text during PDF extraction.
-    let mut previous = 0u16;
-    for value in &mut out {
-        if *value == u16::MAX {
-            *value = previous;
-        } else {
-            previous = *value;
-        }
+        unit = end;
     }
     out
 }
@@ -3679,6 +3676,10 @@ fn paint_run(
             .filter(|slice| !slice.is_empty())
             .map(str::to_owned)
     });
+    let unicode = source
+        .as_deref()
+        .map(|text| unicode_by_glyph(text, &r.clusters, r.glyphs.len()))
+        .unwrap_or_default();
     Some(PaintRun {
         bidi_level: r.bidi_level,
         family: font.face_family(r.face),
@@ -3687,9 +3688,16 @@ fn paint_run(
         em: r.size * k,
         glyphs: r.glyphs.clone(),
         advances: r.advances.iter().map(|a| a * k).collect(),
-        offsets: r.offsets.clone(),
+        offsets: r
+            .offsets
+            .iter()
+            .map(|offset| DWRITE_GLYPH_OFFSET {
+                advanceOffset: offset.advanceOffset * k,
+                ascenderOffset: offset.ascenderOffset * k,
+            })
+            .collect(),
         source,
-        clusters: glyph_clusters(r),
+        unicode,
         x: x * k,
         baseline: 0.0,
         dy,
@@ -5043,7 +5051,7 @@ fn layout_table(
                     } else {
                         (c.text.as_str(), node.text.clone())
                     };
-                    let mut shaped = font.shape_runs(from, range, &st.face, st.size, st.tracking);
+                    let mut shaped = font.shape_runs(from, range.clone(), &st.face, st.size, st.tracking);
                     if node.punctuation.is_some() {
                         fit_punctuation_runs(&mut shaped, node.advance);
                     }
@@ -5071,7 +5079,11 @@ fn layout_table(
                                 },
                             );
                         }
-                        let clusters = glyph_clusters(&r);
+                        let source = if hyphen { None } else { from.get(range.clone()).map(str::to_owned) };
+                        let unicode = source
+                            .as_deref()
+                            .map(|text| unicode_by_glyph(text, &r.clusters, r.glyphs.len()))
+                            .unwrap_or_default();
                         runs.push(PaintRun {
                             bidi_level: r.bidi_level,
                             family: font.face_family(r.face),
@@ -5080,9 +5092,16 @@ fn layout_table(
                             em: r.size * k,
                             glyphs: r.glyphs,
                             advances: r.advances.iter().map(|a| a * k).collect(),
-                            offsets: r.offsets,
-                            source: if hyphen { None } else { c.text.get(node.text.clone()).map(str::to_owned) },
-                            clusters,
+                            offsets: r
+                                .offsets
+                                .iter()
+                                .map(|offset| DWRITE_GLYPH_OFFSET {
+                                    advanceOffset: offset.advanceOffset * k,
+                                    ascenderOffset: offset.ascenderOffset * k,
+                                })
+                                .collect(),
+                            source,
+                            unicode,
                             x: at * k,
                             baseline: 0.0,
                             dy: -st.raise,
@@ -5885,6 +5904,16 @@ fn pdf_point(x: f32, y: f32) -> PdfPoint {
     PdfPoint { x: printpdf::Pt(x), y: printpdf::Pt(y) }
 }
 
+fn pdf_glyph_x(base: f32, advances: &[f32], level: u8, index: usize) -> f32 {
+    let before: f32 = advances.iter().take(index).sum();
+    let after: f32 = advances.iter().take(index + 1).sum();
+    if level % 2 == 1 {
+        base + advances.iter().sum::<f32>() - after
+    } else {
+        base + before
+    }
+}
+
 fn actual_text_span(text: &str) -> PdfOp {
     let mut data = vec![0xFE, 0xFF];
     for unit in text.encode_utf16() {
@@ -5903,35 +5932,13 @@ fn actual_text_span(text: &str) -> PdfOp {
 
 /// The Unicode value attached to one DirectWrite glyph, including the characters
 /// represented by a ligature's shared cluster.
-fn unicode_for_glyph(source: &str, clusters: &[u16], index: usize) -> Option<String> {
-    let units: Vec<u16> = source.encode_utf16().collect();
-    let start = clusters.get(index).copied().unwrap_or(0) as usize;
-    let end = clusters
-        .iter()
-        .skip(index + 1)
-        .map(|v| *v as usize)
-        .find(|v| *v > start)
-        .unwrap_or(units.len());
-    if start >= end {
-        return None;
-    }
-    let mut out = String::new();
-    let mut at = 0usize;
-    for c in source.chars() {
-        let next = at + c.len_utf16();
-        if at >= start && next <= end {
-            out.push(c);
-        }
-        at = next;
-        if at >= end {
-            break;
-        }
-    }
-    (!out.is_empty()).then_some(out)
+#[cfg(test)]
+fn unicode_for_glyph(source: &str, clusters: &[u16], glyph_count: usize, index: usize) -> Option<String> {
+    unicode_by_glyph(source, clusters, glyph_count).get(index).cloned().flatten()
 }
 
 fn glyph_unicode(run: &PaintRun, index: usize) -> Option<String> {
-    unicode_for_glyph(run.source.as_deref()?, &run.clusters, index)
+    run.unicode.get(index).cloned().flatten()
 }
 
 fn write_pdf(
@@ -6071,12 +6078,15 @@ fn write_pdf(
                         if let Some(source) = run.source.as_deref() {
                             ops.push(actual_text_span(source));
                         }
-                        let total: f32 = run.advances.iter().sum();
-                        let mut x = glyph_origin(run.x, total, run.bidi_level);
                         for (i, glyph) in run.glyphs.iter().enumerate() {
                             let item = glyph_unicode(run, i)
                                 .map(|cid| TextItem::GlyphIds(vec![Codepoint::with_cid(*glyph, 0.0, cid)]))
                                 .unwrap_or_else(|| TextItem::GlyphIds(vec![Codepoint::new(*glyph, 0.0)]));
+                            let offset = run.offsets.get(i).copied().unwrap_or_default();
+                            let direction = if run.bidi_level % 2 == 1 { -1.0 } else { 1.0 };
+                            let x = pdf_glyph_x(run.x, &run.advances, run.bidi_level, i)
+                                + offset.advanceOffset * direction;
+                            let glyph_baseline = baseline - offset.ascenderOffset;
                             ops.push(PdfOp::SetTextMatrix {
                                 matrix: PdfTextMatrix::Raw([
                                     1.0,
@@ -6084,11 +6094,10 @@ fn write_pdf(
                                     0.0,
                                     1.0,
                                     x,
-                                    height - baseline,
+                                    height - glyph_baseline,
                                 ]),
                             });
                             ops.push(PdfOp::ShowText { items: vec![item] });
-                            x += run.advances.get(i).copied().unwrap_or(0.0);
                         }
                         ops.push(PdfOp::EndTextSection);
                         if run.source.is_some() {
@@ -6514,10 +6523,19 @@ mod tests {
     }
 
     #[test]
+    fn pdf_rtl_glyph_positions_follow_visual_edges() {
+        let advances = [10.0, 20.0];
+        assert_eq!(pdf_glyph_x(100.0, &advances, 0, 0), 100.0);
+        assert_eq!(pdf_glyph_x(100.0, &advances, 0, 1), 110.0);
+        assert_eq!(pdf_glyph_x(100.0, &advances, 1, 0), 120.0);
+        assert_eq!(pdf_glyph_x(100.0, &advances, 1, 1), 100.0);
+    }
+
+    #[test]
     fn pdf_glyph_clusters_keep_ligature_text_selectable() {
-        assert_eq!(unicode_for_glyph("fi", &[0, 0], 0).as_deref(), Some("fi"));
-        assert_eq!(unicode_for_glyph("a😀b", &[0, 1, 3], 1).as_deref(), Some("😀"));
-        assert_eq!(unicode_for_glyph("abc", &[0, 1, 2], 2).as_deref(), Some("c"));
+        assert_eq!(unicode_for_glyph("fi", &[0, 0], 1, 0).as_deref(), Some("fi"));
+        assert_eq!(unicode_for_glyph("a😀b", &[0, 1, 1, 3], 3, 1).as_deref(), Some("😀"));
+        assert_eq!(unicode_for_glyph("abc", &[0, 1, 2], 3, 2).as_deref(), Some("c"));
     }
 
     #[test]
