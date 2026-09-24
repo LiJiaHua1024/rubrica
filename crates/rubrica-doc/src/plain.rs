@@ -135,6 +135,14 @@ impl ChapterIndex {
         &self.chapters
     }
 
+    pub fn from_parts(chapters: Vec<Chapter>, blank_separated: bool) -> Self {
+        Self { chapters, blank_separated }
+    }
+
+    pub fn range(&self, index: usize) -> Range<usize> {
+        self.chapters.get(index).map(|chapter| chapter.range.clone()).unwrap_or(0..0)
+    }
+
     pub fn chapter_at(&self, source_byte: usize) -> usize {
         self.chapters
             .iter()
@@ -164,6 +172,11 @@ impl ChapterIndex {
         Ok(std::str::from_utf8(&bytes)
             .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "TXT window is not UTF-8"))?
             .to_string())
+    }
+
+    pub fn window_text(&self, source: &str, index: usize, options: TextOptions) -> Document {
+        let range = self.range(index);
+        parse_range(source, 0..source.len(), options, self.blank_separated, range.start)
     }
 
     pub fn window(&self, source: &str, index: usize, options: TextOptions) -> Document {

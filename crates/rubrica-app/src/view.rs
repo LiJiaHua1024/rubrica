@@ -1771,10 +1771,11 @@ pub fn run(mut source: String, path: Option<PathBuf>) -> Result<()> {
     let chapter_index = if plain && preferences.text.chapters {
         if can_window {
             let path = path.as_deref().expect("window path");
-            match ChapterIndex::from_path(path, true) {
+            match reading::scan_chapters(path, preferences.encoding, true) {
                 Ok(index) => {
                     lazy_text = true;
-                    source = index.read_source_window(path, 0).unwrap_or_default();
+                    source = reading::read_chapter_source(path, &index, 0, preferences.encoding)
+                        .map(|decoded| decoded.text).unwrap_or_default();
                     Some(index)
                 }
                 Err(_) => {
@@ -1794,8 +1795,15 @@ pub fn run(mut source: String, path: Option<PathBuf>) -> Result<()> {
     let doc = if preferences.source { Document::source(&source) }
         else if let Some(index) = chapter_index.as_ref() {
             if lazy_text {
-                index.read_window(path.as_deref().expect("window path"), 0, preferences.text)
-                    .unwrap_or_else(|_| Document { blocks: Vec::new(), footnotes: Vec::new() })
+                reading::read_chapter(
+                    path.as_deref().expect("window path"),
+                    index,
+                    0,
+                    preferences.encoding,
+                    preferences.text,
+                )
+                .map(|(_, document)| document)
+                .unwrap_or_else(|_| Document { blocks: Vec::new(), footnotes: Vec::new() })
             } else {
                 index.window(&source, 0, preferences.text)
             }
@@ -3303,7 +3311,13 @@ impl View {
             if let Some(index) = self.chapter_index.as_ref() {
                 if self.lazy_text {
                     if let Some(path) = self.path.as_deref() {
-                        if let Ok(doc) = index.read_window(path, self.chapter, self.text_options) {
+                        if let Ok((_, doc)) = reading::read_chapter(
+                            path,
+                            index,
+                            self.chapter,
+                            self.encoding,
+                            self.text_options,
+                        ) {
                             return doc;
                         }
                     }
@@ -3321,7 +3335,7 @@ impl View {
         let plain = self.plain_override.unwrap_or_else(|| reading::is_plain(self.path.as_deref()));
         self.chapter_index = if plain && self.text_options.chapters {
             if self.lazy_text {
-                self.path.as_deref().and_then(|path| ChapterIndex::from_path(path, true).ok())
+                self.path.as_deref().and_then(|path| reading::scan_chapters(path, self.encoding, true).ok())
             } else {
                 Some(ChapterIndex::new(&self.source, true))
             }
@@ -3346,7 +3360,8 @@ impl View {
             if let (Some(path), Some(index)) = (self.path.as_deref(), self.chapter_index.as_ref()) {
                 let source = self.cached_window(self.chapter)
                     .map(Ok)
-                    .unwrap_or_else(|| index.read_source_window(path, self.chapter));
+                    .unwrap_or_else(|| reading::read_chapter_source(path, index, self.chapter, self.encoding)
+                        .map(|decoded| decoded.text));
                 if let Ok(source) = source {
                     self.cache_window(self.chapter, source.clone());
                     self.source = source;
@@ -4906,12 +4921,12 @@ impl View {
         if plain && preferences.text.chapters && !preferences.source
             && reading::can_window_text(path, preferences.encoding)
         {
-            if let Ok(index) = ChapterIndex::from_path(path, true) {
-                if let Ok(source) = index.read_source_window(path, 0) {
+            if let Ok(index) = reading::scan_chapters(path, preferences.encoding, true) {
+                if let Ok(source) = reading::read_chapter_source(path, &index, 0, preferences.encoding) {
                     self.lazy_text = true;
                     self.decoded_encoding = preferences.encoding;
                     self.encoding_guessed = false;
-                    self.set_page(source, Some(path.to_path_buf()), hwnd);
+                    self.set_page(source.text, Some(path.to_path_buf()), hwnd);
                     self.cache_window(0, self.source.clone());
                     self.prefetch_next_chapter();
                     return true;
@@ -4950,8 +4965,10 @@ impl View {
         let next = self.chapter.saturating_add(1);
         if next >= index.chapters().len() || self.cached_window(next).is_some() { return; }
         let cache = Arc::clone(&self.chapter_cache);
+        let encoding = self.encoding;
         std::thread::spawn(move || {
-            if let Ok(text) = index.read_source_window(&path, next) {
+            if let Ok(decoded) = reading::read_chapter_source(&path, &index, next, encoding) {
+                let text = decoded.text;
                 if let Ok(mut cache) = cache.lock() {
                     cache.insert(next, text);
                 }
@@ -4963,7 +4980,7 @@ impl View {
         let path = self.path.as_deref().ok_or_else(|| std::io::Error::new(std::io::ErrorKind::NotFound, "no document path"))?;
         if self.lazy_text {
             let index = self.chapter_index.as_ref().ok_or_else(|| std::io::Error::new(std::io::ErrorKind::InvalidData, "missing TXT chapter index"))?;
-            let text = index.read_source_window(path, self.chapter)?;
+            let text = reading::read_chapter_source(path, index, self.chapter, self.encoding)?.text;
             Ok(reading::Decoded {
                 text,
                 encoding: self.encoding,

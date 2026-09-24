@@ -1,6 +1,8 @@
 //! Byte decoding and neighboring documents, independent of the window and typography.
 
+use std::io::{self, BufRead, BufReader, Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
+use rubrica_doc::plain::{Chapter, ChapterIndex, TextOptions, is_chapter};
 use windows::Win32::Globalization::{MultiByteToWideChar, MB_ERR_INVALID_CHARS, MULTI_BYTE_TO_WIDE_CHAR_FLAGS};
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -47,14 +49,95 @@ pub fn is_large_text(path: &Path) -> bool {
 /// route because a byte range can cut a multibyte character; a malformed prefix simply
 /// falls back to the old path rather than guessing.
 pub fn can_window_text(path: &Path, requested: Encoding) -> bool {
-    if !is_large_text(path) || !matches!(requested, Encoding::Auto | Encoding::Utf8) {
+    if !is_large_text(path) {
+        return false;
+    }
+    if matches!(requested, Encoding::Gb18030 | Encoding::Big5 | Encoding::ShiftJis | Encoding::EucKr) {
+        return true;
+    }
+    if !matches!(requested, Encoding::Auto | Encoding::Utf8) {
         return false;
     }
     let Ok(mut file) = std::fs::File::open(path) else { return false };
-    use std::io::Read;
     let mut bytes = [0u8; 64 * 1024];
     let Ok(read) = file.read(&mut bytes) else { return false };
     std::str::from_utf8(&bytes[..read]).is_ok()
+}
+
+/// Index chapter boundaries by scanning encoded lines incrementally. UTF-8 uses the
+/// document crate's direct scanner; explicit legacy code pages are decoded one line at a
+/// time, so a large book never has to exist as one giant `String` merely to find chapter
+/// starts.
+pub fn scan_chapters(path: &Path, requested: Encoding, detect: bool) -> io::Result<ChapterIndex> {
+    if matches!(requested, Encoding::Auto | Encoding::Utf8) {
+        if let Ok(index) = ChapterIndex::from_path(path, detect) {
+            return Ok(index);
+        }
+    }
+    let file = std::fs::File::open(path)?;
+    let length = file.metadata()?.len() as usize;
+    let mut reader = BufReader::new(file);
+    let mut chapters: Vec<Chapter> = Vec::new();
+    let mut offset = 0usize;
+    let mut blank_separated = false;
+    let mut first = true;
+    loop {
+        let mut line = Vec::new();
+        let read = reader.read_until(b'\n', &mut line)?;
+        if read == 0 { break; }
+        let mut decoded = decode(&line, requested)?;
+        if first {
+            if let Some(stripped) = decoded.text.strip_prefix('\u{feff}') {
+                decoded.text = stripped.to_string();
+            }
+            first = false;
+        }
+        if decoded.text.trim().is_empty() { blank_separated = true; }
+        if detect && is_chapter(&decoded.text) {
+            if let Some(last) = chapters.last_mut() {
+                last.range.end = offset;
+            } else if offset > 0 {
+                chapters.push(Chapter { title: "Beginning".into(), range: 0..offset });
+            }
+            chapters.push(Chapter { title: decoded.text.trim().into(), range: offset..length });
+        }
+        offset += read;
+    }
+    if chapters.is_empty() {
+        chapters.push(Chapter { title: "Beginning".into(), range: 0..length });
+    } else if let Some(last) = chapters.last_mut() {
+        last.range.end = length;
+    }
+    Ok(ChapterIndex::from_parts(chapters, blank_separated))
+}
+
+fn read_range(path: &Path, range: std::ops::Range<usize>, encoding: Encoding) -> io::Result<Decoded> {
+    let mut file = std::fs::File::open(path)?;
+    file.seek(SeekFrom::Start(range.start as u64))?;
+    let mut bytes = vec![0; range.end.saturating_sub(range.start)];
+    file.read_exact(&mut bytes)?;
+    decode(&bytes, encoding)
+}
+
+pub fn read_chapter_source(
+    path: &Path,
+    index: &ChapterIndex,
+    chapter: usize,
+    encoding: Encoding,
+) -> io::Result<Decoded> {
+    read_range(path, index.range(chapter), encoding)
+}
+
+pub fn read_chapter(
+    path: &Path,
+    index: &ChapterIndex,
+    chapter: usize,
+    encoding: Encoding,
+    options: TextOptions,
+) -> io::Result<(Decoded, rubrica_doc::Document)> {
+    let decoded = read_chapter_source(path, index, chapter, encoding)?;
+    let document = index.window_text(&decoded.text, chapter, options);
+    Ok((decoded, document))
 }
 
 pub fn read(path: &Path, requested: Encoding) -> std::io::Result<Decoded> {
@@ -184,6 +267,54 @@ mod tests {
         assert_eq!(line_column(source, 999), (3, 5));
         assert_eq!(line_column("😀x", 1), (1, 1));
         assert_eq!(line_column("😀x", 4), (1, 2));
+    }
+
+    #[test]
+    fn legacy_encodings_can_index_and_read_one_chapter() {
+        let path = std::env::temp_dir().join(format!("rubrica-legacy-window-{}.txt", std::process::id()));
+        let source = "Prologue\nbody text\n\nChapter 2\nlast line\n";
+        std::fs::write(&path, source).expect("write legacy fixture");
+        for encoding in [Encoding::Gb18030, Encoding::Big5, Encoding::ShiftJis, Encoding::EucKr] {
+            let index = scan_chapters(&path, encoding, true).expect("index legacy file");
+            assert_eq!(index.chapters().len(), 2, "{encoding:?}");
+            let (decoded, document) = read_chapter(
+                &path,
+                &index,
+                1,
+                encoding,
+                rubrica_doc::plain::TextOptions { chapters: true, ..Default::default() },
+            ).expect("read legacy chapter");
+            assert_eq!(decoded.text.trim(), "Chapter 2\nlast line");
+            assert_eq!(document.blocks[0].text, "Chapter 2");
+            assert_eq!(document.blocks[0].sources[0].source, index.range(1).start);
+        }
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn a_large_legacy_file_uses_the_same_chapter_window_path() {
+        let path = std::env::temp_dir().join(format!("rubrica-large-legacy-{}.txt", std::process::id()));
+        let mut bytes = b"Prologue\n".to_vec();
+        while bytes.len() < LAZY_TEXT_THRESHOLD as usize + 32 {
+            bytes.extend_from_slice(b"a long line of body text\n");
+        }
+        bytes.extend_from_slice(b"\nChapter 2\nlast line\n");
+        std::fs::write(&path, &bytes).expect("write large legacy fixture");
+        assert!(is_large_text(&path));
+        for encoding in [Encoding::Gb18030, Encoding::Big5, Encoding::ShiftJis, Encoding::EucKr] {
+            let index = scan_chapters(&path, encoding, true).expect("index large legacy file");
+            let (decoded, document) = read_chapter(
+                &path,
+                &index,
+                1,
+                encoding,
+                TextOptions { chapters: true, ..Default::default() },
+            ).expect("read large legacy chapter");
+            assert_eq!(decoded.text.trim(), "Chapter 2\nlast line");
+            assert_eq!(document.blocks[0].text, "Chapter 2");
+            assert_eq!(document.blocks[0].sources[0].source, index.range(1).start);
+        }
+        let _ = std::fs::remove_file(path);
     }
 
     #[test]
