@@ -7,7 +7,7 @@
 //! every frame. Doing it once per relayout keeps scrolling allocation-free.
 
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use rubrica_doc::{Action, ActionKind, Align, Block, BlockKind, Document, InlineStyle};
@@ -16,6 +16,7 @@ use rubrica_type::paragraph::{Item, Spacing, StyleId, StyleSpan};
 use rubrica_type::units::Pt;
 use rubrica_type::{BreakOptions, Hyphenation, typeset, typeset_hyphenated};
 use windows::core::{w, BOOL, Interface, PCWSTR};
+use windows::Win32::Foundation::GENERIC_WRITE;
 use windows::Win32::Foundation::{COLORREF, HWND, LPARAM, LRESULT, POINT, RECT, WPARAM};
 use windows::Win32::Graphics::Direct2D::Common::{
     D2D1_ALPHA_MODE_PREMULTIPLIED, D2D1_COLOR_F, D2D1_PIXEL_FORMAT, D2D_RECT_F, D2D_SIZE_U,
@@ -27,6 +28,11 @@ use windows::Win32::Graphics::Direct2D::{
     D2D1_TEXT_ANTIALIAS_MODE_CLEARTYPE, ID2D1Factory, ID2D1HwndRenderTarget, ID2D1RenderTarget,
     ID2D1SolidColorBrush, D2D1CreateFactory,
 };
+use windows::Win32::Graphics::Imaging::{
+    CLSID_WICImagingFactory, GUID_ContainerFormatPng, GUID_WICPixelFormat32bppPBGRA,
+    IWICBitmapSource, IWICImagingFactory, WICBitmapCacheOnLoad, WICBitmapEncoderNoCache,
+};
+use windows::Win32::System::Com::{CoCreateInstance, CLSCTX_INPROC_SERVER};
 use windows::Win32::Graphics::DirectWrite::{
     DWRITE_GLYPH_OFFSET, DWRITE_GLYPH_RUN, DWRITE_MEASURING_MODE_NATURAL, IDWriteFontFace,
 };
@@ -5493,6 +5499,189 @@ fn hyphenation_for(
 ///
 /// Returns a [`Page`]: the display list in device independent pixels, the heights and
 /// edges the report measures against, and the rectangles a click can land on.
+#[allow(clippy::too_many_arguments)]
+/// Render a complete document to a PNG file using the same display list as the reader.
+///
+/// `width` is expressed in DIPs and `scale` controls the output pixel density. The
+/// layout is built at `72 * scale` DPI so the coordinates in `Page.ops` are already
+/// pixels and the offscreen target does not apply a second scale.
+pub(crate) fn export_png(
+    source: &str,
+    input_path: Option<&Path>,
+    output: &Path,
+    width: f32,
+    scale: f32,
+    dark: bool,
+    plain: bool,
+    text_options: TextOptions,
+    source_view: bool,
+    keep_line_breaks: bool,
+    zoom: Zoom,
+    face: Option<usize>,
+    measure: Option<usize>,
+    profile: Option<&str>,
+    hyphenate: bool,
+) -> Result<()> {
+    if !width.is_finite() || width <= 0.0 || !scale.is_finite() || scale <= 0.0 {
+        return Err("export width and scale must be positive numbers".into());
+    }
+    let mut theme = Theme::default();
+    if let Some(name) = profile {
+        crate::profiles::load(name).apply(&mut theme);
+    }
+    if let Some(face) = face.filter(|i| TextFace::ALL.get(*i).is_some()) {
+        theme.set_face(face);
+    }
+    if let Some(measure) = measure.filter(|i| Measure::ALL.get(*i).is_some()) {
+        theme.set_measure(measure);
+    }
+    theme.set_zoom(zoom);
+    let doc = if source_view {
+        Document::source(source)
+    } else if plain {
+        rubrica_doc::plain::parse(source, text_options)
+    } else {
+        Document::parse_with(source, rubrica_doc::ParseOptions { keep_line_breaks })
+    };
+    let mut font = FontEngine::new().map_err(|e| -> Error { format!("DirectWrite: {e}").into() })?;
+    if !font.probe() {
+        return Err("no usable font face".into());
+    }
+    let _ = unsafe {
+        CoInitializeEx(None, COINIT_APARTMENTTHREADED)
+    };
+    let store = ImageStore::new().ok();
+    let base = input_path.and_then(Path::parent);
+    let mut math = crate::math::MathStore::new();
+    let mut objects = Objects::new(store.as_ref(), base, &mut math);
+    let hyphenator = if hyphenate { crate::hyphen::Hyphenator::english() } else { None };
+    let page = build_ops(
+        &mut font,
+        &theme,
+        &doc,
+        width,
+        72.0 * scale,
+        &mut objects,
+        hyphenator.as_ref(),
+    );
+    let pixel_width = (width * scale).round().max(1.0) as u32;
+    let pixel_height = (page.height * scale).ceil().max(1.0) as u32;
+    if pixel_width as u64 * pixel_height as u64 > 100_000_000 {
+        return Err("export image is too large; reduce --export-width or --export-scale".into());
+    }
+    unsafe { write_png(&page, output, pixel_width, pixel_height, dark, store.as_ref()) }
+}
+
+unsafe fn write_png(
+    page: &Page,
+    output: &Path,
+    width: u32,
+    height: u32,
+    dark: bool,
+    images: Option<&ImageStore>,
+) -> Result<()> {
+    let wic: IWICImagingFactory = CoCreateInstance(
+        &CLSID_WICImagingFactory,
+        None,
+        CLSCTX_INPROC_SERVER,
+    )?;
+    let bitmap = wic.CreateBitmap(
+        width,
+        height,
+        &GUID_WICPixelFormat32bppPBGRA,
+        WICBitmapCacheOnLoad,
+    )?;
+    let factory: ID2D1Factory = D2D1CreateFactory(D2D1_FACTORY_TYPE_SINGLE_THREADED, None)?;
+    let props = D2D1_RENDER_TARGET_PROPERTIES {
+        r#type: D2D1_RENDER_TARGET_TYPE_DEFAULT,
+        pixelFormat: D2D1_PIXEL_FORMAT {
+            format: DXGI_FORMAT_B8G8R8A8_UNORM,
+            alphaMode: D2D1_ALPHA_MODE_PREMULTIPLIED,
+        },
+        dpiX: 72.0,
+        dpiY: 72.0,
+        usage: D2D1_RENDER_TARGET_USAGE_NONE,
+        minLevel: D2D1_FEATURE_LEVEL_DEFAULT,
+    };
+    let target = factory.CreateWicBitmapRenderTarget(&bitmap, &props)?;
+    target.BeginDraw();
+    let palette = Palette::of(dark);
+    let bg = d2d(palette.bg);
+    target.Clear(Some(&bg));
+    let mut brushes: HashMap<ColorRole, ID2D1SolidColorBrush> = HashMap::new();
+    let mut brush = |role: ColorRole| -> Result<ID2D1SolidColorBrush> {
+        if let Some(existing) = brushes.get(&role) {
+            return Ok(existing.clone());
+        }
+        let color = d2d(palette.ink(role));
+        let made = target.CreateSolidColorBrush(&color, None)?;
+        brushes.insert(role, made.clone());
+        Ok(made)
+    };
+    for op in &page.ops {
+        match op {
+            Op::Rect { x, y, w, h, color } => {
+                let r = D2D_RECT_F { left: *x, top: *y, right: x + w, bottom: y + h };
+                target.FillRectangle(&r, &brush(*color)?);
+            }
+            Op::Line { x0, y0, x1, y1, thickness, color } => {
+                target.DrawLine(
+                    Vector2::new(*x0, *y0),
+                    Vector2::new(*x1, *y1),
+                    &brush(*color)?,
+                    *thickness,
+                    None,
+                );
+            }
+            Op::Image { path, x, y, w, h } => {
+                if let Some(bitmap) = images.and_then(|store| store.bitmap(&target, path)) {
+                    let r = D2D_RECT_F { left: *x, top: *y, right: x + w, bottom: y + h };
+                    target.DrawBitmap(&bitmap, Some(&r), 1.0, D2D1_BITMAP_INTERPOLATION_MODE_LINEAR, None);
+                }
+            }
+            Op::Runs(runs) => {
+                for run in runs {
+                    let description = DWRITE_GLYPH_RUN {
+                        fontFace: std::mem::ManuallyDrop::new(Some(run.face.clone())),
+                        fontEmSize: run.em,
+                        glyphCount: run.glyphs.len() as u32,
+                        glyphIndices: run.glyphs.as_ptr(),
+                        glyphAdvances: run.advances.as_ptr(),
+                        glyphOffsets: run.offsets.as_ptr(),
+                        isSideways: false.into(),
+                        bidiLevel: run.bidi_level as u32,
+                    };
+                    target.DrawGlyphRun(
+                        Vector2::new(glyph_origin(run.x, run.advances.iter().sum(), run.bidi_level), run.baseline),
+                        &description,
+                        &brush(run.color)?,
+                        DWRITE_MEASURING_MODE_NATURAL,
+                    );
+                    let _ = std::mem::ManuallyDrop::into_inner(description.fontFace);
+                }
+            }
+        }
+    }
+    target.EndDraw(None, None)?;
+    let wide = utf16(&output.to_string_lossy());
+    let stream = wic.CreateStream()?;
+    stream.InitializeFromFilename(PCWSTR(wide.as_ptr()), GENERIC_WRITE.0)?;
+    let encoder = wic.CreateEncoder(&GUID_ContainerFormatPng, std::ptr::null())?;
+    encoder.Initialize(&stream, WICBitmapEncoderNoCache)?;
+    let mut frame = None;
+    let mut options = None;
+    encoder.CreateNewFrame(&mut frame, &mut options)?;
+    let frame = frame.ok_or("PNG encoder returned no frame")?;
+    frame.Initialize(None)?;
+    frame.SetSize(width, height)?;
+    let mut format = GUID_WICPixelFormat32bppPBGRA;
+    frame.SetPixelFormat(&mut format)?;
+    frame.WriteSource(&bitmap.cast::<IWICBitmapSource>()?, std::ptr::null())?;
+    frame.Commit()?;
+    encoder.Commit()?;
+    Ok(())
+}
+
 pub fn build_ops(
     font: &mut FontEngine,
     theme: &Theme,
