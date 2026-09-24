@@ -28,7 +28,8 @@ pub struct Placed {
 /// licence covers.
 pub fn place(para: &Paragraph, line: &Line) -> Vec<Placed> {
     let items = &para.items;
-    let delta = f64::from(line.target) - f64::from(line.natural);
+    let target = if line.natural > line.target { line.target + line.hang } else { line.target };
+    let delta = f64::from(target) - f64::from(line.natural);
     // Infinite stretch makes *leftover* space free -- that is what keeps a final line
     // ragged -- but it absorbs no ink. A line whose own width already passes the
     // measure has to be pulled back by shrinking, `\parfillskip` included: TeX
@@ -144,7 +145,8 @@ pub fn place_bidi(para: &Paragraph, line: &Line, bidi: &crate::BidiInfo<'_>) -> 
         slot_levels.push(level);
     }
     let width: Pt = slots.iter().map(|s| s.w).sum();
-    let mut x = if p.level.is_rtl() { (line.target - width).max(0.0) } else { 0.0 };
+    let target = if line.natural > line.target { line.target + line.hang } else { line.target };
+    let mut x = if p.level.is_rtl() { (target - width).max(0.0) } else { 0.0 };
     crate::BidiInfo::reorder_visual(&slot_levels).into_iter().map(|i| {
         let mut slot = slots[i];
         slot.x = x;

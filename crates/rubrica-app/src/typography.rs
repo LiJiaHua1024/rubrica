@@ -44,7 +44,7 @@ pub fn show(owner: HWND, theme: &Theme, plain: bool) -> crate::Result<()> {
         };
         RegisterClassExW(&wc);
         let hwnd = CreateWindowExW(WS_EX_CONTROLPARENT, PCWSTR(class.as_ptr()), PCWSTR(title.as_ptr()),
-            WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU, CW_USEDEFAULT, CW_USEDEFAULT, 720, 620,
+            WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU, CW_USEDEFAULT, CW_USEDEFAULT, 720, 660,
             Some(owner), None, Some(instance.into()), None)?;
         let mut state = Box::new(Form { owner, name: HWND::default(), fields: Vec::new(),
             korean: HWND::default(), bind: HWND::default() });

@@ -15,6 +15,17 @@ pub enum Role {
     Other,
 }
 
+/// Which side of a pair carries the ink in a full-width punctuation glyph.
+///
+/// The advance can be shortened without narrowing the glyph itself: an opening mark
+/// uses the blank on its left, while a closing mark uses the blank on its right.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum PunctuationKind {
+    Opening,
+    Closing,
+    Other,
+}
+
 impl Role {
     pub fn of(ch: char) -> Role {
         if is_cjk_punct(ch) {
@@ -40,6 +51,25 @@ impl Role {
 /// Line-head and line-tail prohibitions -- 、。」 may not start a line, 「 may not
 /// end one -- are deliberately not tabled here. UAX #14 already encodes them, and
 /// a second table would only drift out of sync with the first.
+/// A full-width mark whose blank half may be reclaimed. Ambiguous Western quotes and
+/// the middle dot stay unclassified: they are often proportional in Latin prose.
+pub fn is_compressible_punct(ch: char) -> bool {
+    is_cjk_punct(ch) && !matches!(ch as u32, 0x2018..=0x201D | 0x00B7)
+}
+
+pub fn punctuation(ch: char) -> PunctuationKind {
+    match ch {
+        '（' | '［' | '｛' | '〈' | '《' | '「' | '『' | '【' | '〔' | '〖' | '“' | '‘'
+        | '｟' | '｢' => PunctuationKind::Opening,
+        '）' | '］' | '｝' | '〉' | '》' | '」' | '』' | '】' | '〕' | '〗' | '”' | '’'
+        | '｠' | '｣' | '、' | '。' | '，' | '．' | '！' | '？' | '；' | '：' => {
+            PunctuationKind::Closing
+        }
+        ch if is_compressible_punct(ch) => PunctuationKind::Other,
+        _ => PunctuationKind::Other,
+    }
+}
+
 pub fn is_cjk_punct(ch: char) -> bool {
     matches!(ch as u32,
         0x3000..=0x303F      // 、。〈〉《》「」『』【】〰

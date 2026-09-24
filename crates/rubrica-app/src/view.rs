@@ -3410,6 +3410,19 @@ const CELL_MIN_EM: Pt = 3.0;
 ///
 /// Prose uses `dy = 0`. A formula's pieces each bring their own offset, which is why
 /// the drop is a property of the run rather than something the line loop assumes.
+fn fit_punctuation_runs(runs: &mut [GlyphRun], width: Pt) {
+    let natural = runs.iter().map(GlyphRun::width).sum::<Pt>();
+    if natural <= 0.0 || width <= 0.0 {
+        return;
+    }
+    let scale = width / natural;
+    for run in runs {
+        for advance in &mut run.advances {
+            *advance *= scale;
+        }
+    }
+}
+
 fn paint_run(font: &FontEngine, r: &GlyphRun, x: Pt, dy: Pt, k: f32, color: ColorRole) -> Option<PaintRun> {
     Some(PaintRun {
         bidi_level: r.bidi_level,
@@ -3771,6 +3784,7 @@ fn layout_block(
     };
     let mut spacing = if grid > 0.0 { Spacing::monospace(size, grid) } else { Spacing::for_size(size) };
     spacing.keep_korean_words = grid == 0.0 && theme.keep_korean_words;
+    spacing.punctuation_compression = theme.punctuation_compression;
     let mut opts = BreakOptions::new(column);
     opts.ragged = b.ragged() || column < size * theme.ragged_below_em;
     // A heading that will not fit hangs, and that is the end of it: hyphenating a
@@ -3780,6 +3794,7 @@ fn layout_block(
     // rather than hang, which is what `tight_box` says, and gets a cut offered at
     // every character to do it with.
     opts.tight_box = b.kind == BlockKind::Code;
+    opts.hanging_punctuation = theme.hanging_punctuation_em * size;
     opts.par_indent = if b.kind == BlockKind::Paragraph && hang == 0.0 {
         theme.first_line_indent_em * size
     } else { 0.0 };
@@ -3901,11 +3916,14 @@ fn layout_block(
             // should, since copying a hyphenated word must not hand back a hyphen its
             // author never wrote, and the selectable index must not point at a character
             // that is not there.
-            let shaped = if hyphen {
+            let mut shaped = if hyphen {
                 font.shape_runs(HYPHEN, HYPHEN_RANGE, &st.face, st.size, st.tracking)
             } else {
                 font.shape_runs(text, node.text.clone(), &st.face, st.size, st.tracking)
             };
+            if node.punctuation.is_some() {
+                fit_punctuation_runs(&mut shaped, node.advance);
+            }
             // A raised run hangs above this line's baseline, so its ink joins the
             // ascent and its own descent is measured from where it now stands: the
             // line grows upwards to make room for it, and a superscript never
@@ -4459,6 +4477,7 @@ fn layout_table(
     let size = theme.base;
     let mut spacing = Spacing::for_size(size);
     spacing.keep_korean_words = theme.keep_korean_words;
+    spacing.punctuation_compression = theme.punctuation_compression;
     let leading = theme.body_leading.for_mixed(true);
     let pad = size * CELL_PAD_EM;
     let cols = t.head.len().max(t.rows.iter().map(|r| r.len()).max().unwrap_or(0));
@@ -4486,6 +4505,7 @@ fn layout_table(
         // way out of the problem either -- the painter leaves a ragged line alone,
         // so the ink would land on the neighbour to the right. Break instead.
         opts.tight_box = true;
+        opts.hanging_punctuation = 0.0;
         typeset(&c.text, spacing, base_of(c), &c.spans, &opts, font)
     }
 
@@ -4669,7 +4689,11 @@ fn layout_table(
                     } else {
                         (c.text.as_str(), node.text.clone())
                     };
-                    for r in font.shape_runs(from, range, &st.face, st.size, st.tracking) {
+                    let mut shaped = font.shape_runs(from, range, &st.face, st.size, st.tracking);
+                    if node.punctuation.is_some() {
+                        fit_punctuation_runs(&mut shaped, node.advance);
+                    }
+                    for r in shaped {
                         if !hyphen {
                             mark_run(&c.text, &r, at, &mut marks);
                         }

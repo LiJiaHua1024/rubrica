@@ -56,6 +56,10 @@ pub struct BreakOptions {
     /// line overwrites that neighbour, so this option makes the line unbreakable by
     /// shrinking and lets the solver do the only remaining thing: break it.
     pub tight_box: bool,
+    /// Maximum width closing punctuation may extend beyond the nominal measure.
+    /// A line earns this only when its final content is one or more closing marks;
+    /// opening punctuation and prose at a line end receive nothing.
+    pub hanging_punctuation: Pt,
 }
 
 impl BreakOptions {
@@ -76,6 +80,7 @@ impl BreakOptions {
             nasty_demerits: 1000,
             ragged: false,
             tight_box: false,
+            hanging_punctuation: 0.0,
         }
     }
 
@@ -110,6 +115,8 @@ pub struct Line {
     pub hyphen: Option<u32>,
     /// The block opted out of justification entirely.
     pub ragged: bool,
+    /// Closing punctuation allowed beyond the nominal measure on this line.
+    pub hang: Pt,
 }
 
 impl Line {
@@ -129,7 +136,7 @@ impl Line {
     #[inline]
     pub fn is_overfull(&self) -> bool {
         f64::from(self.natural) - f64::from(self.shrink)
-            > f64::from(self.target) + f64::from(EPSILON)
+            > f64::from(self.target + self.hang) + f64::from(EPSILON)
     }
 }
 
@@ -154,6 +161,7 @@ struct Edge {
     shrink: Pt,
     fitness: u8,
     badness: i32,
+    hang: Pt,
     lo: usize,
     hi: usize,
 }
@@ -233,16 +241,42 @@ fn trim(
 }
 
 /// Score a candidate line. `None` when the break is illegal at this tolerance.
+fn hanging_width(para: &Paragraph, items: &[Item], line: Range<usize>, allowance: Pt) -> Pt {
+    if allowance <= 0.0 {
+        return 0.0;
+    }
+    let mut total = 0.0;
+    for item in line.rev() {
+        match items[item] {
+            Item::Box { node } => {
+                let node = para.node(node);
+                if node.punctuation != Some(crate::classify::PunctuationKind::Closing) {
+                    break;
+                }
+                total += node.advance;
+            }
+            Item::Glue { breakable: false, .. } => {}
+            _ => break,
+        }
+    }
+    total.min(allowance)
+}
+
+#[allow(clippy::too_many_arguments)]
 fn score(
     natural: Pt,
     stretch: Pt,
     shrink: Pt,
     target: Pt,
+    allowance: Pt,
     tolerance: i32,
     prev_fit: u8,
     opts: &BreakOptions,
 ) -> Option<(i32, u8, f64)> {
-    let delta = f64::from(target) - f64::from(natural);
+    // Hanging punctuation is an allowance, not a reason to stretch every short line.
+    // It only enlarges the target when the line would otherwise be overfull.
+    let effective_target = if natural > target { target + allowance } else { target };
+    let delta = f64::from(effective_target) - f64::from(natural);
     let st = f64::from(stretch);
     // In a tight box shrinking is not a way out of an overfull line, so the solver
     // scores the line as if it had no shrinkable glue at all and reaches for a break.
@@ -336,7 +370,7 @@ pub fn break_paragraph(para: &Paragraph, opts: &BreakOptions) -> Plan {
         for (n, (tol, extra, hyphenate)) in attempts.into_iter().enumerate() {
             let mut o = *opts;
             o.hyphenate = hyphenate;
-            if let Some(out) = solve(items, &sums, from, end, &o, tol, extra) {
+            if let Some(out) = solve(para, items, &sums, from, end, &o, tol, extra) {
                 // A pass that had to leave a line overfull is not a success: TeX
                 // keeps going and lets the next pass hyphenate. Accepting it here
                 // would mean the dictionary is never consulted for exactly the
@@ -370,7 +404,7 @@ pub fn break_paragraph(para: &Paragraph, opts: &BreakOptions) -> Plan {
         }
         let ((mut out, cost), p) = match result {
             Some(((out, cost), p)) => ((out, cost), p),
-            None => ((desperate(items, &sums, from, end, opts), f64::INFINITY), 3),
+            None => ((desperate(para, items, &sums, from, end, opts), f64::INFINITY), 3),
         };
         pass = pass.max(p);
         demerits += cost;
@@ -387,7 +421,9 @@ pub fn break_paragraph(para: &Paragraph, opts: &BreakOptions) -> Plan {
 
 /// Dynamic program over the break nodes of one piece. Returns the lines, or `None`
 /// when no legal set of breaks exists at this tolerance.
+#[allow(clippy::too_many_arguments)]
 fn solve(
+    para: &Paragraph,
     items: &[Item],
     sums: &Sums,
     from: usize,
@@ -452,14 +488,25 @@ fn solve(
             // allowed to run past the measure and be reported overfull, which is
             // how an unsplittable word still gets set instead of dropped.
             let ragged = stretch >= INFINITY / 2.0;
+            let hang = if natural > line_target {
+                hanging_width(para, items, range.clone(), opts.hanging_punctuation)
+            } else { 0.0 };
             if !ragged
-                && f64::from(natural) - f64::from(shrink) > f64::from(line_target) + f64::from(EPSILON)
+                && f64::from(natural) - f64::from(shrink)
+                    > f64::from(line_target + hang) + f64::from(EPSILON)
             {
                 continue;
             }
-            let Some((_bad, _fit, demerits)) =
-                score(natural, stretch + extra_stretch, shrink, line_target, tolerance, ed.fitness, opts)
-            else {
+            let Some((_bad, _fit, demerits)) = score(
+                natural,
+                stretch + extra_stretch,
+                shrink,
+                line_target,
+                hang,
+                tolerance,
+                ed.fitness,
+                opts,
+            ) else {
                 // Rejected because the line is too short; every remaining active
                 // edge starts later and so makes an even shorter line.
                 if f64::from(natural) < f64::from(line_target) {
@@ -486,11 +533,15 @@ fn solve(
         };
         let line_target = opts.target(at_start[prev]);
         let (range, natural, stretch, shrink) = trim(items, sums, ed.start, k, pw);
+        let hang = if natural > line_target {
+            hanging_width(para, items, range.clone(), opts.hanging_punctuation)
+        } else { 0.0 };
         let (bad, fit, _) = score(
             natural,
             stretch + extra_stretch,
             shrink,
             line_target,
+            hang,
             tolerance,
             ed.fitness,
             opts,
@@ -507,6 +558,7 @@ fn solve(
             shrink,
             fitness: fit,
             badness: bad,
+            hang,
             lo: range.start,
             hi: range.end,
         });
@@ -543,6 +595,7 @@ fn solve(
                 Item::Penalty { hyphen, .. } => hyphen,
                 _ => None,
             },
+            hang: ed.hang,
         });
     }
     Some((lines, total))
@@ -553,6 +606,7 @@ fn solve(
 /// always has a solution -- but a paragraph must degrade readably rather than
 /// collapse into one line running off the page.
 fn desperate(
+    para: &Paragraph,
     items: &[Item],
     sums: &Sums,
     from: usize,
@@ -604,7 +658,7 @@ fn desperate(
             continue;
         }
         out.push(Line {
-            items: range,
+            items: range.clone(),
             natural,
             stretch,
             shrink,
@@ -615,6 +669,7 @@ fn desperate(
             first: first_line && out.is_empty(),
             ragged: true,
             hyphen: None,
+            hang: hanging_width(para, items, range.clone(), opts.hanging_punctuation),
         });
         if b >= end {
             break;

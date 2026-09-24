@@ -4,13 +4,13 @@ use crate::{settings, theme::{Theme, Leading}};
 
 const ROOT: &str = "Software\\Rubrica\\Typography";
 pub const FONT_LABELS: [&str; 8] = ["Latin body", "Latin headings", "Chinese", "Japanese", "Korean", "Chinese emphasis", "Code", "Math"];
-pub const NUMBER_LABELS: [&str; 8] = ["Size (pt)", "Latin line height", "Asian line height", "Tracking (em)", "Paragraph gap", "First indent (em)", "Column (em)", "Ragged below (em)"];
-const BOUNDS: [(f32, f32); 8] = [(6.0, 72.0), (1.0, 4.0), (1.0, 4.0), (-0.05, 0.3), (0.0, 4.0), (0.0, 8.0), (10.0, 100.0), (0.0, 40.0)];
+pub const NUMBER_LABELS: [&str; 10] = ["Size (pt)", "Latin line height", "Asian line height", "Tracking (em)", "Paragraph gap", "First indent (em)", "Column (em)", "Ragged below (em)", "Punctuation compression", "Hanging punctuation (em)"];
+const BOUNDS: [(f32, f32); 10] = [(6.0, 72.0), (1.0, 4.0), (1.0, 4.0), (-0.05, 0.3), (0.0, 4.0), (0.0, 8.0), (10.0, 100.0), (0.0, 40.0), (0.0, 0.5), (0.0, 1.0)];
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct Profile {
     pub fonts: [String; 8],
-    pub numbers: [f32; 8],
+    pub numbers: [f32; 10],
     pub keep_korean_words: bool,
 }
 
@@ -25,7 +25,8 @@ impl Profile {
                 t.fonts.japanese[0].clone(), t.fonts.korean[0].clone(), t.fonts.emphasis[1].clone(),
                 t.fonts.latin[2].clone(), t.fonts.math[0].clone()],
             numbers: [t.design_base, t.body_leading.latin, t.body_leading.cjk, t.tracking_em,
-                t.space_before_body, t.first_line_indent_em, t.max_measure_em, t.ragged_below_em],
+                t.space_before_body, t.first_line_indent_em, t.max_measure_em, t.ragged_below_em,
+                t.punctuation_compression, t.hanging_punctuation_em],
             keep_korean_words: t.keep_korean_words,
         }
     }
@@ -36,7 +37,7 @@ impl Profile {
         p.fonts[2] = "SimSun".into();
         p.fonts[3] = "Yu Mincho".into();
         p.fonts[4] = "Batang".into();
-        p.numbers = [14.0, 1.65, 1.9, 0.0, 0.25, 2.0, 32.0, 16.0];
+        p.numbers = [14.0, 1.65, 1.9, 0.0, 0.25, 2.0, 32.0, 16.0, 0.5, 0.5];
         p
     }
 
@@ -68,6 +69,7 @@ impl Profile {
         t.tracking_em = self.numbers[3]; t.space_before_body = self.numbers[4];
         t.first_line_indent_em = self.numbers[5]; t.max_measure_em = self.numbers[6];
         t.ragged_below_em = self.numbers[7]; t.keep_korean_words = self.keep_korean_words;
+        t.punctuation_compression = self.numbers[8]; t.hanging_punctuation_em = self.numbers[9];
         t.face = crate::theme::TextFace::ALL.iter().position(|f| f.body == self.fonts[0] && f.heading == self.fonts[1]).unwrap_or(usize::MAX);
         t.measure = crate::theme::Measure::ALL.iter().position(|m| m.em == self.numbers[6]).unwrap_or(usize::MAX);
     }
@@ -133,6 +135,14 @@ pub fn select(name: &str, plain: bool) {
 mod tests {
     use super::*;
     #[test]
+    fn default_profile_keeps_optional_east_asian_policies_off() {
+        let p = Profile::default();
+        assert_eq!(p.numbers[8], 0.0);
+        assert_eq!(p.numbers[9], 0.0);
+        assert!(p.validate().is_ok());
+    }
+
+    #[test]
     fn profiles_apply_all_metrics_and_zoom_from_their_own_design_size() {
         let p = Profile::book();
         let mut t = Theme::default();
@@ -141,6 +151,8 @@ mod tests {
         assert!((t.base - 16.8).abs() < 0.001);
         t.set_zoom(crate::theme::Zoom::DESIGN);
         assert_eq!(Profile::from_theme(&t), p);
+        assert_eq!(p.numbers[8], 0.5);
+        assert_eq!(p.numbers[9], 0.5);
         let mut invalid = p.clone();
         invalid.numbers[3] = f32::NAN;
         assert!(invalid.validate().is_err());

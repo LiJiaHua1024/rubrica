@@ -7,7 +7,7 @@
 
 use std::ops::Range;
 
-use crate::classify::{is_cjk_punct, Role};
+use crate::classify::{is_cjk_punct, is_compressible_punct, punctuation, PunctuationKind, Role};
 use crate::units::{INFINITY, Pt};
 
 /// Identifies a run style in the caller's style table. Opaque to this crate.
@@ -34,6 +34,8 @@ pub struct Node {
     pub advance: Pt,
     /// Role of the first code point, used for glue selection.
     pub role: Role,
+    /// Whether this node is opening, closing, or another full-width punctuation mark.
+    pub punctuation: Option<PunctuationKind>,
     /// Vertical extent around the baseline. Zero for ordinary text, where the
     /// font's own metrics apply; non-zero for an inline object such as an image or
     /// a displayed formula, which has a height the line must make room for.
@@ -87,6 +89,10 @@ pub struct Spacing {
     pub literal_space_runs: bool,
     /// Keep Korean syllables in the same word together; spaces remain breakable.
     pub keep_korean_words: bool,
+    /// Fraction removed from a full-width punctuation mark's advance, from 0 to 0.5.
+    /// The glyph itself keeps its natural outline; only its empty side bearing is
+    /// reclaimed, so the next character moves closer without the mark being squeezed.
+    pub punctuation_compression: f32,
 }
 
 impl Spacing {
@@ -107,6 +113,7 @@ impl Spacing {
             mixed: GlueRecipe { base: size * 0.25, stretch: size * 0.125, shrink: size * 0.125 },
             literal_space_runs: false,
             keep_korean_words: false,
+            punctuation_compression: 0.0,
         }
     }
 
@@ -311,6 +318,20 @@ pub fn build(
             cuts.push((at, required));
         }
     }
+    // Punctuation is segmented as its own node so a full-width mark can surrender
+    // only its blank side bearing. These are shaping boundaries, not line-break
+    // opportunities: UAX #14 still decides where a line may end.
+    for (at, ch) in text.char_indices() {
+        if is_compressible_punct(ch) {
+            if at > 0 {
+                cuts.push((at, false));
+            }
+            let end = at + ch.len_utf8();
+            if end < text.len() {
+                cuts.push((end, false));
+            }
+        }
+    }
     // Style changes are breaks too, so a node never straddles two styles.
     for s in opts.spans {
         for &at in [&s.range.start, &s.range.end] {
@@ -411,14 +432,23 @@ pub fn build(
                     p.items.push(Item::join());
                 }
             }
-            let advance = measure.advance(text, range.clone(), style);
+            let natural = measure.advance(text, range.clone(), style);
             let (ascent, descent) = measure.extent(text, range.clone(), style);
+            let punctuation = core
+                .chars()
+                .next()
+                .filter(|ch| is_compressible_punct(*ch))
+                .map(punctuation);
+            let compression = punctuation
+                .map(|_| opts.spacing.punctuation_compression.clamp(0.0, 0.5))
+                .unwrap_or(0.0);
             let id = p.nodes.len() as u32;
             p.nodes.push(Node {
                 text: range,
                 style,
-                advance,
+                advance: natural * (1.0 - compression),
                 role,
+                punctuation,
                 ascent,
                 descent,
                 kind: NodeKind::Text,
@@ -436,6 +466,7 @@ pub fn build(
                 style,
                 advance: opts.hyphen_width,
                 role: Role::Western,
+                punctuation: None,
                 ascent: 0.0,
                 descent: 0.0,
                 kind: NodeKind::Hyphen,

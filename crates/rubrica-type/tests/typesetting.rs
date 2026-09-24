@@ -169,6 +169,35 @@ fn width_of_line(text: &str, spacing: &Spacing, spans: &[StyleSpan]) -> Pt {
 }
 
 #[test]
+fn punctuation_compression_reclaims_only_full_width_marks() {
+    let text = "界，。";
+    let mut spacing = Spacing::for_size(SIZE);
+    spacing.punctuation_compression = 0.5;
+    let mut measure = MonospaceMeasure { size: SIZE, factor: 0.5 };
+    let (para, plan) = typeset(text, &spacing, StyleId(0), &[], &BreakOptions::new(500.0), &mut measure);
+    let widths: Vec<_> = para.nodes.iter().map(|n| n.advance).collect();
+    assert_eq!(widths, vec![SIZE * 0.5, SIZE * 0.25, SIZE * 0.25]);
+    assert_eq!(para.nodes[1].punctuation, Some(rubrica_type::classify::PunctuationKind::Closing));
+    assert_eq!(para.nodes[2].punctuation, Some(rubrica_type::classify::PunctuationKind::Closing));
+    assert_eq!(line_width(&place(&para, &plan.lines[0])), SIZE * 1.0);
+}
+
+#[test]
+fn a_closing_mark_can_hang_but_an_opening_mark_cannot() {
+    let text = "甲乙。丙丁";
+    let spacing = Spacing::for_size(SIZE);
+    let mut measure = MonospaceMeasure { size: SIZE, factor: 0.5 };
+    let mut options = BreakOptions::new(1.25 * SIZE);
+    options.hanging_punctuation = 0.5 * SIZE;
+    let (para, plan) = typeset(text, &spacing, StyleId(0), &[], &options, &mut measure);
+    let first = &plan.lines[0];
+    let first_text = text_of(&para, text, first);
+    assert!(first_text.ends_with('。'), "line did not keep closing mark with its text: {first_text:?}");
+    assert!(first.hang > 0.0, "closing mark received no hanging allowance");
+    assert!(!first.is_overfull(), "hanging mark was still reported as overfull");
+    assert!(first.natural <= first.target + first.hang + 0.01);
+}
+#[test]
 fn a_break_the_source_offers_still_gets_the_scripts_glue() {
     // The join above must not swallow the gap the mixed-script rule exists to put
     // there: these two boundaries really are break opportunities.

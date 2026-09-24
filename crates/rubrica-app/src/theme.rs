@@ -276,6 +276,10 @@ pub struct Theme {
     pub max_measure_em: Pt,
     pub first_line_indent_em: Pt,
     pub keep_korean_words: bool,
+    /// Fraction of a full-width punctuation advance reclaimed by the paragraph core.
+    pub punctuation_compression: f32,
+    /// Maximum closing-punctuation overhang in ems of the current body size.
+    pub hanging_punctuation_em: Pt,
     /// Stop justifying short columns where stretching overwhelms word spacing.
     pub ragged_below_em: Pt,
     pub quote_indent_em: Pt,
@@ -311,6 +315,8 @@ impl Default for Theme {
             // space, so this stays small.
             first_line_indent_em: 0.0,
             keep_korean_words: true,
+            punctuation_compression: 0.0,
+            hanging_punctuation_em: 0.0,
             ragged_below_em: 16.0,
             quote_indent_em: 1.2,
             list_indent_em: 1.6,
