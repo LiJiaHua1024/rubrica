@@ -6094,32 +6094,58 @@ fn pdf_point(x: f32, y: f32) -> PdfPoint {
 }
 
 fn pdf_page_starts(page: &Page, page_height: Pt) -> Vec<Pt> {
-    if page_height <= 0.0 {
+    if !page_height.is_finite() || page_height <= 0.0 {
         return vec![0.0];
     }
-    let mut starts = vec![0.0];
-    let mut limit = page_height;
-    for line in &page.sel {
-        if line.y + line.h <= limit + 0.01 {
-            continue;
+    if page.sel.is_empty() {
+        let mut starts = vec![0.0];
+        while *starts.last().unwrap_or(&0.0) + page_height < page.height {
+            let next = starts.last().copied().unwrap_or(0.0) + page_height;
+            starts.push(next);
         }
-        let previous = *starts.last().unwrap_or(&0.0);
-        if line.y <= previous + 0.01 {
-            continue;
+        return starts;
+    }
+    use crate::pagination::{paginate, GroupKind, GroupPolicy, Owner, Piece, PlaceRole, Policy, Unit};
+
+    // Feed the measured line boxes through the same deterministic planner used by the
+    // pagination core. Each line is a group here because the display list does not yet
+    // carry block ownership; headings still get the core's keep-with-next rule, while
+    // line boxes themselves remain indivisible and never get cut in half.
+    let mut units = Vec::with_capacity(page.sel.len());
+    let mut groups = Vec::with_capacity(page.sel.len());
+    for (line_index, line) in page.sel.iter().enumerate() {
+        let heading = page.anchor_tops.iter().any(|top| (*top - line.y).abs() < 0.5);
+        let group = units.len();
+        units.push(Unit {
+            piece: Piece::Line { owner: Owner::Body { block: group }, line: line_index },
+            height: line.h.max(0.1),
+            gap_before: 0.0,
+            group,
+            index_in_group: 0,
+        });
+        groups.push(GroupPolicy {
+            id: group,
+            kind: if heading { GroupKind::Heading } else { GroupKind::Paragraph },
+            first: group,
+            len: 1,
+            orphan: 0,
+            widow: 0,
+            keep_with_next: if heading { 2 } else { 0 },
+        });
+    }
+    let plan = paginate(&units, &groups, &[], &[], crate::pagination::PageBox { top: 0.0, height: page_height }, Policy::default());
+    let mut starts = Vec::new();
+    for planned in plan.pages {
+        let Some(first) = planned.items.iter().find(|item| item.role == PlaceRole::Original) else { continue };
+        let Some(line) = page.sel.get(first.unit) else { continue };
+        if starts.last().is_none_or(|last: &Pt| (line.y - *last).abs() > 0.01) {
+            starts.push(line.y);
         }
-        // A heading is kept with the lines that follow it. If the first line that
-        // crosses the nominal boundary is a heading (or follows one closely), move the
-        // break back to that heading instead of leaving it as the last line on a page.
-        let heading = page
-            .anchor_tops
-            .iter()
-            .copied()
-            .find(|top| *top >= previous && *top < line.y && line.y - *top <= line.h * 2.0);
-        let start = heading.unwrap_or(line.y);
-        if start > previous + 0.01 {
-            starts.push(start);
-            limit = start + page_height;
-        }
+    }
+    if starts.is_empty() {
+        starts.push(0.0);
+    } else if starts.first().is_some_and(|first| first.abs() > 0.01) {
+        starts.insert(0, 0.0);
     }
     starts
 }
@@ -6772,7 +6798,7 @@ mod tests {
             wide_regions: Vec::new(),
         };
         let starts = pdf_page_starts(&page, 800.0);
-        assert_eq!(starts, vec![0.0, 780.0]);
+        assert_eq!(starts, vec![0.0, 700.0]);
     }
 
     #[test]
