@@ -1497,6 +1497,39 @@ fn append_rows(
 /// launching them. A control character is refused for the same reason -- it cannot be
 /// part of an address, and the shell parses more of these strings than a reader would
 /// like to think about.
+pub(crate) fn editor_arguments(template: &str, path: &Path, line: usize, column: usize) -> Vec<String> {
+    if template.trim().is_empty() {
+        return vec![path.to_string_lossy().into_owned()];
+    }
+    let mut args = Vec::new();
+    let mut token = String::new();
+    let mut quoted = false;
+    let mut escaped = false;
+    for ch in template.chars() {
+        if escaped {
+            token.push(ch);
+            escaped = false;
+        } else if ch == '\\' && quoted {
+            escaped = true;
+        } else if ch == '"' {
+            quoted = !quoted;
+        } else if ch.is_whitespace() && !quoted {
+            if !token.is_empty() {
+                args.push(std::mem::take(&mut token));
+            }
+        } else {
+            token.push(ch);
+        }
+    }
+    if escaped { token.push('\\'); }
+    if !token.is_empty() { args.push(token); }
+    args.into_iter().map(|arg| {
+        arg.replace("{file}", &path.to_string_lossy())
+            .replace("{line}", &line.to_string())
+            .replace("{column}", &column.to_string())
+    }).filter(|arg| !arg.is_empty()).collect()
+}
+
 pub(crate) fn openable(url: &str) -> bool {
     let Some((scheme, rest)) = url.split_once(':') else {
         // A relative link or a bare fragment points inside this file, which is not a
@@ -3105,13 +3138,15 @@ impl View {
                     let (line, column) = reading::line_column(&self.source, byte);
                     let name = std::path::Path::new(&editor)
                         .file_stem().and_then(|s| s.to_str()).unwrap_or("").to_ascii_lowercase();
-                    let target = if matches!(name.as_str(), "code" | "code-insiders" | "subl" | "sublime_text" | "devenv") {
-                        format!("{}:{}:{}", path.display(), line, column)
+                    let template = crate::settings::editor_args();
+                    let args = if template.trim().is_empty()
+                        && matches!(name.as_str(), "code" | "code-insiders" | "subl" | "sublime_text" | "devenv") {
+                        vec![format!("{}:{}:{}", path.display(), line, column)]
                     } else {
-                        path.to_string_lossy().into_owned()
+                        editor_arguments(&template, path, line, column)
                     };
                     if let Err(error) = std::process::Command::new(editor)
-                        .arg(target).creation_flags(0x08000000).spawn()
+                        .args(args).creation_flags(0x08000000).spawn()
                     { show_error(hwnd, &format!("Cannot start editor: {error}")); }
                 }
             }
@@ -7247,6 +7282,20 @@ mod tests {
         // What an author writes is the heading's words, not its address, and both sides
         // of a link go through the same rule, so either spelling arrives.
         assert_eq!(slug("Global Breaking"), slug("global  breaking"));
+    }
+
+    #[test]
+    fn editor_arguments_expand_paths_and_positions_without_shell_splitting() {
+        let path = Path::new("C:/books/a book.md");
+        assert_eq!(editor_arguments("", path, 3, 7), vec!["C:/books/a book.md".to_string()]);
+        assert_eq!(
+            editor_arguments("--goto {file}:{line}:{column}", path, 3, 7),
+            vec!["--goto".to_string(), "C:/books/a book.md:3:7".to_string()]
+        );
+        assert_eq!(
+            editor_arguments("\"C:/Program Files/Code.exe\" --reuse-window {file}", path, 3, 7),
+            vec!["C:/Program Files/Code.exe".to_string(), "--reuse-window".to_string(), "C:/books/a book.md".to_string()]
+        );
     }
 
     #[test]

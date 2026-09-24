@@ -7,7 +7,7 @@ use windows::Win32::{Foundation::{HWND, LPARAM, LRESULT, WPARAM},
     Graphics::Gdi::{GetStockObject, DEFAULT_GUI_FONT, COLOR_WINDOW},
     System::LibraryLoader::GetModuleHandleW,
     UI::WindowsAndMessaging::*};
-use crate::{profiles::{self, Profile, FONT_LABELS, NUMBER_LABELS}, theme::Theme, view::utf16};
+use crate::{profiles::{self, Profile, FONT_LABELS, NUMBER_LABELS}, settings, theme::Theme, view::utf16};
 
 pub const APPLIED: u32 = WM_APP + 41;
 thread_local! { static OPEN: Cell<Option<HWND>> = const { Cell::new(None) }; }
@@ -18,6 +18,7 @@ struct Form {
     fields: Vec<HWND>,
     korean: HWND,
     bind: HWND,
+    editor_args: HWND,
 }
 
 pub fn route(msg: &MSG) -> bool {
@@ -47,7 +48,7 @@ pub fn show(owner: HWND, theme: &Theme, plain: bool) -> crate::Result<()> {
             WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU, CW_USEDEFAULT, CW_USEDEFAULT, 900, 820,
             Some(owner), None, Some(instance.into()), None)?;
         let mut state = Box::new(Form { owner, name: HWND::default(), fields: Vec::new(),
-            korean: HWND::default(), bind: HWND::default() });
+            korean: HWND::default(), bind: HWND::default(), editor_args: HWND::default() });
         let build = (|| -> windows::core::Result<()> {
             label(hwnd, "Preset name", 18, 16, 150)?;
             let selected = profiles::selected(plain);
@@ -77,8 +78,11 @@ pub fn show(owner: HWND, theme: &Theme, plain: bool) -> crate::Result<()> {
                 WS_TABSTOP | WINDOW_STYLE(BS_AUTOCHECKBOX as u32))?;
             SendMessageW(state.bind, BM_SETCHECK, Some(WPARAM(usize::from(plain))), None);
             label(hwnd, "Use installed font family names. Missing fonts use the fallback families.", 18, 682, 820)?;
-            child(hwnd, "BUTTON", "Save and apply", [628, 720, 130, 30], 1, WS_TABSTOP | WINDOW_STYLE(BS_DEFPUSHBUTTON as u32))?;
-            child(hwnd, "BUTTON", "Cancel", [770, 720, 112, 30], 2, WS_TABSTOP)?;
+            label(hwnd, "Editor arguments ({file}, {line}, {column})", 18, 716, 250)?;
+            state.editor_args = child(hwnd, "EDIT", &settings::editor_args(), [278, 712, 604, 25], 140,
+                WS_BORDER | WS_TABSTOP | WINDOW_STYLE(ES_AUTOHSCROLL as u32))?;
+            child(hwnd, "BUTTON", "Save and apply", [628, 758, 130, 30], 1, WS_TABSTOP | WINDOW_STYLE(BS_DEFPUSHBUTTON as u32))?;
+            child(hwnd, "BUTTON", "Cancel", [770, 758, 112, 30], 2, WS_TABSTOP)?;
             Ok(())
         })();
         if let Err(error) = build { let _ = DestroyWindow(hwnd); return Err(error.into()); }
@@ -122,6 +126,7 @@ unsafe extern "system" fn proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> 
                     *value = text(state.fields[i + FONT_LABELS.len()]).parse().unwrap_or(f32::NAN);
                 }
                 p.keep_korean_words = unsafe { SendMessageW(state.korean, BM_GETCHECK, None, None) }.0 == 1;
+                settings::record_editor_args(&text(state.editor_args));
                 let name = text(state.name);
                 match profiles::save(&name, &p) {
                     Ok(()) => {

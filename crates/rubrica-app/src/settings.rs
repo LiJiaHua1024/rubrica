@@ -198,6 +198,14 @@ pub fn record_editor(path: &std::path::Path) {
     write_text(SUBKEY, "Editor", &path.to_string_lossy());
 }
 
+pub fn editor_args() -> String {
+    text(SUBKEY, "EditorArgs").unwrap_or_default()
+}
+
+pub fn record_editor_args(args: &str) {
+    write_text(SUBKEY, "EditorArgs", args);
+}
+
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct DocumentSettings {
     pub line_breaks: Option<bool>,
