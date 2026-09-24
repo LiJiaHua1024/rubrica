@@ -3613,6 +3613,8 @@ struct Ctx<'a> {
     base: Option<&'a std::path::Path>,
     /// Points to device independent pixels.
     k: f32,
+    /// The extra room a wide table may borrow from the reading margins.
+    wide_limit: Pt,
 }
 
 /// One block plus where on the page it belongs.
@@ -4966,8 +4968,9 @@ fn layout_table(
     mut y: Pt,
 ) -> Pt {
     let Out { ops, hots, sel, hyphens, wide } = out;
-    let Ctx { theme, styles, k, math, .. } = *ctx;
-    let Blk { left, column, .. } = *blk;
+    let Ctx { theme, styles, k, math, wide_limit, .. } = *ctx;
+    let Blk { left: block_left, column, .. } = *blk;
+    let mut left = block_left;
     let size = theme.base;
     let mut spacing = Spacing::for_size(size);
     spacing.keep_korean_words = theme.keep_korean_words;
@@ -5044,17 +5047,25 @@ fn layout_table(
         measure(&mut widths, r);
     }
 
-    let mut total: Pt = widths.iter().sum();
+    let natural_total: Pt = widths.iter().sum();
+    let mut total = natural_total;
     if total > column {
-        let floor = size * CELL_MIN_EM + pad * 2.0;
-        let excess: Pt = widths.iter().map(|w| (w - floor).max(0.0)).sum();
-        if excess > 0.0 {
-            let take = (total - column).min(excess);
-            for w in widths.iter_mut() {
-                let e = (*w - floor).max(0.0);
-                *w -= take * (e / excess);
+        if total <= wide_limit {
+            // A table that is wider than the measure but still fits the window may use
+            // the empty margin rather than shrinking its words. The visible reading
+            // column stays the same; the extra width is a pannable region below.
+            left -= (total - column) * 0.5;
+        } else {
+            let floor = size * CELL_MIN_EM + pad * 2.0;
+            let excess: Pt = widths.iter().map(|w| (w - floor).max(0.0)).sum();
+            if excess > 0.0 {
+                let take = (total - column).min(excess);
+                for w in widths.iter_mut() {
+                    let e = (*w - floor).max(0.0);
+                    *w -= take * (e / excess);
+                }
+                total = widths.iter().sum();
             }
-            total = widths.iter().sum();
         }
     }
 
@@ -5305,7 +5316,7 @@ fn layout_table(
         row_h
     };
 
-    let grid_w = total.min(column);
+    let grid_w = total;
     let grid_top = y;
     ops.push(Op::Rect { x: left * k, y: y * k, w: grid_w * k, h: 0.0, color: ColorRole::Surface });
     let panel = ops.len() - 1;
@@ -5371,14 +5382,14 @@ fn layout_table(
             kind: WideKind::Table,
             x: left * k,
             y: grid_top * k,
-            w: grid_w * k,
+            w: column * k,
             h: (y - grid_top) * k,
             content_w: total * k,
         });
         hots.push(Hot {
             x: left * k,
             y: grid_top * k,
-            w: grid_w * k,
+            w: column * k,
             h: (y - grid_top) * k,
             kind: HotKind::Wide(index),
         });
@@ -6397,6 +6408,7 @@ pub fn build_ops(
         anchors: &anchors,
         base: objects.base_dir,
         k,
+        wide_limit: (client_pt - margin * 0.5).max(column),
     };
 
     for (b, p) in doc.blocks.iter().zip(prepared) {
@@ -7077,6 +7089,7 @@ mod tests {
             anchors: &anchors,
             base: None,
             k: 1.0,
+            wide_limit: 800.0,
         };
         let url = |u: &str| ActionKind::Url(u.to_string());
         assert_eq!(hot_kind(&url("#global-breaking"), &ctx), Some(HotKind::Heading(0)));
@@ -7122,6 +7135,7 @@ mod tests {
             anchors: &empty,
             base: Some(&dir),
             k: 1.0,
+            wide_limit: 800.0,
         };
         let clicked = hot_kind(&ActionKind::Url("other.md".into()), &ctx);
         let _ = std::fs::remove_dir_all(&dir);
