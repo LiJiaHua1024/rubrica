@@ -45,17 +45,19 @@ pub fn is_large_text(path: &Path) -> bool {
     std::fs::metadata(path).map(|meta| meta.len() > LAZY_TEXT_THRESHOLD).unwrap_or(false)
 }
 
-/// A conservative probe for the lazy path. Legacy code pages stay on the fully decoded
-/// route because a byte range can cut a multibyte character; a malformed prefix simply
-/// falls back to the old path rather than guessing.
+/// Probe whether a large text file may use chapter windows. Automatic mode is allowed
+/// to try the incremental scanner: it will fall back to the complete decode only if the
+/// line-by-line decoder cannot establish a valid encoding.
 pub fn can_window_text(path: &Path, requested: Encoding) -> bool {
     if !is_large_text(path) {
         return false;
     }
-    if matches!(requested, Encoding::Gb18030 | Encoding::Big5 | Encoding::ShiftJis | Encoding::EucKr) {
+    if requested == Encoding::Auto
+        || matches!(requested, Encoding::Gb18030 | Encoding::Big5 | Encoding::ShiftJis | Encoding::EucKr)
+    {
         return true;
     }
-    if !matches!(requested, Encoding::Auto | Encoding::Utf8) {
+    if requested != Encoding::Utf8 {
         return false;
     }
     let Ok(mut file) = std::fs::File::open(path) else { return false };
