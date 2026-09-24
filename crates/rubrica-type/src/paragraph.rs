@@ -7,7 +7,7 @@
 
 use std::ops::Range;
 
-use crate::classify::Role;
+use crate::classify::{is_cjk_punct, Role};
 use crate::units::{INFINITY, Pt};
 
 /// Identifies a run style in the caller's style table. Opaque to this crate.
@@ -373,9 +373,11 @@ pub fn build(
         return p;
     }
 
-    // Role of the most recent box, when a break opportunity separates two boxes
-    // with no literal space between them (the Han/Latin and ideograph cases).
-    let mut prev_role: Option<Role> = None;
+    // Role and final code point of the most recent box, when a break opportunity
+    // separates two boxes with no literal space between them (the Han/Latin and
+    // ideograph cases). The role picks the glue recipe; the character decides whether
+    // one applies at all, and whether the line may be drawn there.
+    let mut prev: Option<(Role, char)> = None;
 
     for seg in segments.iter() {
         let slice = &text[seg.clone()];
@@ -389,21 +391,22 @@ pub fn build(
         let trailing = &text[ws_start..seg.end];
 
         if !slice[..lead].is_empty() {
-            emit_space(&mut p, &mut prev_role, &slice[..lead], opts);
+            emit_space(&mut p, &mut prev, &slice[..lead], opts);
         }
 
         if !core.is_empty() {
             let range = seg.start + lead..seg.start + lead + core.len();
-            let role = Role::of(core.chars().next().unwrap());
+            let first = core.chars().next().unwrap();
+            let role = Role::of(first);
             let style = StyleSpan::resolve(opts.spans, range.start, opts.style_of);
-            if let Some(prev) = prev_role {
+            if let Some((prev_role, prev_ch)) = prev {
                 // Getting here means no whitespace separates the two boxes, because
                 // any leading or trailing run of it has already been emitted as a
-                // space, which clears `prev_role`. So the boundary is a cut: use the
+                // space, which clears `prev`. So the boundary is a cut: use the
                 // script's glue only where the source really does allow a break, and
                 // otherwise join the two halves of the same word tightly.
                 if allowed.binary_search(&seg.start).is_ok() {
-                    p.items.push(Item::glue(glue_recipe_for(prev, role, opts.spacing)));
+                    p.items.push(punct_glue(prev_ch, first, prev_role, role, opts.spacing));
                 } else {
                     p.items.push(Item::join());
                 }
@@ -421,7 +424,7 @@ pub fn build(
                 kind: NodeKind::Text,
             });
             p.items.push(Item::Box { node: id });
-            prev_role = Some(role);
+            prev = Some((role, core.chars().next_back().unwrap()));
         }
 
         let split_here = hyphen_set.contains(&seg.end) && trailing.is_empty();
@@ -443,11 +446,11 @@ pub fn build(
                 width: opts.hyphen_width,
                 hyphen: Some(h),
             });
-            // The penalty is itself the separator: leaving `prev_role` set would
+            // The penalty is itself the separator: leaving `prev` set would
             // make the next segment insert a word space between the two halves.
-            prev_role = None;
+            prev = None;
         } else if !trailing.is_empty() {
-            emit_space(&mut p, &mut prev_role, trailing, opts);
+            emit_space(&mut p, &mut prev, trailing, opts);
         }
     }
 
@@ -467,7 +470,7 @@ pub fn build(
 
 /// Emit the item for a run of literal whitespace, and record that the following
 /// box needs no script-recipe glue because this space already separates them.
-fn emit_space(p: &mut Paragraph, prev_role: &mut Option<Role>, ws: &str, opts: &BuildOptions) {
+fn emit_space(p: &mut Paragraph, prev: &mut Option<(Role, char)>, ws: &str, opts: &BuildOptions) {
     if ws.contains('\n') {
         // `\hfil\break`, which is what a forced break is in TeX: the line ends where
         // the author said so and is then left flush at its natural width. Without the
@@ -493,7 +496,7 @@ fn emit_space(p: &mut Paragraph, prev_role: &mut Option<Role>, ws: &str, opts: &
             breakable: true,
         });
     }
-    *prev_role = None;
+    *prev = None;
 }
 
 /// A break the source offers where its author wrote nothing: the line may split
@@ -501,6 +504,21 @@ fn emit_space(p: &mut Paragraph, prev_role: &mut Option<Role>, ws: &str, opts: &
 /// and `:` all reach this arm -- a word space at one of them would set `rubrica-app`
 /// as `rubrica- app`, a character that is in no file.
 const NO_AIR: GlueRecipe = GlueRecipe::fixed(0.0);
+
+/// The glue between two boxes the source runs together.
+///
+/// A full-width mark carries its air inside the glyph, so the script recipe on top of
+/// it is a second gap the author never wrote: `界：对` justified on the page as
+/// `界 ： 对`, and `界、R` as `界、 R`. Which side of a line each mark belongs to is
+/// already UAX #14's answer, not this one's -- `，` and `（` are never offered as a
+/// break at all -- so all a mark changes here is the width.
+fn punct_glue(prev_ch: char, next_ch: char, prev: Role, next: Role, s: &Spacing) -> Item {
+    if is_cjk_punct(prev_ch) || is_cjk_punct(next_ch) {
+        Item::glue(&NO_AIR)
+    } else {
+        Item::glue(glue_recipe_for(prev, next, s))
+    }
+}
 
 fn glue_recipe_for(a: Role, b: Role, s: &Spacing) -> &GlueRecipe {
     match (a, b) {

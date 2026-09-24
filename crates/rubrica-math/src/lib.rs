@@ -401,6 +401,31 @@ mod tests {
         assert!(xs.iter().all(|x| *x > 4.0), "both limits sit beside the sign");
     }
 
+    #[test]
+    fn an_operators_name_is_not_scaled_like_a_display_operator() {
+        // `DisplayOperatorMinHeight` is about the glyph that has a tall variant of its
+        // own. `\lim` and `\max` take their limits above and below in every style, but
+        // they are words, and growing one set `lim` a fifth larger than the formula
+        // around it and gave the line an ascent it had no reason for.
+        let w = |src: &str, display: bool| set(src, 10.0, display, &mut Mock::mathy()).width;
+        assert_eq!(w("\\lim", true), w("\\mathit{lim}", true), "the name keeps its letters' width");
+        assert_eq!(w("\\lim", false), w("\\mathit{lim}", false));
+        assert!(w("\\sum", true) > w("\\sum", false), "a displayed `\\sum` does grow");
+    }
+
+    #[test]
+    fn a_named_function_clears_room_from_its_argument() {
+        // TeX sets `\log` as a `\mathop`, and an operator is spaced from the atom
+        // after it. Without that the source's space is swallowed as it is in TeX, but
+        // the room is not put back, and the page reads `logn` and `limLP(n)`.
+        let w = |src: &str| set(src, 10.0, false, &mut Mock::mathy()).width;
+        let thin = 3.0 / 18.0 * 10.0;
+        assert!((w("\\log n") - w("\\log") - w("n") - thin).abs() < 0.01);
+        assert!((w("x \\sin") - w("x") - w("\\sin") - thin).abs() < 0.01, "and on both sides");
+        // A relation still outranks it: `\log =` is a relation's room, not a thin one.
+        assert!(w("\\log =") - w("\\log") - w("=") > thin);
+    }
+
     /// The one run of `text` and where it was put, at what size: a stacked label and a
     /// framed body are told apart by what they say, since that is all the mock's
     /// uniform arithmetic leaves to go on.

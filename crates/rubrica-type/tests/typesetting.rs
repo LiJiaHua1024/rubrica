@@ -389,6 +389,29 @@ fn closing_punctuation_never_opens_a_line() {
 }
 
 #[test]
+fn a_full_width_mark_carries_its_own_air() {
+    let spacing = Spacing::for_size(SIZE);
+    let wide = |text: &str| -> usize {
+        let mut measure = MonospaceMeasure { size: SIZE, factor: 0.5 };
+        let (para, _) =
+            typeset(text, &spacing, StyleId(0), &[], &BreakOptions::new(500.0), &mut measure);
+        para.items
+            .iter()
+            .filter(|it| matches!(**it, Item::Glue { base, .. } if base > 0.0))
+            .count()
+    };
+    // The control: a Han/Latin join really is handed the quarter em, which is what
+    // makes the three assertions after it say something rather than nothing.
+    assert_eq!(wide("界R对"), 2, "both script joins carry the mixed recipe");
+    // A full-width mark carries its air inside the glyph already, so the script recipe
+    // on top of it was the second gap the author never wrote: `界：对` justified on the
+    // page as `界 ： 对`, and `界、R` as `界、 R`.
+    assert_eq!(wide("界：对"), 0, "a colon is not spaced from its own clause");
+    assert_eq!(wide("界、R"), 0, "nor an enumeration comma from the Latin after it");
+    assert_eq!(wide("12。中"), 0, "nor a full stop from what it closes");
+}
+
+#[test]
 fn hard_break_ends_a_line_and_only_the_final_line_is_ragged() {
     let text = "alpha beta gamma delta epsilon zeta eta theta\none two three four five six seven eight nine ten";
     let (para, plan) = set(text, 20.0 * SIZE);

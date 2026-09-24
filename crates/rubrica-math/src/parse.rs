@@ -1428,18 +1428,38 @@ fn symbol(name: &str) -> Option<&'static str> {
         "bigcap" => "⋂",
         // The function names set as themselves: upright in TeX, and a word rather
         // than a product of its letters, which is why they are atoms of their own.
+        // The first group takes its limits above and below: TeX declares each as a
+        // `\mathop` with `\limits`, and `\limsup`/`\liminf` belong with `\lim` rather
+        // than with `\sin`, because a limit is written under them.
         "lim" => "lim",
+        "limsup" => "limsup",
+        "liminf" => "liminf",
         "max" => "max",
         "min" => "min",
         "sup" => "sup",
         "inf" => "inf",
         "gcd" => "gcd",
+        // The names set upright with a thin space after them. Left out of this list a
+        // function is an ordinary atom, and TeX's room between an operator and its
+        // argument goes missing: `\log n` sets as `logn`.
         "sin" => "sin",
         "cos" => "cos",
         "tan" => "tan",
+        "cot" => "cot",
+        "sec" => "sec",
+        "csc" => "csc",
+        "sinh" => "sinh",
+        "cosh" => "cosh",
+        "tanh" => "tanh",
+        "coth" => "coth",
+        "arcsin" => "arcsin",
+        "arccos" => "arccos",
+        "arctan" => "arctan",
         "log" => "log",
         "ln" => "ln",
+        "lg" => "lg",
         "exp" => "exp",
+        "sgn" => "sgn",
         "det" => "det",
         "arg" => "arg",
         "deg" => "deg",
@@ -1564,7 +1584,14 @@ pub fn big_operator(name: &str) -> Option<(String, Limits)> {
     let text = symbol(name)?;
     let limits = match name {
         "int" | "iint" | "iiint" | "oint" => Limits::Never,
-        "lim" | "max" | "min" | "sup" | "inf" | "gcd" => Limits::Always,
+        "lim" | "limsup" | "liminf" | "max" | "min" | "sup" | "inf" | "gcd" => Limits::Always,
+        // The named functions: an operator for spacing purposes, so the argument that
+        // follows clears a thin space, but one whose limits would be a subscript
+        // written beside it rather than a limit taken under the name.
+        "sin" | "cos" | "tan" | "cot" | "sec" | "csc" | "sinh" | "cosh" | "tanh" | "coth"
+        | "arcsin" | "arccos" | "arctan" | "log" | "ln" | "lg" | "exp" | "sgn" | "det"
+        | "arg" | "deg" | "dim" | "ker" | "Pr" | "hom" | "rank" | "argmax" | "argmin"
+        | "col" | "coker" | "tr" => Limits::Never,
         "sum" | "prod" | "coprod" | "bigcup" | "bigcap" | "bigvee" | "bigwedge"
         | "bigsqcup" | "bigoplus" | "bigotimes" | "bigodot" | "biguplus" => Limits::Default,
         _ => return None,
@@ -2004,6 +2031,7 @@ mod tests {
             "\\infty\\partial\\nabla\\hbar\\ell",
             "\\to\\leftarrow\\Rightarrow\\mapsto",
             "\\sin\\cos\\log\\ln\\exp\\det",
+            "\\limsup\\liminf\\lg\\sec\\csc\\cot\\tanh\\arcsin",
             "\\cdots\\ldots\\vdots",
             "\\lceil x\\rceil",
         ] {
@@ -2011,6 +2039,16 @@ mod tests {
             let out = sexp(&f);
             assert!(!out.contains('\\'), "{src} fell back to literal text: {out}");
         }
+    }
+
+    #[test]
+    fn a_limit_is_taken_under_the_name_that_takes_it() {
+        // `\limsup` is `\lim`'s sibling, so a limit goes under it. `\sin` and `\log`
+        // only look alike: theirs is a subscript written beside the name.
+        assert_eq!(of("\\limsup_{n}"), "(big limsup! n -)");
+        assert_eq!(of("\\liminf_{n}"), "(big liminf! n -)");
+        assert_eq!(of("\\sin_{n}"), "(big sin? n -)");
+        assert_eq!(of("\\log_{n}"), "(big log? n -)");
     }
 
     #[test]

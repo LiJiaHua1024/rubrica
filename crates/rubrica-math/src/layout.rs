@@ -878,7 +878,16 @@ impl Engine<'_> {
         let e = self.ext(op, st.size);
         // A display operator is supposed to be big; a face that has no tall variant
         // simply gets scaled, which is the only thing the constant can ask for.
-        let min_h = self.c(constant::DISPLAY_OPERATOR_MIN_HEIGHT, st.size, 0.0);
+        //
+        // Only the ones with a tall variant of their own, though. `\lim` and `\max`
+        // take their limits above and below in every style, but TeX never grows their
+        // box, and applying the constant to them set the word a fifth larger than the
+        // formula around it and gave the line an ascent it had no reason for.
+        let min_h = if st.display && matches!(limits, Limits::Default) {
+            self.c(constant::DISPLAY_OPERATOR_MIN_HEIGHT, st.size, 0.0)
+        } else {
+            0.0
+        };
         let k = if min_h > 0.0 && e.height() < min_h { min_h / e.height().max(0.01) } else { 1.0 };
         let ob = Mb {
             width: e.advance * k,
@@ -1346,7 +1355,10 @@ fn glue(prev: Class, next: Class, size: Pt) -> Pt {
         (Class::Rel, _) | (_, Class::Rel) => THICK_MU * size,
         (Class::Bin, _) | (_, Class::Bin) => MED_MU * size,
         (Class::Punct, _) => PUNCT_MU * size,
-        (Class::Big, _) => THIN_MU * size,
+        // TeX's `\mathop` is spaced on both sides: `\log` needs the same room before
+        // its argument that `\int_0^1` needs before its integrand, and an argument
+        // written without a space -- `2\log n` -- still clears one.
+        (Class::Big, _) | (_, Class::Big) => THIN_MU * size,
         _ => 0.0,
     }
 }
