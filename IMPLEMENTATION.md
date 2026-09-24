@@ -19,7 +19,7 @@ Scope: implement the complete feature gap review accepted on 2026-09-23. Preserv
 
 - [ ] Targeted pure-function/parser regression tests for each behavior.
 - [ ] Headless display-list/report checks for layout and rendering paths; no desktop automation.
-- [ ] `cargo test --workspace` and `cargo clippy --workspace --all-targets` pass.
+- [x] `cargo test --workspace` and `cargo clippy --workspace --all-targets` pass.
 - [ ] Release build, documentation and requirement-by-requirement audit.
 - [ ] Commit completed feature groups as they are implemented; push at the authorized delivery point.
 
@@ -35,12 +35,14 @@ Scope: implement the complete feature gap review accepted on 2026-09-23. Preserv
 - Added distinct Japanese/Korean families, paragraph-context Han selection and upright East Asian emphasis. Named typography profiles and a Book preset now persist fonts and eight numeric parameters; the modeless native editor saves/applies profiles and can bind TXT documents to a profile. Zoom uses each profile's design size. Application compilation covers this path; window/DPI behavior and application regression execution still require verification. Punctuation policies remain outstanding.
 - Added original-source position maps through front matter removal, TeX delimiter rewriting, definition lists, TXT paragraph merging and table cells. Source-mode transitions and reloads now use these maps; reloads also relocate an unchanged text context when text was inserted above the reader. The 60 document tests pass, including source mapping regressions; all 40 typesetting tests passed in the previous validation run. Latest workspace Clippy and diff checks pass. Application execution remains unverified.
 - The user stopped new feature work and requested only completion of the existing commits. Existing code was split into document parsing/source maps, Korean line breaking, decoding/preferences, typography profiles, and native reader integration commits. No further feature development is authorized until the user resumes it.
+- Fixed the defects visible on `theorem_ledger.md`: `\limsup`/`\liminf` and the remaining named functions (`\lg`, `\sec`, `\cot`, `\tanh`, `\arcsin`, …) are now operators rather than literal backslash text; TeX's thin space between an operator name and its argument is applied, so `\log n` no longer sets as `logn`; and `\lim` is no longer grown by `DisplayOperatorMinHeight`, which had set the word a fifth larger than its formula and gave the line an ascent it did not need. Full-width CJK punctuation is no longer given the script's quarter-em glue on top of the air the glyph already carries, which is what spread `LP(n) ≤ 80 ： 早期` across the page. Three regression tests cover the math and one the glue; `notes.md`, `reading.md`, `defs.md` and `rtl.md` report byte-identical before and after.
+- Repaired the three `rubrica-app` menu tests that the feature commits left failing: they assumed the outline was the menu's only group and that the newline groups were still top level. `contents` now finds its group by label, the radio-group count walks the whole tree, and `Read Source\tCtrl+3` is counted as the row that legitimately prints its key. `cargo test --workspace` is now 301 passed, 0 failed.
 
 ## Remaining work when implementation resumes
 
 - Multiple tabs, preview/pinned behavior, workspace tree, recent-document UI and complete session restoration.
 - Selectable-text PDF and whole-document PNG export, including pagination policies and export controls.
 - Large TXT chapter-window layout and navigation across lazily laid-out chapters.
-- Punctuation compression/hanging and overflow interactions for formulas, tables and full-size images.
+- Hanging punctuation (moving a full-width closing mark into the margin) and overflow interactions for formulas, tables and full-size images.
 - Settings-window DPI behavior, source mapping edge cases and application/runtime regression verification.
 - Final release build, documentation, full requirement audit and delivery push.

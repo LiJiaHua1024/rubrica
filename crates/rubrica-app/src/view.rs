@@ -6103,13 +6103,34 @@ mod tests {
             .collect()
     }
 
+    /// Every row a state gives, at any depth. A radio group that moved one level down
+    /// still owes the same promise about which of its rows is the one in use, so the
+    /// promise is counted over the whole tree rather than over the top menu.
+    fn all_rows(s: &MenuState) -> Vec<(Command, bool, bool)> {
+        fn walk(rows: Vec<MenuRow>, out: &mut Vec<(Command, bool, bool)>) {
+            for r in rows {
+                match r {
+                    MenuRow::Row { cmd, enabled, checked, .. } => out.push((cmd, enabled, checked)),
+                    MenuRow::Sub { items, .. } => walk(items, out),
+                    MenuRow::Gap => {}
+                }
+            }
+        }
+        let mut out = Vec::new();
+        walk(menu_items(s), &mut out);
+        out
+    }
+
     /// The contents of the `Contents` submenu, with their labels -- which is the one thing
     /// about an outline row the rest of these helpers throw away.
+    ///
+    /// Found by name rather than as the first group on the menu, because the menu has
+    /// several now and `Typography` sits beside it whether or not the page has headings.
     fn contents(s: &MenuState) -> Vec<(Command, String)> {
         menu_items(s)
             .into_iter()
             .find_map(|r| match r {
-                MenuRow::Sub { items, .. } => Some(items),
+                MenuRow::Sub { label: "Contents", items } => Some(items),
                 _ => None,
             })
             .unwrap_or_default()
@@ -6170,10 +6191,15 @@ mod tests {
         );
         // The document came from nowhere, so there is nothing on disk to read again.
         assert_eq!(got.last().map(|(c, e, _)| (c.clone(), *e)), Some((Command::Reload, false)));
+        // The newline groups are counted over the whole tree, because they live in a
+        // submenu: a radio group one level down still has to mark exactly one row.
         assert_eq!(
-            got.iter().filter(|(cmd, _, c)| *c && matches!(cmd,
-                Command::Palette(_) | Command::FollowSystem | Command::Face(_) | Command::Measure(_)
-                | Command::DefaultLineBreaks(_) | Command::DocumentLineBreaks(_))).count(),
+            all_rows(&empty)
+                .iter()
+                .filter(|(cmd, _, c)| *c && matches!(cmd,
+                    Command::Palette(_) | Command::FollowSystem | Command::Face(_) | Command::Measure(_)
+                    | Command::DefaultLineBreaks(_) | Command::DocumentLineBreaks(_)))
+                .count(),
             5,
             "palette, face, measure, newline default and document override each select one row"
         );
@@ -6322,7 +6348,7 @@ mod tests {
         let s = state(false, None, None, false, true);
         assert!(contents(&s).is_empty(), "nothing to name");
         assert!(
-            !menu_items(&s).iter().any(|r| matches!(r, MenuRow::Sub { .. })),
+            !menu_items(&s).iter().any(|r| matches!(r, MenuRow::Sub { label: "Contents", .. })),
             "no group offering an empty rectangle"
         );
 
@@ -6362,6 +6388,7 @@ mod tests {
             (&Command::ZoomIn, "Increase Text\tCtrl++"),
             (&Command::ZoomOut, "Decrease Text\tCtrl+-"),
             (&Command::ZoomReset, "Actual Size\tCtrl+0"),
+            (&Command::SourceView, "Read Source\tCtrl+3"),
             (&Command::OpenFile, "Open\u{2026}\tCtrl+O"),
             (&Command::Reload, "Reload\tCtrl+R"),
         ] {
@@ -6371,7 +6398,7 @@ mod tests {
         // Nothing else may claim one. `Ctrl`+`D` picks whichever palette is not on the
         // screen rather than the row it would be printed on, and the bracket keys step
         // the measure instead of settling on the rung they are next to.
-        assert_eq!(got.iter().filter(|(_, l)| l.contains('\t')).count(), 10);
+        assert_eq!(got.iter().filter(|(_, l)| l.contains('\t')).count(), 11);
     }
 
     #[test]
