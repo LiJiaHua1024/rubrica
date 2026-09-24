@@ -80,7 +80,9 @@ pub fn scan_chapters(path: &Path, requested: Encoding, detect: bool) -> io::Resu
     let length = file.metadata()?.len() as usize;
     let mut reader = BufReader::new(file);
     let mut chapters: Vec<Chapter> = Vec::new();
+    let mut decoded_starts: Vec<usize> = Vec::new();
     let mut offset = 0usize;
+    let mut decoded_offset = 0usize;
     let mut blank_separated = false;
     let mut first = true;
     loop {
@@ -100,17 +102,21 @@ pub fn scan_chapters(path: &Path, requested: Encoding, detect: bool) -> io::Resu
                 last.range.end = offset;
             } else if offset > 0 {
                 chapters.push(Chapter { title: "Beginning".into(), range: 0..offset });
+                decoded_starts.push(0);
             }
             chapters.push(Chapter { title: decoded.text.trim().into(), range: offset..length });
+            decoded_starts.push(decoded_offset);
         }
         offset += read;
+        decoded_offset += decoded.text.len();
     }
     if chapters.is_empty() {
         chapters.push(Chapter { title: "Beginning".into(), range: 0..length });
+        decoded_starts.push(0);
     } else if let Some(last) = chapters.last_mut() {
         last.range.end = length;
     }
-    Ok(ChapterIndex::from_parts(chapters, blank_separated))
+    Ok(ChapterIndex::from_parts_with_offsets(chapters, decoded_starts, blank_separated))
 }
 
 fn read_range(path: &Path, range: std::ops::Range<usize>, encoding: Encoding) -> io::Result<Decoded> {
@@ -315,6 +321,36 @@ mod tests {
             assert_eq!(decoded.text.trim(), "Chapter 2\nlast line");
             assert_eq!(document.blocks[0].text, "Chapter 2");
             assert_eq!(document.blocks[0].sources[0].source, index.range(1).start);
+        }
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn legacy_chapter_source_positions_use_decoded_utf8_offsets() {
+        let path = std::env::temp_dir().join(format!("rubrica-legacy-offsets-{}.txt", std::process::id()));
+        for (encoding, body) in [
+            (Encoding::Gb18030, [0xd6, 0xd0]),
+            (Encoding::Big5, [0xa4, 0xa4]),
+            (Encoding::ShiftJis, [0x93, 0xfa]),
+            (Encoding::EucKr, [0xc7, 0xd1]),
+        ] {
+            let mut bytes = b"Prologue\n".to_vec();
+            bytes.extend_from_slice(&body);
+            bytes.extend_from_slice(b"\nChapter 2\nlast line\n");
+            std::fs::write(&path, &bytes).expect("write encoded fixture");
+            let index = scan_chapters(&path, encoding, true).expect("index encoded fixture");
+            let (decoded, document) = read_chapter(
+                &path,
+                &index,
+                1,
+                encoding,
+                TextOptions { chapters: true, ..Default::default() },
+            ).expect("read encoded fixture");
+            assert_eq!(index.range(1).start, 12, "{encoding:?}");
+            assert_eq!(index.decoded_start(1), 13, "{encoding:?}");
+            assert_eq!(index.chapter_at(index.decoded_start(1)), 1, "{encoding:?}");
+            assert_eq!(decoded.text.lines().next(), Some("Chapter 2"));
+            assert_eq!(document.blocks[0].sources[0].source, 13, "{encoding:?}");
         }
         let _ = std::fs::remove_file(path);
     }

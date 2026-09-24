@@ -79,13 +79,17 @@ pub fn chapters(source: &str, detect: bool) -> Vec<Chapter> {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ChapterIndex {
     chapters: Vec<Chapter>,
+    decoded_starts: Vec<usize>,
     blank_separated: bool,
 }
 
 impl ChapterIndex {
     pub fn new(source: &str, detect: bool) -> Self {
+        let chapters = chapters(source, detect);
+        let decoded_starts = chapters.iter().map(|chapter| chapter.range.start).collect();
         Self {
-            chapters: chapters(source, detect),
+            chapters,
+            decoded_starts,
             blank_separated: source.lines().any(|line| line.trim().is_empty()),
         }
     }
@@ -99,7 +103,9 @@ impl ChapterIndex {
         let length = file.metadata()?.len() as usize;
         let mut reader = BufReader::new(file);
         let mut chapters: Vec<Chapter> = Vec::new();
+        let mut decoded_starts: Vec<usize> = Vec::new();
         let mut offset = 0usize;
+        let mut decoded_offset = 0usize;
         let mut blank_separated = false;
         let mut first = true;
         loop {
@@ -118,17 +124,21 @@ impl ChapterIndex {
                     last.range.end = offset;
                 } else if offset > 0 {
                     chapters.push(Chapter { title: "Beginning".into(), range: 0..offset });
+                    decoded_starts.push(0);
                 }
                 chapters.push(Chapter { title: text.trim().into(), range: offset..length });
+                decoded_starts.push(decoded_offset);
             }
             offset += read;
+            decoded_offset += text.len();
         }
         if chapters.is_empty() {
             chapters.push(Chapter { title: "Beginning".into(), range: 0..length });
+            decoded_starts.push(0);
         } else if let Some(last) = chapters.last_mut() {
             last.range.end = length;
         }
-        Ok(Self { chapters, blank_separated })
+        Ok(Self { chapters, decoded_starts, blank_separated })
     }
 
     pub fn chapters(&self) -> &[Chapter] {
@@ -136,17 +146,35 @@ impl ChapterIndex {
     }
 
     pub fn from_parts(chapters: Vec<Chapter>, blank_separated: bool) -> Self {
-        Self { chapters, blank_separated }
+        let decoded_starts = chapters.iter().map(|chapter| chapter.range.start).collect();
+        Self::from_parts_with_offsets(chapters, decoded_starts, blank_separated)
+    }
+
+    /// Build an index whose byte ranges address the encoded file while the parallel
+    /// offsets address the decoded UTF-8 source used by layout and source maps.
+    pub fn from_parts_with_offsets(
+        chapters: Vec<Chapter>,
+        decoded_starts: Vec<usize>,
+        blank_separated: bool,
+    ) -> Self {
+        let mut decoded_starts = decoded_starts;
+        decoded_starts.resize(chapters.len(), 0);
+        Self { chapters, decoded_starts, blank_separated }
     }
 
     pub fn range(&self, index: usize) -> Range<usize> {
         self.chapters.get(index).map(|chapter| chapter.range.clone()).unwrap_or(0..0)
     }
 
+    /// The chapter's start in the decoded UTF-8 source, rather than in the encoded file.
+    pub fn decoded_start(&self, index: usize) -> usize {
+        self.decoded_starts.get(index).copied().unwrap_or(0)
+    }
+
     pub fn chapter_at(&self, source_byte: usize) -> usize {
-        self.chapters
+        self.decoded_starts
             .iter()
-            .rposition(|chapter| chapter.range.start <= source_byte)
+            .rposition(|start| *start <= source_byte)
             .unwrap_or(0)
     }
 
@@ -159,7 +187,8 @@ impl ChapterIndex {
         file.read_exact(&mut bytes)?;
         let source = std::str::from_utf8(&bytes)
             .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "TXT window is not UTF-8"))?;
-        Ok(parse_range(source, 0..source.len(), options, self.blank_separated, range.start))
+        let source = source.strip_prefix('\u{feff}').unwrap_or(source);
+        Ok(parse_range(source, 0..source.len(), options, self.blank_separated, self.decoded_start(index)))
     }
 
     pub fn read_source_window(&self, path: &Path, index: usize) -> io::Result<String> {
@@ -169,14 +198,13 @@ impl ChapterIndex {
         file.seek(SeekFrom::Start(range.start as u64))?;
         let mut bytes = vec![0; range.end.saturating_sub(range.start)];
         file.read_exact(&mut bytes)?;
-        Ok(std::str::from_utf8(&bytes)
-            .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "TXT window is not UTF-8"))?
-            .to_string())
+        let source = std::str::from_utf8(&bytes)
+            .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "TXT window is not UTF-8"))?;
+        Ok(source.strip_prefix('\u{feff}').unwrap_or(source).to_string())
     }
 
     pub fn window_text(&self, source: &str, index: usize, options: TextOptions) -> Document {
-        let range = self.range(index);
-        parse_range(source, 0..source.len(), options, self.blank_separated, range.start)
+        parse_range(source, 0..source.len(), options, self.blank_separated, self.decoded_start(index))
     }
 
     pub fn window(&self, source: &str, index: usize, options: TextOptions) -> Document {
@@ -185,7 +213,13 @@ impl ChapterIndex {
             .get(index)
             .map(|chapter| chapter.range.clone())
             .unwrap_or(0..source.len());
-        parse_window(source, range, options)
+        let start = self.decoded_starts
+            .get(index)
+            .copied()
+            .unwrap_or(range.start)
+            .min(source.len());
+        let end = range.end.min(source.len()).max(start);
+        parse_range(source, start..end, options, self.blank_separated, start)
     }
 }
 
@@ -323,6 +357,20 @@ mod tests {
         assert_eq!(doc.blocks[0].text, "第一章");
         assert_eq!(doc.blocks[0].sources[0].source, index.chapters()[1].range.start);
         assert!(doc.blocks.iter().all(|block| block.text != "结尾"));
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn a_bom_does_not_shift_decoded_source_positions() {
+        let path = std::env::temp_dir().join(format!("rubrica-plain-bom-{}.txt", std::process::id()));
+        let mut bytes = vec![0xef, 0xbb, 0xbf];
+        bytes.extend_from_slice("序言\n开头\n\n第一章\n正文\n".as_bytes());
+        std::fs::write(&path, bytes).expect("write BOM fixture");
+        let index = ChapterIndex::from_path(&path, true).expect("index BOM file");
+        assert_eq!(index.decoded_start(1), "序言\n开头\n\n".len());
+        let doc = index.read_window(&path, 1, TextOptions { paragraphs: ParagraphRule::Lines, chapters: true })
+            .expect("read BOM window");
+        assert_eq!(doc.blocks[0].sources[0].source, index.decoded_start(1));
         let _ = std::fs::remove_file(path);
     }
 
