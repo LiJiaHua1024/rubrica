@@ -32,7 +32,7 @@ use windows::Win32::Graphics::Direct2D::{
     D2D1_BITMAP_INTERPOLATION_MODE_LINEAR, D2D1_FACTORY_TYPE_SINGLE_THREADED, D2D1_FEATURE_LEVEL_DEFAULT,
     D2D1_HWND_RENDER_TARGET_PROPERTIES, D2D1_PRESENT_OPTIONS_NONE, D2D1_RENDER_TARGET_PROPERTIES,
     D2D1_RENDER_TARGET_TYPE_DEFAULT, D2D1_RENDER_TARGET_USAGE_NONE,
-    D2D1_TEXT_ANTIALIAS_MODE_CLEARTYPE, ID2D1Factory, ID2D1HwndRenderTarget, ID2D1RenderTarget,
+    D2D1_DRAW_TEXT_OPTIONS_CLIP, D2D1_TEXT_ANTIALIAS_MODE_CLEARTYPE, ID2D1Factory, ID2D1HwndRenderTarget, ID2D1RenderTarget,
     ID2D1SolidColorBrush, D2D1CreateFactory,
 };
 use windows::Win32::Graphics::Imaging::{
@@ -42,6 +42,7 @@ use windows::Win32::Graphics::Imaging::{
 use windows::Win32::System::Com::{CoCreateInstance, CLSCTX_INPROC_SERVER};
 use windows::Win32::Graphics::DirectWrite::{
     DWRITE_GLYPH_OFFSET, DWRITE_GLYPH_RUN, DWRITE_MEASURING_MODE_NATURAL, IDWriteFontFace,
+    IDWriteTextFormat,
 };
 use windows::Win32::Graphics::Dwm::{DwmSetWindowAttribute, DWMWA_USE_IMMERSIVE_DARK_MODE};
 use windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_B8G8R8A8_UNORM;
@@ -110,6 +111,8 @@ const HYPHEN_RANGE: std::ops::Range<usize> = 0..1;
 
 /// Page margin, in ems of the body size.
 const MARGIN_EM: Pt = 2.6;
+/// Height of the visible document-tab strip, in device-independent pixels.
+const TABBAR_H: Pt = 32.0;
 /// Wheel notch travel, in points.
 const WHEEL_STEP: Pt = 72.0;
 /// Appearance is polled, not pushed; see `WM_TIMER` below.
@@ -893,6 +896,7 @@ pub struct View {
     /// answer or the next timer tick would undo it.
     dark_override: Option<bool>,
     brushes: HashMap<ColorRole, ID2D1SolidColorBrush>,
+    tab_format: Option<IDWriteTextFormat>,
     /// The targets of the current layout, and where each note begins.
     hotspots: Vec<Hot>,
     note_tops: Vec<Pt>,
@@ -1785,6 +1789,7 @@ pub fn run(source: String, path: Option<PathBuf>) -> Result<()> {
         palette: Palette::of(dark),
         dark_override: saved.dark,
         brushes: HashMap::new(),
+        tab_format: None,
         hotspots: Vec::new(),
         wide_regions: Vec::new(),
         preview: None,
@@ -2604,6 +2609,10 @@ impl View {
                 // the release; a press anywhere else belongs to the text.
                 let x = ((lp.0 & 0xFFFF) as i16) as f32;
                 let y = ((lp.0 >> 16) as i16) as f32;
+                if let Some(id) = self.tab_at(x, y) {
+                    self.switch_to_tab(id, hwnd);
+                    return LRESULT(0);
+                }
                 // A press on the bar is not a press on the page. The box itself is a window
                 // and never reaches this handler; this is the strip of paint around it,
                 // under which the reader's own text is still lying.
@@ -2720,7 +2729,8 @@ impl View {
     /// window's client origin. The rectangles are stored against the top of the
     /// document, so the only translation the test needs is the scroll.
     fn hot_at(&self, x: f32, y: f32) -> Option<usize> {
-        let y = y + scroll_dip(self.scroll, self.dpi);
+        if y < TABBAR_H { return None; }
+        let y = y - TABBAR_H + scroll_dip(self.scroll, self.dpi);
         self.hotspots
             .iter()
             .position(|h| {
@@ -2751,7 +2761,8 @@ impl View {
     }
 
     fn wide_region_at(&self, x: f32, y: f32) -> Option<usize> {
-        let y = y + scroll_dip(self.scroll, self.dpi);
+        if y < TABBAR_H { return None; }
+        let y = y - TABBAR_H + scroll_dip(self.scroll, self.dpi);
         self.wide_regions.iter().position(|r| {
             let shift = self
                 .wide_active
@@ -2765,6 +2776,7 @@ impl View {
     /// The place in the page's text under a pointer position given in client pixels,
     /// translated into document pixels the same way [`View::hot_at`] translates.
     fn caret_under(&self, x: f32, y: f32) -> Caret {
+        let y = (y - TABBAR_H).max(0.0);
         let shift = self.shift_at(x, y + scroll_dip(self.scroll, self.dpi));
         caret_at(&self.sel_index, x - shift, y + scroll_dip(self.scroll, self.dpi))
     }
@@ -3416,7 +3428,7 @@ impl View {
 
     /// A relayout can leave the offset past the end of a document that has just grown.
     fn clamp_scroll(&mut self) {
-        let view_h = self.client_h / scale_of(self.dpi);
+        let view_h = (self.client_h - TABBAR_H).max(1.0) / scale_of(self.dpi);
         let max = (self.content_h + self.theme.base - view_h).max(0.0);
         self.scroll = self.scroll.clamp(0.0, max);
     }
@@ -4548,26 +4560,86 @@ impl View {
     /// Client-space height of one text page, in points: most of a window, so a reader
     /// keeps a little of the previous screen as a place to come back to.
     fn page_height(&self) -> Pt {
-        self.client_h / scale_of(self.dpi) * 0.85
+        (self.client_h - TABBAR_H).max(1.0) / scale_of(self.dpi) * 0.85
     }
 
     fn thumb_rect(&self) -> Option<(f32, f32, f32, f32)> {
-        thumb_rect(self.content_h, self.client_w, self.client_h, self.scroll, self.dpi)
+        thumb_rect(self.content_h, self.client_w, (self.client_h - TABBAR_H).max(1.0), self.scroll, self.dpi)
+    }
+
+    fn tab_layout(&self) -> Vec<(TabId, f32, f32)> {
+        let count = self.workspace.tabs.items().len();
+        if count == 0 { return Vec::new(); }
+        let width = (self.client_w / count as f32).clamp(72.0, 240.0);
+        let left = (self.client_w - width * count as f32) * 0.5;
+        self.workspace
+            .tabs
+            .items()
+            .iter()
+            .enumerate()
+            .map(|(i, tab)| (tab.id, left + i as f32 * width, width))
+            .collect()
+    }
+
+    fn tab_at(&self, x: f32, y: f32) -> Option<TabId> {
+        if y >= TABBAR_H { return None; }
+        self.tab_layout().into_iter().find(|(_, left, width)| x >= *left && x < *left + *width).map(|(id, _, _)| id)
+    }
+
+    unsafe fn draw_tab_bar(&mut self, target: &ID2D1RenderTarget) {
+        let tabs: Vec<_> = self.workspace.tabs.items().iter().map(|tab| {
+            let title = match &tab.document {
+                DocumentRef::Sample => "Sample".to_string(),
+                DocumentRef::File(file) => file.path.file_name()
+                    .map(|name| name.to_string_lossy().into_owned())
+                    .unwrap_or_else(|| file.path.to_string_lossy().into_owned()),
+            };
+            (tab.id, title)
+        }).collect();
+        if tabs.is_empty() { return; }
+        let layout = self.tab_layout();
+        let surface = self.brushes.get(&ColorRole::Surface).cloned();
+        let muted = self.brushes.get(&ColorRole::Muted).cloned();
+        let accent = self.brushes.get(&ColorRole::Accent).cloned();
+        if let Some(brush) = surface.as_ref() {
+            let rect = D2D_RECT_F { left: 0.0, top: 0.0, right: self.client_w, bottom: TABBAR_H };
+            target.FillRectangle(&rect, brush);
+        }
+        if self.tab_format.is_none() {
+            self.tab_format = self.font.text_format("Segoe UI", 12.0).ok();
+        }
+        let format = self.tab_format.clone();
+        let active = self.workspace.tabs.active().id;
+        for ((id, title), (_, x, width)) in tabs.into_iter().zip(layout) {
+            let rect = D2D_RECT_F { left: x + 2.0, top: 3.0, right: x + width - 2.0, bottom: TABBAR_H - 3.0 };
+            let fill = if id == active { accent.as_ref() } else { muted.as_ref() };
+            if let Some(brush) = fill {
+                target.FillRectangle(&rect, brush);
+            }
+            if let (Some(format), Some(brush)) = (format.as_ref(), muted.as_ref()) {
+                let text = utf16(&title);
+                let text_rect = D2D_RECT_F { left: x + 4.0, top: 4.0, right: x + width - 4.0, bottom: TABBAR_H - 4.0 };
+                target.DrawText(&text, format, &text_rect, brush, D2D1_DRAW_TEXT_OPTIONS_CLIP, DWRITE_MEASURING_MODE_NATURAL);
+            }
+        }
     }
 
     fn thumb_hit(&self, x: f32, y: f32) -> bool {
         match self.thumb_rect() {
-            Some((tx, ty, _tw, th)) => x >= tx - 8.0 && y >= ty - 8.0 && y <= ty + th + 8.0,
+            Some((tx, ty, _tw, th)) => {
+                let ty = ty + TABBAR_H;
+                x >= tx - 8.0 && y >= ty - 8.0 && y <= ty + th + 8.0
+            }
             None => false,
         }
     }
 
     fn scroll_to_thumb(&mut self, pointer_y: f32) {
         let Some((_, _, _, th)) = self.thumb_rect() else { return };
-        let view = self.client_h;
+        let view = (self.client_h - TABBAR_H).max(1.0);
         let max_scroll = (self.content_h - view / scale_of(self.dpi)).max(0.0);
         let room = (view - th).max(1.0);
-        let centre = (pointer_y - th * 0.5).clamp(0.0, room);
+        let centre = (pointer_y - TABBAR_H - th * 0.5).clamp(0.0, room);
         self.scroll = centre / room * max_scroll;
     }
 
@@ -4839,14 +4911,15 @@ impl View {
             target.BeginDraw();
             let bg = d2d(self.palette.bg);
             target.Clear(Some(&bg));
+            self.draw_tab_bar(&target);
             // The display list is measured from the top of the document, so the whole of
             // it is lifted by the scroll here and nowhere else: a wheel tick costs one
             // subtraction at paint time rather than a relayout of the page, which is the
             // difference between scrolling at the frame rate and building the page again.
-            let up = scroll_dip(self.scroll, self.dpi);
+            let up = scroll_dip(self.scroll, self.dpi) + TABBAR_H;
             // The document's two edges that the window is over.
             let top = up;
-            let bottom = up + self.client_h;
+            let bottom = up + (self.client_h - TABBAR_H).max(1.0);
             for op in self.ops.iter() {
                 match op {
                     Op::Rect { x, y, w, h, color } => {
@@ -4985,7 +5058,7 @@ impl View {
             // sign the reader has that the edge of the window can be gripped.
             if let Some((tx, ty, tw, th)) = self.thumb_rect() {
                 if let Some(brush) = self.brushes.get(&ColorRole::Muted).cloned() {
-                    let r = D2D_RECT_F { left: tx, top: ty, right: tx + tw, bottom: ty + th };
+                    let r = D2D_RECT_F { left: tx, top: ty + TABBAR_H, right: tx + tw, bottom: ty + th + TABBAR_H };
                     target.FillRectangle(&r, &brush);
                 }
             }

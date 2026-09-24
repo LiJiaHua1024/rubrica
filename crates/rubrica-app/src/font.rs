@@ -24,11 +24,12 @@ mod analysis;
 use windows::Win32::Graphics::DirectWrite::{
     DWRITE_FACTORY_TYPE_SHARED, DWRITE_FONT_METRICS, DWRITE_FONT_STRETCH_NORMAL,
     DWRITE_FONT_STYLE_ITALIC, DWRITE_FONT_STYLE_NORMAL, DWRITE_FONT_WEIGHT,
+    DWRITE_PARAGRAPH_ALIGNMENT_CENTER, DWRITE_TEXT_ALIGNMENT_CENTER,
     DWRITE_GLYPH_METRICS, DWRITE_GLYPH_OFFSET, DWRITE_SCRIPT_ANALYSIS,
     DWRITE_SHAPING_GLYPH_PROPERTIES,
     DWRITE_SHAPING_TEXT_PROPERTIES, DWriteCreateFactory,
     IDWriteFactory, IDWriteFontCollection, IDWriteFont, IDWriteFontFace, IDWriteFontFile,
-    IDWriteTextAnalyzer,
+    IDWriteTextAnalyzer, IDWriteTextFormat,
 };
 
 #[derive(Clone)]
@@ -579,6 +580,26 @@ impl FontEngine {
 
     pub fn face_family(&self, idx: usize) -> String {
         self.faces.borrow().get(idx).map(|f| f.family.clone()).unwrap_or_default()
+    }
+
+    pub(crate) fn text_format(&self, family: &str, size: f32) -> WResult<IDWriteTextFormat> {
+        let family = utf16(family);
+        let locale = utf16("en-us");
+        unsafe {
+            let factory: IDWriteFactory = DWriteCreateFactory(DWRITE_FACTORY_TYPE_SHARED)?;
+            let format = factory.CreateTextFormat(
+                PCWSTR(family.as_ptr()),
+                Some(&self.collection),
+                DWRITE_FONT_WEIGHT(400),
+                DWRITE_FONT_STYLE_NORMAL,
+                DWRITE_FONT_STRETCH_NORMAL,
+                size,
+                PCWSTR(locale.as_ptr()),
+            )?;
+            format.SetTextAlignment(DWRITE_TEXT_ALIGNMENT_CENTER)?;
+            format.SetParagraphAlignment(DWRITE_PARAGRAPH_ALIGNMENT_CENTER)?;
+            Ok(format)
+        }
     }
 
     /// Where a strike through this face's text belongs: `(height above the baseline,
