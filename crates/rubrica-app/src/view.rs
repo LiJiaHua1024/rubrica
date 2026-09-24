@@ -1032,6 +1032,15 @@ fn scroll_dip(scroll: Pt, dpi: f32) -> Pt {
     scroll * scale_of(dpi)
 }
 
+/// The document y represented by a pointer y in the reader's client area.
+///
+/// This is the inverse of the document transform used while painting: the page is drawn
+/// below the tab strip and lifted by the scroll, so both offsets are added back here.
+#[inline]
+fn document_y(client_y: f32, scroll: Pt, dpi: f32) -> f32 {
+    client_y + scroll_dip(scroll, dpi) + TABBAR_H
+}
+
 /// One rung of the measure ladder either way, stopping at both ends rather than
 /// wrapping: a key pressed past the widest column the page can be set to should do
 /// nothing, not silently teleport the reader to the narrow one.
@@ -2822,7 +2831,7 @@ impl View {
     fn hot_at(&self, x: f32, y: f32) -> Option<usize> {
         if y < TABBAR_H || x < self.content_dx() { return None; }
         let x = x - self.content_dx();
-        let y = y - TABBAR_H + scroll_dip(self.scroll, self.dpi);
+        let y = document_y(y, self.scroll, self.dpi);
         self.hotspots
             .iter()
             .position(|h| {
@@ -2855,7 +2864,7 @@ impl View {
     fn wide_region_at(&self, x: f32, y: f32) -> Option<usize> {
         if y < TABBAR_H || x < self.content_dx() { return None; }
         let x = x - self.content_dx();
-        let y = y - TABBAR_H + scroll_dip(self.scroll, self.dpi);
+        let y = document_y(y, self.scroll, self.dpi);
         self.wide_regions.iter().position(|r| {
             let shift = self
                 .wide_active
@@ -2870,9 +2879,9 @@ impl View {
     /// translated into document pixels the same way [`View::hot_at`] translates.
     fn caret_under(&self, x: f32, y: f32) -> Caret {
         let x = (x - self.content_dx()).max(0.0);
-        let y = (y - TABBAR_H).max(0.0);
-        let shift = self.shift_at(x, y + scroll_dip(self.scroll, self.dpi));
-        caret_at(&self.sel_index, x - shift, y + scroll_dip(self.scroll, self.dpi))
+        let y = document_y(y, self.scroll, self.dpi);
+        let shift = self.shift_at(x, y);
+        caret_at(&self.sel_index, x - shift, y)
     }
 
     /// Scroll the page when a drag is held against its top or bottom edge, so a
@@ -7438,17 +7447,29 @@ mod tests {
 
     #[test]
     fn a_line_is_painted_where_a_click_is_asked_of_it() {
-        // Two ends of one subtraction: paint lifts the display list by `scroll_dip`, and a
-        // pointer's own y is pushed down by the same number to be asked of that list. A
-        // sign flipped on either end is a page that shows one paragraph and marks the one
+        // Two ends of one transform: paint lifts the display list by the scroll and the
+        // tab strip, and a pointer's y gains both back before the list is asked. A sign
+        // flipped on either end is a page that shows one paragraph and marks the one
         // above it -- and nothing outside a window would notice, so the round trip is the
         // check.
-        let sel = vec![sel_line("first", 0.0, Join::None), sel_line("second", 32.0, Join::None)];
-        let up = scroll_dip(20.0, DPI);
-        let painted = sel[1].y - up;
-        assert!(painted > 0.0 && painted < 800.0, "the scrolled line is still on screen: {painted}");
-        let c = caret_at(&sel, 0.0, painted + up + 1.0);
-        assert_eq!(c.line, 1, "a pointer at the painted place reaches the painted line");
+        let sel = vec![
+            sel_line("first", 0.0, Join::None),
+            sel_line("second", 180.0, Join::None),
+        ];
+        for scroll in [0.0, 20.0] {
+            let up = scroll_dip(scroll, DPI) + TABBAR_H;
+            let painted_y = sel[1].y - up;
+            assert!(
+                (TABBAR_H..800.0).contains(&painted_y),
+                "the line is below the tab strip and still on screen: {painted_y}"
+            );
+            let under = document_y(painted_y, scroll, DPI);
+            let c = caret_at(&sel, 0.0, under + 1.0);
+            assert_eq!(
+                c.line, 1,
+                "a pointer at the painted place reaches the painted line"
+            );
+        }
     }
 
     #[test]
