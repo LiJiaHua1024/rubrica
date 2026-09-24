@@ -84,6 +84,20 @@ pub fn decode(bytes: &[u8], requested: Encoding) -> std::io::Result<Decoded> {
     Ok(Decoded { text, encoding, guessed })
 }
 
+/// Convert a decoded UTF-8 byte offset into a 1-based line and Unicode-scalar column.
+/// The offset is clamped to the nearest character boundary, which is what an editor
+/// command needs when a remembered place came from an older layout.
+pub fn line_column(source: &str, byte: usize) -> (usize, usize) {
+    let mut at = byte.min(source.len());
+    while at > 0 && !source.is_char_boundary(at) {
+        at -= 1;
+    }
+    let before = &source[..at];
+    let line = before.bytes().filter(|b| *b == b'\n').count() + 1;
+    let column = before.rsplit_once('\n').map_or(before, |(_, tail)| tail).chars().count() + 1;
+    (line, column)
+}
+
 pub fn is_plain(path: Option<&Path>) -> bool {
     path.and_then(Path::extension).and_then(|s| s.to_str()).is_some_and(|e| e.eq_ignore_ascii_case("txt"))
 }
@@ -136,6 +150,17 @@ mod tests {
         assert_eq!(cn.encoding, Encoding::Gb18030);
         assert!(decode(&[0xff], Encoding::Utf8).is_err());
         assert!(decode(&[0xff, 0xfe, 0x01], Encoding::Auto).is_err());
+    }
+
+    #[test]
+    fn source_offsets_become_stable_editor_line_columns() {
+        let source = "first\n中文😀\nlast";
+        assert_eq!(line_column(source, 0), (1, 1));
+        assert_eq!(line_column(source, 6), (2, 1));
+        assert_eq!(line_column(source, 10), (2, 3));
+        assert_eq!(line_column(source, 999), (3, 5));
+        assert_eq!(line_column("😀x", 1), (1, 1));
+        assert_eq!(line_column("😀x", 4), (1, 2));
     }
 
     #[test]

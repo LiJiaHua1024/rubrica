@@ -17,8 +17,8 @@ use rubrica_type::units::Pt;
 use rubrica_type::{BreakOptions, Hyphenation, typeset, typeset_hyphenated};
 use printpdf::{
     Color as PdfColor, Codepoint, FontId as PdfFontId, Op as PdfOp, ParsedFont, PdfDocument,
-    PdfFontHandle, PdfPage, PdfSaveOptions, Point as PdfPoint, RawImage, Rect as PdfRect,
-    DictItem,
+    PdfFontHandle, PdfPage, PdfSaveOptions, PdfParseErrorSeverity, Point as PdfPoint, RawImage,
+    Rect as PdfRect, DictItem,
     Rgb as PdfRgb, TextItem, TextMatrix as PdfTextMatrix, XObjectTransform,
 };
 use windows::core::{w, BOOL, Interface, PCWSTR};
@@ -3047,8 +3047,18 @@ impl View {
             Command::OpenEditor => {
                 if let Some(path) = self.path.as_deref() {
                     use std::os::windows::process::CommandExt;
-                    if let Err(error) = std::process::Command::new(crate::settings::editor())
-                        .arg(path).creation_flags(0x08000000).spawn()
+                    let editor = crate::settings::editor();
+                    let byte = self.caret_source().or_else(|| self.source_anchor()).unwrap_or(0);
+                    let (line, column) = reading::line_column(&self.source, byte);
+                    let name = std::path::Path::new(&editor)
+                        .file_stem().and_then(|s| s.to_str()).unwrap_or("").to_ascii_lowercase();
+                    let target = if matches!(name.as_str(), "code" | "code-insiders" | "subl" | "sublime_text" | "devenv") {
+                        format!("{}:{}:{}", path.display(), line, column)
+                    } else {
+                        path.to_string_lossy().into_owned()
+                    };
+                    if let Err(error) = std::process::Command::new(editor)
+                        .arg(target).creation_flags(0x08000000).spawn()
                     { show_error(hwnd, &format!("Cannot start editor: {error}")); }
                 }
             }
@@ -3150,6 +3160,14 @@ impl View {
         if self.scroll == 0.0 { return Some(0); }
         self.sel_index.iter().find(|line| line.y + line.h > self.scroll * scale_of(self.dpi))
             .and_then(|line| line.source.as_ref().map(|range| range.start))
+    }
+
+    fn caret_source(&self) -> Option<usize> {
+        let caret = self.caret?;
+        let line = self.sel_index.get(caret.line)?;
+        let start = line.source.as_ref()?.start;
+        let prefix = line.chars.iter().take(caret.ch).map(char::len_utf8).sum::<usize>();
+        Some(start + prefix)
     }
 
     fn restore_source(&mut self, byte: usize) {
@@ -6115,7 +6133,7 @@ fn write_pdf(
     height: Pt,
     dark: bool,
 ) -> Result<()> {
-    if width <= 0.0 || height <= 0.0 {
+    if !width.is_finite() || !height.is_finite() || width <= 0.0 || height <= 0.0 {
         return Err("PDF page size must be positive".into());
     }
     let page_starts = pdf_page_starts(page, height);
@@ -6227,6 +6245,7 @@ fn write_pdf(
                             let mut font_warnings = Vec::new();
                             let Some(parsed) = ParsedFont::from_bytes(&bytes, face_index, &mut font_warnings)
                             else {
+                                missing_font_faces.push(run.family.clone());
                                 continue;
                             };
                             let id = pdf.add_font(&parsed);
@@ -6292,6 +6311,9 @@ fn write_pdf(
         &PdfSaveOptions { optimize: true, subset_fonts: true, ..PdfSaveOptions::default() },
         &mut warnings,
     );
+    if let Some(error) = warnings.iter().find(|warning| warning.severity == PdfParseErrorSeverity::Error) {
+        return Err(format!("PDF serialization failed: {}", error.msg).into());
+    }
     std::fs::write(output, bytes).map_err(|e| format!("cannot write {}: {e}", output.display()))?;
     Ok(())
 }
