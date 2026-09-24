@@ -8,7 +8,7 @@ Scope: implement the complete feature gap review accepted on 2026-09-23. Preserv
 - [x] East Asian typography: punctuation compression and hanging policies, narrow-column ragged fallback, language-aware Japanese and Korean font selection and Korean keep-all breaking.
 - [x] Export: whole-document PNG with width/scale controls and native selectable-text PDF; pagination with heading/paragraph protection, repeated table headers and continued footnotes; reading typography and colours retained.
 - [x] Multiple documents: tabs with preview/pinned behavior, workspace tree, recent documents, per-document positions and restored session. (The tree is menu-driven and shallow.)
-- [x] Source reading: syntax-coloured source view preserving the original text, position-preserving reload and mode switching; configurable external editor command. (The editor executable is configurable; line/column targets are enabled for common editor launchers.)
+- [x] Source reading: syntax-coloured source view preserving the original text, position-preserving reload and mode switching; configurable external editor command. (The editor executable and `{file}`/`{line}`/`{column}` argument template are configurable.)
 - [x] Plain text: literal TXT parsing, automatic/manual encoding selection, paragraph rules, chapter outline, chapter-window layout for large files, previous/next document navigation and TXT typography binding. (The complete decoded file is still read before the active chapter is laid out.)
 - [x] Wide content: overflow indication and horizontal formula panning/full preview, wide tables extending into available margins, and full-size image viewing. (A separate width-control UI is not present.)
 - [x] Markdown single-newline policy: global preference and per-document override, preserved across reload.
@@ -20,7 +20,7 @@ Scope: implement the complete feature gap review accepted on 2026-09-23. Preserv
 - [ ] Targeted pure-function/parser regression tests for each behavior.
 - [ ] Headless display-list/report checks for layout and rendering paths; no desktop automation.
 - [x] `cargo test --workspace` and `cargo clippy --workspace --all-targets` pass.
-- [ ] Release build, documentation and requirement-by-requirement audit.
+- [x] Release build, documentation and requirement-by-requirement audit.
 - [ ] Commit completed feature groups as they are implemented; push at the authorized delivery point.
 
 ## Work log
