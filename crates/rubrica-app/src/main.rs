@@ -35,11 +35,30 @@ fn main() -> Result<()> {
         let width = flag(&argv, "--width").unwrap_or(1080.0);
         let dpi = flag(&argv, "--dpi").unwrap_or(96.0);
         let zoom = theme::Zoom::nearest_percent(flag(&argv, "--zoom").unwrap_or(100.0));
-        let face = flag(&argv, "--face").unwrap_or(0.0) as usize;
-        let measure = flag(&argv, "--measure").unwrap_or(theme::Measure::DESIGN as f32) as usize;
+        let face = flag(&argv, "--face").map(|v| v as usize).unwrap_or(usize::MAX);
+        let measure = flag(&argv, "--measure").map(|v| v as usize).unwrap_or(usize::MAX);
         let file = positional(&argv);
         let (path, source) = load(file.as_deref())?;
-        let shown = path.and_then(|p| p.to_str().map(str::to_string));
+        let shown = path.as_deref().and_then(|p| p.to_str());
+        let preferences = path.as_deref().map(settings::document).unwrap_or_default();
+        let plain = if argv.iter().any(|a| a == "--plain") {
+            Some(true)
+        } else if argv.iter().any(|a| a == "--markdown") {
+            Some(false)
+        } else {
+            preferences.plain
+        };
+        let profile = text_flag(&argv, "--profile").or_else(|| {
+            path.as_deref().map(|p| {
+                let prefs = settings::document(p);
+                crate::profiles::selected(
+                    prefs.plain.unwrap_or_else(|| reading::is_plain(Some(p))),
+                )
+            })
+        });
+        let keep_line_breaks = argv.iter().any(|a| a == "--keep-line-breaks")
+            || preferences.line_breaks.unwrap_or_else(settings::keep_line_breaks);
+        let source_view = argv.iter().any(|a| a == "--source") || preferences.source;
         let hyphenate = !argv.iter().any(|a| a == "--no-hyphenate");
         let options = report::Options {
             width,
@@ -49,12 +68,13 @@ fn main() -> Result<()> {
             face,
             measure,
             shapes: argv.iter().any(|a| a == "--shapes"),
-            keep_line_breaks: argv.iter().any(|a| a == "--keep-line-breaks"),
-            source_view: argv.iter().any(|a| a == "--source"),
-            plain: if argv.iter().any(|a| a == "--plain") { Some(true) }
-                else if argv.iter().any(|a| a == "--markdown") { Some(false) } else { None },
+            keep_line_breaks,
+            source_view,
+            plain,
+            text_options: preferences.text,
+            profile,
         };
-        return report::report(&source, shown.as_deref(), &options);
+        return report::report(&source, shown, &options);
     }
     // A file named on the command line is what the reader asked for, and one that cannot
     // be read is worth stopping on. Nothing named is not a request for the sample,
@@ -93,7 +113,12 @@ fn reopen() -> (Option<PathBuf>, String) {
 fn load(file: Option<&str>) -> Result<(Option<PathBuf>, String)> {
     match file {
         None => Ok((None, sample::DOCUMENT.to_string())),
-        Some(p) => match reading::read(std::path::Path::new(p), reading::Encoding::Auto).map(|d| d.text) {
+        Some(p) => match reading::read(
+            std::path::Path::new(p),
+            settings::document(std::path::Path::new(p)).encoding,
+        )
+        .map(|d| d.text)
+        {
             Ok(s) => Ok((Some(PathBuf::from(p)), s)),
             Err(e) => Err(format!("cannot read {p}: {e}").into()),
         },
@@ -102,7 +127,7 @@ fn load(file: Option<&str>) -> Result<(Option<PathBuf>, String)> {
 
 /// The document path, skipping the values that belong to `--width` and friends.
 fn positional(argv: &[String]) -> Option<String> {
-    const TAKES_VALUE: [&str; 5] = ["--width", "--dpi", "--zoom", "--face", "--measure"];
+    const TAKES_VALUE: [&str; 6] = ["--width", "--dpi", "--zoom", "--face", "--measure", "--profile"];
     let mut skip_next = false;
     for a in argv.iter().skip(1) {
         if skip_next {
@@ -119,6 +144,14 @@ fn positional(argv: &[String]) -> Option<String> {
         return Some(a.clone());
     }
     None
+}
+
+fn text_flag(argv: &[String], name: &str) -> Option<String> {
+    argv.iter()
+        .position(|a| a == name)
+        .and_then(|i| argv.get(i + 1))
+        .filter(|value| !value.starts_with("--"))
+        .cloned()
 }
 
 fn flag(argv: &[String], name: &str) -> Option<f32> {

@@ -28,6 +28,7 @@ struct Line {
 /// The window the document would have been drawn in, and the reader's own choices about
 /// the page. One argument because they are one kind of thing -- every field is a number
 /// a live window would have supplied, and none of them says anything about the text.
+#[derive(Clone)]
 pub struct Options {
     pub width: f32,
     pub dpi: f32,
@@ -41,6 +42,8 @@ pub struct Options {
     pub keep_line_breaks: bool,
     pub source_view: bool,
     pub plain: Option<bool>,
+    pub text_options: rubrica_doc::plain::TextOptions,
+    pub profile: Option<String>,
 }
 
 pub fn report(source: &str, path: Option<&str>, o: &Options) -> Result<()> {
@@ -57,7 +60,9 @@ pub fn report(source: &str, path: Option<&str>, o: &Options) -> Result<()> {
         keep_line_breaks,
         source_view,
         plain,
-    } = *o;
+        text_options,
+        profile,
+    } = o.clone();
     let mut font =
         FontEngine::new().map_err(|e| -> Error { format!("DirectWrite: {e}").into() })?;
     if !font.probe() {
@@ -65,12 +70,23 @@ pub fn report(source: &str, path: Option<&str>, o: &Options) -> Result<()> {
     }
     let mut theme = Theme::default();
     theme.set_zoom(zoom);
-    theme.set_face(face);
-    theme.set_measure(measure);
-    let doc = if source_view { rubrica_doc::Document::source(source) }
-        else if plain.unwrap_or_else(|| crate::reading::is_plain(path.map(std::path::Path::new))) {
-            rubrica_doc::plain::parse(source, rubrica_doc::plain::TextOptions::default())
-        } else { rubrica_doc::Document::parse_with(source, rubrica_doc::ParseOptions { keep_line_breaks }) };
+    if let Some(name) = profile.as_deref() {
+        crate::profiles::load(name).apply(&mut theme);
+    }
+    if TextFace::ALL.get(face).is_some() {
+        theme.set_face(face);
+    }
+    if Measure::ALL.get(measure).is_some() {
+        theme.set_measure(measure);
+    }
+    let plain = plain.unwrap_or_else(|| crate::reading::is_plain(path.map(std::path::Path::new)));
+    let doc = if source_view {
+        rubrica_doc::Document::source(source)
+    } else if plain {
+        rubrica_doc::plain::parse(source, text_options)
+    } else {
+        rubrica_doc::Document::parse_with(source, rubrica_doc::ParseOptions { keep_line_breaks })
+    };
     // No render target exists here, so figures are measured from their files
     // through WIC but not decoded to bitmaps -- enough to lay out and report.
     let _ = unsafe {
@@ -151,7 +167,7 @@ pub fn report(source: &str, path: Option<&str>, o: &Options) -> Result<()> {
     // Which pairing the page is set in, and which ones this machine could have set it in
     // -- so a face that came back as somebody else's substitute is visible here rather
     // than only on a screen.
-    let f = &TextFace::ALL[theme.face];
+    let f = TextFace::ALL.get(theme.face).unwrap_or(&TextFace::ALL[0]);
     let installed: Vec<&str> = TextFace::ALL
         .iter()
         .filter(|t| crate::view::face_drawable(&font, t))
@@ -161,7 +177,7 @@ pub fn report(source: &str, path: Option<&str>, o: &Options) -> Result<()> {
     println!("             installed: {}", installed.join(", "));
     println!(
         "measure    : {}  {:.1}pt ({:.1} em)  = {col_dip:.1}dip at {dpi}dpi",
-        Measure::ALL[theme.measure].label,
+        Measure::ALL.get(theme.measure).map_or("Custom", |m| m.label),
         column_pt,
         column_pt / theme.base
     );
