@@ -5904,6 +5904,37 @@ fn pdf_point(x: f32, y: f32) -> PdfPoint {
     PdfPoint { x: printpdf::Pt(x), y: printpdf::Pt(y) }
 }
 
+fn pdf_page_starts(page: &Page, page_height: Pt) -> Vec<Pt> {
+    if page_height <= 0.0 {
+        return vec![0.0];
+    }
+    let mut starts = vec![0.0];
+    let mut limit = page_height;
+    for line in &page.sel {
+        if line.y + line.h <= limit + 0.01 {
+            continue;
+        }
+        let previous = *starts.last().unwrap_or(&0.0);
+        if line.y <= previous + 0.01 {
+            continue;
+        }
+        // A heading is kept with the lines that follow it. If the first line that
+        // crosses the nominal boundary is a heading (or follows one closely), move the
+        // break back to that heading instead of leaving it as the last line on a page.
+        let heading = page
+            .anchor_tops
+            .iter()
+            .copied()
+            .find(|top| *top >= previous && *top < line.y && line.y - *top <= line.h * 2.0);
+        let start = heading.unwrap_or(line.y);
+        if start > previous + 0.01 {
+            starts.push(start);
+            limit = start + page_height;
+        }
+    }
+    starts
+}
+
 fn pdf_glyph_x(base: f32, advances: &[f32], level: u8, index: usize) -> f32 {
     let before: f32 = advances.iter().take(index).sum();
     let after: f32 = advances.iter().take(index + 1).sum();
@@ -5952,8 +5983,7 @@ fn write_pdf(
     if width <= 0.0 || height <= 0.0 {
         return Err("PDF page size must be positive".into());
     }
-    let content_h = page.height.max(1.0);
-    let page_count = (content_h / height).ceil().max(1.0) as usize;
+    let page_starts = pdf_page_starts(page, height);
     let mut pdf = PdfDocument::new(output.file_stem().and_then(|s| s.to_str()).unwrap_or("Rubrica document"));
     let mut warnings = Vec::new();
     let mut fonts: HashMap<usize, PdfFontId> = HashMap::new();
@@ -5961,8 +5991,7 @@ fn write_pdf(
     let mut images: HashMap<PathBuf, (printpdf::XObjectId, usize, usize)> = HashMap::new();
     let palette = Palette::of(dark);
 
-    for page_index in 0..page_count {
-        let top = page_index as Pt * height;
+    for top in page_starts.iter().copied() {
         let mut ops = vec![
             PdfOp::SetFillColor { col: pdf_rgb(palette.bg) },
             PdfOp::DrawRectangle {
@@ -6520,6 +6549,34 @@ mod tests {
         assert!(painted > 0.0 && painted < 800.0, "the scrolled line is still on screen: {painted}");
         let c = caret_at(&sel, 0.0, painted + up + 1.0);
         assert_eq!(c.line, 1, "a pointer at the painted place reaches the painted line");
+    }
+
+    #[test]
+    fn pdf_page_starts_break_at_lines_and_keep_a_heading_with_following_text() {
+        let line = |y, h| SelLine {
+            source: None,
+            y,
+            h,
+            join: Join::None,
+            chars: Vec::new(),
+            copies: Vec::new(),
+            xs: Vec::new(),
+            ends: Vec::new(),
+        };
+        let page = Page {
+            ops: Vec::new(),
+            height: 1_000.0,
+            column: 400.0,
+            left: 0.0,
+            hotspots: Vec::new(),
+            note_tops: Vec::new(),
+            anchor_tops: vec![780.0],
+            sel: vec![line(700.0, 30.0), line(780.0, 30.0), line(820.0, 30.0), line(900.0, 30.0)],
+            hyphens: HyphenCount::default(),
+            wide_regions: Vec::new(),
+        };
+        let starts = pdf_page_starts(&page, 800.0);
+        assert_eq!(starts, vec![0.0, 780.0]);
     }
 
     #[test]
