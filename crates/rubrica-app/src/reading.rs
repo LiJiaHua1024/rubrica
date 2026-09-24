@@ -157,7 +157,8 @@ mod tests {
         let source = "first\n中文😀\nlast";
         assert_eq!(line_column(source, 0), (1, 1));
         assert_eq!(line_column(source, 6), (2, 1));
-        assert_eq!(line_column(source, 10), (2, 3));
+        assert_eq!(line_column(source, 10), (2, 2));
+        assert_eq!(line_column(source, 12), (2, 3));
         assert_eq!(line_column(source, 999), (3, 5));
         assert_eq!(line_column("😀x", 1), (1, 1));
         assert_eq!(line_column("😀x", 4), (1, 2));

@@ -23,6 +23,7 @@ mod sample;
 mod settings;
 mod tables;
 mod theme;
+mod tree;
 mod view;
 
 use std::path::PathBuf;

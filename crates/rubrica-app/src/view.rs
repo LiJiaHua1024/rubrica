@@ -98,6 +98,7 @@ use crate::font::{cjk_char, FaceRequest, FontEngine, GlyphRun, ObjectBox, Style 
 use crate::hyphen::Hyphenator;
 use crate::images::ImageStore;
 use crate::math::MathStore;
+use crate::tree::{self, Entry as TreeEntry, EntryKind as TreeEntryKind};
 use rubrica_workspace::{DocumentRef, FileRef, TabId, TabKind, Workspace};
 use crate::theme::{ColorRole, Leading, Measure, Role, TextFace, Theme, Zoom};
 use crate::{Error, Result};
@@ -898,6 +899,7 @@ pub struct View {
     /// Open documents and their stable tab identities. The window keeps one materialized
     /// document at a time; this is the authority for what can be switched to next.
     workspace: Workspace,
+    tree: Vec<TreeEntry>,
     /// What the file behind the page looked like when this text was read out of it: how
     /// long it was, and when it was last written. See [`Stamp`] and `WM_TIMER`.
     stamp: Option<Stamp>,
@@ -1199,6 +1201,8 @@ enum Command {
     FollowSystem,
     OpenFile,
     OpenRecent(usize),
+    OpenTree(usize),
+    TreeDirectory(usize),
     ActivateTab(TabId),
     CloseTab(TabId),
     PinTab(TabId),
@@ -1256,6 +1260,7 @@ struct MenuState {
     chapter: usize,
     tabs: Vec<(TabId, String, bool)>,
     recent: Vec<(usize, String)>,
+    tree: Vec<(usize, String, bool)>,
     encoding: Encoding,
     encoding_notice: Option<String>,
     previous: bool,
@@ -1368,6 +1373,13 @@ fn menu_items(s: &MenuState) -> Vec<MenuRow> {
             .map(|(i, path)| row(Command::OpenRecent(*i), path.clone(), true))
             .collect();
         v.push(MenuRow::Sub { label: "Recent documents", items: recent_items });
+    }
+    if !s.tree.is_empty() {
+        let tree_items = s.tree.iter().map(|(i, name, is_dir)| {
+            let command = if *is_dir { Command::TreeDirectory(*i) } else { Command::OpenTree(*i) };
+            row(command, name.clone(), true)
+        }).collect();
+        v.push(MenuRow::Sub { label: "Workspace tree", items: tree_items });
     }
     v.insert(v.len() - 3, MenuRow::Sub { label: "Single newlines", items: vec![
         check(Command::DefaultLineBreaks(false), "Default: Merge into paragraph", !s.keep_line_breaks),
@@ -1674,6 +1686,9 @@ pub fn run(source: String, path: Option<PathBuf>) -> Result<()> {
     if let Some(path) = path.as_ref() {
         workspace.open_file(View::workspace_file(path), TabKind::Pinned);
     }
+    let tree = path.as_deref().and_then(Path::parent)
+        .map(|root| tree::scan(root, 2))
+        .unwrap_or_default();
 
     let mut view = Box::new(View {
         d2d,
@@ -1718,6 +1733,7 @@ pub fn run(source: String, path: Option<PathBuf>) -> Result<()> {
         dpi: 96.0,
         path,
         workspace,
+        tree,
         stamp,
         history: History::default(),
         dragging: false,
@@ -2889,6 +2905,9 @@ impl View {
                 .filter(|(_, file)| file.path.is_file())
                 .map(|(i, file)| (i, file.path.to_string_lossy().into_owned()))
                 .collect(),
+            tree: self.tree.iter().enumerate()
+                .map(|(i, entry)| (i, format!("{}{}", "  ".repeat(entry.depth), entry.name), entry.kind == TreeEntryKind::Directory))
+                .collect(),
             encoding: self.encoding,
             encoding_notice: Some(format!("{}{}", self.decoded_encoding.label(),
                 if self.encoding_guessed { " (detected by guess; choose if incorrect)" } else { "" })),
@@ -2980,6 +2999,16 @@ impl View {
             Command::OpenRecent(index) => {
                 if let Some(path) = self.workspace.recent.items().get(index).map(|file| file.path.clone()) {
                     self.load_document(&path, hwnd);
+                }
+            }
+            Command::OpenTree(index) => {
+                if let Some(path) = self.tree.get(index).map(|entry| entry.path.clone()) {
+                    self.load_document(&path, hwnd);
+                }
+            }
+            Command::TreeDirectory(index) => {
+                if let Some(path) = self.tree.get(index).map(|entry| entry.path.clone()) {
+                    self.tree = tree::scan(&path, 2);
                 }
             }
             Command::ActivateTab(id) => { self.switch_to_tab(id, hwnd); }
@@ -3166,7 +3195,7 @@ impl View {
         let caret = self.caret?;
         let line = self.sel_index.get(caret.line)?;
         let start = line.source.as_ref()?.start;
-        let prefix = line.chars.iter().take(caret.ch).map(char::len_utf8).sum::<usize>();
+        let prefix = line.chars.iter().take(caret.ch).map(|c| c.len_utf8()).sum::<usize>();
         Some(start + prefix)
     }
 
@@ -4598,6 +4627,9 @@ impl View {
         if let Some(path) = self.path.as_deref() {
             self.workspace.open_file(Self::workspace_file(path), TabKind::Pinned);
         }
+        self.tree = self.path.as_deref().and_then(Path::parent)
+            .map(|root| tree::scan(root, 2))
+            .unwrap_or_default();
         let profile = crate::profiles::selected(self.plain_override.unwrap_or_else(|| reading::is_plain(self.path.as_deref())));
         if profile != self.profile {
             crate::profiles::load(&profile).apply(&mut self.theme);
