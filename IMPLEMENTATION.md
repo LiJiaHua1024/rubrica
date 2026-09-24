@@ -7,7 +7,7 @@ Scope: implement the complete feature gap review accepted on 2026-09-23. Preserv
 - [x] Typography profiles: editable Latin, Chinese, Japanese, Korean, emphasis, code and math fonts; font size, leading, tracking, paragraph spacing and indentation; named saved profiles and a book preset; settings UI and persistence.
 - [x] East Asian typography: punctuation compression and hanging policies, narrow-column ragged fallback, language-aware Japanese and Korean font selection and Korean keep-all breaking.
 - [x] Export: whole-document PNG with width/scale controls and native selectable-text PDF; pagination with heading/paragraph protection, repeated table headers and continued footnotes; reading typography and colours retained.
-- [x] Multiple documents: tabs with preview/pinned behavior, workspace tree, recent documents, per-document positions and restored session. (The tree is menu-driven and shallow.)
+- [x] Multiple documents: tabs with preview/pinned behavior, a visible tab strip, workspace tree, recent documents, per-document positions and restored session. (The tree remains a shallow menu-driven navigation surface.)
 - [x] Source reading: syntax-coloured source view preserving the original text, position-preserving reload and mode switching; configurable external editor command. (The editor executable and `{file}`/`{line}`/`{column}` argument template are configurable.)
 - [x] Plain text: literal TXT parsing, automatic/manual encoding selection, paragraph rules, chapter outline, chapter-window layout for large files, previous/next document navigation and TXT typography binding. (The complete decoded file is still read before the active chapter is laid out.)
 - [x] Wide content: overflow indication and horizontal formula panning/full preview, wide tables extending into available margins, and full-size image viewing; the table margin-borrow control is available in the text menu.
@@ -40,7 +40,7 @@ Scope: implement the complete feature gap review accepted on 2026-09-23. Preserv
 
 ## Remaining work when implementation resumes
 
-- A docked, resizable workspace tree and visible tab strip; the current tree/tabs are menu-driven.
+- A docked, resizable workspace tree; the current tree is a shallow menu-driven navigation surface.
 - Streaming/background decoding for very large TXT files; chapter windows currently reduce layout work after the full decoded source is available.
 - Settings-window DPI behavior, source mapping edge cases and application/runtime regression verification.
 - Final release build, documentation, full requirement audit and delivery push.
