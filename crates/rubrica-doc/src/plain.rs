@@ -69,10 +69,64 @@ pub fn chapters(source: &str, detect: bool) -> Vec<Chapter> {
     out
 }
 
-pub fn parse(source: &str, options: TextOptions) -> Document {
+/// A cheap, reusable index of chapter boundaries in a decoded TXT document.
+///
+/// The index stores only byte ranges and titles. Building it scans line boundaries;
+/// laying out a window then parses just that range, while source positions remain
+/// relative to the complete book rather than to the slice handed to the layout code.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ChapterIndex {
+    chapters: Vec<Chapter>,
+}
+
+impl ChapterIndex {
+    pub fn new(source: &str, detect: bool) -> Self {
+        Self { chapters: chapters(source, detect) }
+    }
+
+    pub fn chapters(&self) -> &[Chapter] {
+        &self.chapters
+    }
+
+    pub fn chapter_at(&self, source_byte: usize) -> usize {
+        self.chapters
+            .iter()
+            .rposition(|chapter| chapter.range.start <= source_byte)
+            .unwrap_or(0)
+    }
+
+    pub fn window(&self, source: &str, index: usize, options: TextOptions) -> Document {
+        let range = self
+            .chapters
+            .get(index)
+            .map(|chapter| chapter.range.clone())
+            .unwrap_or(0..source.len());
+        parse_window(source, range, options)
+    }
+}
+
+/// Parse only one source window while preserving byte positions in the full source.
+///
+/// `range` must lie on UTF-8 character boundaries. Chapter ranges produced by
+/// [`chapters`] always do; callers with arbitrary offsets get a safe empty document
+/// rather than a panic in the middle of a book.
+pub fn parse_window(source: &str, range: Range<usize>, options: TextOptions) -> Document {
+    let start = range.start.min(source.len());
+    let end = range.end.clamp(start, source.len());
+    if !source.is_char_boundary(start) || !source.is_char_boundary(end) {
+        return Document { blocks: Vec::new(), footnotes: Vec::new() };
+    }
+    parse_range(source, start..end, options, source.lines().any(|line| line.trim().is_empty()))
+}
+
+fn parse_range(
+    source: &str,
+    range: Range<usize>,
+    options: TextOptions,
+    blank_separated: bool,
+) -> Document {
     // Short lines in a book with blank paragraph separators are likely hard-wrapped.
     // With no blank separators each source line is a paragraph, as in novel TXT files.
-    let blank_separated = source.lines().any(|l| l.trim().is_empty());
     let merge = match options.paragraphs {
         ParagraphRule::Auto => blank_separated,
         ParagraphRule::Lines => false,
@@ -88,32 +142,50 @@ pub fn parse(source: &str, options: TextOptions) -> Document {
             blocks.push(block);
         }
     };
-    let mut offset = 0;
-    for raw in source.split_inclusive('\n') {
-        let start = offset + raw.len() - raw.trim_start().len();
+    let mut offset = range.start;
+    for raw in source[range.clone()].split_inclusive('\n') {
+        let line_start = offset;
+        let content_start = offset + raw.len() - raw.trim_start().len();
         offset += raw.len();
         let line = raw.trim();
-        if line.is_empty() { flush(&mut paragraph, &mut sources, &mut blocks); continue; }
+        if line.is_empty() {
+            flush(&mut paragraph, &mut sources, &mut blocks);
+            continue;
+        }
         if options.chapters && is_chapter(line) {
             flush(&mut paragraph, &mut sources, &mut blocks);
             let mut block = Block::literal(BlockKind::Heading(1), line.into());
-            block.sources[0].source = start;
+            if let Some(first) = block.sources.first_mut() {
+                first.source = content_start;
+            }
             blocks.push(block);
         } else {
             if !paragraph.is_empty() {
                 let cjk = |c: char| matches!(c as u32, 0x3000..=0x9fff | 0xff00..=0xffef);
                 if !paragraph.chars().last().is_some_and(cjk) || !line.chars().next().is_some_and(cjk) {
-                    sources.push(SourceSpan { range: paragraph.len()..paragraph.len() + 1, source: start.saturating_sub(1) });
+                    sources.push(SourceSpan {
+                        range: paragraph.len()..paragraph.len() + 1,
+                        source: line_start.saturating_sub(1),
+                    });
                     paragraph.push(' ');
                 }
             }
-            sources.push(SourceSpan { range: paragraph.len()..paragraph.len() + line.len(), source: start });
+            sources.push(SourceSpan {
+                range: paragraph.len()..paragraph.len() + line.len(),
+                source: content_start,
+            });
             paragraph.push_str(line);
-            if !merge { flush(&mut paragraph, &mut sources, &mut blocks); }
+            if !merge {
+                flush(&mut paragraph, &mut sources, &mut blocks);
+            }
         }
     }
     flush(&mut paragraph, &mut sources, &mut blocks);
     Document { blocks, footnotes: Vec::new() }
+}
+
+pub fn parse(source: &str, options: TextOptions) -> Document {
+    parse_window(source, 0..source.len(), options)
 }
 
 #[cfg(test)]
@@ -131,6 +203,34 @@ mod tests {
         assert_eq!(doc.blocks[1].text, "# not Markdown");
         assert!(doc.blocks.iter().all(|b| b.objects.is_empty() && b.list.is_none()));
         assert_eq!(doc.blocks.iter().filter(|b| matches!(b.kind, BlockKind::Heading(_))).count(), 3);
+    }
+
+    #[test]
+    fn a_chapter_window_keeps_global_source_positions() {
+        let src = "前言\n开头\n\n第一章\n正文\n换行\n\n第二章\n结尾";
+        let index = ChapterIndex::new(src, true);
+        assert_eq!(index.chapters().len(), 3);
+        let chapter = index.chapters()[1].clone();
+        let doc = index.window(src, 1, TextOptions { paragraphs: ParagraphRule::Lines, chapters: true });
+        assert_eq!(doc.blocks[0].text, "第一章");
+        assert_eq!(doc.blocks[0].sources[0].source, chapter.range.start);
+        assert_eq!(doc.blocks[1].text, "正文");
+        assert_eq!(doc.blocks[2].text, "换行");
+        assert!(doc.blocks.iter().all(|block| block.text != "结尾"));
+    }
+
+    #[test]
+    fn automatic_paragraphs_use_the_whole_book_not_only_the_window() {
+        let src = "序言\n第一行\n第二行\n\n第一章\n窗内第一行\n窗内第二行";
+        let index = ChapterIndex::new(src, true);
+        let doc = index.window(src, 1, TextOptions::default());
+        assert_eq!(doc.blocks[1].text, "窗内第一行窗内第二行");
+    }
+
+    #[test]
+    fn an_invalid_window_is_empty_instead_of_panicking() {
+        let doc = parse_window("中文", 1..2, TextOptions::default());
+        assert!(doc.blocks.is_empty());
     }
 
     #[test]
