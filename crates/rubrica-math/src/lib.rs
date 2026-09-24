@@ -229,6 +229,29 @@ mod tests {
     }
 
     #[test]
+    fn a_fraction_aligns_its_main_letters_across_scripts() {
+        for display in [true, false] {
+            let f = set("\\frac{1}{n^2}=\\frac{\\pi^2}{6}", 10.0, display, &mut Mock::mathy());
+            let (one_x, _, _) = one(&f, "1");
+            let (n_x, _, _) = one(&f, "n");
+            let (pi_x, _, _) = one(&f, "π");
+            let (six_x, _, _) = one(&f, "6");
+
+            // A script is attached to its base; it must not become the centre of
+            // the fraction's whole numerator or denominator box.
+            near(one_x, n_x, "the left fraction's 1 and n share a column");
+            near(pi_x, six_x, "the right fraction's pi and 6 share a column");
+
+            let bars = rules(&f);
+            assert_eq!(bars.len(), 2, "both fractions keep their bar");
+            for (_, width, thickness) in bars {
+                near(width, 9.75, "the bar covers the scripted half without extra width");
+                near(thickness, 1.0, "the bar keeps its MATH-table thickness");
+            }
+        }
+    }
+
+    #[test]
     fn display_and_text_styles_shift_a_fraction_differently() {
         let mut m = Mock::mathy();
         let d = set("\\frac{a}{b}", 10.0, true, &mut m);

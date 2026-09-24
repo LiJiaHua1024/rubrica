@@ -187,11 +187,21 @@ struct Mb {
     ascent: Pt,
     descent: Pt,
     italic: Pt,
+    /// The horizontal centre of the content that should align when this box is
+    /// stacked with another. A scripted box inherits its base's centre rather than
+    /// the centre of the whole box, whose extra width is the script's overhang.
+    align_x: Pt,
 }
 
 impl Mb {
     fn of(e: &Extents) -> Mb {
-        Mb { width: e.advance, ascent: e.ascent, descent: e.descent, italic: e.italic }
+        Mb {
+            width: e.advance,
+            ascent: e.ascent,
+            descent: e.descent,
+            italic: e.italic,
+            align_x: e.advance / 2.0,
+        }
     }
     fn height(&self) -> Pt {
         self.ascent + self.descent
@@ -282,10 +292,13 @@ impl Engine<'_> {
                 }
                 self.lay(body, s)
             }
-            Node::Space(mu) => (
-                Vec::new(),
-                Mb { width: *mu as Pt / 18.0 * st.size, ..Default::default() },
-            ),
+            Node::Space(mu) => {
+                let width = *mu as Pt / 18.0 * st.size;
+                (
+                    Vec::new(),
+                    Mb { width, align_x: width / 2.0, ..Default::default() },
+                )
+            },
         }
     }
 
@@ -304,6 +317,7 @@ impl Engine<'_> {
         let mut out: Vec<Shape> = Vec::new();
         let mut b = Mb::default();
         let mut prev: Option<Class> = None;
+        let mut child_align = 0.0;
         for n in nodes {
             let cls = Class::of(n);
             if let Some(p) = prev {
@@ -318,8 +332,12 @@ impl Engine<'_> {
             b.ascent = b.ascent.max(cb.ascent);
             b.descent = b.descent.max(cb.descent);
             b.italic = cb.italic;
+            child_align = cb.align_x;
             prev = Some(cls);
         }
+        // A group around one construct must not turn that construct's scripted
+        // anchor back into the centre of the whole group.
+        b.align_x = if nodes.len() == 1 { child_align } else { b.width / 2.0 };
         (out, b)
     }
 
@@ -446,14 +464,31 @@ impl Engine<'_> {
         // Denominator ink top (d - den.ascent) must stay below the bar's bottom.
         let d = down.max(bar_bottom + gap_d + d_b.ascent);
 
-        let width = n_b.ink_width().max(d_b.ink_width());
+        // Align the main content of the two halves, not the complete boxes: a
+        // superscript belongs to its base, but it must not pull the base away from
+        // the column it shares with the other half. Taking the larger anchor keeps
+        // both translations non-negative, so the bar starts at the same origin and
+        // only grows when a translated half genuinely needs the extra room.
+        let align = n_b.align_x.max(d_b.align_x);
+        let num_dx = align - n_b.align_x;
+        let den_dx = align - d_b.align_x;
+        let width = (num_dx + n_b.ink_width()).max(den_dx + d_b.ink_width());
         let mut out = Vec::new();
-        translate(&snum, (width - n_b.ink_width()) / 2.0, -u, &mut out);
-        translate(&sden, (width - d_b.ink_width()) / 2.0, d, &mut out);
+        translate(&snum, num_dx, -u, &mut out);
+        translate(&sden, den_dx, d, &mut out);
         if has_bar {
             out.push(Shape::Rule { x: 0.0, y: bar_top, width, thickness: rule });
         }
-        (out, Mb { width, ascent: u + n_b.ascent, descent: d + d_b.descent, italic: 0.0 })
+        (
+            out,
+            Mb {
+                width,
+                ascent: u + n_b.ascent,
+                descent: d + d_b.descent,
+                italic: 0.0,
+                align_x: align,
+            },
+        )
     }
 
     /// A grid of cells: each column as wide as its widest cell, each row far enough
@@ -553,6 +588,7 @@ impl Engine<'_> {
             b.descent = b.descent.max(falls[i] + baselines[i]);
         }
         b.width = grid_w;
+        b.align_x = grid_w / 2.0;
         // `\hline`: a rule across the grid at the boundary it was written at, in the
         // middle of the clearance the rows already keep apart -- the gap is at least
         // three rule thicknesses, so a rule never touches the ink above or under it,
@@ -691,7 +727,10 @@ impl Engine<'_> {
         // `spaceAfterScript` is the side bearing a script owes whatever follows, so
         // the next atom in the row cannot crowd the subscript's descender.
         width += self.c(constant::SPACE_AFTER_SCRIPT, st.size, 1.0 / 24.0);
-        (out, Mb { width, ascent, descent, italic: 0.0 })
+        (
+            out,
+            Mb { width, ascent, descent, italic: 0.0, align_x: bb.align_x },
+        )
     }
 
     /// A radical: the sign stretched to the body, its horizontal bar drawn as a rule
@@ -777,7 +816,10 @@ impl Engine<'_> {
             let pct = self.m.percent(constant::RADICAL_DEGREE_BOTTOM_RAISE_PERCENT, 0.6);
             translate(&sd, before, -sign_h * pct - db.descent, &mut out);
         }
-        (out, Mb { width, ascent, descent, italic: 0.0 })
+        (
+            out,
+            Mb { width, ascent, descent, italic: 0.0, align_x: body_x + bb.align_x },
+        )
     }
 
     /// `\left( ... \right)`: the body first, then delimiters grown to its height.
@@ -810,7 +852,13 @@ impl Engine<'_> {
         };
 
         let mut out = Vec::new();
-        let mut b = Mb { width: 0.0, ascent: up, descent: down, italic: 0.0 };
+        let mut b = Mb {
+            width: 0.0,
+            ascent: up,
+            descent: down,
+            italic: 0.0,
+            align_x: 0.0,
+        };
         if left != '\0' {
             let (w, a, d) = self.delimiter(left, st.size, up, down, 0.0, &mut out);
             b.width += w;
@@ -820,6 +868,8 @@ impl Engine<'_> {
             b.descent = b.descent.max(d);
         }
         let body_x = b.width;
+        let body_anchor = body_x + bb.align_x;
+        let has_body = bb.width > 0.0;
         translate(sbody, body_x, 0.0, &mut out);
         b.width += bb.ink_width();
         if right != '\0' {
@@ -828,6 +878,7 @@ impl Engine<'_> {
             b.ascent = b.ascent.max(a);
             b.descent = b.descent.max(d);
         }
+        b.align_x = if has_body { body_anchor } else { b.width / 2.0 };
         (out, b)
     }
 
@@ -894,6 +945,7 @@ impl Engine<'_> {
             ascent: e.ascent * k,
             descent: e.descent * k,
             italic: e.italic * k,
+            align_x: e.advance * k / 2.0,
         };
         let (a_shapes, _) = self.atom(op, Style { size: st.size * k, ..st });
         self.stacked(a_shapes, ob, sub, sup, st)
@@ -965,7 +1017,10 @@ impl Engine<'_> {
             width = width.max(sb.ink_width());
             descent = descent.max(d + sb.descent);
         }
-        (out, Mb { width, ascent, descent, italic: 0.0 })
+        (
+            out,
+            Mb { width, ascent, descent, italic: 0.0, align_x: ob.align_x },
+        )
     }
 
     /// Accents. `accentBaseHeight` is the tallest base that needs no *raising*, so a
@@ -1028,6 +1083,7 @@ impl Engine<'_> {
                 ascent: (-y + sa.ascent).max(bb.ascent),
                 descent: bb.descent,
                 italic: bb.italic,
+                align_x: bb.align_x,
             },
         )
     }
@@ -1064,7 +1120,10 @@ impl Engine<'_> {
                 (bb.ascent, bb.descent + gap + t + extra)
             }
         };
-        (out, Mb { width: w, ascent, descent, italic: 0.0 })
+        (
+            out,
+            Mb { width: w, ascent, descent, italic: 0.0, align_x: bb.align_x },
+        )
     }
 
     /// `\overbrace` and `\underbrace`: a brace grown across the whole body.
@@ -1108,6 +1167,7 @@ impl Engine<'_> {
                     ascent: bb.ascent + gap + deep + tall,
                     descent: bb.descent,
                     italic: bb.italic,
+                    align_x: bb.align_x,
                 })
             }
             BarSide::Under => {
@@ -1120,6 +1180,7 @@ impl Engine<'_> {
                     ascent: bb.ascent,
                     descent: bb.descent + gap + tall + deep,
                     italic: bb.italic,
+                    align_x: bb.align_x,
                 })
             }
         }
@@ -1143,7 +1204,13 @@ impl Engine<'_> {
         // lifts about one unit of ex, and each step adds another 0.6 of them.
         let want = st.size * (1.2 + 0.6 * f32::from(step.saturating_sub(1)));
         let half = want / 2.0;
-        let b = Mb { width: 0.0, ascent: half, descent: half, italic: 0.0 };
+        let b = Mb {
+            width: 0.0,
+            ascent: half,
+            descent: half,
+            italic: 0.0,
+            align_x: 0.0,
+        };
         match role {
             BigRole::Close => self.fenced('\0', delim, &[], b, st),
             _ => self.fenced(delim, '\0', &[], b, st),
@@ -1171,7 +1238,16 @@ impl Engine<'_> {
             Shape::Rule { x: 0.0, y: top, width: t, thickness: h },
             Shape::Rule { x: w - t, y: top, width: t, thickness: h },
         ]);
-        (out, Mb { width: w, ascent: bb.ascent + off, descent: bb.descent + off, italic: 0.0 })
+        (
+            out,
+            Mb {
+                width: w,
+                ascent: bb.ascent + off,
+                descent: bb.descent + off,
+                italic: 0.0,
+                align_x: off + bb.align_x,
+            },
+        )
     }
 }
 
