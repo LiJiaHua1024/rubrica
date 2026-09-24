@@ -42,6 +42,6 @@ Scope: implement the complete feature gap review accepted on 2026-09-23. Preserv
 
 - A docked, resizable workspace tree and visible tab strip; the current tree/tabs are menu-driven.
 - Streaming/background decoding for very large TXT files; chapter windows currently reduce layout work after the full decoded source is available.
-- PDF selectable source text for synthetic formula glyphs and support for image formats beyond PNG/JPEG.
+- PDF selectable source text for synthetic formula glyphs.
 - Settings-window DPI behavior, source mapping edge cases and application/runtime regression verification.
 - Final release build, documentation, full requirement audit and delivery push.

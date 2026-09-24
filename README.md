@@ -88,10 +88,7 @@ rubrica-app --export-pdf document.pdf --pdf-width 612 --pdf-height 792 document.
 PNG uses the native WIC encoder and keeps the reader's colours, images, wide-content
 panning geometry, and typography. PDF embeds the DirectWrite font files, writes glyph
 positions and Unicode mappings, and wraps text runs in PDF `ActualText` spans so CJK,
-ligatures, emoji, and bidirectional text remain selectable. Page breaks are planned at
-line boundaries and keep headings with the lines that follow them. PDF images currently
-support PNG and JPEG; formula assemblies remain visual glyphs because their synthetic
-glyphs have no single source character.
+ligatures, emoji, and bidirectional text remain selectable. Page breaks are planned at line boundaries and keep headings with the lines that follow them. Tables repeat their header on continuation pages, and continued footnotes receive an explicit continuation marker. PDF images support the enabled PNG/JPEG/GIF/BMP/TIFF/WebP decoders; formula assemblies remain visual glyphs because their synthetic glyphs have no single source character.
 
 ## What it reads
 
@@ -163,8 +160,7 @@ internals, which is why the whole engine is testable from a console.
 - Windows-only by construction, and no installer: it is a single `.exe`.
 - The workspace tree is a shallow, menu-driven tree; it does not yet provide a docked
   resizable sidebar.
-- PDF formula assemblies are visual glyphs without a single selectable source character,
-  and PDF link annotations are not emitted yet.
+- PDF formula assemblies are visual glyphs without a single selectable source character.
 - The file is still read and decoded as a whole before a TXT chapter window is laid out;
   the window limits layout work, not initial I/O.
 
