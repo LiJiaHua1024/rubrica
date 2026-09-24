@@ -158,7 +158,7 @@ internals, which is why the whole engine is testable from a console.
 ## Known limitations
 
 - Windows-only by construction, and no installer: it is a single `.exe`.
-- Large UTF-8 TXT books are indexed and read by chapter, with the next chapter prefetched in the background; legacy code-page books still use the full decoded path.
+- Large TXT books (UTF-8 and explicit legacy code pages) are indexed and read by chapter, with the next chapter prefetched in the background.
 
 ## Licence
 
