@@ -16,7 +16,8 @@ use rubrica_type::paragraph::{Item, Spacing, StyleId, StyleSpan};
 use rubrica_type::units::Pt;
 use rubrica_type::{BreakOptions, Hyphenation, typeset, typeset_hyphenated};
 use printpdf::{
-    BuiltinFont, Color as PdfColor, Codepoint, FontId as PdfFontId, Op as PdfOp, ParsedFont, PdfDocument,
+    Actions as PdfActions, BuiltinFont, Color as PdfColor, Codepoint, FontId as PdfFontId,
+    LinkAnnotation as PdfLinkAnnotation, Op as PdfOp, ParsedFont, PdfDocument,
     PdfFontHandle, PdfPage, PdfSaveOptions, PdfParseErrorSeverity, Point as PdfPoint, RawImage,
     Rect as PdfRect, DictItem,
     Rgb as PdfRgb, TextItem, TextMatrix as PdfTextMatrix, XObjectTransform,
@@ -6414,6 +6415,29 @@ fn write_pdf(
                     }
                 }
             }
+        }
+        for hot in &page.hotspots {
+            let HotKind::Url(url) = &hot.kind else { continue };
+            let local_y = hot.y + content_shift - top;
+            let local_bottom = local_y + hot.h;
+            if local_bottom <= 0.0 || local_y >= content_height || hot.w <= 0.0 || hot.h <= 0.0 {
+                continue;
+            }
+            let clipped_top = local_y.max(0.0);
+            let clipped_bottom = local_bottom.min(content_height);
+            let link = PdfLinkAnnotation::new(
+                PdfRect::from_xywh(
+                    printpdf::Pt(hot.x),
+                    printpdf::Pt(height - clipped_bottom),
+                    printpdf::Pt(hot.w),
+                    printpdf::Pt(clipped_bottom - clipped_top),
+                ),
+                PdfActions::Uri(url.clone()),
+                None,
+                None,
+                None,
+            );
+            ops.push(PdfOp::LinkAnnotation { link });
         }
         pdf.pages.push(PdfPage::new(
             printpdf::Mm(width * 25.4 / 72.0),
