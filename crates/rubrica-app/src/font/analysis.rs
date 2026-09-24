@@ -7,6 +7,7 @@ use windows::Win32::Graphics::DirectWrite::*;
 #[implement(IDWriteTextAnalysisSource, IDWriteTextAnalysisSink)]
 struct Analysis {
     text: Vec<u16>,
+    locale: Vec<u16>,
     scripts: Rc<RefCell<Vec<DWRITE_SCRIPT_ANALYSIS>>>,
 }
 
@@ -36,11 +37,10 @@ impl IDWriteTextAnalysisSource_Impl for Analysis_Impl {
         DWRITE_READING_DIRECTION_LEFT_TO_RIGHT
     }
 
-    fn GetLocaleName(&self, position: u32, length: *mut u32, name: *mut *mut u16) -> Result<()> {
-        static LOCALE: [u16; 1] = [0];
+    fn GetLocaleName(&self, _position: u32, length: *mut u32, name: *mut *mut u16) -> Result<()> {
         unsafe {
-            *length = self.text.len().saturating_sub(position as usize) as u32;
-            *name = LOCALE.as_ptr() as *mut u16;
+            *length = self.locale.len().saturating_sub(1) as u32;
+            *name = self.locale.as_ptr() as *mut u16;
         }
         Ok(())
     }
@@ -65,12 +65,21 @@ impl IDWriteTextAnalysisSink_Impl for Analysis_Impl {
     fn SetNumberSubstitution(&self, _: u32, _: u32, _: Ref<IDWriteNumberSubstitution>) -> Result<()> { Ok(()) }
 }
 
-pub(super) fn scripts(analyzer: &IDWriteTextAnalyzer, text: &str) -> Result<Vec<DWRITE_SCRIPT_ANALYSIS>> {
+pub(super) fn scripts(
+    analyzer: &IDWriteTextAnalyzer,
+    text: &str,
+    locale: &str,
+) -> Result<Vec<DWRITE_SCRIPT_ANALYSIS>> {
     use windows::core::Interface;
     let units: Vec<u16> = text.encode_utf16().collect();
     let len = units.len();
     let scripts = Rc::new(RefCell::new(vec![DWRITE_SCRIPT_ANALYSIS::default(); len]));
-    let source: IDWriteTextAnalysisSource = Analysis { text: units, scripts: scripts.clone() }.into();
+    let source: IDWriteTextAnalysisSource = Analysis {
+        text: units,
+        locale: locale.encode_utf16().chain(std::iter::once(0)).collect(),
+        scripts: scripts.clone(),
+    }
+    .into();
     let sink: IDWriteTextAnalysisSink = source.cast()?;
     unsafe { analyzer.AnalyzeScript(&source, 0, len as u32, &sink)?; }
     let result = scripts.borrow().clone();

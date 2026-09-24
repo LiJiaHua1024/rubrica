@@ -310,7 +310,8 @@ impl FontEngine {
         if !self.analyzed.borrow().contains_key(text) {
             let language = east_asian_language(text);
             let bidi = rubrica_type::BidiInfo::new(text, None);
-            let scripts = analysis::scripts(&self.analyzer, text).unwrap_or_default();
+            let scripts =
+                analysis::scripts(&self.analyzer, text, locale_for_text(text, language)).unwrap_or_default();
             let mut runs: Vec<TextRun> = Vec::new();
             let mut unit = 0;
             for (at, c) in text.char_indices() {
@@ -616,6 +617,15 @@ impl FontEngine {
     }
 }
 
+fn locale_for_text(text: &str, language: u8) -> &'static str {
+    match language {
+        1 => "ja-JP",
+        2 => "ko-KR",
+        _ if text.chars().any(cjk_char) => "zh-CN",
+        _ => "en-US",
+    }
+}
+
 fn east_asian_language(text: &str) -> u8 {
     if text.chars().any(|c| east_asian_script(c) == 1) { 1 }
     else if text.chars().any(|c| east_asian_script(c) == 2) { 2 }
@@ -637,11 +647,20 @@ mod language_tests {
     fn paragraph_context_selects_han_forms_without_misclassifying_latin() {
         assert_eq!(east_asian_language("中文，with Latin"), 0);
         assert_eq!(east_asian_language("漢字とかな"), 1);
+        assert_eq!(east_asian_language("한글만"), 2);
         assert_eq!(east_asian_language("漢字 한글"), 2);
         assert_eq!(east_asian_script('한'), 2);
         assert_eq!(east_asian_script('あ'), 1);
         assert!(cjk_char('한'));
         assert!(!cjk_char('A'));
+    }
+
+    #[test]
+    fn paragraph_locale_follows_the_language_being_shaped() {
+        assert_eq!(locale_for_text("中文", east_asian_language("中文")), "zh-CN");
+        assert_eq!(locale_for_text("日本語です", east_asian_language("日本語です")), "ja-JP");
+        assert_eq!(locale_for_text("한국어", east_asian_language("한국어")), "ko-KR");
+        assert_eq!(locale_for_text("Latin", east_asian_language("Latin")), "en-US");
     }
 }
 

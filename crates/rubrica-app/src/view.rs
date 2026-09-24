@@ -82,7 +82,7 @@ use crate::clipboard;
 use crate::reading::{self, Encoding};
 use rubrica_doc::plain::{ParagraphRule, TextOptions};
 use crate::find::Needle;
-use crate::font::{FaceRequest, FontEngine, GlyphRun, ObjectBox, Style as RunStyle};
+use crate::font::{cjk_char, FaceRequest, FontEngine, GlyphRun, ObjectBox, Style as RunStyle};
 use crate::hyphen::Hyphenator;
 use crate::images::ImageStore;
 use crate::math::MathStore;
@@ -3754,7 +3754,7 @@ fn layout_block(
         return y;
     }
 
-    let mixed = text.chars().any(|c| matches!(c as u32, 0x3000..=0x303F | 0x4E00..=0x9FFF | 0x3040..=0x30FF | 0xFF00..=0xFFEF));
+    let mixed = text.chars().any(cjk_char);
     // A fence is a grid: its spaces are the face's own space wide, a run of them is as
     // wide as it is long, and none of it moves when the line is set. The prose recipe
     // -- a third of an em, elastic, collapsed -- sets `let x` and `let  x` the same
