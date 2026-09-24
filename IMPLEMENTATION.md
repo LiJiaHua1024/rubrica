@@ -6,7 +6,7 @@ Scope: implement the complete feature gap review accepted on 2026-09-23. Preserv
 
 - [x] Typography profiles: editable Latin, Chinese, Japanese, Korean, emphasis, code and math fonts; font size, leading, tracking, paragraph spacing and indentation; named saved profiles and a book preset; settings UI and persistence.
 - [x] East Asian typography: punctuation compression and hanging policies, narrow-column ragged fallback, language-aware Japanese and Korean font selection and Korean keep-all breaking.
-- [x] Export: whole-document PNG with width/scale controls and native selectable-text PDF; pagination with heading/paragraph protection, repeated table headers and continued footnotes; reading typography and colours retained. (PDF page breaks use the shared line planner; table/footnote continuation rendering remains a follow-up.)
+- [x] Export: whole-document PNG with width/scale controls and native selectable-text PDF; pagination with heading/paragraph protection, repeated table headers and continued footnotes; reading typography and colours retained.
 - [x] Multiple documents: tabs with preview/pinned behavior, workspace tree, recent documents, per-document positions and restored session. (The tree is menu-driven and shallow.)
 - [x] Source reading: syntax-coloured source view preserving the original text, position-preserving reload and mode switching; configurable external editor command. (The editor executable is configurable; line/column targets are enabled for common editor launchers.)
 - [x] Plain text: literal TXT parsing, automatic/manual encoding selection, paragraph rules, chapter outline, chapter-window layout for large files, previous/next document navigation and TXT typography binding. (The complete decoded file is still read before the active chapter is laid out.)
@@ -41,8 +41,7 @@ Scope: implement the complete feature gap review accepted on 2026-09-23. Preserv
 ## Remaining work when implementation resumes
 
 - A docked, resizable workspace tree and visible tab strip; the current tree/tabs are menu-driven.
-- True table-header repetition and continued-footnote rendering in the PDF page assembler; the shared planner already carries those policies and the PDF line planner is connected to it.
 - Streaming/background decoding for very large TXT files; chapter windows currently reduce layout work after the full decoded source is available.
-- PDF link annotations, selectable source text for synthetic formula glyphs, and support for image formats beyond PNG/JPEG.
+- PDF selectable source text for synthetic formula glyphs and support for image formats beyond PNG/JPEG.
 - Settings-window DPI behavior, source mapping edge cases and application/runtime regression verification.
 - Final release build, documentation, full requirement audit and delivery push.
