@@ -91,7 +91,7 @@ use windows::Win32::UI::WindowsAndMessaging::{
     WM_CTLCOLOREDIT, WM_GETTEXTLENGTH, WM_SETFONT, WINDOWPLACEMENT, WINDOW_STYLE, WNDPROC,
     WS_BORDER, WS_CHILD, WS_VISIBLE,
 };
-use windows_numerics::Vector2;
+use windows_numerics::{Matrix3x2, Vector2};
 
 use crate::clipboard;
 use crate::reading::{self, Encoding};
@@ -114,6 +114,9 @@ const HYPHEN_RANGE: std::ops::Range<usize> = 0..1;
 const MARGIN_EM: Pt = 2.6;
 /// Height of the visible document-tab strip, in device-independent pixels.
 const TABBAR_H: Pt = 32.0;
+const TREE_ROW_H: Pt = 24.0;
+const TREE_MIN_W: f32 = 160.0;
+const TREE_MAX_W: f32 = 360.0;
 /// Wheel notch travel, in points.
 const WHEEL_STEP: Pt = 72.0;
 /// Appearance is polled, not pushed; see `WM_TIMER` below.
@@ -946,6 +949,9 @@ pub struct View {
     /// document at a time; this is the authority for what can be switched to next.
     workspace: Workspace,
     tree: Vec<TreeEntry>,
+    tree_visible: bool,
+    tree_width: f32,
+    tree_dragging: bool,
     /// What the file behind the page looked like when this text was read out of it: how
     /// long it was, and when it was last written. See [`Stamp`] and `WM_TIMER`.
     stamp: Option<Stamp>,
@@ -1246,6 +1252,7 @@ enum Command {
     /// manual choice once the room's light has changed.
     FollowSystem,
     OpenFile,
+    ToggleTree,
     OpenRecent(usize),
     OpenTree(usize),
     TreeDirectory(usize),
@@ -1403,6 +1410,7 @@ fn menu_items(s: &MenuState) -> Vec<MenuRow> {
     ]);
     v.push(MenuRow::Gap);
     v.extend([
+        row(Command::ToggleTree, "Workspace tree", true),
         row(Command::OpenFile, "Open\u{2026}\tCtrl+O", true),
         row(Command::Reload, "Reload\tCtrl+R", s.from_file),
     ]);
@@ -1850,6 +1858,9 @@ pub fn run(mut source: String, path: Option<PathBuf>) -> Result<()> {
         path,
         workspace,
         tree,
+        tree_visible: false,
+        tree_width: 220.0,
+        tree_dragging: false,
         stamp,
         history: History::default(),
         dragging: false,
@@ -2654,6 +2665,20 @@ impl View {
                     self.switch_to_tab(id, hwnd);
                     return LRESULT(0);
                 }
+                if self.tree_visible && (x - self.tree_width).abs() <= 6.0 {
+                    self.tree_dragging = true;
+                    return LRESULT(0);
+                }
+                if let Some(index) = self.tree_at(x, y) {
+                    if let Some(entry) = self.tree.get(index).cloned() {
+                        if entry.kind == TreeEntryKind::Directory {
+                            self.tree = tree::scan(&entry.path, 2);
+                        } else {
+                            self.load_document(&entry.path, hwnd);
+                        }
+                    }
+                    return LRESULT(0);
+                }
                 // A press on the bar is not a press on the page. The box itself is a window
                 // and never reaches this handler; this is the strip of paint around it,
                 // under which the reader's own text is still lying.
@@ -2662,7 +2687,7 @@ impl View {
                     let _ = InvalidateRect(Some(hwnd), None, false);
                     return LRESULT(0);
                 }
-                if self.find.is_some() && in_find_panel(x, y, self.client_w) {
+                if self.find.is_some() && in_find_panel(x - self.content_dx(), y, self.client_w) {
                     return LRESULT(0);
                 }
                 self.pressed = None;
@@ -2712,7 +2737,11 @@ impl View {
             WM_MOUSEMOVE => {
                 let x = ((lp.0 & 0xFFFF) as i16) as f32;
                 let y = ((lp.0 >> 16) as i16) as f32;
-                if self.dragging {
+                if self.tree_dragging {
+                    self.tree_width = x.clamp(TREE_MIN_W, TREE_MAX_W);
+                    self.relayout();
+                    let _ = InvalidateRect(Some(hwnd), None, false);
+                } else if self.dragging {
                     self.scroll_to_thumb(y);
                     let _ = InvalidateRect(Some(hwnd), None, false);
                 } else if let Some(from) = self.press_caret {
@@ -2738,6 +2767,7 @@ impl View {
                 // rest of the desktop, thumb drags being the only case it is meant for.
                 let _ = ReleaseCapture();
                 self.dragging = false;
+                self.tree_dragging = false;
                 // The drag is over, but what it drew stays selected: a reader lets go of
                 // the button to look at the selection, not to be quit out of it.
                 self.press_at = None;
@@ -2770,7 +2800,8 @@ impl View {
     /// window's client origin. The rectangles are stored against the top of the
     /// document, so the only translation the test needs is the scroll.
     fn hot_at(&self, x: f32, y: f32) -> Option<usize> {
-        if y < TABBAR_H { return None; }
+        if y < TABBAR_H || x < self.content_dx() { return None; }
+        let x = x - self.content_dx();
         let y = y - TABBAR_H + scroll_dip(self.scroll, self.dpi);
         self.hotspots
             .iter()
@@ -2802,7 +2833,8 @@ impl View {
     }
 
     fn wide_region_at(&self, x: f32, y: f32) -> Option<usize> {
-        if y < TABBAR_H { return None; }
+        if y < TABBAR_H || x < self.content_dx() { return None; }
+        let x = x - self.content_dx();
         let y = y - TABBAR_H + scroll_dip(self.scroll, self.dpi);
         self.wide_regions.iter().position(|r| {
             let shift = self
@@ -2817,6 +2849,7 @@ impl View {
     /// The place in the page's text under a pointer position given in client pixels,
     /// translated into document pixels the same way [`View::hot_at`] translates.
     fn caret_under(&self, x: f32, y: f32) -> Caret {
+        let x = (x - self.content_dx()).max(0.0);
         let y = (y - TABBAR_H).max(0.0);
         let shift = self.shift_at(x, y + scroll_dip(self.scroll, self.dpi));
         caret_at(&self.sel_index, x - shift, y + scroll_dip(self.scroll, self.dpi))
@@ -3120,6 +3153,15 @@ impl View {
                 if let Some(path) = unsafe { self.prompt_for_file(hwnd) } {
                     self.load_document(&path, hwnd);
                 }
+            }
+            Command::ToggleTree => {
+                self.tree_visible = !self.tree_visible;
+                if self.tree.is_empty() {
+                    if let Some(root) = self.path.as_deref().and_then(Path::parent) {
+                        self.tree = tree::scan(root, 2);
+                    }
+                }
+                self.relayout();
             }
             Command::OpenRecent(index) => {
                 if let Some(path) = self.workspace.recent.items().get(index).map(|file| file.path.clone()) {
@@ -3672,7 +3714,7 @@ impl View {
             let _ = SendMessageW(edit, WM_SETFONT, Some(WPARAM(font.0 as usize)), Some(LPARAM(1)));
         }
         let (x, y, w, h) = find_edit(self.client_w, self.dpi);
-        let _ = MoveWindow(edit, x, y, w, h, true);
+        let _ = MoveWindow(edit, x + self.content_dx() as i32, y, w, h, true);
     }
 
     /// The box's letters, made at the size this window is drawn at.
@@ -4674,6 +4716,39 @@ impl View {
         self.tab_layout().into_iter().find(|(_, left, width)| x >= *left && x < *left + *width).map(|(id, _, _)| id)
     }
 
+    fn content_dx(&self) -> f32 {
+        if self.tree_visible { self.tree_width } else { 0.0 }
+    }
+
+    fn tree_at(&self, x: f32, y: f32) -> Option<usize> {
+        if !self.tree_visible || x >= self.tree_width || y < TABBAR_H { return None; }
+        let row = ((y - TABBAR_H - 6.0) / TREE_ROW_H).floor();
+        (row >= 0.0).then_some(row as usize).filter(|row| *row < self.tree.len())
+    }
+
+    unsafe fn draw_tree_panel(&mut self, target: &ID2D1RenderTarget) {
+        if !self.tree_visible { return; }
+        let surface = self.brushes.get(&ColorRole::Surface).cloned();
+        let muted = self.brushes.get(&ColorRole::Muted).cloned();
+        if let Some(brush) = surface.as_ref() {
+            let rect = D2D_RECT_F { left: 0.0, top: TABBAR_H, right: self.tree_width, bottom: self.client_h };
+            target.FillRectangle(&rect, brush);
+        }
+        if self.tab_format.is_none() {
+            self.tab_format = self.font.text_format("Segoe UI", 11.0).ok();
+        }
+        let entries = self.tree.clone();
+        let format = self.tab_format.clone();
+        for (i, entry) in entries.iter().enumerate() {
+            let top = TABBAR_H + 6.0 + i as f32 * TREE_ROW_H;
+            let rect = D2D_RECT_F { left: 8.0 + entry.depth as f32 * 12.0, top, right: self.tree_width - 6.0, bottom: top + TREE_ROW_H - 2.0 };
+            if let (Some(format), Some(brush)) = (format.as_ref(), muted.as_ref()) {
+                let text = utf16(&entry.name);
+                target.DrawText(&text, format, &rect, brush, D2D1_DRAW_TEXT_OPTIONS_CLIP, DWRITE_MEASURING_MODE_NATURAL);
+            }
+        }
+    }
+
     unsafe fn draw_tab_bar(&mut self, target: &ID2D1RenderTarget) {
         let tabs: Vec<_> = self.workspace.tabs.items().iter().map(|tab| {
             let title = match &tab.document {
@@ -4713,6 +4788,7 @@ impl View {
     }
 
     fn thumb_hit(&self, x: f32, y: f32) -> bool {
+        let x = x - self.content_dx();
         match self.thumb_rect() {
             Some((tx, ty, _tw, th)) => {
                 let ty = ty + TABBAR_H;
@@ -5058,6 +5134,9 @@ impl View {
             let bg = d2d(self.palette.bg);
             target.Clear(Some(&bg));
             self.draw_tab_bar(&target);
+            self.draw_tree_panel(&target);
+            let content_dx = self.content_dx();
+            target.SetTransform(&Matrix3x2::translation(content_dx, 0.0));
             // The display list is measured from the top of the document, so the whole of
             // it is lifted by the scroll here and nowhere else: a wheel tick costs one
             // subtraction at paint time rather than a relayout of the page, which is the
@@ -5220,6 +5299,7 @@ impl View {
                 }
                 self.draw_runs(&target, &self.find_label, 0.0);
             }
+            target.SetTransform(&Matrix3x2::identity());
             let _ = target.EndDraw(None, None);
         }
     }
