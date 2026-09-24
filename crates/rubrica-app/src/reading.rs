@@ -56,7 +56,7 @@ pub fn decode(bytes: &[u8], requested: Encoding) -> std::io::Result<Decoded> {
         Encoding::Utf8 => std::str::from_utf8(bytes).map_err(|_| error())?.to_string(),
         Encoding::Utf16Le | Encoding::Utf16Be => {
             if bytes.len() % 2 != 0 { return Err(error()); }
-            let units: Vec<_> = bytes.chunks_exact(2).map(|p| if encoding == Encoding::Utf16Le {
+            let units: Vec<_> = bytes.as_chunks::<2>().0.iter().map(|p| if encoding == Encoding::Utf16Le {
                 u16::from_le_bytes([p[0], p[1]])
             } else { u16::from_be_bytes([p[0], p[1]]) }).collect();
             String::from_utf16(&units).map_err(|_| error())?
