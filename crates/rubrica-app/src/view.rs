@@ -92,7 +92,7 @@ use windows_numerics::Vector2;
 
 use crate::clipboard;
 use crate::reading::{self, Encoding};
-use rubrica_doc::plain::{ParagraphRule, TextOptions};
+use rubrica_doc::plain::{ChapterIndex, ParagraphRule, TextOptions};
 use crate::find::Needle;
 use crate::font::{cjk_char, FaceRequest, FontEngine, GlyphRun, ObjectBox, Style as RunStyle};
 use crate::hyphen::Hyphenator;
@@ -839,6 +839,10 @@ pub struct View {
     source: String,
     source_view: bool,
     text_options: TextOptions,
+    /// Chapter ranges for a plain-text book. `None` keeps the whole document in one
+    /// layout, which is still the right answer for a short story or a Markdown file.
+    chapter_index: Option<ChapterIndex>,
+    chapter: usize,
     plain_override: Option<bool>,
     encoding: Encoding,
     decoded_encoding: Encoding,
@@ -1200,6 +1204,8 @@ enum Command {
     DetectChapters(bool),
     TextEncoding(Encoding),
     Neighbor(bool),
+    PreviousChapter,
+    NextChapter,
     OpenEditor,
     ChooseEditor,
 }
@@ -1236,6 +1242,8 @@ struct MenuState {
     source_view: bool,
     plain_override: Option<bool>,
     text_options: TextOptions,
+    chapter_titles: Vec<String>,
+    chapter: usize,
     encoding: Encoding,
     encoding_notice: Option<String>,
     previous: bool,
@@ -1356,6 +1364,8 @@ fn menu_items(s: &MenuState) -> Vec<MenuRow> {
         check(Command::TextParagraphs(ParagraphRule::BlankLines), "Paragraphs: Blank lines", s.text_options.paragraphs == ParagraphRule::BlankLines),
         check(Command::DetectChapters(!s.text_options.chapters), "Detect chapter headings", s.text_options.chapters),
         MenuRow::Gap,
+        row(Command::PreviousChapter, "Previous chapter\tCtrl+Alt+Up", s.chapter > 0),
+        row(Command::NextChapter, "Next chapter\tCtrl+Alt+Down", s.chapter + 1 < s.chapter_titles.len()),
         row(Command::Neighbor(false), "Previous file\tCtrl+Alt+Left", s.previous),
         row(Command::Neighbor(true), "Next file\tCtrl+Alt+Right", s.next),
     ] });
@@ -1623,9 +1633,11 @@ pub fn run(source: String, path: Option<PathBuf>) -> Result<()> {
     let profile = crate::profiles::selected(preferences.plain.unwrap_or_else(|| reading::is_plain(path.as_deref())));
     if profile != "Default" { crate::profiles::load(&profile).apply(&mut theme); }
     let decoded = path.as_deref().and_then(|p| reading::read(p, preferences.encoding).ok());
+    let plain = preferences.plain.unwrap_or_else(|| reading::is_plain(path.as_deref()));
+    let chapter_index = plain.then(|| ChapterIndex::new(&source, preferences.text.chapters));
     let doc = if preferences.source { Document::source(&source) }
-        else if preferences.plain.unwrap_or_else(|| reading::is_plain(path.as_deref())) {
-            rubrica_doc::plain::parse(&source, preferences.text)
+        else if let Some(index) = chapter_index.as_ref() {
+            index.window(&source, 0, preferences.text)
         } else { Document::parse_with(&source, rubrica_doc::ParseOptions {
             keep_line_breaks: preferences.line_breaks.unwrap_or(keep_line_breaks),
         }) };
@@ -1641,6 +1653,8 @@ pub fn run(source: String, path: Option<PathBuf>) -> Result<()> {
         source,
         source_view: preferences.source,
         text_options: preferences.text,
+        chapter_index,
+        chapter: 0,
         plain_override: preferences.plain,
         encoding: preferences.encoding,
         decoded_encoding: decoded.as_ref().map_or(Encoding::Utf8, |d| d.encoding),
@@ -2367,7 +2381,13 @@ impl View {
             WM_SYSKEYDOWN => {
                 let k = wp.0 as u32;
                 let alt = held(VK_MENU);
-                if alt && held(VK_CONTROL) && (k == VK_LEFT.0 as u32 || k == VK_RIGHT.0 as u32) {
+                if alt && held(VK_CONTROL) && (k == VK_UP.0 as u32 || k == VK_DOWN.0 as u32) {
+                    self.apply_command(
+                        if k == VK_DOWN.0 as u32 { Command::NextChapter } else { Command::PreviousChapter },
+                        hwnd,
+                    );
+                    LRESULT(0)
+                } else if alt && held(VK_CONTROL) && (k == VK_LEFT.0 as u32 || k == VK_RIGHT.0 as u32) {
                     self.apply_command(Command::Neighbor(k == VK_RIGHT.0 as u32), hwnd);
                     LRESULT(0)
                 } else if alt && k == VK_LEFT.0 as u32 {
@@ -2794,6 +2814,12 @@ impl View {
             source_view: self.source_view,
             plain_override: self.plain_override,
             text_options: self.text_options,
+            chapter_titles: self
+                .chapter_index
+                .as_ref()
+                .map(|index| index.chapters().iter().map(|chapter| chapter.title.clone()).collect())
+                .unwrap_or_default(),
+            chapter: self.chapter,
             encoding: self.encoding,
             encoding_notice: Some(format!("{}{}", self.decoded_encoding.label(),
                 if self.encoding_guessed { " (detected by guess; choose if incorrect)" } else { "" })),
@@ -2931,6 +2957,8 @@ impl View {
                     self.load_document(&path, hwnd);
                 }
             }
+            Command::PreviousChapter => self.switch_chapter(-1, hwnd),
+            Command::NextChapter => self.switch_chapter(1, hwnd),
             Command::OpenEditor => {
                 if let Some(path) = self.path.as_deref() {
                     use std::os::windows::process::CommandExt;
@@ -2972,11 +3000,48 @@ impl View {
     fn parse_source(&self) -> Document {
         if self.source_view { return Document::source(&self.source); }
         if self.plain_override.unwrap_or_else(|| reading::is_plain(self.path.as_deref())) {
+            if let Some(index) = self.chapter_index.as_ref() {
+                return index.window(&self.source, self.chapter, self.text_options);
+            }
             return rubrica_doc::plain::parse(&self.source, self.text_options);
         }
         Document::parse_with(&self.source, rubrica_doc::ParseOptions {
             keep_line_breaks: self.line_break_override.unwrap_or(self.keep_line_breaks),
         })
+    }
+
+    fn refresh_chapter_index(&mut self) {
+        let plain = self.plain_override.unwrap_or_else(|| reading::is_plain(self.path.as_deref()));
+        self.chapter_index = if plain && self.text_options.chapters {
+            Some(ChapterIndex::new(&self.source, true))
+        } else {
+            None
+        };
+        if let Some(index) = self.chapter_index.as_ref() {
+            self.chapter = self.chapter.min(index.chapters().len().saturating_sub(1));
+        } else {
+            self.chapter = 0;
+        }
+    }
+
+    fn switch_chapter(&mut self, delta: isize, hwnd: HWND) {
+        let Some(index) = self.chapter_index.as_ref() else { return };
+        let count = index.chapters().len();
+        if count == 0 { return; }
+        let next = (self.chapter as isize + delta).clamp(0, count as isize - 1) as usize;
+        if next == self.chapter { return; }
+        self.chapter = next;
+        self.doc = self.parse_source();
+        self.scroll = 0.0;
+        self.relayout();
+        if let Some(chapter) = self.chapter_index.as_ref().and_then(|i| i.chapters().get(self.chapter)) {
+            if let Some(scroll) = scroll_for_source(&self.sel_index, chapter.range.start, scale_of(self.dpi)) {
+                self.scroll = scroll;
+            }
+        }
+        self.clamp_scroll();
+        self.update_title(hwnd);
+        let _ = unsafe { InvalidateRect(Some(hwnd), None, false) };
     }
 
     fn reparse(&mut self, hwnd: HWND) {
@@ -2987,6 +3052,7 @@ impl View {
             self.profile = profile;
             self.math = MathStore::new();
         }
+        self.refresh_chapter_index();
         self.doc = self.parse_source();
         self.relayout_in_place(hwnd);
         if let Some(byte) = source { self.restore_source(byte); }
@@ -4378,6 +4444,8 @@ impl View {
             self.profile = profile;
             self.math = MathStore::new();
         }
+        self.chapter = 0;
+        self.refresh_chapter_index();
         self.doc = self.parse_source();
         // Filed at the same moment as the text that came out of it, so that the next tick
         // of the poll compares the page on screen against the file it was read from rather
