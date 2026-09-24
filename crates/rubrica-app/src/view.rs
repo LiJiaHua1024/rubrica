@@ -241,6 +241,7 @@ enum ObjectSource {
 }
 
 /// One face's positioned glyphs, in device independent pixels.
+#[derive(Clone)]
 pub struct PaintRun {
     pub bidi_level: u8,
     face: IDWriteFontFace,
@@ -276,6 +277,30 @@ pub enum Op {
     Line { x0: f32, y0: f32, x1: f32, y1: f32, thickness: f32, color: ColorRole },
 }
 
+/// A piece of content wider than the reading column and the interaction it owns.
+#[derive(Clone, Debug, PartialEq)]
+pub enum WideKind {
+    Formula(usize),
+    Image(PathBuf),
+    Table,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub enum Preview {
+    Image(PathBuf),
+    Formula(usize),
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct WideRegion {
+    pub kind: WideKind,
+    pub x: f32,
+    pub y: f32,
+    pub w: f32,
+    pub h: f32,
+    pub content_w: f32,
+}
+
 /// Where a click lands, and what it means.
 #[derive(Clone, Debug, PartialEq)]
 pub enum HotKind {
@@ -293,6 +318,8 @@ pub enum HotKind {
     /// exists. The reader is a document reader, so the answer to such a link is to read
     /// that document rather than to hand the path to some other program.
     Document(DocumentTarget),
+    /// A wide object or table; the index names its [`Page::wide_regions`] entry.
+    Wide(usize),
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -775,6 +802,9 @@ pub struct Page {
     /// Hyphenated breaks taken against hyphen marks drawn, which is the one number that
     /// says whether a split word shows the split.
     pub hyphens: HyphenCount,
+    /// Regions whose natural width exceeds the visible column, or whose object has a
+    /// click action even when it fits.
+    pub wide_regions: Vec<WideRegion>,
 }
 
 pub struct View {
@@ -806,6 +836,10 @@ pub struct View {
     note_tops: Vec<Pt>,
     /// Where each heading begins, for the fragment links in a table of contents.
     anchor_tops: Vec<Pt>,
+    /// Wide regions in the current page, matching `HotKind::Wide` indices.
+    wide_regions: Vec<WideRegion>,
+    /// A full-size object preview opened from a wide hotspot.
+    preview: Option<Preview>,
     /// The page's text, character by character, as the current layout drew it.
     sel_index: Vec<SelLine>,
     /// What the reader has dragged out, if anything. Cleared by a relayout, whose
@@ -845,6 +879,10 @@ pub struct View {
     history: History,
     /// Set while the pointer is dragging the scroll thumb.
     dragging: bool,
+    /// Horizontal offset currently applied to the wide region under the pointer.
+    wide_offset: f32,
+    /// The wide region currently being panned or previewed.
+    wide_active: Option<usize>,
     /// Where the left button went down, in client pixels. A press that has moved past
     /// a few of them is a reader dragging out a selection rather than one aiming at a
     /// link, and the difference has to be settled before the release.
@@ -914,6 +952,17 @@ fn scroll_dip(scroll: Pt, dpi: f32) -> Pt {
 /// nothing, not silently teleport the reader to the narrow one.
 fn step_measure(from: usize, delta: i32) -> usize {
     (from as i32 + delta).clamp(0, Measure::ALL.len() as i32 - 1) as usize
+}
+
+fn pan_offset(content_w: Pt, visible_w: Pt, requested: Pt) -> Pt {
+    (requested).clamp(0.0, (content_w - visible_w).max(0.0))
+}
+
+fn region_shift(region: &WideRegion, offset: Pt, x: f32, y: f32) -> Pt {
+    if y < region.y || y > region.y + region.h {
+        return 0.0;
+    }
+    if x >= region.x && x <= region.x + region.content_w { -offset } else { 0.0 }
 }
 
 /// A page the reader was on, and how far down it they had got.
@@ -1449,8 +1498,12 @@ fn open_url(url: &str) {
     if !openable(url) {
         return;
     }
+    open_path(url);
+}
+
+fn open_path(path: &str) {
     let verb = utf16("open");
-    let target = utf16(url);
+    let target = utf16(path);
     let r = unsafe {
         ShellExecuteW(
             None,
@@ -1463,7 +1516,7 @@ fn open_url(url: &str) {
     };
     // Failures come back as small integers in the handle rather than as a null one.
     if (r.0 as usize) <= 32 {
-        eprintln!("could not open {url}");
+        eprintln!("could not open {path}");
     }
 }
 
@@ -1578,6 +1631,8 @@ pub fn run(source: String, path: Option<PathBuf>) -> Result<()> {
         dark_override: saved.dark,
         brushes: HashMap::new(),
         hotspots: Vec::new(),
+        wide_regions: Vec::new(),
+        preview: None,
         note_tops: Vec::new(),
         anchor_tops: Vec::new(),
         sel_index: Vec::new(),
@@ -1597,6 +1652,8 @@ pub fn run(source: String, path: Option<PathBuf>) -> Result<()> {
         stamp,
         history: History::default(),
         dragging: false,
+        wide_offset: 0.0,
+        wide_active: None,
         press_at: None,
         images: None,
         math: MathStore::new(),
@@ -2036,6 +2093,13 @@ impl View {
         // The bar's panel and its count of matches are drawn from their geometry like the
         // thumb, for the same reason, so the ink they fill with has to be asked for by
         // name rather than found in a list of what the page happens to be made of.
+        if self.preview.is_some() {
+            for role in [ColorRole::Surface, ColorRole::Text, ColorRole::Muted] {
+                if !roles.contains(&role) {
+                    roles.push(role);
+                }
+            }
+        }
         if self.find.is_some() {
             for role in [ColorRole::Surface, ColorRole::Muted] {
                 if !roles.contains(&role) {
@@ -2138,7 +2202,20 @@ impl View {
             }
             WM_MOUSEWHEEL => {
                 let ticks = ((wp.0 >> 16) & 0xFFFF) as i16 as f32;
-                if held(VK_CONTROL) {
+                if held(VK_SHIFT) {
+                    let mut pt = POINT::default();
+                    let _ = GetCursorPos(&mut pt);
+                    let _ = ScreenToClient(hwnd, &mut pt);
+                    if let Some(index) = self.wide_region_at(pt.x as f32, pt.y as f32) {
+                        self.wide_active = Some(index);
+                    }
+                    if self.pan_wide(ticks) {
+                        let _ = InvalidateRect(Some(hwnd), None, false);
+                    } else {
+                        self.scroll_by(-ticks / 120.0 * WHEEL_STEP);
+                        let _ = InvalidateRect(Some(hwnd), None, false);
+                    }
+                } else if held(VK_CONTROL) {
                     // The one gesture every Windows reader already means: `Ctrl` turns
                     // the wheel from a scroller into a magnifier. A notch is a whole
                     // ladder step, which is as fine as a wheel can be made to be.
@@ -2184,7 +2261,9 @@ impl View {
                     // arrows, which go back to being the scroll. Only an unmarked page
                     // takes the key as a request to close.
                     k if k == VK_ESCAPE.0 as u32 => {
-                        if self.caret.is_some() || self.selection.is_some() {
+                        if self.preview.take().is_some() {
+                            let _ = unsafe { InvalidateRect(Some(hwnd), None, false) };
+                        } else if self.caret.is_some() || self.selection.is_some() {
                             self.caret = None;
                             self.selection = None;
                         } else {
@@ -2351,6 +2430,11 @@ impl View {
                 // A press on the bar is not a press on the page. The box itself is a window
                 // and never reaches this handler; this is the strip of paint around it,
                 // under which the reader's own text is still lying.
+                if self.preview.is_some() {
+                    self.preview = None;
+                    let _ = InvalidateRect(Some(hwnd), None, false);
+                    return LRESULT(0);
+                }
                 if self.find.is_some() && in_find_panel(x, y, self.client_w) {
                     return LRESULT(0);
                 }
@@ -2462,13 +2546,50 @@ impl View {
         let y = y + scroll_dip(self.scroll, self.dpi);
         self.hotspots
             .iter()
-            .position(|h| x >= h.x && x <= h.x + h.w && y >= h.y && y <= h.y + h.h)
+            .position(|h| {
+                let shift = self
+                    .wide_active
+                    .and_then(|i| self.wide_regions.get(i))
+                    .map_or(0.0, |r| region_shift(r, self.wide_offset, h.x, h.y));
+                let hx = h.x + shift;
+                x >= hx && x <= hx + h.w && y >= h.y && y <= h.y + h.h
+            })
+    }
+
+    fn shift_at(&self, x: f32, y: f32) -> f32 {
+        self.wide_active
+            .and_then(|i| self.wide_regions.get(i))
+            .map_or(0.0, |r| region_shift(r, self.wide_offset, x, y))
+    }
+
+    fn pan_wide(&mut self, ticks: f32) -> bool {
+        let Some(index) = self.wide_active else { return false };
+        let Some(region) = self.wide_regions.get(index).cloned() else { return false };
+        self.wide_offset = pan_offset(
+            region.content_w,
+            region.w,
+            self.wide_offset + ticks / 120.0 * WHEEL_STEP * scale_of(self.dpi),
+        );
+        true
+    }
+
+    fn wide_region_at(&self, x: f32, y: f32) -> Option<usize> {
+        let y = y + scroll_dip(self.scroll, self.dpi);
+        self.wide_regions.iter().position(|r| {
+            let shift = self
+                .wide_active
+                .and_then(|active| self.wide_regions.get(active))
+                .map_or(0.0, |active| region_shift(active, self.wide_offset, r.x, r.y));
+            let left = r.x + shift;
+            x >= left && x <= left + r.w && y >= r.y && y <= r.y + r.h
+        })
     }
 
     /// The place in the page's text under a pointer position given in client pixels,
     /// translated into document pixels the same way [`View::hot_at`] translates.
     fn caret_under(&self, x: f32, y: f32) -> Caret {
-        caret_at(&self.sel_index, x, y + scroll_dip(self.scroll, self.dpi))
+        let shift = self.shift_at(x, y + scroll_dip(self.scroll, self.dpi));
+        caret_at(&self.sel_index, x - shift, y + scroll_dip(self.scroll, self.dpi))
     }
 
     /// Scroll the page when a drag is held against its top or bottom edge, so a
@@ -2574,6 +2695,18 @@ impl View {
             HotKind::Url(url) => open_url(&url),
             HotKind::Cite(note) => self.jump_to(self.note_tops.get(note).copied(), hwnd),
             HotKind::Heading(at) => self.jump_to(self.anchor_tops.get(at).copied(), hwnd),
+            HotKind::Wide(index) => {
+                let Some(region) = self.wide_regions.get(index).cloned() else { return };
+                match region.kind {
+                    WideKind::Image(path) => self.preview = Some(Preview::Image(path)),
+                    WideKind::Formula(source) => self.preview = Some(Preview::Formula(source)),
+                    WideKind::Table => {
+                        self.wide_active = Some(index);
+                        self.wide_offset = 0.0;
+                    }
+                }
+                let _ = unsafe { InvalidateRect(Some(hwnd), None, false) };
+            }
             HotKind::Document(target) => {
                 let from = self.here();
                 let same = self.path.as_deref() == Some(target.path.as_path());
@@ -3050,6 +3183,7 @@ impl View {
         self.content_h = page.height;
         self.ops = page.ops;
         self.hotspots = page.hotspots;
+        self.wide_regions = page.wide_regions;
         self.note_tops = page.note_tops;
         self.anchor_tops = page.anchor_tops;
         // A selection is a pair of places in the old wrapping. Lines have moved, so
@@ -3346,6 +3480,7 @@ struct Out<'a> {
     hots: &'a mut Vec<Hot>,
     sel: &'a mut Vec<SelLine>,
     hyphens: &'a mut HyphenCount,
+    wide: &'a mut Vec<WideRegion>,
 }
 
 /// How many lines the solver broke on a discretionary hyphen, and how many hyphen marks
@@ -3741,7 +3876,7 @@ fn layout_block(
     out: &mut Out<'_>,
     mut y: Pt,
 ) -> Pt {
-    let Out { ops, hots, sel, hyphens } = out;
+    let Out { ops, hots, sel, hyphens, wide } = out;
     let Ctx { theme, styles, math, k, .. } = *ctx;
     let Blk { b, text, spans, base, left, column, hyphenation, size, hang, actions, .. } = *blk;
     let leading = &blk.leading;
@@ -3759,7 +3894,7 @@ fn layout_block(
         return y + theme.base * 0.6;
     }
     if let Some(t) = blk.table {
-        return layout_table(font, ctx, blk, t, &mut Out { ops, hots, sel, hyphens }, y);
+        return layout_table(font, ctx, blk, t, &mut Out { ops, hots, sel, hyphens, wide }, y);
     }
     if text.trim().is_empty() {
         return y;
@@ -3851,6 +3986,7 @@ fn layout_block(
         // ideograph and every word its own node, so a struck Chinese phrase would
         // otherwise draw a separate op per character.
         let mut ruled: Option<Rule> = None;
+        let mut line_wide: Option<(WideKind, Pt, Pt, Pt)> = None;
         for slot in placed {
             let Some(node_id) = slot.node else {
                 mark_glue(text, &slot, line_left, &mut segs, &mut marks);
@@ -3880,8 +4016,10 @@ fn layout_block(
                             o.ascent,
                             o.descent,
                         ));
+                        line_wide = Some((WideKind::Image(file.clone()), line_left + slot.x, o.advance, column.min(o.advance)));
                     }
                     Some(ObjectSource::Math(index)) => {
+                        line_wide = Some((WideKind::Formula(*index), line_left + slot.x, o.advance, column.min(o.advance)));
                         // Every piece arrives at its own place inside the formula's
                         // box, so nothing here accumulates an advance.
                         if let Some(entry) = math.get(*index) {
@@ -3977,6 +4115,18 @@ fn layout_block(
         let baseline = y + (line_h - natural) * 0.5 + ascent;
         seat(&mut runs, baseline, k);
         ops.push(Op::Runs(runs));
+        if let Some((kind, x, content_w, visible_w)) = line_wide {
+            let index = wide.len();
+            wide.push(WideRegion {
+                kind,
+                x: x * k,
+                y: top * k,
+                w: visible_w * k,
+                h: line_h * k,
+                content_w: content_w * k,
+            });
+            hots.push(Hot { x: x * k, y: top * k, w: visible_w * k, h: line_h * k, kind: HotKind::Wide(index) });
+        }
         for (x, top, w, h, color) in bars {
             ops.push(Op::Rect { x: x * k, y: (baseline + top) * k, w: w * k, h: h * k, color });
         }
@@ -4276,29 +4426,31 @@ impl View {
             for op in self.ops.iter() {
                 match op {
                     Op::Rect { x, y, w, h, color } => {
+                        let dx = self.shift_at(*x, *y);
                         if y + h < top || *y > bottom {
                             continue;
                         }
                         let role = *color;
                         if let Some(brush) = self.brushes.get(&role).cloned() {
                             let r = D2D_RECT_F {
-                                left: *x,
+                                left: *x + dx,
                                 top: *y - up,
-                                right: x + w,
+                                right: x + w + dx,
                                 bottom: y + h - up,
                             };
                             target.FillRectangle(&r, &brush);
                         }
                     }
                     Op::Line { x0, y0, x1, y1, thickness, color } => {
+                        let dx = self.shift_at(*x0, *y0);
                         if (*y1).max(*y0) < top || (*y0).min(*y1) > bottom {
                             continue;
                         }
                         let role = *color;
                         if let Some(brush) = self.brushes.get(&role).cloned() {
                             target.DrawLine(
-                                Vector2::new(*x0, y0 - up),
-                                Vector2::new(*x1, y1 - up),
+                                Vector2::new(*x0 + dx, y0 - up),
+                                Vector2::new(*x1 + dx, y1 - up),
                                 &brush,
                                 *thickness,
                                 None,
@@ -4306,6 +4458,7 @@ impl View {
                         }
                     }
                     Op::Image { path, x, y, w, h } => {
+                        let dx = self.shift_at(*x, *y);
                         if y + h < top || *y > bottom {
                             continue;
                         }
@@ -4314,9 +4467,9 @@ impl View {
                         };
                         if let Some(bmp) = store.bitmap(&t, path) {
                             let r = D2D_RECT_F {
-                                left: *x,
+                                left: *x + dx,
                                 top: y - up,
-                                right: x + w,
+                                right: x + w + dx,
                                 bottom: y + h - up,
                             };
                             target.DrawBitmap(
@@ -4328,9 +4481,18 @@ impl View {
                             );
                         }
                     }
-                    Op::Runs(runs) => self.draw_runs(&target, runs, up),
+                    Op::Runs(runs) => {
+                        let mut shifted = Vec::with_capacity(runs.len());
+                        for run in runs {
+                            let mut run = run.clone();
+                            run.x += self.shift_at(run.x, run.baseline);
+                            shifted.push(run);
+                        }
+                        self.draw_runs(&target, &shifted, up);
+                    }
                 }
             }
+            self.draw_preview(&target);
             // Every place the search found what the reader typed. Under their own
             // selection and over the page's ink, because a hit is a suggestion and a drag
             // is a decision.
@@ -4343,9 +4505,9 @@ impl View {
                             continue;
                         }
                         let r = D2D_RECT_F {
-                            left: x,
+                            left: x + self.shift_at(x, y),
                             top: y - up,
-                            right: x + w,
+                            right: x + w + self.shift_at(x, y),
                             bottom: y + h - up,
                         };
                         target.FillRectangle(&r, &brush);
@@ -4361,8 +4523,13 @@ impl View {
                         if y + h < top || y > bottom {
                             continue;
                         }
-                        let r =
-                            D2D_RECT_F { left: x, top: y - up, right: x + w, bottom: y + h - up };
+                        let dx = self.shift_at(x, y);
+                        let r = D2D_RECT_F {
+                            left: x + dx,
+                            top: y - up,
+                            right: x + w + dx,
+                            bottom: y + h - up,
+                        };
                         target.FillRectangle(&r, &brush);
                     }
                 }
@@ -4377,10 +4544,11 @@ impl View {
                 {
                     if let Some((x, y, w, h)) = caret_rect(&self.sel_index, c) {
                         if y + h >= top && y <= bottom {
+                            let dx = self.shift_at(x, y);
                             let r = D2D_RECT_F {
-                                left: x,
+                                left: x + dx,
                                 top: y - up,
-                                right: x + w,
+                                right: x + w + dx,
                                 bottom: y + h - up,
                             };
                             target.FillRectangle(&r, &brush);
@@ -4410,6 +4578,67 @@ impl View {
                 self.draw_runs(&target, &self.find_label, 0.0);
             }
             let _ = target.EndDraw(None, None);
+        }
+    }
+
+    unsafe fn draw_preview(&mut self, target: &ID2D1RenderTarget) {
+        let Some(preview) = self.preview.clone() else { return };
+        let panel = D2D_RECT_F {
+            left: self.client_w * 0.08,
+            top: self.client_h * 0.08,
+            right: self.client_w * 0.92,
+            bottom: self.client_h * 0.92,
+        };
+        if let Some(brush) = self.brushes.get(&ColorRole::Surface).cloned() {
+            target.FillRectangle(&panel, &brush);
+        }
+        match preview {
+            Preview::Image(path) => {
+                let Some((w, h)) = self.images.as_ref().and_then(|s| s.natural_size(&path)) else { return };
+                let k = scale_of(self.dpi);
+                let avail_w = (panel.right - panel.left - 32.0) / k;
+                let avail_h = (panel.bottom - panel.top - 32.0) / k;
+                let scale = (avail_w / w.max(1.0)).min(avail_h / h.max(1.0));
+                let dw = w * scale * k;
+                let dh = h * scale * k;
+                let r = D2D_RECT_F {
+                    left: panel.left + (panel.right - panel.left - dw) * 0.5,
+                    top: panel.top + (panel.bottom - panel.top - dh) * 0.5,
+                    right: panel.left + (panel.right - panel.left + dw) * 0.5,
+                    bottom: panel.top + (panel.bottom - panel.top + dh) * 0.5,
+                };
+                if let (Some(store), Some(bmp)) = (self.images.as_ref(), self.images.as_ref().and_then(|s| s.bitmap(target, &path))) {
+                    let _ = store;
+                    target.DrawBitmap(&bmp, Some(&r), 1.0, D2D1_BITMAP_INTERPOLATION_MODE_LINEAR, None);
+                }
+            }
+            Preview::Formula(index) => {
+                let Some(entry) = self.math.get(index) else { return };
+                let k = scale_of(self.dpi);
+                let scale = ((panel.right - panel.left - 32.0) / (entry.object.advance * k).max(1.0))
+                    .min((panel.bottom - panel.top - 32.0) / ((entry.object.ascent + entry.object.descent) * k).max(1.0));
+                let baseline = panel.top + (panel.bottom - panel.top + (entry.object.ascent - entry.object.descent) * scale * k) * 0.5;
+                let left = panel.left + (panel.right - panel.left - entry.object.advance * scale * k) * 0.5;
+                let mut runs = Vec::new();
+                for (r, x, y) in &entry.parts {
+                    if let Some(mut run) = paint_run(&self.font, r, (left / k) + *x * scale, *y * scale, k * scale, ColorRole::Text) {
+                        run.baseline = baseline;
+                        runs.push(run);
+                    }
+                }
+                self.draw_runs(target, &runs, 0.0);
+                if let Some(brush) = self.brushes.get(&ColorRole::Text).cloned() {
+                    for (x, top, w, h) in &entry.rules {
+                        let r = D2D_RECT_F {
+                            left: left + *x * scale * k,
+                            top: baseline + *top * scale * k,
+                            right: left + (*x + *w) * scale * k,
+                            bottom: baseline + (*top + *h) * scale * k,
+                        };
+                        target.FillRectangle(&r, &brush);
+                    }
+                }
+            }
         }
     }
 
@@ -4469,7 +4698,7 @@ fn layout_table(
     out: &mut Out<'_>,
     mut y: Pt,
 ) -> Pt {
-    let Out { ops, hots, sel, hyphens } = out;
+    let Out { ops, hots, sel, hyphens, wide } = out;
     let Ctx { theme, styles, k, math, .. } = *ctx;
     let Blk { left, column, .. } = *blk;
     let size = theme.base;
@@ -4857,6 +5086,24 @@ fn layout_table(
     // in once the first row has been measured.
     if let Some(Op::Rect { h, .. }) = ops.get_mut(panel) {
         *h = head_h * k;
+    }
+    if total > column {
+        let index = wide.len();
+        wide.push(WideRegion {
+            kind: WideKind::Table,
+            x: left * k,
+            y: grid_top * k,
+            w: grid_w * k,
+            h: (y - grid_top) * k,
+            content_w: total * k,
+        });
+        hots.push(Hot {
+            x: left * k,
+            y: grid_top * k,
+            w: grid_w * k,
+            h: (y - grid_top) * k,
+            kind: HotKind::Wide(index),
+        });
     }
     y
 }
@@ -5269,6 +5516,7 @@ pub fn build_ops(
     let mut ops = Vec::new();
     let mut hots = Vec::new();
     let mut sel: Vec<SelLine> = Vec::new();
+    let mut wide: Vec<WideRegion> = Vec::new();
     let mut breaks = HyphenCount::default();
     let mut note_tops: Vec<Pt> = Vec::with_capacity(doc.footnotes.len());
     // A citation names its note by the author's own label, while the page knows notes
@@ -5430,7 +5678,7 @@ pub fn build_ops(
                 hang: if b.list.is_some() { level } else { 0.0 },
                 actions: &p.actions,
             },
-            &mut Out { ops: &mut ops, hots: &mut hots, sel: &mut sel, hyphens: &mut breaks },
+            &mut Out { ops: &mut ops, hots: &mut hots, sel: &mut sel, hyphens: &mut breaks, wide: &mut wide },
             y,
         );
     }
@@ -5482,7 +5730,7 @@ pub fn build_ops(
                         hang: note_hang,
                         actions: &p.actions,
                     },
-                    &mut Out { ops: &mut ops, hots: &mut hots, sel: &mut sel, hyphens: &mut breaks },
+                    &mut Out { ops: &mut ops, hots: &mut hots, sel: &mut sel, hyphens: &mut breaks, wide: &mut wide },
                     y,
                 );
             }
@@ -5506,6 +5754,7 @@ pub fn build_ops(
         column,
         left,
         hotspots: hots,
+        wide_regions: wide,
         note_tops,
         anchor_tops,
         sel,
@@ -5640,7 +5889,24 @@ mod tests {
         assert_eq!(c.line, 1, "a pointer at the painted place reaches the painted line");
     }
 
-    /// The bar's own arithmetic, which is the whole of what can be asked of it outside a
+    #[test]
+    fn wide_pan_is_bounded_and_only_moves_its_region() {
+        let region = WideRegion {
+            kind: WideKind::Table,
+            x: 100.0,
+            y: 200.0,
+            w: 80.0,
+            h: 40.0,
+            content_w: 180.0,
+        };
+        assert_eq!(pan_offset(180.0, 80.0, -20.0), 0.0);
+        assert_eq!(pan_offset(180.0, 80.0, 20.0), 20.0);
+        assert_eq!(pan_offset(180.0, 80.0, 200.0), 100.0);
+        assert_eq!(region_shift(&region, 30.0, 110.0, 210.0), -30.0);
+        assert_eq!(region_shift(&region, 30.0, 90.0, 210.0), 0.0);
+        assert_eq!(region_shift(&region, 30.0, 110.0, 100.0), 0.0);
+    }
+
     /// window: where it goes, and what it says when it is there.
     #[test]
     fn the_bar_leaves_the_thumb_outside_it_and_the_count_inside_it() {
