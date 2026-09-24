@@ -27,7 +27,8 @@ use windows::Win32::Graphics::DirectWrite::{
     DWRITE_GLYPH_METRICS, DWRITE_GLYPH_OFFSET, DWRITE_SCRIPT_ANALYSIS,
     DWRITE_SHAPING_GLYPH_PROPERTIES,
     DWRITE_SHAPING_TEXT_PROPERTIES, DWriteCreateFactory,
-    IDWriteFactory, IDWriteFontCollection, IDWriteFont, IDWriteFontFace, IDWriteTextAnalyzer,
+    IDWriteFactory, IDWriteFontCollection, IDWriteFont, IDWriteFontFace, IDWriteFontFile,
+    IDWriteTextAnalyzer,
 };
 
 #[derive(Clone)]
@@ -108,6 +109,9 @@ pub struct FontEngine {
     /// `(position, thickness)` of this face's strikeout rule, in design units, read
     /// from its file: a face is asked once, however many struck runs it carries.
     strikeout: RefCell<HashMap<usize, Option<(f32, f32)>>>,
+    /// The source sfnt bytes behind a face, read through DirectWrite when an export
+    /// needs an embeddable font rather than a COM draw handle.
+    font_files: RefCell<HashMap<usize, (Vec<u8>, usize)>>,
     styles: RefCell<Vec<Style>>,
 }
 
@@ -151,6 +155,7 @@ impl FontEngine {
                 shaped: RefCell::new(HashMap::new()),
                 analyzed: RefCell::new(HashMap::new()),
                 strikeout: RefCell::new(HashMap::new()),
+                font_files: RefCell::new(HashMap::new()),
                 styles: RefCell::new(Vec::new()),
             })
         }
@@ -526,6 +531,50 @@ impl FontEngine {
     /// The COM face handle, for `DrawGlyphRun`.
     pub fn font_face(&self, idx: usize) -> Option<IDWriteFontFace> {
         self.faces.borrow().get(idx).map(|f| f.face.clone())
+    }
+
+    /// Read the sfnt file and face index behind a resolved face.
+    ///
+    /// Direct2D only needs a COM face, but a PDF has to carry the font program so
+    /// that its glyphs remain visible on another machine. Reading the same face through
+    /// DirectWrite keeps the PDF's glyph ids and advances tied to the ones the reader
+    /// actually painted, instead of guessing from a family name and a second font file.
+    pub(crate) fn font_file(&self, idx: usize) -> Option<(Vec<u8>, usize)> {
+        if let Some(hit) = self.font_files.borrow().get(&idx) {
+            return Some(hit.clone());
+        }
+        let face = self.font_face(idx)?;
+        let mut count = 0u32;
+        unsafe { face.GetFiles(&mut count, None).ok()? };
+        if count == 0 {
+            return None;
+        }
+        let mut files: Vec<Option<IDWriteFontFile>> = vec![None; count as usize];
+        unsafe { face.GetFiles(&mut count, Some(files.as_mut_ptr())).ok()? };
+        let file = files.into_iter().flatten().next()?;
+        let mut key = std::ptr::null_mut();
+        let mut key_size = 0u32;
+        unsafe { file.GetReferenceKey(&mut key, &mut key_size).ok()? };
+        let loader = unsafe { file.GetLoader().ok()? };
+        let stream = unsafe { loader.CreateStreamFromKey(key, key_size).ok()? };
+        let size = unsafe { stream.GetFileSize().ok()? };
+        // A font file larger than this is not a sane document export and copying it
+        // would turn a failed export into an unbounded allocation.
+        if size == 0 || size > 256 * 1024 * 1024 {
+            return None;
+        }
+        let mut fragment = std::ptr::null_mut();
+        let mut context = std::ptr::null_mut();
+        unsafe { stream.ReadFileFragment(&mut fragment, 0, size, &mut context).ok()? };
+        if fragment.is_null() {
+            return None;
+        }
+        let bytes = unsafe { std::slice::from_raw_parts(fragment.cast::<u8>(), size as usize) }.to_vec();
+        unsafe { stream.ReleaseFileFragment(context) };
+        let face_index = unsafe { face.GetIndex() } as usize;
+        let result = (bytes, face_index);
+        self.font_files.borrow_mut().insert(idx, result.clone());
+        Some(result)
     }
 
     pub fn face_family(&self, idx: usize) -> String {

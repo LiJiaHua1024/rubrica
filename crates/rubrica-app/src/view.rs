@@ -15,6 +15,12 @@ use rubrica_type::justification::place_bidi;
 use rubrica_type::paragraph::{Item, Spacing, StyleId, StyleSpan};
 use rubrica_type::units::Pt;
 use rubrica_type::{BreakOptions, Hyphenation, typeset, typeset_hyphenated};
+use printpdf::{
+    Color as PdfColor, Codepoint, FontId as PdfFontId, Op as PdfOp, ParsedFont, PdfDocument,
+    PdfFontHandle, PdfPage, PdfSaveOptions, Point as PdfPoint, RawImage, Rect as PdfRect,
+    DictItem,
+    Rgb as PdfRgb, TextItem, TextMatrix as PdfTextMatrix, XObjectTransform,
+};
 use windows::core::{w, BOOL, Interface, PCWSTR};
 use windows::Win32::Foundation::GENERIC_WRITE;
 use windows::Win32::Foundation::{COLORREF, HWND, LPARAM, LRESULT, POINT, RECT, WPARAM};
@@ -44,7 +50,7 @@ use windows::Win32::Graphics::Gdi::{
     InvalidateRect, MONITORINFO, OUT_DEFAULT_PRECIS, ScreenToClient, SetBkColor, SetTextColor,
 };
 use windows::Win32::System::Com::{
-    CoInitializeEx, COINIT_APARTMENTTHREADED, COINIT_DISABLE_OLE1DDE,
+    CoInitializeEx, COINIT_APARTMENTTHREADED, COINIT_DISABLE_OLE1DDE, COINIT_MULTITHREADED,
 };
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::System::Registry::{RRF_RT_DWORD, RegGetValueW, HKEY_CURRENT_USER};
@@ -250,19 +256,28 @@ enum ObjectSource {
 #[derive(Clone)]
 pub struct PaintRun {
     pub bidi_level: u8,
-    face: IDWriteFontFace,
+    pub(crate) face: IDWriteFontFace,
+    pub(crate) face_index: usize,
     /// Resolved family, recorded at layout time so the report can show which face
     /// actually carried each run without a COM round trip per frame.
     pub family: String,
     pub em: f32,
     pub glyphs: Vec<u16>,
     pub advances: Vec<f32>,
-    offsets: Vec<DWRITE_GLYPH_OFFSET>,
+    pub(crate) offsets: Vec<DWRITE_GLYPH_OFFSET>,
+    /// The source slice that produced this run, when it came from document text.
+    /// PDF export needs it to give each glyph a Unicode value; a formula's synthetic
+    /// assembly has no one-to-one source range and leaves it empty.
+    pub(crate) source: Option<String>,
+    /// DirectWrite's first UTF-16 cluster for every glyph, retained with the source slice
+    /// so a ligature still extracts as the characters it replaced. The raw
+    /// `GlyphRun::clusters` is the opposite direction (one entry per input code unit).
+    pub(crate) clusters: Vec<u16>,
     pub x: f32,
     pub baseline: f32,
     /// Extra drop below the line's baseline, positive downwards. Zero for prose; a
     /// formula's pieces each sit somewhere of their own within its box.
-    dy: f32,
+    pub(crate) dy: f32,
     /// Which of the theme's inks carries this run, recorded for the same reason
     /// `family` is: the report can then say what the page actually painted rather
     /// than what the layout asked for.
@@ -3419,7 +3434,7 @@ impl View {
         let baseline = py + ph / 2.0 + size * k * 0.35;
         let mut label = Vec::new();
         for r in &runs {
-            if let Some(mut p) = paint_run(&self.font, r, 0.0, 0.0, k, ColorRole::Muted) {
+            if let Some(mut p) = paint_run(&self.font, r, 0.0, 0.0, k, ColorRole::Muted, Some(&text)) {
                 p.x = at;
                 p.baseline = baseline;
                 at += r.width() * k;
@@ -3562,15 +3577,53 @@ fn fit_punctuation_runs(runs: &mut [GlyphRun], width: Pt) {
     }
 }
 
-fn paint_run(font: &FontEngine, r: &GlyphRun, x: Pt, dy: Pt, k: f32, color: ColorRole) -> Option<PaintRun> {
+fn glyph_clusters(r: &GlyphRun) -> Vec<u16> {
+    let mut out = vec![u16::MAX; r.glyphs.len()];
+    for (input, glyph) in r.clusters.iter().copied().enumerate() {
+        let index = glyph as usize;
+        if index < out.len() {
+            out[index] = out[index].min(input as u16);
+        }
+    }
+    // A shaping implementation may leave a generated mark without a direct cluster
+    // entry. Keep it attached to the nearest preceding input rather than dropping its
+    // text during PDF extraction.
+    let mut previous = 0u16;
+    for value in &mut out {
+        if *value == u16::MAX {
+            *value = previous;
+        } else {
+            previous = *value;
+        }
+    }
+    out
+}
+
+fn paint_run(
+    font: &FontEngine,
+    r: &GlyphRun,
+    x: Pt,
+    dy: Pt,
+    k: f32,
+    color: ColorRole,
+    source: Option<&str>,
+) -> Option<PaintRun> {
+    let source = source.and_then(|text| {
+        text.get(r.text.clone())
+            .filter(|slice| !slice.is_empty())
+            .map(str::to_owned)
+    });
     Some(PaintRun {
         bidi_level: r.bidi_level,
         family: font.face_family(r.face),
         face: font.font_face(r.face)?,
+        face_index: r.face,
         em: r.size * k,
         glyphs: r.glyphs.clone(),
         advances: r.advances.iter().map(|a| a * k).collect(),
         offsets: r.offsets.clone(),
+        source,
+        clusters: glyph_clusters(r),
         x: x * k,
         baseline: 0.0,
         dy,
@@ -4030,7 +4083,7 @@ fn layout_block(
                         // box, so nothing here accumulates an advance.
                         if let Some(entry) = math.get(*index) {
                             for (r, dx, dy) in &entry.parts {
-                                if let Some(p) = paint_run(font, r, line_left + slot.x + dx, *dy, k, st.color) {
+                                if let Some(p) = paint_run(font, r, line_left + slot.x + dx, *dy, k, st.color, None) {
                                     runs.push(p);
                                 }
                             }
@@ -4081,7 +4134,7 @@ fn layout_block(
                 }
                 ascent = ascent.max(r.ascent - dy);
                 descent = descent.max((r.descent + dy).max(0.0));
-                if let Some(p) = paint_run(font, &r, at, dy, k, st.color) {
+                if let Some(p) = paint_run(font, &r, at, dy, k, st.color, (!hyphen).then_some(text)) {
                     runs.push(p);
                     if hyphen {
                         hyphens.marks += 1;
@@ -4627,7 +4680,7 @@ impl View {
                 let left = panel.left + (panel.right - panel.left - entry.object.advance * scale * k) * 0.5;
                 let mut runs = Vec::new();
                 for (r, x, y) in &entry.parts {
-                    if let Some(mut run) = paint_run(&self.font, r, (left / k) + *x * scale, *y * scale, k * scale, ColorRole::Text) {
+                    if let Some(mut run) = paint_run(&self.font, r, (left / k) + *x * scale, *y * scale, k * scale, ColorRole::Text, None) {
                         run.baseline = baseline;
                         runs.push(run);
                     }
@@ -4891,7 +4944,7 @@ fn layout_table(
                                 if let Some(entry) = math.get(*index) {
                                     for (r, dx, dy) in &entry.parts {
                                         if let Some(p) =
-                                            paint_run(font, r, at + dx, *dy, k, st.color)
+                                            paint_run(font, r, at + dx, *dy, k, st.color, None)
                                         {
                                             runs.push(p);
                                         }
@@ -4950,14 +5003,18 @@ fn layout_table(
                                 },
                             );
                         }
+                        let clusters = glyph_clusters(&r);
                         runs.push(PaintRun {
                             bidi_level: r.bidi_level,
                             family: font.face_family(r.face),
                             face,
+                            face_index: r.face,
                             em: r.size * k,
                             glyphs: r.glyphs,
                             advances: r.advances.iter().map(|a| a * k).collect(),
                             offsets: r.offsets,
+                            source: if hyphen { None } else { c.text.get(node.text.clone()).map(str::to_owned) },
+                            clusters,
                             x: at * k,
                             baseline: 0.0,
                             dy: -st.raise,
@@ -5682,6 +5739,316 @@ unsafe fn write_png(
     Ok(())
 }
 
+/// Export the same display list as a multi-page PDF with selectable text.
+///
+/// The page is measured at 72 dpi, so every coordinate in `Page` is already a PDF
+/// point. Glyphs are emitted as positioned glyph ids with a ToUnicode value rather
+/// than flattened to a screenshot: copying from the PDF therefore sees the document's
+/// Unicode, including CJK, while the embedded sfnt keeps the exact DirectWrite shapes.
+#[allow(clippy::too_many_arguments)]
+pub fn export_pdf(
+    source: &str,
+    input_path: Option<&Path>,
+    output: &Path,
+    width: Pt,
+    height: Pt,
+    dark: bool,
+    plain: bool,
+    text_options: TextOptions,
+    source_view: bool,
+    keep_line_breaks: bool,
+    zoom: Zoom,
+    face: Option<usize>,
+    measure: Option<usize>,
+    profile: Option<&str>,
+    hyphenate: bool,
+) -> Result<()> {
+    unsafe {
+        let _ = CoInitializeEx(None, COINIT_MULTITHREADED);
+    }
+    let mut theme = Theme::default();
+    theme.set_zoom(zoom);
+    if let Some(name) = profile {
+        crate::profiles::load(name).apply(&mut theme);
+    }
+    if let Some(face) = face.filter(|i| TextFace::ALL.get(*i).is_some()) {
+        theme.set_face(face);
+    }
+    if let Some(measure) = measure.filter(|i| Measure::ALL.get(*i).is_some()) {
+        theme.set_measure(measure);
+    }
+    let doc = if source_view {
+        Document::source(source)
+    } else if plain {
+        rubrica_doc::plain::parse(source, text_options)
+    } else {
+        Document::parse_with(source, rubrica_doc::ParseOptions { keep_line_breaks })
+    };
+    let mut font = FontEngine::new().map_err(|e| -> Error { format!("DirectWrite: {e}").into() })?;
+    if !font.probe() {
+        return Err("no usable font face".into());
+    }
+    let store = ImageStore::new().ok();
+    let base = input_path.and_then(Path::parent);
+    let mut math = crate::math::MathStore::new();
+    let mut objects = Objects::new(store.as_ref(), base, &mut math);
+    let hyphenator = if hyphenate { crate::hyphen::Hyphenator::english() } else { None };
+    let page = build_ops(
+        &mut font,
+        &theme,
+        &doc,
+        width,
+        72.0,
+        &mut objects,
+        hyphenator.as_ref(),
+    );
+    write_pdf(&page, &font, output, width, height, dark)
+}
+
+fn pdf_rgb(c: Rgb) -> PdfColor {
+    PdfColor::Rgb(PdfRgb::new(c.r, c.g, c.b, None))
+}
+
+fn pdf_color(role: ColorRole, dark: bool) -> PdfColor {
+    pdf_rgb(Palette::of(dark).ink(role))
+}
+
+fn pdf_point(x: f32, y: f32) -> PdfPoint {
+    PdfPoint { x: printpdf::Pt(x), y: printpdf::Pt(y) }
+}
+
+fn actual_text_span(text: &str) -> PdfOp {
+    let mut data = vec![0xFE, 0xFF];
+    for unit in text.encode_utf16() {
+        data.extend_from_slice(&unit.to_be_bytes());
+    }
+    let mut map = std::collections::BTreeMap::new();
+    map.insert(
+        "ActualText".to_string(),
+        DictItem::String { data, literal: false },
+    );
+    PdfOp::BeginMarkedContentWithProperties {
+        tag: "Span".to_string(),
+        properties: DictItem::Dict { map },
+    }
+}
+
+/// The Unicode value attached to one DirectWrite glyph, including the characters
+/// represented by a ligature's shared cluster.
+fn unicode_for_glyph(source: &str, clusters: &[u16], index: usize) -> Option<String> {
+    let units: Vec<u16> = source.encode_utf16().collect();
+    let start = clusters.get(index).copied().unwrap_or(0) as usize;
+    let end = clusters
+        .iter()
+        .skip(index + 1)
+        .map(|v| *v as usize)
+        .find(|v| *v > start)
+        .unwrap_or(units.len());
+    if start >= end {
+        return None;
+    }
+    let mut out = String::new();
+    let mut at = 0usize;
+    for c in source.chars() {
+        let next = at + c.len_utf16();
+        if at >= start && next <= end {
+            out.push(c);
+        }
+        at = next;
+        if at >= end {
+            break;
+        }
+    }
+    (!out.is_empty()).then_some(out)
+}
+
+fn glyph_unicode(run: &PaintRun, index: usize) -> Option<String> {
+    unicode_for_glyph(run.source.as_deref()?, &run.clusters, index)
+}
+
+fn write_pdf(
+    page: &Page,
+    font: &FontEngine,
+    output: &Path,
+    width: Pt,
+    height: Pt,
+    dark: bool,
+) -> Result<()> {
+    if width <= 0.0 || height <= 0.0 {
+        return Err("PDF page size must be positive".into());
+    }
+    let content_h = page.height.max(1.0);
+    let page_count = (content_h / height).ceil().max(1.0) as usize;
+    let mut pdf = PdfDocument::new(output.file_stem().and_then(|s| s.to_str()).unwrap_or("Rubrica document"));
+    let mut warnings = Vec::new();
+    let mut fonts: HashMap<usize, PdfFontId> = HashMap::new();
+    let mut missing_font_faces = Vec::new();
+    let mut images: HashMap<PathBuf, (printpdf::XObjectId, usize, usize)> = HashMap::new();
+    let palette = Palette::of(dark);
+
+    for page_index in 0..page_count {
+        let top = page_index as Pt * height;
+        let mut ops = vec![
+            PdfOp::SetFillColor { col: pdf_rgb(palette.bg) },
+            PdfOp::DrawRectangle {
+                rectangle: PdfRect::from_xywh(
+                    printpdf::Pt(0.0),
+                    printpdf::Pt(0.0),
+                    printpdf::Pt(width),
+                    printpdf::Pt(height),
+                ),
+            },
+        ];
+        for op in &page.ops {
+            match op {
+                Op::Rect { x, y, w, h, color } => {
+                    let y0 = *y - top;
+                    let y1 = y0 + *h;
+                    if y1 <= 0.0 || y0 >= height || *w <= 0.0 || *h <= 0.0 {
+                        continue;
+                    }
+                    let clipped0 = y0.max(0.0);
+                    let clipped1 = y1.min(height);
+                    ops.push(PdfOp::SetFillColor { col: pdf_color(*color, dark) });
+                    ops.push(PdfOp::DrawRectangle {
+                        rectangle: PdfRect::from_xywh(
+                            printpdf::Pt(*x),
+                            printpdf::Pt(height - clipped1),
+                            printpdf::Pt(*w),
+                            printpdf::Pt(clipped1 - clipped0),
+                        ),
+                    });
+                }
+                Op::Line { x0, y0, x1, y1, thickness, color } => {
+                    let a = *y0 - top;
+                    let b = *y1 - top;
+                    if (a < 0.0 && b < 0.0) || (a >= height && b >= height) {
+                        continue;
+                    }
+                    let (a, b) = if a <= b { (a, b) } else { (b, a) };
+                    let clipped0 = a.max(0.0);
+                    let clipped1 = b.min(height);
+                    if clipped1 <= clipped0 {
+                        continue;
+                    }
+                    ops.push(PdfOp::SetOutlineColor { col: pdf_color(*color, dark) });
+                    ops.push(PdfOp::SetOutlineThickness { pt: printpdf::Pt(*thickness) });
+                    ops.push(PdfOp::DrawLine {
+                        line: printpdf::Line {
+                            points: vec![
+                                printpdf::LinePoint { p: pdf_point(*x0, height - clipped0), bezier: false },
+                                printpdf::LinePoint { p: pdf_point(*x1, height - clipped1), bezier: false },
+                            ],
+                            is_closed: false,
+                        },
+                    });
+                }
+                Op::Image { path, x, y, w, h } => {
+                    let local_y = *y - top;
+                    if local_y + *h <= 0.0 || local_y >= height || *w <= 0.0 || *h <= 0.0 {
+                        continue;
+                    }
+                    let (id, pixel_w, pixel_h) = if let Some(hit) = images.get(path) {
+                        hit.clone()
+                    } else {
+                        let Ok(bytes) = std::fs::read(path) else { continue };
+                        let Ok(image) = RawImage::decode_from_bytes(&bytes, &mut warnings) else { continue };
+                        let id = pdf.add_image(&image);
+                        let hit = (id, image.width, image.height);
+                        images.insert(path.clone(), hit.clone());
+                        hit
+                    };
+                    let transform = XObjectTransform {
+                        translate_x: Some(printpdf::Pt(*x)),
+                        translate_y: Some(printpdf::Pt(height - local_y - *h)),
+                        scale_x: Some(*w / pixel_w.max(1) as f32),
+                        scale_y: Some(*h / pixel_h.max(1) as f32),
+                        dpi: Some(72.0),
+                        no_auto_scale: true,
+                        ..Default::default()
+                    };
+                    ops.push(PdfOp::UseXobject { id, transform });
+                }
+                Op::Runs(runs) => {
+                    for run in runs {
+                        if run.glyphs.is_empty() {
+                            continue;
+                        }
+                        let baseline = run.baseline - top;
+                        if baseline < 0.0 || baseline >= height {
+                            continue;
+                        }
+                        let font_id = if let Some(id) = fonts.get(&run.face_index) {
+                            id.clone()
+                        } else {
+                            let Some((bytes, face_index)) = font.font_file(run.face_index) else {
+                                missing_font_faces.push(run.family.clone());
+                                continue;
+                            };
+                            let mut font_warnings = Vec::new();
+                            let Some(parsed) = ParsedFont::from_bytes(&bytes, face_index, &mut font_warnings)
+                            else {
+                                continue;
+                            };
+                            let id = pdf.add_font(&parsed);
+                            fonts.insert(run.face_index, id.clone());
+                            id
+                        };
+                        ops.push(PdfOp::SetFillColor { col: pdf_color(run.color, dark) });
+                        ops.push(PdfOp::SetFont {
+                            font: PdfFontHandle::External(font_id),
+                            size: printpdf::Pt(run.em),
+                        });
+                        ops.push(PdfOp::StartTextSection);
+                        if let Some(source) = run.source.as_deref() {
+                            ops.push(actual_text_span(source));
+                        }
+                        let total: f32 = run.advances.iter().sum();
+                        let mut x = glyph_origin(run.x, total, run.bidi_level);
+                        for (i, glyph) in run.glyphs.iter().enumerate() {
+                            let item = glyph_unicode(run, i)
+                                .map(|cid| TextItem::GlyphIds(vec![Codepoint::with_cid(*glyph, 0.0, cid)]))
+                                .unwrap_or_else(|| TextItem::GlyphIds(vec![Codepoint::new(*glyph, 0.0)]));
+                            ops.push(PdfOp::SetTextMatrix {
+                                matrix: PdfTextMatrix::Raw([
+                                    1.0,
+                                    0.0,
+                                    0.0,
+                                    1.0,
+                                    x,
+                                    height - baseline,
+                                ]),
+                            });
+                            ops.push(PdfOp::ShowText { items: vec![item] });
+                            x += run.advances.get(i).copied().unwrap_or(0.0);
+                        }
+                        ops.push(PdfOp::EndTextSection);
+                        if run.source.is_some() {
+                            ops.push(PdfOp::EndMarkedContent);
+                        }
+                    }
+                }
+            }
+        }
+        pdf.pages.push(PdfPage::new(
+            printpdf::Mm(width * 25.4 / 72.0),
+            printpdf::Mm(height * 25.4 / 72.0),
+            ops,
+        ));
+    }
+    if !missing_font_faces.is_empty() {
+        missing_font_faces.sort_unstable();
+        missing_font_faces.dedup();
+        return Err(format!("PDF cannot embed font(s): {}", missing_font_faces.join(", ")).into());
+    }
+    let bytes = pdf.save(
+        &PdfSaveOptions { optimize: true, subset_fonts: true, ..PdfSaveOptions::default() },
+        &mut warnings,
+    );
+    std::fs::write(output, bytes).map_err(|e| format!("cannot write {}: {e}", output.display()))?;
+    Ok(())
+}
+
 pub fn build_ops(
     font: &mut FontEngine,
     theme: &Theme,
@@ -6076,6 +6443,13 @@ mod tests {
         assert!(painted > 0.0 && painted < 800.0, "the scrolled line is still on screen: {painted}");
         let c = caret_at(&sel, 0.0, painted + up + 1.0);
         assert_eq!(c.line, 1, "a pointer at the painted place reaches the painted line");
+    }
+
+    #[test]
+    fn pdf_glyph_clusters_keep_ligature_text_selectable() {
+        assert_eq!(unicode_for_glyph("fi", &[0, 0], 0).as_deref(), Some("fi"));
+        assert_eq!(unicode_for_glyph("a😀b", &[0, 1, 3], 1).as_deref(), Some("😀"));
+        assert_eq!(unicode_for_glyph("abc", &[0, 1, 2], 2).as_deref(), Some("c"));
     }
 
     #[test]

@@ -36,3 +36,4 @@ windows = { version = "0.62", features = [
 windows-numerics = "0.3"
 windows-core = "0.62"
 hyphenation = { version = "0.8", features = ["embed_en-us"] }
+printpdf = { version = "0.12.8", default-features = false, features = ["images", "png"] }

@@ -69,6 +69,43 @@ fn main() -> Result<()> {
             !argv.iter().any(|a| a == "--no-hyphenate"),
         );
     }
+    if argv.iter().any(|a| a == "--export-pdf") {
+        let output = text_flag(&argv, "--export-pdf").ok_or("--export-pdf needs an output path")?;
+        let width = flag(&argv, "--pdf-width").or_else(|| flag(&argv, "--export-width")).unwrap_or(612.0);
+        let height = flag(&argv, "--pdf-height").unwrap_or(792.0);
+        let file = positional(&argv);
+        let (path, source) = load(file.as_deref())?;
+        let prefs = path.as_deref().map(settings::document).unwrap_or_default();
+        let plain = if argv.iter().any(|a| a == "--plain") { Some(true) }
+            else if argv.iter().any(|a| a == "--markdown") { Some(false) }
+            else { prefs.plain };
+        let profile = text_flag(&argv, "--profile").or_else(|| {
+            path.as_deref().map(|p| crate::profiles::selected(
+                prefs.plain.unwrap_or_else(|| reading::is_plain(Some(p))),
+            ))
+        });
+        let zoom = theme::Zoom::nearest_percent(flag(&argv, "--zoom").unwrap_or(100.0));
+        let face = flag(&argv, "--face").map(|v| v as usize);
+        let measure = flag(&argv, "--measure").map(|v| v as usize);
+        return view::export_pdf(
+            &source,
+            path.as_deref(),
+            std::path::Path::new(&output),
+            width,
+            height,
+            argv.iter().any(|a| a == "--dark"),
+            plain.unwrap_or_else(|| reading::is_plain(path.as_deref())),
+            prefs.text,
+            argv.iter().any(|a| a == "--source") || prefs.source,
+            argv.iter().any(|a| a == "--keep-line-breaks")
+                || prefs.line_breaks.unwrap_or_else(settings::keep_line_breaks),
+            zoom,
+            face,
+            measure,
+            profile.as_deref(),
+            !argv.iter().any(|a| a == "--no-hyphenate"),
+        );
+    }
     if argv.iter().any(|a| a == "--report") {
         let width = flag(&argv, "--width").unwrap_or(1080.0);
         let dpi = flag(&argv, "--dpi").unwrap_or(96.0);
@@ -165,9 +202,10 @@ fn load(file: Option<&str>) -> Result<(Option<PathBuf>, String)> {
 
 /// The document path, skipping the values that belong to `--width` and friends.
 fn positional(argv: &[String]) -> Option<String> {
-    const TAKES_VALUE: [&str; 9] = [
+    const TAKES_VALUE: [&str; 12] = [
         "--width", "--dpi", "--zoom", "--face", "--measure", "--profile",
-        "--export-png", "--export-width", "--export-scale",
+        "--export-png", "--export-width", "--export-scale", "--export-pdf",
+        "--pdf-width", "--pdf-height",
     ];
     let mut skip_next = false;
     for a in argv.iter().skip(1) {
