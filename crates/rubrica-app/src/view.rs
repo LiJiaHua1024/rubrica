@@ -64,7 +64,7 @@ use windows::Win32::UI::Input::KeyboardAndMouse::{VK_DOWN, VK_ESCAPE, VK_NEXT, V
 use windows::Win32::UI::Input::KeyboardAndMouse::{
     VK_0, VK_A, VK_ADD, VK_C, VK_D, VK_END, VK_F, VK_F3, VK_HOME, VK_LEFT, VK_MENU, VK_NUMPAD0,
     VK_OEM_4, VK_OEM_6, VK_OEM_MINUS, VK_OEM_PLUS, VK_R, VK_RETURN, VK_RIGHT, VK_SHIFT,
-    VK_SUBTRACT, VIRTUAL_KEY,
+    VK_SUBTRACT, VK_TAB, VK_W, VIRTUAL_KEY,
 };
 use windows::Win32::UI::Controls::EM_SETCUEBANNER;
 use windows::Win32::UI::Controls::Dialogs::{
@@ -98,6 +98,7 @@ use crate::font::{cjk_char, FaceRequest, FontEngine, GlyphRun, ObjectBox, Style 
 use crate::hyphen::Hyphenator;
 use crate::images::ImageStore;
 use crate::math::MathStore;
+use rubrica_workspace::{DocumentRef, FileRef, TabId, TabKind, Workspace};
 use crate::theme::{ColorRole, Leading, Measure, Role, TextFace, Theme, Zoom};
 use crate::{Error, Result};
 
@@ -269,11 +270,10 @@ pub struct PaintRun {
     /// PDF export needs it to give each glyph a Unicode value; a formula's synthetic
     /// assembly has no one-to-one source range and leaves it empty.
     pub(crate) source: Option<String>,
-    /// Unicode values for every glyph, derived from DirectWrite's input-unit → glyph
-    /// cluster map. This is deliberately a per-glyph value rather than a second cluster
-    /// index: RTL shaping can return cluster starts in visual order, while the source
-    /// substring must still be attached by the original UTF-16 map.
-    pub(crate) unicode: Vec<Option<String>>,
+    /// DirectWrite's raw UTF-16-unit → glyph map. It is compact and is interpreted only by
+    /// the PDF exporter, so normal window layout does not allocate one Unicode string per
+    /// glyph.
+    pub(crate) clusters: Vec<u16>,
     pub x: f32,
     pub baseline: f32,
     /// Extra drop below the line's baseline, positive downwards. Zero for prose; a
@@ -895,6 +895,9 @@ pub struct View {
     client_h: f32,
     dpi: f32,
     path: Option<PathBuf>,
+    /// Open documents and their stable tab identities. The window keeps one materialized
+    /// document at a time; this is the authority for what can be switched to next.
+    workspace: Workspace,
     /// What the file behind the page looked like when this text was read out of it: how
     /// long it was, and when it was last written. See [`Stamp`] and `WM_TIMER`.
     stamp: Option<Stamp>,
@@ -1195,6 +1198,12 @@ enum Command {
     /// manual choice once the room's light has changed.
     FollowSystem,
     OpenFile,
+    OpenRecent(usize),
+    ActivateTab(TabId),
+    CloseTab(TabId),
+    PinTab(TabId),
+    NextTab,
+    PreviousTab,
     /// Read the file this page came from again, from disk.
     Reload,
     DefaultLineBreaks(bool),
@@ -1245,6 +1254,8 @@ struct MenuState {
     text_options: TextOptions,
     chapter_titles: Vec<String>,
     chapter: usize,
+    tabs: Vec<(TabId, String, bool)>,
+    recent: Vec<(usize, String)>,
     encoding: Encoding,
     encoding_notice: Option<String>,
     previous: bool,
@@ -1342,6 +1353,22 @@ fn menu_items(s: &MenuState) -> Vec<MenuRow> {
         row(Command::OpenFile, "Open\u{2026}\tCtrl+O", true),
         row(Command::Reload, "Reload\tCtrl+R", s.from_file),
     ]);
+    if !s.tabs.is_empty() {
+        let mut tab_items = Vec::new();
+        for (id, title, active) in &s.tabs {
+            tab_items.push(row(Command::ActivateTab(*id), format!("{} {}", if *active { "●" } else { "○" }, title), true));
+            tab_items.push(row(Command::PinTab(*id), "Pin", !*active));
+            tab_items.push(row(Command::CloseTab(*id), "Close", !*active));
+        }
+        v.push(MenuRow::Gap);
+        v.push(MenuRow::Sub { label: "Open tabs", items: tab_items });
+    }
+    if !s.recent.is_empty() {
+        let recent_items = s.recent.iter()
+            .map(|(i, path)| row(Command::OpenRecent(*i), path.clone(), true))
+            .collect();
+        v.push(MenuRow::Sub { label: "Recent documents", items: recent_items });
+    }
     v.insert(v.len() - 3, MenuRow::Sub { label: "Single newlines", items: vec![
         check(Command::DefaultLineBreaks(false), "Default: Merge into paragraph", !s.keep_line_breaks),
         check(Command::DefaultLineBreaks(true), "Default: Keep line breaks", s.keep_line_breaks),
@@ -1643,6 +1670,11 @@ pub fn run(source: String, path: Option<PathBuf>) -> Result<()> {
             keep_line_breaks: preferences.line_breaks.unwrap_or(keep_line_breaks),
         }) };
 
+    let mut workspace = crate::settings::workspace().map(Workspace::restore).unwrap_or_default();
+    if let Some(path) = path.as_ref() {
+        workspace.open_file(View::workspace_file(path), TabKind::Pinned);
+    }
+
     let mut view = Box::new(View {
         d2d,
         target: None,
@@ -1685,6 +1717,7 @@ pub fn run(source: String, path: Option<PathBuf>) -> Result<()> {
         client_h: 1.0,
         dpi: 96.0,
         path,
+        workspace,
         stamp,
         history: History::default(),
         dragging: false,
@@ -1981,6 +2014,9 @@ unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM)
             // already gone and its place with them.
             if let Some(v) = view {
                 v.remember_reading();
+                if let Err(error) = crate::settings::record_workspace(&v.workspace.snapshot()) {
+                    eprintln!("workspace: {error}");
+                }
             }
             // The frame goes with the place for the same reason: the usual way to close a
             // window is its own `X`, which asks nothing of the process on the way out.
@@ -2270,6 +2306,17 @@ impl View {
                 let shift = held(VK_SHIFT);
                 if ctrl && wp.0 == 0x33 {
                     self.apply_command(Command::SourceView, hwnd);
+                    return LRESULT(0);
+                }
+                if ctrl && wp.0 == VK_TAB.0 as usize {
+                    self.apply_command(
+                        if held(VK_SHIFT) { Command::PreviousTab } else { Command::NextTab },
+                        hwnd,
+                    );
+                    return LRESULT(0);
+                }
+                if ctrl && !shift && wp.0 == VK_W.0 as usize {
+                    self.close_active_tab(hwnd);
                     return LRESULT(0);
                 }
                 // Once the reader has put a caret on the page -- by a click or by an
@@ -2752,14 +2799,16 @@ impl View {
             HotKind::Document(target) => {
                 let from = self.here();
                 let same = self.path.as_deref() == Some(target.path.as_path());
-                if !same && !self.show_document(&target.path, hwnd) { return; }
+                if !same {
+                    self.load_document(&target.path, hwnd);
+                }
                 if let Some(at) = target.fragment.as_deref().and_then(|f| heading_index(&self.doc, f)) {
                     if let Some(top) = self.anchor_tops.get(at) {
                         self.scroll = (*top - self.theme.base).max(0.0);
                     }
                 }
                 self.clamp_scroll();
-                if !same || (self.scroll - from.scroll).abs() > 0.5 {
+                if same && (self.scroll - from.scroll).abs() > 0.5 {
                     self.history.leave(from);
                 }
                 self.remember_reading();
@@ -2821,6 +2870,25 @@ impl View {
                 .map(|index| index.chapters().iter().map(|chapter| chapter.title.clone()).collect())
                 .unwrap_or_default(),
             chapter: self.chapter,
+            tabs: self
+                .workspace
+                .tabs
+                .items()
+                .iter()
+                .map(|tab| {
+                    let title = match &tab.document {
+                        DocumentRef::Sample => "Sample".to_string(),
+                        DocumentRef::File(file) => file.path.file_name()
+                            .map(|name| name.to_string_lossy().into_owned())
+                            .unwrap_or_else(|| file.path.to_string_lossy().into_owned()),
+                    };
+                    (tab.id, title, tab.id == self.workspace.tabs.active().id)
+                })
+                .collect(),
+            recent: self.workspace.recent.items().iter().enumerate()
+                .filter(|(_, file)| file.path.is_file())
+                .map(|(i, file)| (i, file.path.to_string_lossy().into_owned()))
+                .collect(),
             encoding: self.encoding,
             encoding_notice: Some(format!("{}{}", self.decoded_encoding.label(),
                 if self.encoding_guessed { " (detected by guess; choose if incorrect)" } else { "" })),
@@ -2909,6 +2977,22 @@ impl View {
                     self.load_document(&path, hwnd);
                 }
             }
+            Command::OpenRecent(index) => {
+                if let Some(path) = self.workspace.recent.items().get(index).map(|file| file.path.clone()) {
+                    self.load_document(&path, hwnd);
+                }
+            }
+            Command::ActivateTab(id) => { self.switch_to_tab(id, hwnd); }
+            Command::CloseTab(id) => {
+                if self.workspace.tabs.active().id == id {
+                    self.close_active_tab(hwnd);
+                } else {
+                    self.workspace.close(id);
+                }
+            }
+            Command::PinTab(id) => { self.workspace.pin(id); }
+            Command::NextTab => self.switch_relative_tab(1, hwnd),
+            Command::PreviousTab => self.switch_relative_tab(-1, hwnd),
             Command::Reload => {
                 if let Some(path) = self.path.clone() {
                     if let Ok(decoded) = reading::read(&path, self.encoding) {
@@ -3676,10 +3760,6 @@ fn paint_run(
             .filter(|slice| !slice.is_empty())
             .map(str::to_owned)
     });
-    let unicode = source
-        .as_deref()
-        .map(|text| unicode_by_glyph(text, &r.clusters, r.glyphs.len()))
-        .unwrap_or_default();
     Some(PaintRun {
         bidi_level: r.bidi_level,
         family: font.face_family(r.face),
@@ -3697,7 +3777,7 @@ fn paint_run(
             })
             .collect(),
         source,
-        unicode,
+        clusters: r.clusters.clone(),
         x: x * k,
         baseline: 0.0,
         dy,
@@ -4358,27 +4438,76 @@ impl View {
         Visit { path: self.path.clone(), scroll: self.scroll }
     }
 
+    fn workspace_file(path: &std::path::Path) -> FileRef {
+        let canonical = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
+        FileRef::new(canonical, 0)
+    }
+
+    fn switch_to_tab(&mut self, id: TabId, hwnd: HWND) -> bool {
+        if !self.workspace.activate(id) {
+            return false;
+        }
+        self.remember_reading();
+        match self.workspace.tabs.active().document.clone() {
+            DocumentRef::File(file) => self.show_document(&file.path, hwnd),
+            DocumentRef::Sample => {
+                self.set_page(crate::sample::DOCUMENT.to_string(), None, hwnd);
+                true
+            }
+        }
+    }
+
+    fn switch_relative_tab(&mut self, delta: isize, hwnd: HWND) {
+        let count = self.workspace.tabs.items().len();
+        if count < 2 {
+            return;
+        }
+        let current = self.workspace.tabs.active_index() as isize;
+        let next = (current + delta).rem_euclid(count as isize) as usize;
+        let id = self.workspace.tabs.items()[next].id;
+        self.switch_to_tab(id, hwnd);
+    }
+
+    fn close_active_tab(&mut self, hwnd: HWND) {
+        let id = self.workspace.tabs.active().id;
+        self.remember_reading();
+        if !self.workspace.close(id) {
+            return;
+        }
+        let next = self.workspace.tabs.active().document.clone();
+        match next {
+            DocumentRef::File(file) => { self.show_document(&file.path, hwnd); }
+            DocumentRef::Sample => { self.set_page(crate::sample::DOCUMENT.to_string(), None, hwnd); }
+        }
+        self.update_title(hwnd);
+    }
+
     /// Replace the open document, resetting the view to its top, and leave the page being
     /// stood on behind where a step back can find it again.
     fn load_document(&mut self, path: &std::path::Path, hwnd: HWND) {
         let from = self.here();
-        // Asked before the page is replaced, because after it `self.path` is the very
-        // path being compared against.
+        let file = Self::workspace_file(path);
+        let already_open = self.workspace.tabs.find_file(&file).is_some();
         let same = self.path.as_deref() == Some(path);
-        if !self.show_document(path, hwnd) {
-            return;
+        if already_open {
+            self.workspace.open_file(file, TabKind::Pinned);
+            if !self.show_document(path, hwnd) {
+                return;
+            }
+        } else {
+            // Read before creating a tab: a file that cannot be decoded must not become
+            // a tab or a recent-document entry.
+            if !self.show_document(path, hwnd) {
+                return;
+            }
+            self.workspace.open_file(file, TabKind::Pinned);
         }
-        // Remember the restored position, including when a dialog or file drop reopens
-        // a previously read document.
         self.remember_reading();
-        // Reading the page already open again is not a step: the reader did not go
-        // anywhere, so there is nothing to come back from. `Reload` is this call with the
-        // same path, and a history that grew on every `Ctrl`+`R` would be a `Back` that
-        // landed on the same text at the top of the window.
         if !same {
             self.history.leave(from);
         }
     }
+
 
     /// Read a file and make it the page, saying whether that worked.
     fn show_document(&mut self, path: &std::path::Path, hwnd: HWND) -> bool {
@@ -4446,6 +4575,9 @@ impl View {
         self.encoding = preferences.encoding;
         self.source = source;
         self.path = path;
+        if let Some(path) = self.path.as_deref() {
+            self.workspace.open_file(Self::workspace_file(path), TabKind::Pinned);
+        }
         let profile = crate::profiles::selected(self.plain_override.unwrap_or_else(|| reading::is_plain(self.path.as_deref())));
         if profile != self.profile {
             crate::profiles::load(&profile).apply(&mut self.theme);
@@ -5080,10 +5212,6 @@ fn layout_table(
                             );
                         }
                         let source = if hyphen { None } else { from.get(range.clone()).map(str::to_owned) };
-                        let unicode = source
-                            .as_deref()
-                            .map(|text| unicode_by_glyph(text, &r.clusters, r.glyphs.len()))
-                            .unwrap_or_default();
                         runs.push(PaintRun {
                             bidi_level: r.bidi_level,
                             family: font.face_family(r.face),
@@ -5101,7 +5229,7 @@ fn layout_table(
                                 })
                                 .collect(),
                             source,
-                            unicode,
+                            clusters: r.clusters,
                             x: at * k,
                             baseline: 0.0,
                             dy: -st.raise,
@@ -5968,10 +6096,6 @@ fn unicode_for_glyph(source: &str, clusters: &[u16], glyph_count: usize, index: 
     unicode_by_glyph(source, clusters, glyph_count).get(index).cloned().flatten()
 }
 
-fn glyph_unicode(run: &PaintRun, index: usize) -> Option<String> {
-    run.unicode.get(index).cloned().flatten()
-}
-
 fn write_pdf(
     page: &Page,
     font: &FontEngine,
@@ -6107,8 +6231,14 @@ fn write_pdf(
                         if let Some(source) = run.source.as_deref() {
                             ops.push(actual_text_span(source));
                         }
+                        let unicode = run
+                            .source
+                            .as_deref()
+                            .map(|source| unicode_by_glyph(source, &run.clusters, run.glyphs.len()));
                         for (i, glyph) in run.glyphs.iter().enumerate() {
-                            let item = glyph_unicode(run, i)
+                            let item = unicode
+                                .as_ref()
+                                .and_then(|values| values.get(i).cloned().flatten())
                                 .map(|cid| TextItem::GlyphIds(vec![Codepoint::with_cid(*glyph, 0.0, cid)]))
                                 .unwrap_or_else(|| TextItem::GlyphIds(vec![Codepoint::new(*glyph, 0.0)]));
                             let offset = run.offsets.get(i).copied().unwrap_or_default();

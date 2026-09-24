@@ -759,6 +759,7 @@ dependencies = [
  "rubrica-doc",
  "rubrica-math",
  "rubrica-type",
+ "rubrica-workspace",
  "windows",
  "windows-core",
  "windows-numerics",

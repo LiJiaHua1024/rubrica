@@ -11,6 +11,7 @@ description = "Native Windows Markdown reader using Direct2D, DirectWrite, and O
 rubrica-type.workspace = true
 rubrica-doc.workspace = true
 rubrica-math.workspace = true
+rubrica-workspace.workspace = true
 windows = { version = "0.62", features = [
     "Win32_Foundation",
     "Win32_Globalization",

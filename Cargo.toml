@@ -13,6 +13,7 @@ repository = "https://github.com/LiJiaHua1024/rubrica"
 rubrica-type = { path = "crates/rubrica-type" }
 rubrica-doc = { path = "crates/rubrica-doc" }
 rubrica-math = { path = "crates/rubrica-math" }
+rubrica-workspace = { path = "crates/rubrica-workspace" }
 unicode-linebreak = "0.1"
 unicode-script = "0.5"
 

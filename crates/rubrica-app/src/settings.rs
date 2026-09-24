@@ -15,12 +15,13 @@ use std::path::PathBuf;
 use windows::core::PCWSTR;
 use windows::Win32::Foundation::RECT;
 use windows::Win32::System::Registry::{
-    HKEY_CURRENT_USER, RegGetValueW, RegSetKeyValueW, RRF_RT_REG_DWORD, RRF_RT_REG_SZ, REG_DWORD,
-    REG_SZ,
+    HKEY_CURRENT_USER, RegGetValueW, RegSetKeyValueW, RRF_RT_REG_BINARY, RRF_RT_REG_DWORD,
+    RRF_RT_REG_SZ, REG_BINARY, REG_DWORD, REG_SZ,
 };
 
 use crate::theme::{Measure, TextFace, Zoom};
 use crate::view::utf16;
+use rubrica_workspace::{DocumentRef, FileRef, SessionSnapshot, SessionTab, TabKind, WorkspaceSnapshot};
 
 const SUBKEY: &str = "Software\\Rubrica";
 /// The names the numbers are stored under, in the order [`words`] writes them.
@@ -340,6 +341,59 @@ pub(crate) fn write_text(sub: &str, name: &str, raw: &str) {
     }
 }
 
+pub(crate) fn binary(sub: &str, name: &str) -> Option<Vec<u8>> {
+    let sub = utf16(sub);
+    let name = utf16(name);
+    let mut len = 0u32;
+    let r = unsafe {
+        RegGetValueW(
+            HKEY_CURRENT_USER,
+            PCWSTR(sub.as_ptr()),
+            PCWSTR(name.as_ptr()),
+            RRF_RT_REG_BINARY,
+            None,
+            None,
+            Some(&mut len),
+        )
+    };
+    if r.is_err() || len == 0 {
+        return None;
+    }
+    let mut data = vec![0u8; len as usize];
+    let r = unsafe {
+        RegGetValueW(
+            HKEY_CURRENT_USER,
+            PCWSTR(sub.as_ptr()),
+            PCWSTR(name.as_ptr()),
+            RRF_RT_REG_BINARY,
+            None,
+            Some(data.as_mut_ptr() as *mut core::ffi::c_void),
+            Some(&mut len),
+        )
+    };
+    if r.is_err() {
+        return None;
+    }
+    data.truncate(len as usize);
+    Some(data)
+}
+
+pub(crate) fn try_write_binary(sub: &str, name: &str, data: &[u8]) -> Result<(), String> {
+    let sub = utf16(sub);
+    let value = utf16(name);
+    let r = unsafe {
+        RegSetKeyValueW(
+            HKEY_CURRENT_USER,
+            PCWSTR(sub.as_ptr()),
+            PCWSTR(value.as_ptr()),
+            REG_BINARY.0,
+            Some(data.as_ptr() as *const core::ffi::c_void),
+            data.len() as u32,
+        )
+    };
+    if r.is_err() { Err(format!("cannot write {name}: {r:?}")) } else { Ok(()) }
+}
+
 /// The path written down under this key, if it is still a file.
 fn read_opened(sub: &str) -> Option<PathBuf> {
     text(sub, OPENED).map(PathBuf::from).filter(|p| p.is_file())
@@ -534,6 +588,107 @@ pub fn window() -> Option<Frame> {
     read_frame(SUBKEY)
 }
 
+const WORKSPACE_KEY: &str = "Workspace";
+const WORKSPACE_MAGIC: &[u8; 4] = b"RWS1";
+
+fn put_workspace_string(out: &mut Vec<u8>, value: &str) -> Option<()> {
+    let bytes = value.as_bytes();
+    let len = u32::try_from(bytes.len()).ok()?;
+    out.extend_from_slice(&len.to_le_bytes());
+    out.extend_from_slice(bytes);
+    Some(())
+}
+
+fn take_workspace_string(input: &mut &[u8]) -> Option<String> {
+    let bytes = take_workspace_bytes(input)?;
+    String::from_utf8(bytes).ok()
+}
+
+fn take_workspace_bytes(input: &mut &[u8]) -> Option<Vec<u8>> {
+    let raw = input.get(..4)?;
+    let len = u32::from_le_bytes(raw.try_into().ok()?) as usize;
+    *input = &input[4..];
+    let bytes = input.get(..len)?;
+    *input = &input[len..];
+    Some(bytes.to_vec())
+}
+
+fn put_workspace_file(out: &mut Vec<u8>, file: &FileRef) -> Option<()> {
+    out.extend_from_slice(&file.fingerprint.to_le_bytes());
+    put_workspace_string(out, file.path.to_str()?)
+}
+
+fn take_workspace_file(input: &mut &[u8]) -> Option<FileRef> {
+    let raw = input.get(..8)?;
+    let fingerprint = u64::from_le_bytes(raw.try_into().ok()?);
+    *input = &input[8..];
+    Some(FileRef::new(PathBuf::from(take_workspace_string(input)?), fingerprint))
+}
+
+/// Encode the tab/recent session as one versioned blob. Paths are UTF-8 because the
+/// reader could not have opened a non-UTF-8 path on Windows; a path that cannot be encoded
+/// makes the whole save fail rather than leaving a half-restored session.
+pub fn encode_workspace(snapshot: &WorkspaceSnapshot) -> Option<Vec<u8>> {
+    let mut out = WORKSPACE_MAGIC.to_vec();
+    out.extend_from_slice(&(snapshot.session.tabs.len() as u32).to_le_bytes());
+    for tab in &snapshot.session.tabs {
+        out.push(match tab.kind { TabKind::Pinned => 0, TabKind::Preview => 1 });
+        put_workspace_file(&mut out, &tab.document)?;
+    }
+    match &snapshot.session.active {
+        None => out.push(0),
+        Some(DocumentRef::Sample) => out.push(1),
+        Some(DocumentRef::File(file)) => {
+            out.push(2);
+            put_workspace_file(&mut out, file)?;
+        }
+    }
+    out.extend_from_slice(&(snapshot.recent.len() as u32).to_le_bytes());
+    for file in &snapshot.recent {
+        put_workspace_file(&mut out, file)?;
+    }
+    Some(out)
+}
+
+pub fn decode_workspace(data: &[u8]) -> Option<WorkspaceSnapshot> {
+    let mut input = data;
+    if input.get(..4)? != WORKSPACE_MAGIC { return None; }
+    input = &input[4..];
+    let count = u32::from_le_bytes(input.get(..4)?.try_into().ok()?) as usize;
+    input = &input[4..];
+    let mut tabs = Vec::with_capacity(count.min(128));
+    for _ in 0..count {
+        let kind = match *input.first()? { 0 => TabKind::Pinned, 1 => TabKind::Preview, _ => return None };
+        input = &input[1..];
+        tabs.push(SessionTab { document: take_workspace_file(&mut input)?, kind });
+    }
+    let active_marker = *input.first()?;
+    input = &input[1..];
+    let active = match active_marker {
+        0 => None,
+        1 => Some(DocumentRef::Sample),
+        2 => Some(DocumentRef::File(take_workspace_file(&mut input)?)),
+        _ => return None,
+    };
+    let count = u32::from_le_bytes(input.get(..4)?.try_into().ok()?) as usize;
+    input = &input[4..];
+    let mut recent = Vec::with_capacity(count.min(128));
+    for _ in 0..count { recent.push(take_workspace_file(&mut input)?); }
+    input.is_empty().then_some(WorkspaceSnapshot {
+        session: SessionSnapshot { tabs, active },
+        recent,
+    })
+}
+
+pub fn record_workspace(snapshot: &WorkspaceSnapshot) -> Result<(), String> {
+    let data = encode_workspace(snapshot).ok_or("workspace contains a path that cannot be encoded")?;
+    try_write_binary(SUBKEY, WORKSPACE_KEY, &data)
+}
+
+pub fn workspace() -> Option<WorkspaceSnapshot> {
+    decode_workspace(&binary(SUBKEY, WORKSPACE_KEY)?)
+}
+
 #[cfg(test)]
 mod tests {    use super::*;
 
@@ -554,6 +709,25 @@ mod tests {    use super::*;
             assert_eq!(DocumentSettings::from_words(preferences.words().map(Some)), preferences);
         }
     }
+    #[test]
+    fn workspace_blob_round_trips_tabs_active_document_and_recent_files() {
+        let a = FileRef::new("books/a.md", 7);
+        let b = FileRef::new("books/b.md", 9);
+        let snapshot = WorkspaceSnapshot {
+            session: SessionSnapshot {
+                tabs: vec![
+                    SessionTab { document: a.clone(), kind: TabKind::Pinned },
+                    SessionTab { document: b.clone(), kind: TabKind::Preview },
+                ],
+                active: Some(DocumentRef::File(b.clone())),
+            },
+            recent: vec![a, b],
+        };
+        let encoded = encode_workspace(&snapshot).expect("workspace paths encode");
+        assert_eq!(decode_workspace(&encoded), Some(snapshot));
+        assert!(decode_workspace(b"RWS2").is_none());
+    }
+
     // Only the tests tidy up after themselves; nothing else this module writes is ever
     // taken away again.
     use windows::Win32::System::Registry::RegDeleteTreeW;
