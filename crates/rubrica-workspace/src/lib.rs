@@ -202,7 +202,7 @@ impl Workspace {
 
     pub fn restore(snapshot: WorkspaceSnapshot) -> Self {
         let mut workspace = Self::default();
-        for file in snapshot.recent {
+        for file in snapshot.recent.into_iter().rev() {
             workspace.recent.touch(file);
         }
         for tab in snapshot.session.tabs {
@@ -289,6 +289,16 @@ mod tests {
         assert_eq!(workspace.recent.items()[0], file("7.md"));
         assert_eq!(workspace.recent.items().len(), 10);
         assert!(!workspace.recent.items().contains(&file("0.md")));
+    }
+
+    #[test]
+    fn restoring_recent_files_keeps_their_newest_first_order() {
+        let mut workspace = Workspace::default();
+        for name in ["a", "b", "c"] {
+            workspace.open_file(file(name), TabKind::Pinned);
+        }
+        let restored = Workspace::restore(workspace.snapshot());
+        assert_eq!(restored.recent.items(), workspace.recent.items());
     }
 
     #[test]
