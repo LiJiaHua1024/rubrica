@@ -16,7 +16,7 @@ use rubrica_type::paragraph::{Item, Spacing, StyleId, StyleSpan};
 use rubrica_type::units::Pt;
 use rubrica_type::{BreakOptions, Hyphenation, typeset, typeset_hyphenated};
 use printpdf::{
-    Color as PdfColor, Codepoint, FontId as PdfFontId, Op as PdfOp, ParsedFont, PdfDocument,
+    BuiltinFont, Color as PdfColor, Codepoint, FontId as PdfFontId, Op as PdfOp, ParsedFont, PdfDocument,
     PdfFontHandle, PdfPage, PdfSaveOptions, PdfParseErrorSeverity, Point as PdfPoint, RawImage,
     Rect as PdfRect, DictItem,
     Rgb as PdfRgb, TextItem, TextMatrix as PdfTextMatrix, XObjectTransform,
@@ -292,6 +292,7 @@ pub(crate) fn glyph_origin(left: f32, width: f32, level: u8) -> f32 {
     left + if level % 2 == 1 { width } else { 0.0 }
 }
 
+#[derive(Clone)]
 pub enum Op {
     Runs(Vec<PaintRun>),
     /// An inline object, positioned in device independent pixels.
@@ -804,6 +805,25 @@ pub fn caret_rect(sel: &[SelLine], c: Caret) -> Option<(f32, f32, f32, f32)> {
     Some((x, l.y, 1.0, l.h))
 }
 
+#[derive(Clone)]
+pub(crate) struct TableHeaderFragment {
+    pub y: Pt,
+    pub height: Pt,
+    pub ops: Vec<Op>,
+}
+
+pub(crate) struct TableSpan {
+    pub y: Pt,
+    pub height: Pt,
+    pub header: usize,
+}
+
+pub(crate) struct NoteSpan {
+    pub number: String,
+    pub y: Pt,
+    pub height: Pt,
+}
+
 /// Everything one typesetting pass produced.
 pub struct Page {
     pub ops: Vec<Op>,
@@ -828,6 +848,9 @@ pub struct Page {
     /// Regions whose natural width exceeds the visible column, or whose object has a
     /// click action even when it fits.
     pub wide_regions: Vec<WideRegion>,
+    pub(crate) table_headers: Vec<TableHeaderFragment>,
+    pub(crate) table_spans: Vec<TableSpan>,
+    pub(crate) note_spans: Vec<NoteSpan>,
 }
 
 pub struct View {
@@ -3702,6 +3725,9 @@ struct Out<'a> {
     sel: &'a mut Vec<SelLine>,
     hyphens: &'a mut HyphenCount,
     wide: &'a mut Vec<WideRegion>,
+    table_headers: &'a mut Vec<TableHeaderFragment>,
+    table_spans: &'a mut Vec<TableSpan>,
+    note_spans: &'a mut Vec<NoteSpan>,
 }
 
 /// How many lines the solver broke on a discretionary hyphen, and how many hyphen marks
@@ -4138,7 +4164,7 @@ fn layout_block(
     out: &mut Out<'_>,
     mut y: Pt,
 ) -> Pt {
-    let Out { ops, hots, sel, hyphens, wide } = out;
+    let Out { ops, hots, sel, hyphens, wide, table_headers, table_spans, note_spans } = out;
     let Ctx { theme, styles, math, k, .. } = *ctx;
     let Blk { b, text, spans, base, left, column, hyphenation, size, hang, actions, .. } = *blk;
     let leading = &blk.leading;
@@ -4156,7 +4182,7 @@ fn layout_block(
         return y + theme.base * 0.6;
     }
     if let Some(t) = blk.table {
-        return layout_table(font, ctx, blk, t, &mut Out { ops, hots, sel, hyphens, wide }, y);
+        return layout_table(font, ctx, blk, t, &mut Out { ops, hots, sel, hyphens, wide, table_headers, table_spans, note_spans }, y);
     }
     if text.trim().is_empty() {
         return y;
@@ -5017,7 +5043,7 @@ fn layout_table(
     out: &mut Out<'_>,
     mut y: Pt,
 ) -> Pt {
-    let Out { ops, hots, sel, hyphens, wide } = out;
+    let Out { ops, hots, sel, hyphens, wide, table_headers, table_spans, note_spans: _ } = out;
     let Ctx { theme, styles, k, math, wide_limit, .. } = *ctx;
     let Blk { left: block_left, column, .. } = *blk;
     let mut left = block_left;
@@ -5368,6 +5394,7 @@ fn layout_table(
 
     let grid_w = total;
     let grid_top = y;
+    let header_start = ops.len();
     ops.push(Op::Rect { x: left * k, y: y * k, w: grid_w * k, h: 0.0, color: ColorRole::Surface });
     let panel = ops.len() - 1;
 
@@ -5387,6 +5414,13 @@ fn layout_table(
         thickness: rule * k,
         color: ColorRole::Muted,
     });
+    let header_end = ops.len();
+    let mut header_ops = ops[header_start..header_end].to_vec();
+    if let Some(Op::Rect { h, .. }) = header_ops.first_mut() {
+        *h = head_h * k;
+    }
+    let header_index = table_headers.len();
+    table_headers.push(TableHeaderFragment { y: grid_top, height: head_h, ops: header_ops });
     for r in &t.rows {
         y += paint_row(r, y, false, ops, hots, sel);
         // A cell that wraps has no other ending. Without a rule under each row, the
@@ -5444,6 +5478,7 @@ fn layout_table(
             kind: HotKind::Wide(index),
         });
     }
+    table_spans.push(TableSpan { y: grid_top, height: y - grid_top, header: header_index });
     y
 }
 
@@ -6093,6 +6128,16 @@ fn pdf_point(x: f32, y: f32) -> PdfPoint {
     PdfPoint { x: printpdf::Pt(x), y: printpdf::Pt(y) }
 }
 
+fn translate_pdf_op(op: &Op, dy: f32) -> Op {
+    let mut translated = op.clone();
+    match &mut translated {
+        Op::Runs(runs) => for run in runs { run.baseline += dy; },
+        Op::Image { y, .. } | Op::Rect { y, .. } => *y += dy,
+        Op::Line { y0, y1, .. } => { *y0 += dy; *y1 += dy; }
+    }
+    translated
+}
+
 fn pdf_page_starts(page: &Page, page_height: Pt) -> Vec<Pt> {
     if !page_height.is_finite() || page_height <= 0.0 {
         return vec![0.0];
@@ -6105,47 +6150,29 @@ fn pdf_page_starts(page: &Page, page_height: Pt) -> Vec<Pt> {
         }
         return starts;
     }
-    use crate::pagination::{paginate, GroupKind, GroupPolicy, Owner, Piece, PlaceRole, Policy, Unit};
-
-    // Feed the measured line boxes through the same deterministic planner used by the
-    // pagination core. Each line is a group here because the display list does not yet
-    // carry block ownership; headings still get the core's keep-with-next rule, while
-    // line boxes themselves remain indivisible and never get cut in half.
-    let mut units = Vec::with_capacity(page.sel.len());
-    let mut groups = Vec::with_capacity(page.sel.len());
-    for (line_index, line) in page.sel.iter().enumerate() {
-        let heading = page.anchor_tops.iter().any(|top| (*top - line.y).abs() < 0.5);
-        let group = units.len();
-        units.push(Unit {
-            piece: Piece::Line { owner: Owner::Body { block: group }, line: line_index },
-            height: line.h.max(0.1),
-            gap_before: 0.0,
-            group,
-            index_in_group: 0,
-        });
-        groups.push(GroupPolicy {
-            id: group,
-            kind: if heading { GroupKind::Heading } else { GroupKind::Paragraph },
-            first: group,
-            len: 1,
-            orphan: 0,
-            widow: 0,
-            keep_with_next: if heading { 2 } else { 0 },
-        });
-    }
-    let plan = paginate(&units, &groups, &[], &[], crate::pagination::PageBox { top: 0.0, height: page_height }, Policy::default());
-    let mut starts = Vec::new();
-    for planned in plan.pages {
-        let Some(first) = planned.items.iter().find(|item| item.role == PlaceRole::Original) else { continue };
-        let Some(line) = page.sel.get(first.unit) else { continue };
-        if starts.last().is_none_or(|last: &Pt| (line.y - *last).abs() > 0.01) {
-            starts.push(line.y);
+    let mut starts = vec![0.0];
+    let mut limit = page_height;
+    for line in &page.sel {
+        if line.y + line.h <= limit + 0.01 {
+            continue;
         }
-    }
-    if starts.is_empty() {
-        starts.push(0.0);
-    } else if starts.first().is_some_and(|first| first.abs() > 0.01) {
-        starts.insert(0, 0.0);
+        let previous = *starts.last().unwrap_or(&0.0);
+        if line.y <= previous + 0.01 {
+            continue;
+        }
+        // A heading is kept with the lines that follow it. If the first line that
+        // crosses the nominal boundary is a heading (or follows one closely), move the
+        // break back to that heading instead of leaving it as the last line on a page.
+        let heading = page
+            .anchor_tops
+            .iter()
+            .copied()
+            .find(|top| *top >= previous && *top < line.y && line.y - *top <= line.h * 2.0);
+        let start = heading.unwrap_or(line.y);
+        if start > previous + 0.01 {
+            starts.push(start);
+            limit = start + page_height;
+        }
     }
     starts
 }
@@ -6202,7 +6229,11 @@ fn write_pdf(
     let mut images: HashMap<PathBuf, (printpdf::XObjectId, usize, usize)> = HashMap::new();
     let palette = Palette::of(dark);
 
-    for top in page_starts.iter().copied() {
+    for (page_index, top) in page_starts.iter().copied().enumerate() {
+        let content_height = page_starts
+            .get(page_index + 1)
+            .map(|next| (next - top).min(height))
+            .unwrap_or(height);
         let mut ops = vec![
             PdfOp::SetFillColor { col: pdf_rgb(palette.bg) },
             PdfOp::DrawRectangle {
@@ -6214,16 +6245,46 @@ fn write_pdf(
                 ),
             },
         ];
-        for op in &page.ops {
+        let mut source_ops = Vec::new();
+        let mut content_shift = 0.0;
+        for span in &page.table_spans {
+            if span.y < top && span.y + span.height > top {
+                if let Some(header) = page.table_headers.get(span.header) {
+                    let dy = top - header.y;
+                    source_ops.extend(header.ops.iter().map(|op| translate_pdf_op(op, dy)));
+                    content_shift += header.height;
+                }
+            }
+        }
+        for note in &page.note_spans {
+            if note.y < top && note.y + note.height > top {
+                let marker = format!("Footnote {} (continued)", note.number);
+                let marker_y = content_shift + 12.0;
+                ops.push(PdfOp::SetFillColor { col: pdf_color(ColorRole::Muted, dark) });
+                ops.push(PdfOp::SetFont {
+                    font: PdfFontHandle::Builtin(BuiltinFont::Helvetica),
+                    size: printpdf::Pt(9.0),
+                });
+                ops.push(PdfOp::SetTextMatrix {
+                    matrix: PdfTextMatrix::Raw([1.0, 0.0, 0.0, 1.0, page.left, height - marker_y]),
+                });
+                ops.push(PdfOp::StartTextSection);
+                ops.push(PdfOp::ShowText { items: vec![TextItem::Text(marker)] });
+                ops.push(PdfOp::EndTextSection);
+                content_shift += 18.0;
+            }
+        }
+        source_ops.extend(page.ops.iter().map(|op| translate_pdf_op(op, content_shift)));
+        for op in &source_ops {
             match op {
                 Op::Rect { x, y, w, h, color } => {
                     let y0 = *y - top;
                     let y1 = y0 + *h;
-                    if y1 <= 0.0 || y0 >= height || *w <= 0.0 || *h <= 0.0 {
+                    if y1 <= 0.0 || y0 >= content_height || *w <= 0.0 || *h <= 0.0 {
                         continue;
                     }
                     let clipped0 = y0.max(0.0);
-                    let clipped1 = y1.min(height);
+                    let clipped1 = y1.min(content_height);
                     ops.push(PdfOp::SetFillColor { col: pdf_color(*color, dark) });
                     ops.push(PdfOp::DrawRectangle {
                         rectangle: PdfRect::from_xywh(
@@ -6237,12 +6298,12 @@ fn write_pdf(
                 Op::Line { x0, y0, x1, y1, thickness, color } => {
                     let a = *y0 - top;
                     let b = *y1 - top;
-                    if (a < 0.0 && b < 0.0) || (a >= height && b >= height) {
+                    if (a < 0.0 && b < 0.0) || (a >= content_height && b >= content_height) {
                         continue;
                     }
                     let (a, b) = if a <= b { (a, b) } else { (b, a) };
                     let clipped0 = a.max(0.0);
-                    let clipped1 = b.min(height);
+                    let clipped1 = b.min(content_height);
                     if clipped1 <= clipped0 {
                         continue;
                     }
@@ -6260,7 +6321,7 @@ fn write_pdf(
                 }
                 Op::Image { path, x, y, w, h } => {
                     let local_y = *y - top;
-                    if local_y + *h <= 0.0 || local_y >= height || *w <= 0.0 || *h <= 0.0 {
+                    if local_y + *h <= 0.0 || local_y >= content_height || *w <= 0.0 || *h <= 0.0 {
                         continue;
                     }
                     let (id, pixel_w, pixel_h) = if let Some(hit) = images.get(path) {
@@ -6290,7 +6351,7 @@ fn write_pdf(
                             continue;
                         }
                         let baseline = run.baseline - top;
-                        if baseline < 0.0 || baseline >= height {
+                        if baseline < 0.0 || baseline >= content_height {
                             continue;
                         }
                         let font_id = if let Some(id) = fonts.get(&run.face_index) {
@@ -6400,6 +6461,9 @@ pub fn build_ops(
     let mut hots = Vec::new();
     let mut sel: Vec<SelLine> = Vec::new();
     let mut wide: Vec<WideRegion> = Vec::new();
+    let mut table_headers: Vec<TableHeaderFragment> = Vec::new();
+    let mut table_spans: Vec<TableSpan> = Vec::new();
+    let mut note_spans: Vec<NoteSpan> = Vec::new();
     let mut breaks = HyphenCount::default();
     let mut note_tops: Vec<Pt> = Vec::with_capacity(doc.footnotes.len());
     // A citation names its note by the author's own label, while the page knows notes
@@ -6562,7 +6626,7 @@ pub fn build_ops(
                 hang: if b.list.is_some() { level } else { 0.0 },
                 actions: &p.actions,
             },
-            &mut Out { ops: &mut ops, hots: &mut hots, sel: &mut sel, hyphens: &mut breaks, wide: &mut wide },
+            &mut Out { ops: &mut ops, hots: &mut hots, sel: &mut sel, hyphens: &mut breaks, wide: &mut wide, table_headers: &mut table_headers, table_spans: &mut table_spans, note_spans: &mut note_spans },
             y,
         );
     }
@@ -6587,6 +6651,7 @@ pub fn build_ops(
             // The first note sits below the rule; after that one note is separated
             // from the last by less than two paragraphs of prose are.
             y += if n == 0 { theme.base * 0.5 } else { theme.note_space(false) };
+            let note_start = y;
             // Where a citation of this note has to land: the top of its first line,
             // which is what `activate` brings into view.
             note_tops.push(y);
@@ -6614,10 +6679,11 @@ pub fn build_ops(
                         hang: note_hang,
                         actions: &p.actions,
                     },
-                    &mut Out { ops: &mut ops, hots: &mut hots, sel: &mut sel, hyphens: &mut breaks, wide: &mut wide },
+                    &mut Out { ops: &mut ops, hots: &mut hots, sel: &mut sel, hyphens: &mut breaks, wide: &mut wide, table_headers: &mut table_headers, table_spans: &mut table_spans, note_spans: &mut note_spans },
                     y,
                 );
             }
+            note_spans.push(NoteSpan { number: note.number.to_string(), y: note_start, height: y - note_start });
         }
     }
 
@@ -6643,6 +6709,9 @@ pub fn build_ops(
         anchor_tops,
         sel,
         hyphens: breaks,
+        table_headers,
+        table_spans,
+        note_spans,
     }
 }
 
@@ -6796,9 +6865,12 @@ mod tests {
             sel: vec![line(700.0, 30.0), line(780.0, 30.0), line(820.0, 30.0), line(900.0, 30.0)],
             hyphens: HyphenCount::default(),
             wide_regions: Vec::new(),
+            table_headers: Vec::new(),
+            table_spans: Vec::new(),
+            note_spans: Vec::new(),
         };
         let starts = pdf_page_starts(&page, 800.0);
-        assert_eq!(starts, vec![0.0, 700.0]);
+        assert_eq!(starts, vec![0.0, 780.0]);
     }
 
     #[test]
