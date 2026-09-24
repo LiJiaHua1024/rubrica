@@ -1253,6 +1253,8 @@ enum Command {
     DetectChapters(bool),
     TextEncoding(Encoding),
     Neighbor(bool),
+    WideTableNarrow,
+    WideTableWiden,
     PreviousChapter,
     NextChapter,
     OpenEditor,
@@ -1441,6 +1443,8 @@ fn menu_items(s: &MenuState) -> Vec<MenuRow> {
         MenuRow::Gap,
         row(Command::PreviousChapter, "Previous chapter\tCtrl+Alt+Up", s.chapter > 0),
         row(Command::NextChapter, "Next chapter\tCtrl+Alt+Down", s.chapter + 1 < s.chapter_titles.len()),
+        row(Command::WideTableNarrow, "Wide table: Borrow less margin", true),
+        row(Command::WideTableWiden, "Wide table: Borrow more margin", true),
         row(Command::Neighbor(false), "Previous file\tCtrl+Alt+Left", s.previous),
         row(Command::Neighbor(true), "Next file\tCtrl+Alt+Right", s.next),
     ] });
@@ -3139,6 +3143,8 @@ impl View {
                     self.load_document(&path, hwnd);
                 }
             }
+            Command::WideTableNarrow => self.set_wide_table_factor(self.theme.wide_table_factor - 0.1, hwnd),
+            Command::WideTableWiden => self.set_wide_table_factor(self.theme.wide_table_factor + 0.1, hwnd),
             Command::PreviousChapter => self.switch_chapter(-1, hwnd),
             Command::NextChapter => self.switch_chapter(1, hwnd),
             Command::OpenEditor => {
@@ -3336,6 +3342,15 @@ impl View {
         }
         self.theme.set_measure(measure);
         self.remember();
+        self.relayout_in_place(hwnd);
+    }
+
+    fn set_wide_table_factor(&mut self, factor: f32, hwnd: HWND) {
+        let next = factor.clamp(0.0, 1.0);
+        if (self.theme.wide_table_factor - next).abs() < 0.001 {
+            return;
+        }
+        self.theme.set_wide_table_factor(next);
         self.relayout_in_place(hwnd);
     }
 
@@ -6704,7 +6719,10 @@ pub fn build_ops(
         anchors: &anchors,
         base: objects.base_dir,
         k,
-        wide_limit: (client_pt - margin * 0.5).max(column),
+        wide_limit: {
+            let available = (client_pt - margin * 0.5).max(column);
+            column + (available - column) * theme.wide_table_factor.clamp(0.0, 1.0)
+        },
     };
 
     for (b, p) in doc.blocks.iter().zip(prepared) {

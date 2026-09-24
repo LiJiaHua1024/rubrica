@@ -285,6 +285,8 @@ pub struct Theme {
     pub quote_indent_em: Pt,
     pub list_indent_em: Pt,
     pub definition_indent_em: Pt,
+    /// Fraction of the available margin space a wide table may borrow, 0..=1.
+    pub wide_table_factor: f32,
     /// The reader's size preference, applied to [`Theme::base`] by [`Theme::set_zoom`].
     /// Carried by the theme so a relayout needs only the theme it is already handed.
     pub zoom: Zoom,
@@ -322,6 +324,7 @@ impl Default for Theme {
             quote_indent_em: 1.2,
             list_indent_em: 1.6,
             definition_indent_em: 1.5,
+            wide_table_factor: 1.0,
             zoom: Zoom::DESIGN,
             face: 0,
             measure: Measure::DESIGN,
@@ -367,6 +370,10 @@ impl Theme {
         let Some(m) = Measure::ALL.get(measure) else { return };
         self.measure = measure;
         self.max_measure_em = m.em;
+    }
+
+    pub fn set_wide_table_factor(&mut self, factor: f32) {
+        self.wide_table_factor = factor.clamp(0.0, 1.0);
     }
 }
 
