@@ -76,6 +76,23 @@ rubrica-app --report --shapes document.md      # formula pieces and glyph runs, 
 rubrica-app --report --no-hyphenate document.md
 ```
 
+## Exporting
+
+The reader can export the same typeset display list without going through a printer:
+
+```
+rubrica-app --export-png page.png --export-width 1080 --export-scale 2 document.md
+rubrica-app --export-pdf document.pdf --pdf-width 612 --pdf-height 792 document.md
+```
+
+PNG uses the native WIC encoder and keeps the reader's colours, images, wide-content
+panning geometry, and typography. PDF embeds the DirectWrite font files, writes glyph
+positions and Unicode mappings, and wraps text runs in PDF `ActualText` spans so CJK,
+ligatures, emoji, and bidirectional text remain selectable. Page breaks are planned at
+line boundaries and keep headings with the lines that follow them. PDF images currently
+support PNG and JPEG; formula assemblies remain visual glyphs because their synthetic
+glyphs have no single source character.
+
 ## What it reads
 
 CommonMark and GFM: headings, paragraphs, lists (ordered, nested, task lists), block
@@ -99,14 +116,21 @@ links and footnote citations as jump targets with back and forward history, an o
 of the document's headings, find in page, zoom, light and dark themes, a reader-set
 measure, per-document reading position and window frame restored on reopen (clamped back
 onto a screen when the monitor setup changed), and a reload when the file changes on
-disk.
+disk. Open documents are available as pinned/preview tabs (`Ctrl+Tab`, `Ctrl+W`), with
+recent files and a shallow workspace tree in the menu; the session is restored on the
+next launch. TXT files keep chapter boundaries and lay out the active chapter window,
+with `Ctrl+Alt+Up/Down` for chapter navigation. `Ctrl+3` switches source view, and
+`Ctrl+Shift+O` opens the file in an editor at the current source position.
 
 Right-click opens the menu: navigation, copy, select all, find, the contents, zoom, the
-installed reading faces, the measure, and the theme.
+installed reading faces, the measure, the theme, open tabs, recent documents, and the
+workspace tree.
 
 | Key | |
 | --- | --- |
 | `Ctrl+O` / `Ctrl+R` | open a document · read it again from disk |
+| `Ctrl+Tab` / `Ctrl+W` | next/previous tab · close the active tab |
+| `Ctrl+Alt+Up/Down` | previous/next TXT chapter |
 | `Ctrl+F` / `F3` | find · next match |
 | `Ctrl+A` / `Ctrl+C` | select all · copy |
 | `Ctrl+D` | light, dark, follow the system |
@@ -128,7 +152,8 @@ Preferences live in `HKCU\Software\Rubrica`.
 | `rubrica-type` | the line breaker: paragraph model, Knuth–Plass solver, justification, script classification, hyphenation |
 | `rubrica-doc` | Markdown to blocks, spans, tables, footnotes and inline objects |
 | `rubrica-math` | a LaTeX subset to boxes, measured through a `MathMeasure` the caller implements |
-| `rubrica-app` | the window: Direct2D/DirectWrite painting, selection, hit-testing, themes, settings, `--report` |
+| `rubrica-app` | the window: Direct2D/DirectWrite painting, selection, hit-testing, themes, settings, workspace navigation, `--report`, PNG/PDF export |
+| `rubrica-workspace` | tab identity, preview/pinned state, recent files, and versioned session snapshots |
 
 The first three have no dependency on Windows and no dependency on each other's
 internals, which is why the whole engine is testable from a console.
@@ -136,7 +161,12 @@ internals, which is why the whole engine is testable from a console.
 ## Known limitations
 
 - Windows-only by construction, and no installer: it is a single `.exe`.
-- No document writing, no tabs, no PDF export.
+- The workspace tree is a shallow, menu-driven tree; it does not yet provide a docked
+  resizable sidebar.
+- PDF formula assemblies are visual glyphs without a single selectable source character,
+  and PDF link annotations are not emitted yet.
+- The file is still read and decoded as a whole before a TXT chapter window is laid out;
+  the window limits layout work, not initial I/O.
 
 ## Licence
 

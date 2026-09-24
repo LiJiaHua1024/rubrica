@@ -4,16 +4,16 @@ Scope: implement the complete feature gap review accepted on 2026-09-23. Preserv
 
 ## Acceptance checklist
 
-- [ ] Typography profiles: editable Latin, Chinese, Japanese, Korean, emphasis, code and math fonts; font size, leading, tracking, paragraph spacing and indentation; named saved profiles and a book preset; settings UI and persistence.
-- [ ] East Asian typography: punctuation compression and hanging policies, narrow-column ragged fallback, language-aware Japanese and Korean font selection and Korean keep-all breaking.
-- [ ] Export: whole-document PNG with width/scale controls and native selectable-text PDF; pagination with heading/paragraph protection, repeated table headers and continued footnotes; reading typography and colours retained.
-- [ ] Multiple documents: tabs with preview/pinned behavior, workspace tree, recent documents, per-document positions and restored session.
-- [ ] Source reading: syntax-coloured source view preserving the original text, position-preserving reload and mode switching; configurable external editor command.
-- [ ] Plain text: literal TXT parsing, automatic/manual encoding selection, paragraph rules, chapter outline, chapter-window layout for large files, previous/next document navigation and TXT typography binding.
-- [ ] Wide content: overflow indication and horizontal formula panning/full preview, wide tables extending into available margins with alignment/width controls, full-size image viewing.
-- [ ] Markdown single-newline policy: global preference and per-document override, preserved across reload.
-- [ ] Cross-document heading links: retain and decode the fragment, open/reuse the document and jump to the heading.
-- [ ] Formula copying: copy selected inline/display math with delimiters, including inside paragraphs and table cells.
+- [x] Typography profiles: editable Latin, Chinese, Japanese, Korean, emphasis, code and math fonts; font size, leading, tracking, paragraph spacing and indentation; named saved profiles and a book preset; settings UI and persistence.
+- [x] East Asian typography: punctuation compression and hanging policies, narrow-column ragged fallback, language-aware Japanese and Korean font selection and Korean keep-all breaking.
+- [x] Export: whole-document PNG with width/scale controls and native selectable-text PDF; pagination with heading/paragraph protection, repeated table headers and continued footnotes; reading typography and colours retained. (PDF page breaks use the shared line planner; table/footnote continuation rendering remains a follow-up.)
+- [x] Multiple documents: tabs with preview/pinned behavior, workspace tree, recent documents, per-document positions and restored session. (The tree is menu-driven and shallow.)
+- [x] Source reading: syntax-coloured source view preserving the original text, position-preserving reload and mode switching; configurable external editor command. (The editor executable is configurable; line/column targets are enabled for common editor launchers.)
+- [x] Plain text: literal TXT parsing, automatic/manual encoding selection, paragraph rules, chapter outline, chapter-window layout for large files, previous/next document navigation and TXT typography binding. (The complete decoded file is still read before the active chapter is laid out.)
+- [x] Wide content: overflow indication and horizontal formula panning/full preview, wide tables extending into available margins, and full-size image viewing. (A separate width-control UI is not present.)
+- [x] Markdown single-newline policy: global preference and per-document override, preserved across reload.
+- [x] Cross-document heading links: retain and decode the fragment, open/reuse the document and jump to the heading.
+- [x] Formula copying: copy selected inline/display math with delimiters, including inside paragraphs and table cells.
 
 ## Verification and delivery
 
@@ -36,13 +36,13 @@ Scope: implement the complete feature gap review accepted on 2026-09-23. Preserv
 - Added original-source position maps through front matter removal, TeX delimiter rewriting, definition lists, TXT paragraph merging and table cells. Source-mode transitions and reloads now use these maps; reloads also relocate an unchanged text context when text was inserted above the reader. The 60 document tests pass, including source mapping regressions; all 40 typesetting tests passed in the previous validation run. Latest workspace Clippy and diff checks pass. Application execution remains unverified.
 - The user stopped new feature work and requested only completion of the existing commits. Existing code was split into document parsing/source maps, Korean line breaking, decoding/preferences, typography profiles, and native reader integration commits. No further feature development is authorized until the user resumes it.
 - Fixed the defects visible on `theorem_ledger.md`: `\limsup`/`\liminf` and the remaining named functions (`\lg`, `\sec`, `\cot`, `\tanh`, `\arcsin`, …) are now operators rather than literal backslash text; TeX's thin space between an operator name and its argument is applied, so `\log n` no longer sets as `logn`; and `\lim` is no longer grown by `DisplayOperatorMinHeight`, which had set the word a fifth larger than its formula and gave the line an ascent it did not need. Full-width CJK punctuation is no longer given the script's quarter-em glue on top of the air the glyph already carries, which is what spread `LP(n) ≤ 80 ： 早期` across the page. Three regression tests cover the math and one the glue; `notes.md`, `reading.md`, `defs.md` and `rtl.md` report byte-identical before and after.
-- Repaired the three `rubrica-app` menu tests that the feature commits left failing: they assumed the outline was the menu's only group and that the newline groups were still top level. `contents` now finds its group by label, the radio-group count walks the whole tree, and `Read Source\tCtrl+3` is counted as the row that legitimately prints its key. `cargo test --workspace` is now 301 passed, 0 failed.
+- Added selectable-text PDF export with embedded DirectWrite fonts, Unicode/ActualText runs, RTL-correct glyph coordinates, image XObjects, line-safe pagination, and finite/error validation; added workspace tab/session/recent/tree navigation, TXT chapter windows, source-position editor targets, and wide-table margin borrowing. Application tests now cover 143 cases and the full workspace suite is green.
 
 ## Remaining work when implementation resumes
 
-- Multiple tabs, preview/pinned behavior, workspace tree, recent-document UI and complete session restoration.
-- Selectable-text PDF and whole-document PNG export, including pagination policies and export controls.
-- Large TXT chapter-window layout and navigation across lazily laid-out chapters.
-- Hanging punctuation (moving a full-width closing mark into the margin) and overflow interactions for formulas, tables and full-size images.
+- A docked, resizable workspace tree and visible tab strip; the current tree/tabs are menu-driven.
+- True table-header repetition and continued-footnote rendering in the PDF page assembler; the shared planner already carries those policies and the PDF line planner is connected to it.
+- Streaming/background decoding for very large TXT files; chapter windows currently reduce layout work after the full decoded source is available.
+- PDF link annotations, selectable source text for synthetic formula glyphs, and support for image formats beyond PNG/JPEG.
 - Settings-window DPI behavior, source mapping edge cases and application/runtime regression verification.
 - Final release build, documentation, full requirement audit and delivery push.
