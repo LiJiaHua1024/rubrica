@@ -9,6 +9,7 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
 
 use rubrica_doc::{Action, ActionKind, Align, Block, BlockKind, Document, InlineStyle};
 use rubrica_type::justification::place_bidi;
@@ -828,6 +829,8 @@ pub(crate) struct NoteSpan {
     pub height: Pt,
 }
 
+type ChapterCache = Arc<Mutex<HashMap<usize, String>>>;
+
 pub(crate) struct MathTextFragment {
     pub source: String,
     pub x: Pt,
@@ -883,6 +886,10 @@ pub struct View {
     /// layout, which is still the right answer for a short story or a Markdown file.
     chapter_index: Option<ChapterIndex>,
     chapter: usize,
+    chapter_cache: ChapterCache,
+    /// Large UTF-8 TXT files keep only the active chapter text in `source`; the file
+    /// remains the authority and is reread when another chapter is selected.
+    lazy_text: bool,
     plain_override: Option<bool>,
     encoding: Encoding,
     decoded_encoding: Encoding,
@@ -1681,7 +1688,7 @@ fn held(vk: VIRTUAL_KEY) -> bool {
     unsafe { (GetKeyState(vk.0 as i32) as u16 & 0x8000) != 0 }
 }
 
-pub fn run(source: String, path: Option<PathBuf>) -> Result<()> {
+pub fn run(mut source: String, path: Option<PathBuf>) -> Result<()> {
     // Must happen before the first window exists, or the process is already
     // bitmap-scaled and text on a secondary high-density monitor is soft.
     unsafe {
@@ -1748,12 +1755,42 @@ pub fn run(source: String, path: Option<PathBuf>) -> Result<()> {
     let preferences = path.as_deref().map(crate::settings::document).unwrap_or_default();
     let profile = crate::profiles::selected(preferences.plain.unwrap_or_else(|| reading::is_plain(path.as_deref())));
     if profile != "Default" { crate::profiles::load(&profile).apply(&mut theme); }
-    let decoded = path.as_deref().and_then(|p| reading::read(p, preferences.encoding).ok());
     let plain = preferences.plain.unwrap_or_else(|| reading::is_plain(path.as_deref()));
-    let chapter_index = plain.then(|| ChapterIndex::new(&source, preferences.text.chapters));
+    let can_window = plain && !preferences.source && path.as_deref().is_some_and(|p| {
+        preferences.text.chapters && reading::can_window_text(p, preferences.encoding)
+    });
+    let mut lazy_text = false;
+    let chapter_index = if plain && preferences.text.chapters {
+        if can_window {
+            let path = path.as_deref().expect("window path");
+            match ChapterIndex::from_path(path, true) {
+                Ok(index) => {
+                    lazy_text = true;
+                    source = index.read_source_window(path, 0).unwrap_or_default();
+                    Some(index)
+                }
+                Err(_) => {
+                    source = reading::read(path, preferences.encoding)?.text;
+                    Some(ChapterIndex::new(&source, true))
+                }
+            }
+        } else {
+            Some(ChapterIndex::new(&source, preferences.text.chapters))
+        }
+    } else { None };
+    let decoded = if lazy_text {
+        Some(reading::Decoded { text: source.clone(), encoding: preferences.encoding, guessed: false })
+    } else {
+        path.as_deref().and_then(|p| reading::read(p, preferences.encoding).ok())
+    };
     let doc = if preferences.source { Document::source(&source) }
         else if let Some(index) = chapter_index.as_ref() {
-            index.window(&source, 0, preferences.text)
+            if lazy_text {
+                index.read_window(path.as_deref().expect("window path"), 0, preferences.text)
+                    .unwrap_or_else(|_| Document { blocks: Vec::new(), footnotes: Vec::new() })
+            } else {
+                index.window(&source, 0, preferences.text)
+            }
         } else { Document::parse_with(&source, rubrica_doc::ParseOptions {
             keep_line_breaks: preferences.line_breaks.unwrap_or(keep_line_breaks),
         }) };
@@ -1779,6 +1816,8 @@ pub fn run(source: String, path: Option<PathBuf>) -> Result<()> {
         text_options: preferences.text,
         chapter_index,
         chapter: 0,
+        chapter_cache: Arc::new(Mutex::new(HashMap::new())),
+        lazy_text,
         plain_override: preferences.plain,
         encoding: preferences.encoding,
         decoded_encoding: decoded.as_ref().map_or(Encoding::Utf8, |d| d.encoding),
@@ -1828,6 +1867,8 @@ pub fn run(source: String, path: Option<PathBuf>) -> Result<()> {
         hit_brush: None,
         focus_brush: None,
     });
+
+    view.prefetch_next_chapter();
 
     const CLASS: &str = "Rubrica.Main";
     unsafe {
@@ -3108,7 +3149,7 @@ impl View {
             Command::PreviousTab => self.switch_relative_tab(-1, hwnd),
             Command::Reload => {
                 if let Some(path) = self.path.clone() {
-                    if let Ok(decoded) = reading::read(&path, self.encoding) {
+                    if let Ok(decoded) = self.read_current() {
                         self.reload_text(decoded, hwnd);
                         self.stamp = stamp_of(&path);
                     }
@@ -3164,7 +3205,12 @@ impl View {
                     use std::os::windows::process::CommandExt;
                     let editor = crate::settings::editor();
                     let byte = self.caret_source().or_else(|| self.source_anchor()).unwrap_or(0);
-                    let (line, column) = reading::line_column(&self.source, byte);
+                    let position_source = if self.lazy_text {
+                        reading::read(path, self.encoding).map(|decoded| decoded.text).unwrap_or_else(|_| self.source.clone())
+                    } else {
+                        self.source.clone()
+                    };
+                    let (line, column) = reading::line_column(&position_source, byte);
                     let name = std::path::Path::new(&editor)
                         .file_stem().and_then(|s| s.to_str()).unwrap_or("").to_ascii_lowercase();
                     let template = crate::settings::editor_args();
@@ -3213,6 +3259,13 @@ impl View {
         if self.source_view { return Document::source(&self.source); }
         if self.plain_override.unwrap_or_else(|| reading::is_plain(self.path.as_deref())) {
             if let Some(index) = self.chapter_index.as_ref() {
+                if self.lazy_text {
+                    if let Some(path) = self.path.as_deref() {
+                        if let Ok(doc) = index.read_window(path, self.chapter, self.text_options) {
+                            return doc;
+                        }
+                    }
+                }
                 return index.window(&self.source, self.chapter, self.text_options);
             }
             return rubrica_doc::plain::parse(&self.source, self.text_options);
@@ -3225,7 +3278,11 @@ impl View {
     fn refresh_chapter_index(&mut self) {
         let plain = self.plain_override.unwrap_or_else(|| reading::is_plain(self.path.as_deref()));
         self.chapter_index = if plain && self.text_options.chapters {
-            Some(ChapterIndex::new(&self.source, true))
+            if self.lazy_text {
+                self.path.as_deref().and_then(|path| ChapterIndex::from_path(path, true).ok())
+            } else {
+                Some(ChapterIndex::new(&self.source, true))
+            }
         } else {
             None
         };
@@ -3243,6 +3300,18 @@ impl View {
         let next = (self.chapter as isize + delta).clamp(0, count as isize - 1) as usize;
         if next == self.chapter { return; }
         self.chapter = next;
+        if self.lazy_text {
+            if let (Some(path), Some(index)) = (self.path.as_deref(), self.chapter_index.as_ref()) {
+                let source = self.cached_window(self.chapter)
+                    .map(Ok)
+                    .unwrap_or_else(|| index.read_source_window(path, self.chapter));
+                if let Ok(source) = source {
+                    self.cache_window(self.chapter, source.clone());
+                    self.source = source;
+                }
+            }
+            self.prefetch_next_chapter();
+        }
         self.doc = self.parse_source();
         self.scroll = 0.0;
         self.relayout();
@@ -3257,6 +3326,16 @@ impl View {
     }
 
     fn reparse(&mut self, hwnd: HWND) {
+        if self.lazy_text
+            && (self.source_view || !self.plain_override.unwrap_or_else(|| reading::is_plain(self.path.as_deref())))
+        {
+            if let Some(path) = self.path.as_deref() {
+                if let Ok(decoded) = reading::read(path, self.encoding) {
+                    self.source = decoded.text;
+                    self.lazy_text = false;
+                }
+            }
+        }
         let source = self.source_anchor();
         let profile = crate::profiles::selected(self.plain_override.unwrap_or_else(|| reading::is_plain(self.path.as_deref())));
         if profile != self.profile {
@@ -3274,7 +3353,12 @@ impl View {
     }
 
     fn source_anchor(&self) -> Option<usize> {
-        if self.scroll == 0.0 { return Some(0); }
+        if self.scroll == 0.0 {
+            return Some(self.chapter_index.as_ref()
+                .and_then(|index| index.chapters().get(self.chapter))
+                .map(|chapter| chapter.range.start)
+                .unwrap_or(0));
+        }
         self.sel_index.iter().find(|line| line.y + line.h > self.scroll * scale_of(self.dpi))
             .and_then(|line| line.source.as_ref().map(|range| range.start))
     }
@@ -3293,7 +3377,11 @@ impl View {
     }
 
     fn reload_text(&mut self, decoded: reading::Decoded, hwnd: HWND) {
-        let source = self.source_anchor().map(|byte| relocated_source(&self.source, &decoded.text, byte));
+        let source = if self.lazy_text {
+            self.source_anchor()
+        } else {
+            self.source_anchor().map(|byte| relocated_source(&self.source, &decoded.text, byte))
+        };
         self.accept_decoded(decoded);
         self.reparse(hwnd);
         if let Some(byte) = source { self.restore_source(byte); }
@@ -4738,8 +4826,25 @@ impl View {
     /// Read a file and make it the page, saying whether that worked.
     fn show_document(&mut self, path: &std::path::Path, hwnd: HWND) -> bool {
         let preferences = crate::settings::document(path);
+        let plain = preferences.plain.unwrap_or_else(|| reading::is_plain(Some(path)));
+        if plain && preferences.text.chapters && !preferences.source
+            && reading::can_window_text(path, preferences.encoding)
+        {
+            if let Ok(index) = ChapterIndex::from_path(path, true) {
+                if let Ok(source) = index.read_source_window(path, 0) {
+                    self.lazy_text = true;
+                    self.decoded_encoding = preferences.encoding;
+                    self.encoding_guessed = false;
+                    self.set_page(source, Some(path.to_path_buf()), hwnd);
+                    self.cache_window(0, self.source.clone());
+                    self.prefetch_next_chapter();
+                    return true;
+                }
+            }
+        }
         match reading::read(path, preferences.encoding) {
             Ok(decoded) => {
+                self.lazy_text = false;
                 self.decoded_encoding = decoded.encoding;
                 self.encoding_guessed = decoded.guessed;
                 self.set_page(decoded.text, Some(path.to_path_buf()), hwnd);
@@ -4749,6 +4854,47 @@ impl View {
                 show_error(hwnd, &format!("Cannot open {}: {e}", path.display()));
                 false
             }
+        }
+    }
+
+    fn cached_window(&self, index: usize) -> Option<String> {
+        self.chapter_cache.lock().ok()?.get(&index).cloned()
+    }
+
+    fn cache_window(&self, index: usize, text: String) {
+        if let Ok(mut cache) = self.chapter_cache.lock() {
+            cache.insert(index, text);
+        }
+    }
+
+    fn prefetch_next_chapter(&self) {
+        if !self.lazy_text { return; }
+        let Some(path) = self.path.clone() else { return; };
+        let Some(index) = self.chapter_index.clone() else { return; };
+        let next = self.chapter.saturating_add(1);
+        if next >= index.chapters().len() || self.cached_window(next).is_some() { return; }
+        let cache = Arc::clone(&self.chapter_cache);
+        std::thread::spawn(move || {
+            if let Ok(text) = index.read_source_window(&path, next) {
+                if let Ok(mut cache) = cache.lock() {
+                    cache.insert(next, text);
+                }
+            }
+        });
+    }
+
+    fn read_current(&self) -> std::io::Result<reading::Decoded> {
+        let path = self.path.as_deref().ok_or_else(|| std::io::Error::new(std::io::ErrorKind::NotFound, "no document path"))?;
+        if self.lazy_text {
+            let index = self.chapter_index.as_ref().ok_or_else(|| std::io::Error::new(std::io::ErrorKind::InvalidData, "missing TXT chapter index"))?;
+            let text = index.read_source_window(path, self.chapter)?;
+            Ok(reading::Decoded {
+                text,
+                encoding: self.encoding,
+                guessed: false,
+            })
+        } else {
+            reading::read(path, self.encoding)
         }
     }
 
@@ -4772,7 +4918,7 @@ impl View {
         if !is_written(self.stamp, now) {
             return;
         }
-        let Ok(decoded) = reading::read(&path, self.encoding) else {
+        let Ok(decoded) = self.read_current() else {
             // Half way through being written, or locked by whatever is writing it. The
             // stamp is left as it was, so the next tick asks again rather than assuming
             // this file has already been read.

@@ -1,7 +1,9 @@
 //! Plain-text books retain punctuation and Markdown markers literally. Chapter byte
 //! ranges let the reader lay out a small window without parsing the whole book again.
 
+use std::io::{self, BufRead, BufReader, Read, Seek, SeekFrom};
 use std::ops::Range;
+use std::path::Path;
 use crate::{Block, BlockKind, Document, SourceSpan};
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -77,11 +79,56 @@ pub fn chapters(source: &str, detect: bool) -> Vec<Chapter> {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ChapterIndex {
     chapters: Vec<Chapter>,
+    blank_separated: bool,
 }
 
 impl ChapterIndex {
     pub fn new(source: &str, detect: bool) -> Self {
-        Self { chapters: chapters(source, detect) }
+        Self {
+            chapters: chapters(source, detect),
+            blank_separated: source.lines().any(|line| line.trim().is_empty()),
+        }
+    }
+
+    /// Build a chapter index by scanning a UTF-8 file line by line, without first
+    /// materialising the complete book in memory. Legacy encodings use the decoded-string
+    /// constructor because their code-page state cannot safely resume at an arbitrary byte
+    /// offset.
+    pub fn from_path(path: &Path, detect: bool) -> io::Result<Self> {
+        let file = std::fs::File::open(path)?;
+        let length = file.metadata()?.len() as usize;
+        let mut reader = BufReader::new(file);
+        let mut chapters: Vec<Chapter> = Vec::new();
+        let mut offset = 0usize;
+        let mut blank_separated = false;
+        let mut first = true;
+        loop {
+            let mut line = Vec::new();
+            let read = reader.read_until(b'\n', &mut line)?;
+            if read == 0 { break; }
+            let mut text = std::str::from_utf8(&line)
+                .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "TXT window requires UTF-8"))?;
+            if first {
+                text = text.strip_prefix('\u{feff}').unwrap_or(text);
+                first = false;
+            }
+            if text.trim().is_empty() { blank_separated = true; }
+            if detect && is_chapter(text) {
+                if let Some(last) = chapters.last_mut() {
+                    last.range.end = offset;
+                } else if offset > 0 {
+                    chapters.push(Chapter { title: "Beginning".into(), range: 0..offset });
+                }
+                chapters.push(Chapter { title: text.trim().into(), range: offset..length });
+            }
+            offset += read;
+        }
+        if chapters.is_empty() {
+            chapters.push(Chapter { title: "Beginning".into(), range: 0..length });
+        } else if let Some(last) = chapters.last_mut() {
+            last.range.end = length;
+        }
+        Ok(Self { chapters, blank_separated })
     }
 
     pub fn chapters(&self) -> &[Chapter] {
@@ -93,6 +140,30 @@ impl ChapterIndex {
             .iter()
             .rposition(|chapter| chapter.range.start <= source_byte)
             .unwrap_or(0)
+    }
+
+    pub fn read_window(&self, path: &Path, index: usize, options: TextOptions) -> io::Result<Document> {
+        let range = self.chapters.get(index).map(|chapter| chapter.range.clone())
+            .unwrap_or(0..0);
+        let mut file = std::fs::File::open(path)?;
+        file.seek(SeekFrom::Start(range.start as u64))?;
+        let mut bytes = vec![0; range.end.saturating_sub(range.start)];
+        file.read_exact(&mut bytes)?;
+        let source = std::str::from_utf8(&bytes)
+            .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "TXT window is not UTF-8"))?;
+        Ok(parse_range(source, 0..source.len(), options, self.blank_separated, range.start))
+    }
+
+    pub fn read_source_window(&self, path: &Path, index: usize) -> io::Result<String> {
+        let range = self.chapters.get(index).map(|chapter| chapter.range.clone())
+            .unwrap_or(0..0);
+        let mut file = std::fs::File::open(path)?;
+        file.seek(SeekFrom::Start(range.start as u64))?;
+        let mut bytes = vec![0; range.end.saturating_sub(range.start)];
+        file.read_exact(&mut bytes)?;
+        Ok(std::str::from_utf8(&bytes)
+            .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "TXT window is not UTF-8"))?
+            .to_string())
     }
 
     pub fn window(&self, source: &str, index: usize, options: TextOptions) -> Document {
@@ -116,7 +187,7 @@ pub fn parse_window(source: &str, range: Range<usize>, options: TextOptions) -> 
     if !source.is_char_boundary(start) || !source.is_char_boundary(end) {
         return Document { blocks: Vec::new(), footnotes: Vec::new() };
     }
-    parse_range(source, start..end, options, source.lines().any(|line| line.trim().is_empty()))
+    parse_range(source, start..end, options, source.lines().any(|line| line.trim().is_empty()), start)
 }
 
 fn parse_range(
@@ -124,6 +195,7 @@ fn parse_range(
     range: Range<usize>,
     options: TextOptions,
     blank_separated: bool,
+    source_base: usize,
 ) -> Document {
     // Short lines in a book with blank paragraph separators are likely hard-wrapped.
     // With no blank separators each source line is a paragraph, as in novel TXT files.
@@ -142,10 +214,10 @@ fn parse_range(
             blocks.push(block);
         }
     };
-    let mut offset = range.start;
+    let mut offset = 0usize;
     for raw in source[range.clone()].split_inclusive('\n') {
-        let line_start = offset;
-        let content_start = offset + raw.len() - raw.trim_start().len();
+        let line_start = source_base + offset;
+        let content_start = source_base + offset + raw.len() - raw.trim_start().len();
         offset += raw.len();
         let line = raw.trim();
         if line.is_empty() {
@@ -225,6 +297,20 @@ mod tests {
         let index = ChapterIndex::new(src, true);
         let doc = index.window(src, 1, TextOptions::default());
         assert_eq!(doc.blocks[1].text, "窗内第一行窗内第二行");
+    }
+
+    #[test]
+    fn a_utf8_file_window_reads_only_the_requested_chapter() {
+        let path = std::env::temp_dir().join(format!("rubrica-plain-window-{}.txt", std::process::id()));
+        let source = "序言\n开头\n\n第一章\n正文\n换行\n\n第二章\n结尾";
+        std::fs::write(&path, source).expect("write text fixture");
+        let index = ChapterIndex::from_path(&path, true).expect("index file");
+        assert_eq!(index.chapters().len(), 3);
+        let doc = index.read_window(&path, 1, TextOptions { paragraphs: ParagraphRule::Lines, chapters: true }).expect("read window");
+        assert_eq!(doc.blocks[0].text, "第一章");
+        assert_eq!(doc.blocks[0].sources[0].source, index.chapters()[1].range.start);
+        assert!(doc.blocks.iter().all(|block| block.text != "结尾"));
+        let _ = std::fs::remove_file(path);
     }
 
     #[test]

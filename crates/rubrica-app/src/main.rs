@@ -160,7 +160,15 @@ fn main() -> Result<()> {
     let (path, source) = match arg.as_ref().and_then(|p| p.to_str()) {
         Some(p) => {
             let path = PathBuf::from(p);
-            let source = reading::read(&path, settings::document(&path).encoding)?.text;
+            let prefs = settings::document(&path);
+            let source = if reading::is_plain(Some(&path))
+                && prefs.text.chapters
+                && reading::can_window_text(&path, prefs.encoding)
+            {
+                String::new()
+            } else {
+                reading::read(&path, prefs.encoding)?.text
+            };
             (Some(path), source)
         }
         None => reopen(),
@@ -178,7 +186,13 @@ fn main() -> Result<()> {
 /// document named on the command line gets the same treatment.
 fn reopen() -> (Option<PathBuf>, String) {
     if let Some((path, _)) = settings::reading() {
-        if let Ok(source) = reading::read(&path, settings::document(&path).encoding).map(|d| d.text) {
+        let prefs = settings::document(&path);
+        if reading::is_plain(Some(&path)) && prefs.text.chapters
+            && reading::can_window_text(&path, prefs.encoding)
+        {
+            return (Some(path), String::new());
+        }
+        if let Ok(source) = reading::read(&path, prefs.encoding).map(|d| d.text) {
             return (Some(path), source);
         }
     }

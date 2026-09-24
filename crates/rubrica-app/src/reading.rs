@@ -35,6 +35,28 @@ pub struct Decoded {
     pub guessed: bool,
 }
 
+/// Above this size a plain UTF-8 book may be indexed and read by chapter instead of
+/// decoding the whole file before the first page is laid out.
+pub const LAZY_TEXT_THRESHOLD: u64 = 4 * 1024 * 1024;
+
+pub fn is_large_text(path: &Path) -> bool {
+    std::fs::metadata(path).map(|meta| meta.len() > LAZY_TEXT_THRESHOLD).unwrap_or(false)
+}
+
+/// A conservative probe for the lazy path. Legacy code pages stay on the fully decoded
+/// route because a byte range can cut a multibyte character; a malformed prefix simply
+/// falls back to the old path rather than guessing.
+pub fn can_window_text(path: &Path, requested: Encoding) -> bool {
+    if !is_large_text(path) || !matches!(requested, Encoding::Auto | Encoding::Utf8) {
+        return false;
+    }
+    let Ok(mut file) = std::fs::File::open(path) else { return false };
+    use std::io::Read;
+    let mut bytes = [0u8; 64 * 1024];
+    let Ok(read) = file.read(&mut bytes) else { return false };
+    std::str::from_utf8(&bytes[..read]).is_ok()
+}
+
 pub fn read(path: &Path, requested: Encoding) -> std::io::Result<Decoded> {
     decode(&std::fs::read(path)?, requested)
 }
