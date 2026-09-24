@@ -14,6 +14,7 @@ mod highlight;
 mod hyphen;
 mod images;
 mod math;
+mod pagination;
 mod report;
 mod reading;
 mod profiles;
