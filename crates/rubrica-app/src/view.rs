@@ -32,8 +32,9 @@ use windows::Win32::Graphics::Direct2D::Common::{
 use windows::Win32::Graphics::Direct2D::{
     D2D1_BITMAP_INTERPOLATION_MODE_LINEAR, D2D1_FACTORY_TYPE_SINGLE_THREADED, D2D1_FEATURE_LEVEL_DEFAULT,
     D2D1_HWND_RENDER_TARGET_PROPERTIES, D2D1_PRESENT_OPTIONS_NONE, D2D1_RENDER_TARGET_PROPERTIES,
-    D2D1_RENDER_TARGET_TYPE_DEFAULT, D2D1_RENDER_TARGET_USAGE_NONE,
-    D2D1_DRAW_TEXT_OPTIONS_CLIP, D2D1_TEXT_ANTIALIAS_MODE_CLEARTYPE, ID2D1Factory, ID2D1HwndRenderTarget, ID2D1RenderTarget,
+    D2D1_RENDER_TARGET_TYPE_DEFAULT, D2D1_RENDER_TARGET_USAGE_NONE, D2D1_ROUNDED_RECT,
+    D2D1_DRAW_TEXT_OPTIONS, D2D1_DRAW_TEXT_OPTIONS_CLIP, D2D1_TEXT_ANTIALIAS_MODE_CLEARTYPE,
+    D2D1_ANTIALIAS_MODE_PER_PRIMITIVE, ID2D1Factory, ID2D1HwndRenderTarget, ID2D1RenderTarget,
     ID2D1SolidColorBrush, D2D1CreateFactory,
 };
 use windows::Win32::Graphics::Imaging::{
@@ -43,7 +44,7 @@ use windows::Win32::Graphics::Imaging::{
 use windows::Win32::System::Com::{CoCreateInstance, CLSCTX_INPROC_SERVER};
 use windows::Win32::Graphics::DirectWrite::{
     DWRITE_GLYPH_OFFSET, DWRITE_GLYPH_RUN, DWRITE_MEASURING_MODE_NATURAL, IDWriteFontFace,
-    IDWriteTextFormat,
+    IDWriteTextFormat, IDWriteTextLayout,
 };
 use windows::Win32::Graphics::Dwm::{DwmSetWindowAttribute, DWMWA_USE_IMMERSIVE_DARK_MODE};
 use windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_B8G8R8A8_UNORM;
@@ -51,6 +52,7 @@ use windows::Win32::Graphics::Gdi::{
     CLIP_DEFAULT_PRECIS, CreateFontW, CreateSolidBrush, DEFAULT_CHARSET, DEFAULT_QUALITY,
     DeleteObject, EnumDisplayMonitors, GetMonitorInfoW, HBRUSH, HDC, HFONT, HGDIOBJ, HMONITOR,
     InvalidateRect, MONITORINFO, OUT_DEFAULT_PRECIS, ScreenToClient, SetBkColor, SetTextColor,
+    ValidateRect,
 };
 use windows::Win32::System::Com::{
     CoInitializeEx, COINIT_APARTMENTTHREADED, COINIT_DISABLE_OLE1DDE, COINIT_MULTITHREADED,
@@ -62,6 +64,7 @@ use windows::Win32::UI::HiDpi::{
 };
 use windows::Win32::UI::Input::KeyboardAndMouse::{
     GetKeyState, ReleaseCapture, SetCapture, SetFocus, VK_CONTROL, VK_O, VK_UP,
+    TrackMouseEvent, TME_LEAVE, TRACKMOUSEEVENT,
 };
 use windows::Win32::UI::Input::KeyboardAndMouse::{VK_DOWN, VK_ESCAPE, VK_NEXT, VK_PRIOR};
 use windows::Win32::UI::Input::KeyboardAndMouse::{
@@ -69,7 +72,7 @@ use windows::Win32::UI::Input::KeyboardAndMouse::{
     VK_OEM_4, VK_OEM_6, VK_OEM_MINUS, VK_OEM_PLUS, VK_R, VK_RETURN, VK_RIGHT, VK_SHIFT,
     VK_SUBTRACT, VK_TAB, VK_W, VIRTUAL_KEY,
 };
-use windows::Win32::UI::Controls::EM_SETCUEBANNER;
+use windows::Win32::UI::Controls::{EM_SETCUEBANNER, WM_MOUSELEAVE};
 use windows::Win32::UI::Controls::Dialogs::{
     GetOpenFileNameW, OPENFILENAMEW, OFN_FILEMUSTEXIST, OFN_HIDEREADONLY, OFN_PATHMUSTEXIST,
 };
@@ -86,7 +89,7 @@ use windows::Win32::UI::WindowsAndMessaging::{
     WM_DESTROY, WM_DPICHANGED, WM_ERASEBKGND, WM_EXITSIZEMOVE, WM_KEYDOWN, WM_MOUSEWHEEL,
     WM_NCCREATE, WM_PAINT, WM_SETCURSOR, WM_SIZE, WM_TIMER, WS_EX_APPWINDOW, WS_OVERLAPPEDWINDOW,
     SWP_NOACTIVATE, SWP_NOZORDER, WM_DROPFILES, WM_LBUTTONDOWN, WM_LBUTTONDBLCLK, WM_LBUTTONUP,
-    WM_MOUSEMOVE, WM_SYSKEYDOWN, CallWindowProcW, EN_CHANGE, ES_AUTOHSCROLL, GetParent,
+    WM_MBUTTONDOWN, WM_MOUSEMOVE, WM_SYSKEYDOWN, CallWindowProcW, EN_CHANGE, ES_AUTOHSCROLL, GetParent,
     GetWindowTextW, GWLP_WNDPROC, MoveWindow, SendMessageW, SW_HIDE, SW_SHOW, WM_CHAR, WM_COMMAND,
     WM_CTLCOLOREDIT, WM_GETTEXTLENGTH, WM_SETFONT, WINDOWPLACEMENT, WINDOW_STYLE, WNDPROC,
     WS_BORDER, WS_CHILD, WS_VISIBLE,
@@ -102,7 +105,7 @@ use crate::hyphen::Hyphenator;
 use crate::images::ImageStore;
 use crate::math::MathStore;
 use crate::tree::{self, Entry as TreeEntry, EntryKind as TreeEntryKind};
-use rubrica_workspace::{DocumentRef, FileRef, TabId, TabKind, Workspace};
+use rubrica_workspace::{DocumentRef, FileRef, Tab, TabId, TabKind, Workspace};
 use crate::theme::{ColorRole, Leading, Measure, Role, TextFace, Theme, Zoom};
 use crate::{Error, Result};
 
@@ -114,6 +117,18 @@ const HYPHEN_RANGE: std::ops::Range<usize> = 0..1;
 const MARGIN_EM: Pt = 2.6;
 /// Height of the visible document-tab strip, in device-independent pixels.
 const TABBAR_H: Pt = 32.0;
+/// Tab pill metrics, in device-independent pixels. The pill is centred in the strip,
+/// sized to its label, and spaced a step apart so two adjacent pills read as two.
+const TAB_PILL_H: Pt = 22.0;
+const TAB_GAP: Pt = 4.0;
+const TAB_FIRST_LEFT: Pt = 8.0;
+const TAB_PAD_X: Pt = 11.0;
+const TAB_MIN_W: Pt = 72.0;
+const TAB_MAX_W: Pt = 220.0;
+/// The square the new-tab button answers in, after the last pill.
+const TAB_PLUS_SIZE: Pt = 24.0;
+/// The right-hand strip of a pill that closes it, once the pointer is on the pill.
+const TAB_CLOSE_W: Pt = 16.0;
 const TREE_ROW_H: Pt = 24.0;
 const TREE_MIN_W: f32 = 160.0;
 const TREE_MAX_W: f32 = 360.0;
@@ -169,6 +184,10 @@ struct Palette {
     comment: Rgb,
     number: Rgb,
     ty: Rgb,
+    tab_strip: Rgb,
+    tab_inactive: Rgb,
+    tab_hover: Rgb,
+    on_accent: Rgb,
 }
 
 impl Palette {
@@ -189,6 +208,12 @@ impl Palette {
                 comment: Rgb { r: 0.52, g: 0.58, b: 0.55 },
                 number: Rgb { r: 0.55, g: 0.79, b: 0.75 },
                 ty: Rgb { r: 0.62, g: 0.80, b: 0.58 },
+                // The strip is darker than the page, the resting pill lighter than the
+                // strip, and the accent bright enough that its own label wants dark ink.
+                tab_strip: Rgb::gray(0.085),
+                tab_inactive: Rgb::gray(0.168),
+                tab_hover: Rgb::gray(0.21),
+                on_accent: Rgb::gray(0.05),
             }
         } else {
             Palette {
@@ -206,6 +231,12 @@ impl Palette {
                 comment: Rgb { r: 0.40, g: 0.46, b: 0.42 },
                 number: Rgb { r: 0.09, g: 0.40, b: 0.44 },
                 ty: Rgb { r: 0.16, g: 0.40, b: 0.22 },
+                // The same relationship the night palette has, the other way up: a strip
+                // a step darker than the paper, a pill a step lighter than the strip.
+                tab_strip: Rgb { r: 0.906, g: 0.902, b: 0.892 },
+                tab_inactive: Rgb { r: 0.968, g: 0.965, b: 0.958 },
+                tab_hover: Rgb { r: 0.925, g: 0.921, b: 0.911 },
+                on_accent: Rgb { r: 1.0, g: 1.0, b: 1.0 },
             }
         }
     }
@@ -221,6 +252,10 @@ impl Palette {
             ColorRole::Comment => self.comment,
             ColorRole::Number => self.number,
             ColorRole::Type => self.ty,
+            ColorRole::TabStrip => self.tab_strip,
+            ColorRole::TabInactive => self.tab_inactive,
+            ColorRole::TabHover => self.tab_hover,
+            ColorRole::OnAccent => self.on_accent,
         }
     }
 }
@@ -909,6 +944,21 @@ pub struct View {
     dark_override: Option<bool>,
     brushes: HashMap<ColorRole, ID2D1SolidColorBrush>,
     tab_format: Option<IDWriteTextFormat>,
+    /// Measured tab labels, keyed on the tab list that produced them: hit-testing and
+    /// painting answer from one geometry, and a repaint never re-shapes a file name.
+    tab_labels: Option<TabLabelCache>,
+    /// The pill, and the new-tab button, the pointer is over. Cleared when USER32 says
+    /// the pointer has left the window.
+    tab_hot: Option<TabId>,
+    plus_hot: bool,
+    tracking_leave: bool,
+    /// Other tabs' materialized pages; see [`TabPage`].
+    pages: HashMap<TabId, TabPage>,
+    /// Bumped whenever a layout input other than the document changes -- the window's
+    /// width, its DPI, the reading size, a face, a measure, the profile's options. A
+    /// cached page from an older epoch is still warm in its text, and only its
+    /// wrapping is rebuilt before it is shown.
+    layout_epoch: u64,
     /// The targets of the current layout, and where each note begins.
     hotspots: Vec<Hot>,
     note_tops: Vec<Pt>,
@@ -974,8 +1024,9 @@ pub struct View {
     press_at: Option<(f32, f32)>,
     /// Built once a render target exists, since bitmaps need one.
     images: Option<ImageStore>,
-    /// Typeset formulas, kept across relayouts so a document's math is set once.
-    math: MathStore,
+    /// Typeset formulas, one store per profile so a tab switch that flips the profile
+    /// back and forth keeps each profile's work; see [`View::math_for`].
+    maths: HashMap<String, MathStore>,
     /// English word breaks, when the embedded dictionary loaded.
     hyphenator: Option<Hyphenator>,
     /// What the reader is looking for, and everywhere the page has it. `Some` while the
@@ -993,6 +1044,93 @@ pub struct View {
     find_label: Vec<PaintRun>,
     hit_brush: Option<ID2D1SolidColorBrush>,
     focus_brush: Option<ID2D1SolidColorBrush>,
+}
+
+/// Measured tab labels, keyed on the tab list that produced them: the key decides when
+/// the labels must be measured again.
+type TabLabelCache = (Vec<(TabId, String)>, Vec<TabLabel>);
+
+/// One tab's measured label: the laid-out text, the pill width it asked for, and the
+/// height of its layout box for centring.
+#[derive(Clone)]
+struct TabLabel {
+    id: TabId,
+    title: String,
+    layout: Option<IDWriteTextLayout>,
+    width: f32,
+    box_h: f32,
+}
+
+/// One tab's materialized page: everything [`View`] keeps for the document it is
+/// showing, set aside when the reader moves to another tab.
+///
+/// A switch that finds its page here costs a swap of fields -- no read, no parse, no
+/// typesetting -- and one that finds it stale in shape still keeps the parse, since
+/// only the wrapping has to be built again. The store grows with the tabs the reader
+/// keeps open, which is the reader's own choice, and shrinks with each tab they close.
+struct TabPage {
+    /// The layout inputs the page's ops were built under. An epoch that differs from
+    /// the view's means the window's width, DPI, size or face moved while this page
+    /// slept, and the wrapping -- not the text -- is rebuilt before it is shown.
+    epoch: u64,
+    source: String,
+    doc: Document,
+    ops: Vec<Op>,
+    sel_index: Vec<SelLine>,
+    hotspots: Vec<Hot>,
+    note_tops: Vec<Pt>,
+    anchor_tops: Vec<Pt>,
+    wide_regions: Vec<WideRegion>,
+    tree: Vec<TreeEntry>,
+    chapter_index: Option<ChapterIndex>,
+    chapter: usize,
+    lazy_text: bool,
+    content_h: Pt,
+    scroll: Pt,
+    stamp: Option<Stamp>,
+    path: Option<PathBuf>,
+    profile: String,
+    plain_override: Option<bool>,
+    encoding: Encoding,
+    decoded_encoding: Encoding,
+    encoding_guessed: bool,
+    line_break_override: Option<bool>,
+    source_view: bool,
+    text_options: TextOptions,
+}
+
+impl TabPage {
+    /// An empty page, whose only work is to be the other side of the field swaps: its
+    /// contents are overwritten before anything reads them.
+    fn empty() -> Self {
+        TabPage {
+            epoch: 0,
+            source: String::new(),
+            doc: Document { blocks: Vec::new(), footnotes: Vec::new() },
+            ops: Vec::new(),
+            sel_index: Vec::new(),
+            hotspots: Vec::new(),
+            note_tops: Vec::new(),
+            anchor_tops: Vec::new(),
+            wide_regions: Vec::new(),
+            tree: Vec::new(),
+            chapter_index: None,
+            chapter: 0,
+            lazy_text: false,
+            content_h: 0.0,
+            scroll: 0.0,
+            stamp: None,
+            path: None,
+            profile: String::new(),
+            plain_override: None,
+            encoding: Encoding::default(),
+            decoded_encoding: Encoding::default(),
+            encoding_guessed: false,
+            line_break_override: None,
+            source_view: false,
+            text_options: TextOptions::default(),
+        }
+    }
 }
 
 /// Thumb geometry, in device independent pixels, or `None` when the document fits.
@@ -1035,10 +1173,12 @@ fn scroll_dip(scroll: Pt, dpi: f32) -> Pt {
 /// The document y represented by a pointer y in the reader's client area.
 ///
 /// This is the inverse of the document transform used while painting: the page is drawn
-/// below the tab strip and lifted by the scroll, so both offsets are added back here.
+/// below the tab strip and lifted by the scroll, so the scroll is added back here and
+/// the strip is not -- a pointer below the strip names the document y the paint put
+/// there, and a pointer on the strip is nobody's business but the tab bar's.
 #[inline]
 fn document_y(client_y: f32, scroll: Pt, dpi: f32) -> f32 {
-    client_y + scroll_dip(scroll, dpi) + TABBAR_H
+    client_y + scroll_dip(scroll, dpi)
 }
 
 /// One rung of the measure ladder either way, stopping at both ends rather than
@@ -1863,6 +2003,12 @@ pub fn run(mut source: String, path: Option<PathBuf>) -> Result<()> {
         dark_override: saved.dark,
         brushes: HashMap::new(),
         tab_format: None,
+        tab_labels: None,
+        tab_hot: None,
+        plus_hot: false,
+        tracking_leave: false,
+        pages: HashMap::new(),
+        layout_epoch: 0,
         hotspots: Vec::new(),
         wide_regions: Vec::new(),
         preview: None,
@@ -1894,7 +2040,7 @@ pub fn run(mut source: String, path: Option<PathBuf>) -> Result<()> {
         wide_active: None,
         press_at: None,
         images: None,
-        math: MathStore::new(),
+        maths: HashMap::new(),
         hyphenator: Hyphenator::english(),
         find: None,
         edit: None,
@@ -1982,9 +2128,20 @@ pub fn run(mut source: String, path: Option<PathBuf>) -> Result<()> {
     Ok(())
 }
 
+/// The path as it is shown, not as it is named. `canonicalize` answers in the Windows
+/// verbatim form, and a title is copied and read by people, who want the drive letter
+/// they opened and not the machine's spelling of an extended-length path.
+fn display_path(path: &Path) -> String {
+    let s = path.as_os_str().to_string_lossy();
+    if let Some(rest) = s.strip_prefix(r"\\?\UNC\") {
+        return format!(r"\\{rest}");
+    }
+    s.strip_prefix(r"\\?\").map(str::to_owned).unwrap_or_else(|| s.into_owned())
+}
+
 fn window_title(path: Option<&std::path::Path>) -> String {
     match path {
-        Some(p) => format!("Rubrica \u{2014} {}", p.display()),
+        Some(p) => format!("Rubrica \u{2014} {}", display_path(p)),
         None => "Rubrica \u{2014} sample".to_string(),
     }
 }
@@ -2304,56 +2461,33 @@ impl View {
         );
     }
 
-    /// Create every brush the display list references, before drawing.
+    /// Create every brush the window can name, before drawing.
     ///
     /// The paint loop only reads `self.ops` and `self.brushes`, so brushes cannot
     /// be created lazily inside it without a mutable borrow colliding with that
-    /// iteration. Warming them up here also keeps a cache miss out of the frame path.
+    /// iteration. They are made from a fixed list of roles rather than from a scan of
+    /// what the current display list happens to reference: the scan ran over every op
+    /// and every glyph run of every frame, and a fixed list is checked in nanoseconds.
     fn ensure_brushes(&mut self) {
         let Some(rt) = self.target.clone() else { return };
-        let mut roles: Vec<ColorRole> = Vec::new();
-        for op in self.ops.iter() {
-            let mut push = |r: ColorRole| {
-                if !roles.contains(&r) {
-                    roles.push(r);
-                }
-            };
-            match op {
-                Op::Rect { color, .. } | Op::Line { color, .. } => push(*color),
-                Op::Runs(rs) => {
-                    for r in rs {
-                        push(r.color);
-                    }
-                }
-                // Images are drawn with their own bitmap, not a brush.
-                Op::Image { .. } => {}
-            }
-        }
-        // The thumb is painted from its geometry rather than from an op, because an op
-        // would mean relaying out the document on every wheel tick. That leaves it
-        // asking for the one brush it needs by name: a document that has no muted text
-        // on the page but does overflow the window still has to be able to draw it.
-        if self.thumb_rect().is_some() && !roles.contains(&ColorRole::Muted) {
-            roles.push(ColorRole::Muted);
-        }
-        // The bar's panel and its count of matches are drawn from their geometry like the
-        // thumb, for the same reason, so the ink they fill with has to be asked for by
-        // name rather than found in a list of what the page happens to be made of.
-        if self.preview.is_some() {
-            for role in [ColorRole::Surface, ColorRole::Text, ColorRole::Muted] {
-                if !roles.contains(&role) {
-                    roles.push(role);
-                }
-            }
-        }
-        if self.find.is_some() {
-            for role in [ColorRole::Surface, ColorRole::Muted] {
-                if !roles.contains(&role) {
-                    roles.push(role);
-                }
-            }
-        }
-        for role in roles {
+        const ROLES: [ColorRole; 15] = [
+            ColorRole::Text,
+            ColorRole::Muted,
+            ColorRole::Accent,
+            ColorRole::Code,
+            ColorRole::Faint,
+            ColorRole::Surface,
+            ColorRole::Keyword,
+            ColorRole::String,
+            ColorRole::Comment,
+            ColorRole::Number,
+            ColorRole::Type,
+            ColorRole::TabStrip,
+            ColorRole::TabInactive,
+            ColorRole::TabHover,
+            ColorRole::OnAccent,
+        ];
+        for role in ROLES {
             if self.brushes.contains_key(&role) {
                 continue;
             }
@@ -2400,6 +2534,8 @@ impl View {
                     let _ = t.Resize(&D2D_SIZE_U { width: w.max(1), height: h.max(1) });
                 }
                 self.dpi = GetDpiForWindow(hwnd).max(96) as f32;
+                // A new width is a new wrapping, for every tab and not only this one.
+                self.layout_epoch += 1;
                 self.relayout();
                 self.layout_find();
                 let _ = InvalidateRect(Some(hwnd), None, false);
@@ -2441,6 +2577,8 @@ impl View {
                 // The box's letters were made for the monitor it is leaving, and a font is
                 // sized in pixels, so it has to be made again rather than scaled up.
                 self.drop_edit_font();
+                // New pixels are a new wrapping for every tab as well.
+                self.layout_epoch += 1;
                 self.relayout();
                 self.layout_find();
                 let _ = InvalidateRect(Some(hwnd), None, false);
@@ -2673,10 +2811,12 @@ impl View {
                     _ => {
                         // A poll, not a push: there is no message for this setting. The
                         // reader's own choice outranks it, and `set_dark` does nothing when
-                        // the answer it gets is already on screen.
+                        // the answer it gets is already on screen -- a tick whose answer is
+                        // already on screen must not cost a repaint either.
                         let dark = self.dark_override.unwrap_or_else(system_prefers_dark);
-                        self.set_dark(dark, hwnd);
-                        let _ = InvalidateRect(Some(hwnd), None, false);
+                        if self.set_dark(dark, hwnd) {
+                            let _ = InvalidateRect(Some(hwnd), None, false);
+                        }
                     }
                 }
                 LRESULT(0)
@@ -2690,8 +2830,17 @@ impl View {
                 // the release; a press anywhere else belongs to the text.
                 let x = ((lp.0 & 0xFFFF) as i16) as f32;
                 let y = ((lp.0 >> 16) as i16) as f32;
-                if let Some(id) = self.tab_at(x, y) {
-                    self.switch_to_tab(id, hwnd);
+                // The strip answers for its own presses, and keeps the page's: a close
+                // zone first, then a pill, then the new-tab button, and a press on none
+                // of them is a press on nothing at all.
+                if y < TABBAR_H {
+                    if let Some(id) = self.tab_close_at(x, y) {
+                        self.apply_command(Command::CloseTab(id), hwnd);
+                    } else if let Some(id) = self.tab_at(x, y) {
+                        self.switch_to_tab(id, hwnd);
+                    } else if self.plus_at(x, y) {
+                        self.apply_command(Command::OpenFile, hwnd);
+                    }
                     return LRESULT(0);
                 }
                 if self.tree_visible && (x - self.tree_width).abs() <= 6.0 {
@@ -2756,7 +2905,13 @@ impl View {
                     let mut pt = POINT::default();
                     let _ = GetCursorPos(&mut pt);
                     let _ = ScreenToClient(hwnd, &mut pt);
-                    let over = self.hot_at(pt.x as f32, pt.y as f32).is_some();
+                    let (px, py) = (pt.x as f32, pt.y as f32);
+                    // The strip's controls are as much a hand as a link is.
+                    let over = if py < TABBAR_H {
+                        self.tab_at(px, py).is_some() || self.plus_at(px, py)
+                    } else {
+                        self.hot_at(px, py).is_some()
+                    };
                     SetCursor(Some(if over { self.hand } else { self.arrow }));
                     LRESULT(1)
                 } else {
@@ -2766,6 +2921,33 @@ impl View {
             WM_MOUSEMOVE => {
                 let x = ((lp.0 & 0xFFFF) as i16) as f32;
                 let y = ((lp.0 >> 16) as i16) as f32;
+                // The strip's hovers -- a pill, its close button by way of the pill, the
+                // new-tab button -- are asked for before the drags below, since a pointer
+                // that has left the strip owes neither of them any ink. A change costs an
+                // invalidate; an unchanged hover costs nothing.
+                let hot = self.tab_hot;
+                let plus = self.plus_hot;
+                if y < TABBAR_H {
+                    self.tab_hot = self.tab_at(x, y);
+                    self.plus_hot = self.plus_at(x, y);
+                    if !self.tracking_leave {
+                        let mut tme = TRACKMOUSEEVENT {
+                            cbSize: std::mem::size_of::<TRACKMOUSEEVENT>() as u32,
+                            dwFlags: TME_LEAVE,
+                            hwndTrack: hwnd,
+                            dwHoverTime: 0,
+                        };
+                        if unsafe { TrackMouseEvent(&mut tme) }.is_ok() {
+                            self.tracking_leave = true;
+                        }
+                    }
+                } else {
+                    self.tab_hot = None;
+                    self.plus_hot = false;
+                }
+                if self.tab_hot != hot || self.plus_hot != plus {
+                    let _ = InvalidateRect(Some(hwnd), None, false);
+                }
                 if self.tree_dragging {
                     self.tree_width = x.clamp(TREE_MIN_W, TREE_MAX_W);
                     self.relayout();
@@ -2814,6 +2996,33 @@ impl View {
             }
             WM_PAINT => {
                 self.paint();
+                // A D2D present clears nothing of USER32's update region: without
+                // this, the window would be told to paint again every time its queue
+                // emptied, forever -- a full-scene redraw at the refresh rate whether or
+                // not anything had changed.
+                unsafe {
+                    let _ = ValidateRect(Some(hwnd), None);
+                }
+                LRESULT(0)
+            }
+            WM_MOUSELEAVE => {
+                // The tab strip's hovers live only while the pointer is on the window.
+                self.tracking_leave = false;
+                if self.tab_hot.is_some() || self.plus_hot {
+                    self.tab_hot = None;
+                    self.plus_hot = false;
+                    let _ = InvalidateRect(Some(hwnd), None, false);
+                }
+                LRESULT(0)
+            }
+            WM_MBUTTONDOWN => {
+                // A middle press on a tab closes it, the way every tabbed surface on
+                // this platform answers.
+                let x = ((lp.0 & 0xFFFF) as i16) as f32;
+                let y = ((lp.0 >> 16) as i16) as f32;
+                if let Some(id) = self.tab_at(x, y) {
+                    self.apply_command(Command::CloseTab(id), hwnd);
+                }
                 LRESULT(0)
             }
             _ => DefWindowProcW(hwnd, msg, wp, lp),
@@ -3090,7 +3299,7 @@ impl View {
                 .collect(),
             recent: self.workspace.recent.items().iter().enumerate()
                 .filter(|(_, file)| file.path.is_file())
-                .map(|(i, file)| (i, file.path.to_string_lossy().into_owned()))
+                .map(|(i, file)| (i, display_path(&file.path)))
                 .collect(),
             tree: self.tree.iter().enumerate()
                 .map(|(i, entry)| (i, format!("{}{}", "  ".repeat(entry.depth), entry.name), entry.kind == TreeEntryKind::Directory))
@@ -3170,13 +3379,17 @@ impl View {
             Command::Palette(dark) => {
                 self.dark_override = Some(dark);
                 self.remember();
-                self.set_dark(dark, hwnd);
+                if self.set_dark(dark, hwnd) {
+                    let _ = unsafe { InvalidateRect(Some(hwnd), None, false) };
+                }
             }
             Command::FollowSystem => {
                 self.dark_override = None;
                 self.remember();
                 let dark = system_prefers_dark();
-                self.set_dark(dark, hwnd);
+                if self.set_dark(dark, hwnd) {
+                    let _ = unsafe { InvalidateRect(Some(hwnd), None, false) };
+                }
             }
             Command::OpenFile => {
                 if let Some(path) = unsafe { self.prompt_for_file(hwnd) } {
@@ -3212,10 +3425,18 @@ impl View {
                 if self.workspace.tabs.active().id == id {
                     self.close_active_tab(hwnd);
                 } else {
+                    // A tab that is not showing keeps no page to throw away a view for:
+                    // its materialization goes with it, and the strip is redrawn.
                     self.workspace.close(id);
+                    self.pages.remove(&id);
+                    let _ = unsafe { InvalidateRect(Some(hwnd), None, false) };
                 }
             }
-            Command::PinTab(id) => { self.workspace.pin(id); }
+            Command::PinTab(id) => {
+                if self.workspace.pin(id) {
+                    let _ = unsafe { InvalidateRect(Some(hwnd), None, false) };
+                }
+            }
             Command::NextTab => self.switch_relative_tab(1, hwnd),
             Command::PreviousTab => self.switch_relative_tab(-1, hwnd),
             Command::Reload => {
@@ -3415,6 +3636,9 @@ impl View {
     }
 
     fn reparse(&mut self, hwnd: HWND) {
+        // Source view, line breaks, paragraph rules: inputs the wrapping answers to,
+        // here and on every other tab that now has to be wrapped again when shown.
+        self.layout_epoch += 1;
         self.reset_chapter_cache();
         let plain = self.plain_override.unwrap_or_else(|| reading::is_plain(self.path.as_deref()));
         if self.lazy_text
@@ -3438,7 +3662,6 @@ impl View {
         if profile != self.profile {
             crate::profiles::load(&profile).apply(&mut self.theme);
             self.profile = profile;
-            self.math = MathStore::new();
         }
         self.refresh_chapter_index();
         if self.lazy_text && plain && self.text_options.chapters && self.chapter_index.is_none() {
@@ -3544,7 +3767,6 @@ impl View {
     fn apply_profile(&mut self, name: String, hwnd: HWND) {
         crate::profiles::load(&name).apply(&mut self.theme);
         self.profile = name;
-        self.math = MathStore::new();
         self.relayout_in_place(hwnd);
         self.remember();
     }
@@ -3606,6 +3828,9 @@ impl View {
     /// six lines is now eight. So the place is remembered as what the reader was looking
     /// at rather than as a distance, and found again where the new layout put it.
     fn relayout_in_place(&mut self, hwnd: HWND) {
+        // Every caller has just changed something the wrapping answers to -- a face, a
+        // measure, the reading size, the profile -- so every cached page goes stale.
+        self.layout_epoch += 1;
         let k = scale_of(self.dpi);
         let anchor = anchor_at(&self.sel_index, self.scroll, k);
         self.relayout();
@@ -3681,16 +3906,18 @@ impl View {
         }
         self.scroll *= self.theme.base / before;
         self.remember();
+        self.layout_epoch += 1;
         self.relayout();
         self.clamp_scroll();
         let _ = unsafe { InvalidateRect(Some(hwnd), None, false) };
     }
 
-    /// Paint in one palette or the other. Cheap when it is already the right one, since
-    /// the appearance poll calls this on every tick.
-    fn set_dark(&mut self, dark: bool, hwnd: HWND) {
+    /// Paint in one palette or the other. Says whether anything changed: the appearance
+    /// poll asks on every tick, and a tick whose answer is already on screen must not
+    /// cost a repaint.
+    fn set_dark(&mut self, dark: bool, hwnd: HWND) -> bool {
         if dark == self.palette.dark {
-            return;
+            return false;
         }
         self.palette = Palette::of(dark);
         // The brushes hold the old inks, keyed by role rather than by palette, so they
@@ -3709,14 +3936,20 @@ impl View {
             unsafe { let _ = InvalidateRect(Some(e), None, true); }
         }
         unsafe { self.apply_dark_titlebar(hwnd) };
+        true
     }
 
     fn relayout(&mut self) {
         // Every field handed in is borrowed for its own reason: the decoder and the
-        // document's directory for figures, the cache so a resize does not reset the
-        // document's formulas.
+        // document's directory for figures, and the profile's own math store, so a
+        // resize does not reset the document's formulas. The store is picked by
+        // profile -- typeset math depends on the profile's fonts, so each profile
+        // keeps its own, and a tab switch that flips the profile back and forth keeps
+        // both instead of re-setting what was set.
+        let profile = self.profile.clone();
+        let math = self.maths.entry(profile).or_default();
         let mut objects =
-            Objects::new(self.images.as_ref(), self.path.as_deref().and_then(|p| p.parent()), &mut self.math);
+            Objects::new(self.images.as_ref(), self.path.as_deref().and_then(|p| p.parent()), math);
         let page = build_ops(
             &mut self.font,
             &self.theme,
@@ -4800,23 +5033,86 @@ impl View {
         thumb_rect(self.content_h, self.client_w, (self.client_h - TABBAR_H).max(1.0), self.scroll, self.dpi)
     }
 
-    fn tab_layout(&self) -> Vec<(TabId, f32, f32)> {
-        let count = self.workspace.tabs.items().len();
-        if count == 0 { return Vec::new(); }
-        let width = (self.client_w / count as f32).clamp(72.0, 240.0);
-        let left = (self.client_w - width * count as f32) * 0.5;
-        self.workspace
-            .tabs
-            .items()
+    fn tab_title(tab: &Tab) -> String {
+        match &tab.document {
+            DocumentRef::Sample => "Sample".to_string(),
+            DocumentRef::File(file) => file.path.file_name()
+                .map(|name| name.to_string_lossy().into_owned())
+                .unwrap_or_else(|| file.path.to_string_lossy().into_owned()),
+        }
+    }
+
+    fn tab_titles(&self) -> Vec<(TabId, String)> {
+        self.workspace.tabs.items().iter().map(|tab| (tab.id, Self::tab_title(tab))).collect()
+    }
+
+    /// The pills' geometry, from one measurement that the painter and the pointer both
+    /// answer to: left-aligned from the strip's left edge, each pill as wide as its
+    /// label asks and no wider than the cap, a step apart.
+    ///
+    /// The measurement is a laid-out label kept until the tab list changes, so a wheel
+    /// tick or a hover never shapes a file name twice.
+    fn tab_metrics(&mut self) -> Vec<(TabId, f32, f32)> {
+        let titles = self.tab_titles();
+        if self.tab_labels.as_ref().is_none_or(|(key, _)| *key != titles) {
+            let room = TAB_MAX_W - 2.0 * TAB_PAD_X;
+            let mut labels = Vec::with_capacity(titles.len());
+            for (id, title) in &titles {
+                let (layout, width, box_h) = self
+                    .font
+                    .ui_label(title, "Segoe UI", 12.0, room)
+                    .map(|(layout, w, h)| (Some(layout), w, h))
+                    .unwrap_or((None, TAB_MIN_W - 2.0 * TAB_PAD_X, 0.0));
+                let width = (width + 2.0 * TAB_PAD_X).clamp(TAB_MIN_W, TAB_MAX_W);
+                labels.push(TabLabel { id: *id, title: title.clone(), layout, width, box_h });
+            }
+            self.tab_labels = Some((titles, labels));
+        }
+        let labels = self.tab_labels.as_ref().map(|(_, l)| l).expect("just built");
+        let mut left = TAB_FIRST_LEFT;
+        labels
             .iter()
-            .enumerate()
-            .map(|(i, tab)| (tab.id, left + i as f32 * width, width))
+            .map(|label| {
+                let here = left;
+                left += label.width + TAB_GAP;
+                (label.id, here, label.width)
+            })
             .collect()
     }
 
-    fn tab_at(&self, x: f32, y: f32) -> Option<TabId> {
+    fn tab_at(&mut self, x: f32, y: f32) -> Option<TabId> {
         if y >= TABBAR_H { return None; }
-        self.tab_layout().into_iter().find(|(_, left, width)| x >= *left && x < *left + *width).map(|(id, _, _)| id)
+        self.tab_metrics()
+            .into_iter()
+            .find(|(_, left, width)| x >= *left && x < *left + *width)
+            .map(|(id, _, _)| id)
+    }
+
+    /// The close zone of the pill the pointer is on, which is where its `×` shows.
+    fn tab_close_at(&mut self, x: f32, y: f32) -> Option<TabId> {
+        if y >= TABBAR_H { return None; }
+        let pill_top = (TABBAR_H - TAB_PILL_H) * 0.5;
+        let pill_band = pill_top..pill_top + TAB_PILL_H;
+        self.tab_metrics()
+            .into_iter()
+            .find(|(_, left, width)| x >= left + width - TAB_CLOSE_W && x < left + width && pill_band.contains(&y))
+            .map(|(id, _, _)| id)
+    }
+
+    fn plus_rect(&mut self) -> D2D_RECT_F {
+        let left = self.tab_metrics().last().map_or(TAB_FIRST_LEFT, |(_, l, w)| l + w + TAB_GAP);
+        D2D_RECT_F {
+            left,
+            top: (TABBAR_H - TAB_PLUS_SIZE) * 0.5,
+            right: left + TAB_PLUS_SIZE,
+            bottom: (TABBAR_H + TAB_PLUS_SIZE) * 0.5,
+        }
+    }
+
+    fn plus_at(&mut self, x: f32, y: f32) -> bool {
+        if y >= TABBAR_H { return false; }
+        let r = self.plus_rect();
+        x >= r.left && x < r.right && y >= r.top && y < r.bottom
     }
 
     fn content_dx(&self) -> f32 {
@@ -4853,40 +5149,85 @@ impl View {
     }
 
     unsafe fn draw_tab_bar(&mut self, target: &ID2D1RenderTarget) {
-        let tabs: Vec<_> = self.workspace.tabs.items().iter().map(|tab| {
-            let title = match &tab.document {
-                DocumentRef::Sample => "Sample".to_string(),
-                DocumentRef::File(file) => file.path.file_name()
-                    .map(|name| name.to_string_lossy().into_owned())
-                    .unwrap_or_else(|| file.path.to_string_lossy().into_owned()),
-            };
-            (tab.id, title)
-        }).collect();
-        if tabs.is_empty() { return; }
-        let layout = self.tab_layout();
-        let surface = self.brushes.get(&ColorRole::Surface).cloned();
-        let muted = self.brushes.get(&ColorRole::Muted).cloned();
+        if self.workspace.tabs.items().is_empty() { return; }
+        let strip = self.brushes.get(&ColorRole::TabStrip).cloned();
+        let pills = self.brushes.get(&ColorRole::TabInactive).cloned();
+        let hover = self.brushes.get(&ColorRole::TabHover).cloned();
         let accent = self.brushes.get(&ColorRole::Accent).cloned();
-        if let Some(brush) = surface.as_ref() {
+        let on_accent = self.brushes.get(&ColorRole::OnAccent).cloned();
+        let muted = self.brushes.get(&ColorRole::Muted).cloned();
+        if let Some(brush) = strip.as_ref() {
             let rect = D2D_RECT_F { left: 0.0, top: 0.0, right: self.client_w, bottom: TABBAR_H };
+            target.FillRectangle(&rect, brush);
+        }
+        // The hairline between the strip and everything it governs. With it the tabs are
+        // chrome resting over a page; without it they are paint on the page.
+        if let Some(brush) = pills.as_ref() {
+            let rect = D2D_RECT_F { left: 0.0, top: TABBAR_H - 1.0, right: self.client_w, bottom: TABBAR_H };
             target.FillRectangle(&rect, brush);
         }
         if self.tab_format.is_none() {
             self.tab_format = self.font.text_format("Segoe UI", 12.0).ok();
         }
         let format = self.tab_format.clone();
+        let rects = self.tab_metrics();
         let active = self.workspace.tabs.active().id;
-        for ((id, title), (_, x, width)) in tabs.into_iter().zip(layout) {
-            let rect = D2D_RECT_F { left: x + 2.0, top: 3.0, right: x + width - 2.0, bottom: TABBAR_H - 3.0 };
-            let fill = if id == active { accent.as_ref() } else { muted.as_ref() };
+        let labels = self.tab_labels.as_ref().map(|(_, l)| l).expect("tab_metrics built the labels").clone();
+        for ((id, left, width), label) in rects.into_iter().zip(labels) {
+            let hot = self.tab_hot == Some(id);
+            let pill_top = (TABBAR_H - TAB_PILL_H) * 0.5;
+            let pill = D2D1_ROUNDED_RECT {
+                rect: D2D_RECT_F { left, top: pill_top, right: left + width, bottom: pill_top + TAB_PILL_H },
+                radiusX: TAB_PILL_H * 0.5,
+                radiusY: TAB_PILL_H * 0.5,
+            };
+            let fill = if id == active { accent.as_ref() } else if hot { hover.as_ref() } else { pills.as_ref() };
             if let Some(brush) = fill {
-                target.FillRectangle(&rect, brush);
+                target.FillRoundedRectangle(&pill, brush);
             }
-            if let (Some(format), Some(brush)) = (format.as_ref(), muted.as_ref()) {
-                let text = utf16(&title);
-                let text_rect = D2D_RECT_F { left: x + 4.0, top: 4.0, right: x + width - 4.0, bottom: TABBAR_H - 4.0 };
+            let ink = if id == active { on_accent.clone() } else { muted.clone() };
+            // The label from the layout the measurement already shaped, so a repaint
+            // neither re-shapes nor re-measures a file name.
+            if let (Some(layout), Some(brush)) = (label.layout.as_ref(), ink.as_ref()) {
+                target.DrawTextLayout(
+                    Vector2::new(left + TAB_PAD_X, pill_top + (TAB_PILL_H - label.box_h) * 0.5),
+                    layout,
+                    brush,
+                    D2D1_DRAW_TEXT_OPTIONS(0),
+                );
+            } else if let (Some(format), Some(brush)) = (format.as_ref(), ink.as_ref()) {
+                let text = utf16(&label.title);
+                let text_rect = D2D_RECT_F {
+                    left: left + TAB_PAD_X,
+                    top: pill_top,
+                    right: left + width - TAB_PAD_X,
+                    bottom: pill_top + TAB_PILL_H,
+                };
                 target.DrawText(&text, format, &text_rect, brush, D2D1_DRAW_TEXT_OPTIONS_CLIP, DWRITE_MEASURING_MODE_NATURAL);
             }
+            // The close button, while the pointer holds the pill: a control that shows
+            // itself when it can be used and leaves the resting strip to the labels.
+            if hot {
+                if let (Some(format), Some(brush)) = (format.as_ref(), ink.as_ref()) {
+                    let close = D2D_RECT_F {
+                        left: left + width - TAB_CLOSE_W - 2.0,
+                        top: pill_top,
+                        right: left + width - 1.0,
+                        bottom: pill_top + TAB_PILL_H,
+                    };
+                    target.DrawText(&utf16("\u{00D7}"), format, &close, brush, D2D1_DRAW_TEXT_OPTIONS_CLIP, DWRITE_MEASURING_MODE_NATURAL);
+                }
+            }
+        }
+        let plus = self.plus_rect();
+        if self.plus_hot {
+            if let Some(brush) = hover.as_ref() {
+                let round = D2D1_ROUNDED_RECT { rect: plus, radiusX: TAB_PLUS_SIZE * 0.5, radiusY: TAB_PLUS_SIZE * 0.5 };
+                target.FillRoundedRectangle(&round, brush);
+            }
+        }
+        if let (Some(format), Some(brush)) = (format.as_ref(), muted.as_ref()) {
+            target.DrawText(&utf16("+"), format, &plus, brush, D2D1_DRAW_TEXT_OPTIONS_CLIP, DWRITE_MEASURING_MODE_NATURAL);
         }
     }
 
@@ -4936,22 +5277,142 @@ impl View {
         FileRef::new(canonical, 0)
     }
 
+    /// Take the live page's fields into `page`, leaving the view's own holding whatever
+    /// `page` had -- which the caller overwrites before anything reads them. The same
+    /// swaps, run the other way, put a page back: nothing is copied, only exchanged.
+    ///
+    /// The epoch is not swapped; it is filed, since it is the view's counter and the
+    /// page only records where in it its wrapping was built.
+    fn take_page(&mut self, page: &mut TabPage) {
+        page.epoch = self.layout_epoch;
+        std::mem::swap(&mut page.source, &mut self.source);
+        std::mem::swap(&mut page.doc, &mut self.doc);
+        std::mem::swap(&mut page.ops, &mut self.ops);
+        std::mem::swap(&mut page.sel_index, &mut self.sel_index);
+        std::mem::swap(&mut page.hotspots, &mut self.hotspots);
+        std::mem::swap(&mut page.note_tops, &mut self.note_tops);
+        std::mem::swap(&mut page.anchor_tops, &mut self.anchor_tops);
+        std::mem::swap(&mut page.wide_regions, &mut self.wide_regions);
+        std::mem::swap(&mut page.tree, &mut self.tree);
+        std::mem::swap(&mut page.chapter_index, &mut self.chapter_index);
+        std::mem::swap(&mut page.chapter, &mut self.chapter);
+        std::mem::swap(&mut page.lazy_text, &mut self.lazy_text);
+        std::mem::swap(&mut page.content_h, &mut self.content_h);
+        std::mem::swap(&mut page.scroll, &mut self.scroll);
+        std::mem::swap(&mut page.stamp, &mut self.stamp);
+        std::mem::swap(&mut page.path, &mut self.path);
+        std::mem::swap(&mut page.profile, &mut self.profile);
+        std::mem::swap(&mut page.plain_override, &mut self.plain_override);
+        std::mem::swap(&mut page.encoding, &mut self.encoding);
+        std::mem::swap(&mut page.decoded_encoding, &mut self.decoded_encoding);
+        std::mem::swap(&mut page.encoding_guessed, &mut self.encoding_guessed);
+        std::mem::swap(&mut page.line_break_override, &mut self.line_break_override);
+        std::mem::swap(&mut page.source_view, &mut self.source_view);
+        std::mem::swap(&mut page.text_options, &mut self.text_options);
+    }
+
+    /// Put a page's fields back into the view: the same swaps run the other way, so
+    /// `page` comes out holding what the view had, ready to be stored or dropped.
+    fn give_page(&mut self, page: &mut TabPage) {
+        self.take_page(page);
+    }
+
+    /// What every way of putting another page under the reader has to do once the
+    /// fields are in place: nothing of the last page survives but its reading position.
+    fn after_switch(&mut self, hwnd: HWND) {
+        self.preview = None;
+        self.wide_active = None;
+        self.wide_offset = 0.0;
+        self.selection = None;
+        self.press_caret = None;
+        self.caret = None;
+        self.pressed = None;
+        // The chapter windows belong to the page just left; the next one windows its
+        // own text afresh.
+        self.reset_chapter_cache();
+        if let Some(query) = self.find.as_ref().map(|f| f.query.clone()) {
+            self.apply_find(&query, false);
+        }
+        self.clamp_scroll();
+        self.update_title(hwnd);
+        let _ = unsafe { InvalidateRect(Some(hwnd), None, false) };
+    }
+
+    /// Make the tab now active show its document, from the page it left behind when it
+    /// can.
+    ///
+    /// `previous` is the tab the reader is leaving, whose live page is set aside under
+    /// its own id. A warm page -- one whose wrapping still fits the window -- costs a
+    /// swap of fields; a stale one keeps its text and rebuilds the wrapping; a cold one
+    /// is read and parsed as if opened for the first time.
+    fn enter_active_tab(&mut self, previous: TabId, hwnd: HWND) -> bool {
+        let id = self.workspace.tabs.active().id;
+        if id == previous { return true; }
+        let document = self.workspace.tabs.active().document.clone();
+        let mut outgoing = TabPage::empty();
+        self.take_page(&mut outgoing);
+        self.pages.insert(previous, outgoing);
+        match self.pages.remove(&id) {
+            Some(mut page) => {
+                let warm = page.epoch == self.layout_epoch;
+                // The profile comes with the page: its wrapping was built under the
+                // theme its own profile asked for.
+                if page.profile != self.profile {
+                    crate::profiles::load(&page.profile).apply(&mut self.theme);
+                    self.profile = page.profile.clone();
+                }
+                self.give_page(&mut page);
+                if !warm {
+                    // The text and the parse are kept; only the wrapping is rebuilt.
+                    self.relayout();
+                }
+                self.remember_reading();
+                self.after_switch(hwnd);
+                true
+            }
+            None => {
+                let loaded = match document {
+                    DocumentRef::File(file) => self.show_document(&file.path, hwnd),
+                    DocumentRef::Sample => {
+                        self.set_page(crate::sample::DOCUMENT.to_string(), None, hwnd);
+                        true
+                    }
+                };
+                if loaded {
+                    self.remember_reading();
+                    self.after_switch(hwnd);
+                }
+                loaded
+            }
+        }
+    }
+
+    /// A switch that failed halfway: the page the reader was on comes back from where
+    /// it was set aside, and the view is as it was.
+    fn undo_enter(&mut self, previous: TabId, hwnd: HWND) {
+        if let Some(mut page) = self.pages.remove(&previous) {
+            if page.profile != self.profile {
+                crate::profiles::load(&page.profile).apply(&mut self.theme);
+                self.profile = page.profile.clone();
+            }
+            self.give_page(&mut page);
+        }
+        self.update_title(hwnd);
+    }
+
     fn switch_to_tab(&mut self, id: TabId, hwnd: HWND) -> bool {
         let previous = self.workspace.tabs.active().id;
         if previous == id { return true; }
         if !self.workspace.activate(id) {
             return false;
         }
+        // The outgoing reading position, written once; the incoming one is written by
+        // the switch itself.
         self.remember_reading();
-        let loaded = match self.workspace.tabs.active().document.clone() {
-            DocumentRef::File(file) => self.show_document(&file.path, hwnd),
-            DocumentRef::Sample => {
-                self.set_page(crate::sample::DOCUMENT.to_string(), None, hwnd);
-                true
-            }
-        };
+        let loaded = self.enter_active_tab(previous, hwnd);
         if !loaded {
             self.workspace.activate(previous);
+            self.undo_enter(previous, hwnd);
         }
         loaded
     }
@@ -4971,23 +5432,35 @@ impl View {
         let index = self.workspace.tabs.active_index();
         let active = self.workspace.tabs.active().clone();
         let next = if self.workspace.tabs.items().len() == 1 {
-            Some(DocumentRef::Sample)
+            None
         } else if index + 1 < self.workspace.tabs.items().len() {
-            Some(self.workspace.tabs.items()[index + 1].document.clone())
+            Some(self.workspace.tabs.items()[index + 1].clone())
         } else {
-            Some(self.workspace.tabs.items()[index - 1].document.clone())
+            Some(self.workspace.tabs.items()[index - 1].clone())
         };
         self.remember_reading();
-        let loaded = match next {
-            Some(DocumentRef::File(file)) => self.show_document(&file.path, hwnd),
-            Some(DocumentRef::Sample) | None => {
-                self.set_page(crate::sample::DOCUMENT.to_string(), None, hwnd);
-                true
+        match next {
+            Some(neighbour) => {
+                if !self.workspace.activate(neighbour.id) {
+                    return;
+                }
+                let loaded = self.enter_active_tab(active.id, hwnd);
+                if !loaded {
+                    self.workspace.activate(active.id);
+                    self.undo_enter(active.id, hwnd);
+                    return;
+                }
             }
-        };
-        if !loaded {
-            return;
+            None => {
+                // The last tab: the sample takes its place, and the page being closed
+                // is simply let go of.
+                let mut discard = TabPage::empty();
+                self.take_page(&mut discard);
+                self.set_page(crate::sample::DOCUMENT.to_string(), None, hwnd);
+                self.after_switch(hwnd);
+            }
         }
+        self.pages.remove(&active.id);
         self.workspace.close(active.id);
         self.update_title(hwnd);
     }
@@ -4999,9 +5472,21 @@ impl View {
         let file = Self::workspace_file(path);
         let already_open = self.workspace.tabs.find_file(&file).is_some();
         let same = self.path.as_deref() == Some(path);
+        let previous = self.workspace.tabs.active().id;
         if already_open {
             self.workspace.open_file(file, TabKind::Pinned);
-            if !self.show_document(path, hwnd) {
+            let loaded = if self.workspace.tabs.active().id == previous {
+                // The tab asked for is already the one on screen; "open" has always
+                // meant a fresh read of it, and still does.
+                self.show_document(path, hwnd)
+            } else {
+                self.remember_reading();
+                self.enter_active_tab(previous, hwnd)
+            };
+            if !loaded {
+                // The tab stays, but the page the reader was on comes back.
+                self.workspace.activate(previous);
+                self.undo_enter(previous, hwnd);
                 return;
             }
         } else {
@@ -5177,7 +5662,6 @@ impl View {
         if profile != self.profile {
             crate::profiles::load(&profile).apply(&mut self.theme);
             self.profile = profile;
-            self.math = MathStore::new();
         }
         self.refresh_chapter_index();
         self.chapter = self
@@ -5196,6 +5680,7 @@ impl View {
             self.restore_to(anchor);
         }
         self.update_title(hwnd);
+        let _ = unsafe { InvalidateRect(Some(hwnd), None, false) };
     }
 
     /// Step back, or forward again after a step back.
@@ -5282,6 +5767,13 @@ impl View {
             let bg = d2d(self.palette.bg);
             target.Clear(Some(&bg));
             self.draw_tab_bar(&target);
+            // The page lives below the strip, and nothing it draws may rise into the
+            // strip's band, whatever a transform or a tall image does. The tree panel is
+            // under the same law, so both are clipped to the viewport the strip leaves.
+            target.PushAxisAlignedClip(
+                &D2D_RECT_F { left: 0.0, top: TABBAR_H, right: self.client_w, bottom: self.client_h },
+                D2D1_ANTIALIAS_MODE_PER_PRIMITIVE,
+            );
             self.draw_tree_panel(&target);
             let content_dx = self.content_dx();
             target.SetTransform(&Matrix3x2::translation(content_dx, 0.0));
@@ -5289,10 +5781,14 @@ impl View {
             // it is lifted by the scroll here and nowhere else: a wheel tick costs one
             // subtraction at paint time rather than a relayout of the page, which is the
             // difference between scrolling at the frame rate and building the page again.
-            let up = scroll_dip(self.scroll, self.dpi) + TABBAR_H;
-            // The document's two edges that the window is over.
-            let top = up;
-            let bottom = up + (self.client_h - TABBAR_H).max(1.0);
+            // The strip is not part of the lift -- the page is drawn where the strip
+            // ends, which is what keeps its first line under the tabs, not over them.
+            let up = scroll_dip(self.scroll, self.dpi);
+            // The document's two edges that the window is over. The strip's own height
+            // belongs to the band the viewport shows, though not to where ink lands:
+            // document y = `top` is the first line under the strip, at client y = TABBAR_H.
+            let top = up + TABBAR_H;
+            let bottom = top + (self.client_h - TABBAR_H).max(1.0);
             for op in self.ops.iter() {
                 match op {
                     Op::Rect { x, y, w, h, color } => {
@@ -5352,8 +5848,16 @@ impl View {
                         }
                     }
                     Op::Runs(runs) => {
-                        let mut shifted = Vec::with_capacity(runs.len());
+                        // Cloned, not borrowed: a run's x gains its wide region's shift
+                        // here, and the shift belongs to this frame's pointer. The band
+                        // test runs first, though -- off-screen lines are most of a long
+                        // document, and a clone per line of them is the cost of ignoring
+                        // that.
+                        let mut shifted = Vec::new();
                         for run in runs {
+                            if run.baseline < top - 40.0 || run.baseline > bottom + 40.0 {
+                                continue;
+                            }
                             let mut run = run.clone();
                             run.x += self.shift_at(run.x, run.baseline);
                             shifted.push(run);
@@ -5438,7 +5942,10 @@ impl View {
             // The bar's panel last of all, and over the page: it is pinned to the glass, so
             // what lies under it is whatever the reader has scrolled into place there, and
             // must not be read as part of the answer. The box on the panel's left is USER32's
-            // to paint and sits over this ink by being a window.
+            // to paint and sits over this ink by being a window. The viewport's clip ends
+            // here, because the bar is pinned to the strip's own band at the top of the
+            // window, and a clip that begins below that band would erase the bar entire.
+            target.PopAxisAlignedClip();
             if self.find.is_some() {
                 let (px, py, pw, ph) = find_panel(self.client_w);
                 if let Some(brush) = self.brushes.get(&ColorRole::Surface).cloned() {
@@ -5484,7 +5991,7 @@ impl View {
                 }
             }
             Preview::Formula(index) => {
-                let Some(entry) = self.math.get(index) else { return };
+                let Some(entry) = self.maths.get(&self.profile).and_then(|store| store.get(index)) else { return };
                 let k = scale_of(self.dpi);
                 let scale = ((panel.right - panel.left - 32.0) / (entry.object.advance * k).max(1.0))
                     .min((panel.bottom - panel.top - 32.0) / ((entry.object.ascent + entry.object.descent) * k).max(1.0));
@@ -7447,17 +7954,17 @@ mod tests {
 
     #[test]
     fn a_line_is_painted_where_a_click_is_asked_of_it() {
-        // Two ends of one transform: paint lifts the display list by the scroll and the
-        // tab strip, and a pointer's y gains both back before the list is asked. A sign
-        // flipped on either end is a page that shows one paragraph and marks the one
-        // above it -- and nothing outside a window would notice, so the round trip is the
-        // check.
+        // Two ends of one transform: paint lifts the display list by the scroll alone,
+        // into the band below the strip, and a pointer's y gains the scroll back before
+        // the list is asked. A sign flipped on either end is a page that shows one
+        // paragraph and marks the one above it -- and nothing outside a window would
+        // notice, so the round trip is the check.
         let sel = vec![
             sel_line("first", 0.0, Join::None),
             sel_line("second", 180.0, Join::None),
         ];
         for scroll in [0.0, 20.0] {
-            let up = scroll_dip(scroll, DPI) + TABBAR_H;
+            let up = scroll_dip(scroll, DPI);
             let painted_y = sel[1].y - up;
             assert!(
                 (TABBAR_H..800.0).contains(&painted_y),

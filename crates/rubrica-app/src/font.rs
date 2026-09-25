@@ -25,11 +25,13 @@ use windows::Win32::Graphics::DirectWrite::{
     DWRITE_FACTORY_TYPE_SHARED, DWRITE_FONT_METRICS, DWRITE_FONT_STRETCH_NORMAL,
     DWRITE_FONT_STYLE_ITALIC, DWRITE_FONT_STYLE_NORMAL, DWRITE_FONT_WEIGHT,
     DWRITE_PARAGRAPH_ALIGNMENT_CENTER, DWRITE_TEXT_ALIGNMENT_CENTER,
+    DWRITE_TEXT_METRICS,
     DWRITE_GLYPH_METRICS, DWRITE_GLYPH_OFFSET, DWRITE_SCRIPT_ANALYSIS,
     DWRITE_SHAPING_GLYPH_PROPERTIES,
-    DWRITE_SHAPING_TEXT_PROPERTIES, DWriteCreateFactory,
+    DWRITE_SHAPING_TEXT_PROPERTIES, DWRITE_TRIMMING, DWRITE_TRIMMING_GRANULARITY_CHARACTER,
+    DWriteCreateFactory,
     IDWriteFactory, IDWriteFontCollection, IDWriteFont, IDWriteFontFace, IDWriteFontFile,
-    IDWriteTextAnalyzer, IDWriteTextFormat,
+    IDWriteTextAnalyzer, IDWriteTextFormat, IDWriteTextLayout,
 };
 
 #[derive(Clone)]
@@ -188,7 +190,15 @@ impl FontEngine {
     /// Install the style table the layout pass will index with its `StyleId`s.
     pub fn begin_layout(&self, styles: Vec<Style>) {
         *self.styles.borrow_mut() = styles;
-        self.analyzed.borrow_mut().clear();
+        // The itemization cache is content-addressed -- script, level and language come
+        // out of the text alone -- so it stays valid across layouts and documents, and
+        // dropping it per layout would re-analyse every paragraph of every switch. Only
+        // its size is policed here, since the reader can walk through many documents
+        // without the window ever going away.
+        const ANALYZED_CACHE_CAP: usize = 8192;
+        if self.analyzed.borrow().len() > ANALYZED_CACHE_CAP {
+            self.analyzed.borrow_mut().clear();
+        }
         // Content-addressed run cache stays valid across documents; face handles
         // depend only on (family, weight, slant) so they do too.
     }
@@ -599,6 +609,37 @@ impl FontEngine {
             format.SetTextAlignment(DWRITE_TEXT_ALIGNMENT_CENTER)?;
             format.SetParagraphAlignment(DWRITE_PARAGRAPH_ALIGNMENT_CENTER)?;
             Ok(format)
+        }
+    }
+
+    /// A single-line UI label at `size` dip, with the width it was measured at and the
+    /// height of its layout box, both in dip.
+    ///
+    /// A label wider than `max_width` is trimmed with an ellipsis rather than run past
+    /// the room it has, so the caller can size its control from the width alone. The
+    /// layout comes back ready to draw: the same object that answered the measurement
+    /// paints the glyphs, and nothing shapes the label a second time.
+    pub fn ui_label(&self, text: &str, family: &str, size: f32, max_width: f32) -> Option<(IDWriteTextLayout, f32, f32)> {
+        let format = self.text_format(family, size).ok()?;
+        let text = utf16(text);
+        unsafe {
+            let factory: IDWriteFactory = DWriteCreateFactory(DWRITE_FACTORY_TYPE_SHARED).ok()?;
+            let layout: IDWriteTextLayout = factory.CreateTextLayout(
+                &text,
+                &format,
+                max_width,
+                size * 2.0,
+            ).ok()?;
+            let sign = factory.CreateEllipsisTrimmingSign(&format).ok()?;
+            let trimming = DWRITE_TRIMMING {
+                granularity: DWRITE_TRIMMING_GRANULARITY_CHARACTER,
+                delimiter: 0,
+                delimiterCount: 0,
+            };
+            layout.SetTrimming(&trimming, &sign).ok()?;
+            let mut metrics = DWRITE_TEXT_METRICS::default();
+            layout.GetMetrics(&mut metrics).ok()?;
+            Some((layout, metrics.width, metrics.layoutHeight))
         }
     }
 

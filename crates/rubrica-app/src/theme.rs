@@ -117,6 +117,19 @@ pub enum ColorRole {
     Comment,
     Number,
     Type,
+    /// The band the document tabs sit on. A strip the same colour as the page reads as
+    /// part of it, which is how tab ink and page ink came to be read as one surface;
+    /// its own colour is what makes the strip chrome and the page paper.
+    TabStrip,
+    /// An unselected tab's pill, lighter than the strip it sits on but darker than the
+    /// page, so it reads as a control resting on the strip rather than as a hole in it.
+    TabInactive,
+    /// An unselected tab under the pointer.
+    TabHover,
+    /// The ink a selected tab's label is set in. A label in the page's own text colour
+    /// on the accent would be chosen for the page's sake; this one is chosen for the
+    /// accent's, which is a different question -- what can be read on that fill.
+    OnAccent,
 }
 
 /// The reader's size preference, as a step on a ladder rather than a free ratio.
