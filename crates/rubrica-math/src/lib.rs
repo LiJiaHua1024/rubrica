@@ -229,26 +229,57 @@ mod tests {
     }
 
     #[test]
-    fn a_fraction_aligns_its_main_letters_across_scripts() {
+    fn a_fraction_aligns_its_main_letters_and_rule_on_one_centre() {
         for display in [true, false] {
-            let f = set("\\frac{1}{n^2}=\\frac{\\pi^2}{6}", 10.0, display, &mut Mock::mathy());
-            let (one_x, _, _) = one(&f, "1");
-            let (n_x, _, _) = one(&f, "n");
-            let (pi_x, _, _) = one(&f, "π");
-            let (six_x, _, _) = one(&f, "6");
+            for (src, numerator, denominator) in
+                [("\\frac{1}{n^2}", "1", "n"), ("\\frac{\\pi^2}{6}", "π", "6")]
+            {
+                let f = set(src, 10.0, display, &mut Mock::mathy());
+                let bars = frame(&f);
+                assert_eq!(bars.len(), 1, "the fraction keeps one rule");
+                let (bar_x, _, bar_width, _) = bars[0];
+                let (num_x, _, num_size) = one(&f, numerator);
+                let (den_x, _, den_size) = one(&f, denominator);
+                let rule_centre = bar_x + bar_width / 2.0;
+                let centre = |x, size| x + size / 4.0;
 
-            // A script is attached to its base; it must not become the centre of
-            // the fraction's whole numerator or denominator box.
-            near(one_x, n_x, "the left fraction's 1 and n share a column");
-            near(pi_x, six_x, "the right fraction's pi and 6 share a column");
-
-            let bars = rules(&f);
-            assert_eq!(bars.len(), 2, "both fractions keep their bar");
-            for (_, width, thickness) in bars {
-                near(width, 9.75, "the bar covers the scripted half without extra width");
-                near(thickness, 1.0, "the bar keeps its MATH-table thickness");
+                // The base glyphs and the rule share one centre, while the script
+                // remains inside the rule's symmetric horizontal coverage.
+                near(centre(num_x, num_size), rule_centre, "numerator is centred on the rule");
+                near(centre(den_x, den_size), rule_centre, "denominator is centred on the rule");
+                near(bar_x, 0.0, "the rule keeps the fraction's left origin");
+                near(bar_width, 14.5, "the rule expands symmetrically around the base axis");
+                near(f.width, bar_width, "the fraction box is the rule's width");
+                for (_, x, _, size) in runs(&f) {
+                    assert!(
+                        x >= bar_x - 0.001 && x + size / 4.0 <= bar_x + bar_width + 0.001,
+                        "a run escaped the rule: x={x}, size={size}, rule={bars:?}"
+                    );
+                }
             }
         }
+    }
+
+    #[test]
+    fn an_unscripted_fraction_keeps_its_minimum_width() {
+        let f = set("\\frac{x}{yz}", 10.0, true, &mut Mock::mathy());
+        let bars = frame(&f);
+        assert_eq!(bars.len(), 1, "the unscripted fraction keeps one rule");
+        let (bar_x, _, bar_width, _) = bars[0];
+        let centre = bar_x + bar_width / 2.0;
+        near(bar_width, 10.0, "the wider denominator still sets the bar width");
+        near(f.width, bar_width, "the fraction box is the rule's width");
+        for (text, x, _, size) in runs(&f) {
+            let advance = 0.5 * size * text.chars().count() as f32;
+            near(x + advance / 2.0, centre, "each unscripted half shares the rule centre");
+        }
+    }
+
+    #[test]
+    fn a_stack_without_a_rule_keeps_its_existing_width() {
+        let f = set("1\\atop 2", 10.0, true, &mut Mock::mathy());
+        assert!(frame(&f).is_empty(), "atop has no fraction rule");
+        near(f.width, 5.0, "the no-rule stack keeps its minimum width");
     }
 
     #[test]

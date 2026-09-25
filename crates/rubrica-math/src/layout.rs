@@ -467,12 +467,34 @@ impl Engine<'_> {
         // Align the main content of the two halves, not the complete boxes: a
         // superscript belongs to its base, but it must not pull the base away from
         // the column it shares with the other half. Taking the larger anchor keeps
-        // both translations non-negative, so the bar starts at the same origin and
-        // only grows when a translated half genuinely needs the extra room.
-        let align = n_b.align_x.max(d_b.align_x);
-        let num_dx = align - n_b.align_x;
-        let den_dx = align - d_b.align_x;
-        let width = (num_dx + n_b.ink_width()).max(den_dx + d_b.ink_width());
+        // both initial translations non-negative.
+        let common_axis = n_b.align_x.max(d_b.align_x);
+        let initial_num_dx = common_axis - n_b.align_x;
+        let initial_den_dx = common_axis - d_b.align_x;
+        let (num_dx, den_dx, width, align_x) = if has_bar {
+            // A visible rule is the fraction's visual centre. Measure both sides of
+            // the common main-content axis, then move the whole construct so that
+            // axis lands at the rule's midpoint instead of the rule's left edge.
+            let right_edge = (initial_num_dx + n_b.ink_width())
+                .max(initial_den_dx + d_b.ink_width());
+            let half_width = common_axis.max(right_edge - common_axis);
+            let origin_dx = half_width - common_axis;
+            (
+                initial_num_dx + origin_dx,
+                initial_den_dx + origin_dx,
+                half_width * 2.0,
+                half_width,
+            )
+        } else {
+            // A binom/stack has no rule to centre; keep its existing minimum width.
+            (
+                initial_num_dx,
+                initial_den_dx,
+                (initial_num_dx + n_b.ink_width())
+                    .max(initial_den_dx + d_b.ink_width()),
+                common_axis,
+            )
+        };
         let mut out = Vec::new();
         translate(&snum, num_dx, -u, &mut out);
         translate(&sden, den_dx, d, &mut out);
@@ -486,7 +508,7 @@ impl Engine<'_> {
                 ascent: u + n_b.ascent,
                 descent: d + d_b.descent,
                 italic: 0.0,
-                align_x: align,
+                align_x,
             },
         )
     }
