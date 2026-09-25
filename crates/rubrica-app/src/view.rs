@@ -80,7 +80,7 @@ use windows::Win32::UI::Shell::{DragAcceptFiles, DragFinish, DragQueryFileW, She
 use windows::Win32::UI::WindowsAndMessaging::{
     AppendMenuW, CS_DBLCLKS, CS_HREDRAW, CS_VREDRAW, CREATESTRUCTW, CreatePopupMenu,
     CreateWindowExW, DefWindowProcW, DestroyMenu, DispatchMessageW,
-    GWLP_USERDATA, GetClientRect, GetCursorPos, GetWindowLongPtrW, GetMessageW, GetWindowPlacement,
+    GWLP_USERDATA, GetCaretBlinkTime, GetClientRect, GetCursorPos, GetWindowLongPtrW, GetMessageW, GetWindowPlacement,
     HCURSOR, HMENU, HWND_TOP, HTCLIENT, IDC_ARROW, IDC_HAND, KillTimer, LoadCursorW, MF_CHECKED,
     MF_GRAYED, MF_POPUP, MF_SEPARATOR, MF_STRING, MSG, PostMessageW, PostQuitMessage,
     RegisterClassExW, SetCursor, SetForegroundWindow, SetWindowTextW, SW_SHOWNORMAL, SetTimer,
@@ -141,6 +141,12 @@ const APPEARANCE_TICK_MS: u32 = 400;
 /// `GetFileTime` gives in a microsecond.
 const DOCUMENT_TIMER: usize = 0x5141;
 const DOCUMENT_TICK_MS: u32 = 700;
+/// The caret's blink. The beat is the system's own, the way every other text surface
+/// on it blinks; a tick that lands while the caret is hidden costs nothing, because
+/// there is nothing to draw and so nothing to invalidate.
+const CARET_TIMER: usize = 0x5142;
+/// The beat to keep if the system does not name one, which is the classic half second.
+const CARET_TICK_MS: u32 = 500;
 /// How far the pointer has to travel, in device pixels, before a held left button stops
 /// meaning "here" and starts meaning "from here to there".
 const DRAG_SLOP: f32 = 3.0;
@@ -846,6 +852,15 @@ pub fn caret_rect(sel: &[SelLine], c: Caret) -> Option<(f32, f32, f32, f32)> {
     Some((x, l.y, 1.0, l.h))
 }
 
+/// The system's blink beat, in milliseconds, falling back to the classic half second
+/// when the answer is zero -- which is what it is on systems that disable blinking.
+fn caret_tick_ms() -> u32 {
+    match unsafe { GetCaretBlinkTime() } {
+        0 => CARET_TICK_MS,
+        ms => ms,
+    }
+}
+
 #[derive(Clone)]
 pub(crate) struct TableHeaderFragment {
     pub y: Pt,
@@ -977,6 +992,10 @@ pub struct View {
     /// arrow keys belong to it rather than to the scroll, which is what every text
     /// surface on this system does and the reason `Escape` has to give it back.
     caret: Option<Caret>,
+    /// The blink phase the caret is drawn in. Toggled by the caret timer and forced
+    /// back to visible whenever the caret moves, so a beat never ends the instant the
+    /// reader has aimed it somewhere new.
+    caret_on: bool,
     /// The ink laid over selected text. A highlight drawn *under* the ink cannot
     /// work: a code block paints its own opaque panel after it.
     sel_brush: Option<ID2D1SolidColorBrush>,
@@ -2014,6 +2033,7 @@ pub fn run(mut source: String, path: Option<PathBuf>) -> Result<()> {
         selection: None,
         press_caret: None,
         caret: None,
+        caret_on: true,
         sel_brush: None,
         arrow,
         hand,
@@ -2110,6 +2130,10 @@ pub fn run(mut source: String, path: Option<PathBuf>) -> Result<()> {
         // the tick costs a branch, while a document opened later by the dialog or a drop has
         // to find the timer already running.
         let _ = SetTimer(Some(hwnd), DOCUMENT_TIMER, DOCUMENT_TICK_MS, None);
+        // The blink runs for the life of the window and decides nothing on its own: a
+        // tick with no caret, or one hidden behind a preview, flips a phase that nothing
+        // reads and costs no repaint.
+        let _ = SetTimer(Some(hwnd), CARET_TIMER, caret_tick_ms(), None);
 
         let mut msg = MSG::default();
         while GetMessageW(&mut msg, None, 0, 0).as_bool() {
@@ -2119,6 +2143,7 @@ pub fn run(mut source: String, path: Option<PathBuf>) -> Result<()> {
         }
         let _ = KillTimer(Some(hwnd), APPEARANCE_TIMER);
         let _ = KillTimer(Some(hwnd), DOCUMENT_TIMER);
+        let _ = KillTimer(Some(hwnd), CARET_TIMER);
         // `view` is dropped here; the pointer stored in GWLP_USERDATA dies with it.
     }
     Ok(())
@@ -2640,6 +2665,7 @@ impl View {
                     let page_moves = caretless && !shift && self.scroll_page(m, step);
                     if !page_moves {
                         self.move_caret(m, shift);
+                        self.restart_caret_beat(hwnd);
                     }
                     let _ = InvalidateRect(Some(hwnd), None, false);
                     return LRESULT(0);
@@ -2804,6 +2830,15 @@ impl View {
             WM_TIMER => {
                 match wp.0 {
                     DOCUMENT_TIMER => self.reload_if_written(hwnd),
+                    CARET_TIMER => {
+                        // A beat only means something while a caret stands on the page
+                        // and nothing covers it; otherwise the phase flips in the dark
+                        // and costs no repaint.
+                        if self.caret.is_some() && self.preview.is_none() {
+                            self.caret_on = !self.caret_on;
+                            let _ = InvalidateRect(Some(hwnd), None, false);
+                        }
+                    }
                     _ => {
                         // A poll, not a push: there is no message for this setting. The
                         // reader's own choice outranks it, and `set_dark` does nothing when
@@ -2885,6 +2920,7 @@ impl View {
                     // reader can click into a paragraph and finish the selection with the
                     // keyboard without the caret starting at the top of the page.
                     self.caret = Some(c);
+                    self.restart_caret_beat(hwnd);
                 }
                 self.press_at = Some((x, y));
                 let _ = SetCapture(hwnd);
@@ -3135,6 +3171,13 @@ impl View {
         self.caret = Some(to);
         self.selection = (to != anchor).then_some(Selection { from: anchor, to });
         self.scroll_to_caret(to);
+    }
+
+    /// Put the caret's beat back on the visible phase and restart it, so a caret that
+    /// has just been aimed does not go dark a moment after it arrived.
+    fn restart_caret_beat(&mut self, hwnd: HWND) {
+        self.caret_on = true;
+        let _ = unsafe { SetTimer(Some(hwnd), CARET_TIMER, caret_tick_ms(), None) };
     }
 
     /// Move the page instead of a caret, on a page that has none: one line for the
@@ -3734,6 +3777,11 @@ impl View {
     }
 
     fn reload_text(&mut self, decoded: reading::Decoded, hwnd: HWND) {
+        // A page rewritten underneath the reader keeps their caret where it can: the
+        // lines are counted again by the reparse, and a caret whose line survives is
+        // clamped into it, so a file saved by something else does not read as the caret
+        // blinking off. One whose line is gone has nowhere to stand.
+        let caret = self.caret;
         let source = if self.lazy_text {
             self.source_anchor()
         } else {
@@ -3741,6 +3789,13 @@ impl View {
         };
         self.accept_decoded(decoded);
         self.reparse(hwnd);
+        if let Some(mut c) = caret {
+            if let Some(l) = self.sel_index.get(c.line) {
+                c.ch = c.ch.min(l.chars.len());
+                self.caret = Some(c);
+                self.caret_on = true;
+            }
+        }
         if let Some(byte) = source { self.restore_source(byte); }
         self.remember_reading();
     }
@@ -5873,11 +5928,11 @@ impl View {
                 }
             }
             // The caret, when the reader has one and is not marking anything with it. An
-            // arrow that moves an invisible bar is an arrow the reader cannot aim, and a
-            // steady one rather than a blinking one because nothing here ticks at the
-            // half-second a blink would need -- the page has no reason to repaint that
-            // often, and a blink that misses its beats is worse than no blink.
-            if self.selection.is_none() {
+            // arrow that moves an invisible bar is an arrow the reader cannot aim. The
+            // beat is the timer's, which toggles the phase; here only the phase is read,
+            // and a caret under the preview overlay is left out of the panel's way until
+            // the preview is gone rather than dropped, so it comes back where it stood.
+            if self.selection.is_none() && self.caret_on && self.preview.is_none() {
                 if let (Some(c), Some(brush)) = (self.caret, self.brushes.get(&ColorRole::Text).cloned())
                 {
                     if let Some((x, y, w, h)) = caret_rect(&self.sel_index, c) {
@@ -5963,8 +6018,16 @@ impl View {
                 let left = panel.left + (panel.right - panel.left - entry.object.advance * scale * k) * 0.5;
                 let mut runs = Vec::new();
                 for (r, x, y) in &entry.parts {
-                    if let Some(mut run) = paint_run(&self.font, r, (left / k) + *x * scale, *y * scale, k * scale, ColorRole::Text, None) {
-                        run.baseline = baseline;
+                    // `paint_run` scales the x it is handed by its own `k`, which here
+                    // already carries the preview's zoom -- so the part's offset goes in
+                    // unmultiplied and the panel's left edge is divided out the same way.
+                    // Scaling here as well would spread the formula by `scale` a second
+                    // time and walk its right hand out of the panel.
+                    if let Some(mut run) = paint_run(&self.font, r, (left / (k * scale)) + *x, *y * scale, k * scale, ColorRole::Text, None) {
+                        // The part's lift is in points below the baseline -- negative for a
+                        // numerator -- so it rejoins the rule the same way the rules below
+                        // do, at `baseline + y * scale * k`.
+                        run.baseline = baseline + run.dy * k;
                         runs.push(run);
                     }
                 }
