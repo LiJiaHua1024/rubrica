@@ -46,7 +46,7 @@ use windows::Win32::Graphics::DirectWrite::{
     DWRITE_GLYPH_OFFSET, DWRITE_GLYPH_RUN, DWRITE_MEASURING_MODE_NATURAL, IDWriteFontFace,
     IDWriteTextFormat, IDWriteTextLayout,
 };
-use windows::Win32::Graphics::Dwm::{DwmSetWindowAttribute, DWMWA_USE_IMMERSIVE_DARK_MODE};
+use windows::Win32::Graphics::Dwm::{DwmSetWindowAttribute, DWMWA_BORDER_COLOR, DWMWA_USE_IMMERSIVE_DARK_MODE};
 use windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_B8G8R8A8_UNORM;
 use windows::Win32::Graphics::Gdi::{
     CLIP_DEFAULT_PRECIS, CreateFontW, CreateSolidBrush, DEFAULT_CHARSET, DEFAULT_QUALITY,
@@ -80,14 +80,16 @@ use windows::Win32::UI::Shell::{DragAcceptFiles, DragFinish, DragQueryFileW, She
 use windows::Win32::UI::WindowsAndMessaging::{
     AppendMenuW, CS_DBLCLKS, CS_HREDRAW, CS_VREDRAW, CREATESTRUCTW, CreatePopupMenu,
     CreateWindowExW, DefWindowProcW, DestroyMenu, DispatchMessageW,
-    GWLP_USERDATA, GetCaretBlinkTime, GetClientRect, GetCursorPos, GetWindowLongPtrW, GetMessageW, GetWindowPlacement,
-    HCURSOR, HMENU, HWND_TOP, HTCLIENT, IDC_ARROW, IDC_HAND, IsIconic, KillTimer, LoadCursorW, MF_CHECKED,
+    GWLP_USERDATA, GetCaretBlinkTime, GetClientRect, GetCursorPos, GetSystemMetrics, GetWindowLongPtrW, GetMessageW, GetWindowPlacement,
+    HCURSOR, HMENU, HWND_TOP, HTCLIENT, HTCAPTION, HTBOTTOM, HTBOTTOMLEFT, HTBOTTOMRIGHT, HTLEFT, HTRIGHT,
+    HTTOP, HTTOPLEFT, HTTOPRIGHT, IDC_ARROW, IDC_HAND, IsIconic, IsZoomed, KillTimer, LoadCursorW, MF_CHECKED,
     MF_GRAYED, MF_POPUP, MF_SEPARATOR, MF_STRING, MSG, PostMessageW, PostQuitMessage,
-    RegisterClassExW, SetCursor, SetForegroundWindow, SetWindowTextW, SW_SHOWNORMAL, SetTimer,
+    RegisterClassExW, SetCursor, SetForegroundWindow, SetWindowTextW, SM_CXPADDEDBORDER, SM_CXSIZEFRAME,
+    SW_MAXIMIZE, SW_MINIMIZE, SW_SHOWNORMAL, SetTimer,
     SetWindowLongPtrW, SetWindowPos, ShowWindow, SW_SHOWMAXIMIZED, SW_RESTORE, TPM_RETURNCMD,
-    TPM_RIGHTBUTTON, TrackPopupMenuEx, TranslateMessage, WM_CONTEXTMENU, WM_NULL, WNDCLASSEXW,
+    SWP_FRAMECHANGED, SWP_NOMOVE, SWP_NOSIZE, TPM_RIGHTBUTTON, TrackPopupMenuEx, TranslateMessage, WM_CONTEXTMENU, WM_NULL, WNDCLASSEXW,
     WM_DESTROY, WM_DPICHANGED, WM_ERASEBKGND, WM_EXITSIZEMOVE, WM_KEYDOWN, WM_MOUSEWHEEL,
-    WM_NCCREATE, WM_PAINT, WM_SETCURSOR, WM_SIZE, WM_TIMER, WS_EX_APPWINDOW, WS_OVERLAPPEDWINDOW,
+    WM_CAPTURECHANGED, WM_CLOSE, WM_NCCALCSIZE, WM_NCCREATE, WM_NCHITTEST, WM_PAINT, WM_SETCURSOR, WM_SIZE, WM_TIMER, WS_EX_APPWINDOW, WS_OVERLAPPEDWINDOW,
     SWP_NOACTIVATE, SWP_NOZORDER, WM_COPYDATA, WM_DROPFILES, WM_LBUTTONDOWN, WM_LBUTTONDBLCLK, WM_LBUTTONUP,
     WM_MBUTTONDOWN, WM_MOUSEMOVE, WM_SYSKEYDOWN, CallWindowProcW, EN_CHANGE, ES_AUTOHSCROLL, GetParent,
     GetWindowTextW, GWLP_WNDPROC, MoveWindow, SendMessageW, SW_HIDE, SW_SHOW, WM_CHAR, WM_COMMAND,
@@ -115,8 +117,15 @@ const HYPHEN_RANGE: std::ops::Range<usize> = 0..1;
 
 /// Page margin, in ems of the body size.
 const MARGIN_EM: Pt = 2.6;
-/// Height of the visible document-tab strip, in device-independent pixels.
-const TABBAR_H: Pt = 32.0;
+/// Height of the fused title bar and document-tab strip, in device-independent pixels.
+///
+/// The window has no caption of its own (`WM_NCCALCSIZE` gives the frame's room to the
+/// client), so this one strip answers for both: tabs at the left, the window title in
+/// the space between, and the window controls at the right.
+const TOPBAR_H: Pt = 40.0;
+/// The width of one window control -- minimise, maximise, close -- in the strip's
+/// right-hand end. Each is the strip's own height tall, the way the system's are.
+const CAPTION_BTN_W: Pt = 46.0;
 /// Tab pill metrics, in device-independent pixels. The pill is centred in the strip,
 /// sized to its label, and spaced a step apart so two adjacent pills read as two.
 const TAB_PILL_H: Pt = 22.0;
@@ -266,6 +275,15 @@ impl Palette {
 
 fn d2d(c: Rgb) -> D2D1_COLOR_F {
     D2D1_COLOR_F { r: c.r, g: c.g, b: c.b, a: 1.0 }
+}
+
+/// A palette colour as the one number the DWM's window attributes take.
+fn colorref(c: Rgb) -> COLORREF {
+    COLORREF(
+        ((c.r * 255.0).round() as u32)
+            | (((c.g * 255.0).round() as u32) << 8)
+            | (((c.b * 255.0).round() as u32) << 16),
+    )
 }
 
 /// A style-table entry: what a `StyleId` means for measuring and painting.
@@ -963,6 +981,22 @@ pub struct View {
     /// The pill the pointer is over. Cleared when USER32 says the pointer has left
     /// the window.
     tab_hot: Option<TabId>,
+    /// The window control the pointer is over, and the one a button went down on.
+    /// A control lights under the pointer and acts on the release, and only where
+    /// the release finds the press again: sliding off before letting go is the
+    /// reader changing their mind.
+    cap_hot: Option<CapBtn>,
+    cap_pressed: Option<CapBtn>,
+    /// Whether the last size change left the window maximised. The middle control's
+    /// glyph and its action both answer to this.
+    zoomed: bool,
+    /// The window's title, as the strip draws it between the tabs and the controls.
+    /// `SetWindowTextW` writes the taskbar's copy, which this view cannot read back,
+    /// so its own is kept here.
+    title_text: String,
+    /// The title's measured label, keyed on the text and the room it was measured
+    /// for: a repaint neither re-shapes nor re-measures what it can look up.
+    title_label: Option<TitleLabelCache>,
     tracking_leave: bool,
     /// Other tabs' materialized pages; see [`TabPage`].
     pages: HashMap<TabId, TabPage>,
@@ -1060,6 +1094,15 @@ pub struct View {
     find_label: Vec<PaintRun>,
     hit_brush: Option<ID2D1SolidColorBrush>,
     focus_brush: Option<ID2D1SolidColorBrush>,
+    /// The close control's background while the pointer holds it, the system's own
+    /// red: a control that deletes keeps a colour no part of this palette can say.
+    cap_red_brush: Option<ID2D1SolidColorBrush>,
+    /// The same red a step darker, for the press the hover became.
+    cap_red_press_brush: Option<ID2D1SolidColorBrush>,
+    /// The ink for a control's glyph on that red, and the strip a pressed control
+    /// sinks into: neither is a role, because each belongs to one drawing only.
+    cap_ink_brush: Option<ID2D1SolidColorBrush>,
+    cap_press_brush: Option<ID2D1SolidColorBrush>,
 }
 
 /// Measured tab labels, keyed on the tab list that produced them: the key decides when
@@ -1076,6 +1119,20 @@ struct TabLabel {
     width: f32,
     box_h: f32,
 }
+
+/// The window controls at the strip's right-hand end, named for what they do. The
+/// order on the screen is the system's own: close at the corner, then maximise,
+/// then minimise innermost.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CapBtn {
+    Min,
+    Max,
+    Close,
+}
+
+/// The window title's measured label, keyed on the text and the room it was given:
+/// either changing asks for the shaping again.
+type TitleLabelCache = ((String, f32), Option<IDWriteTextLayout>, f32, f32, Vec<u16>);
 
 /// One tab's materialized page: everything [`View`] keeps for the document it is
 /// showing, set aside when the reader moves to another tab.
@@ -1325,7 +1382,7 @@ struct Find {
 /// when a key is pressed, and a reader searching has already lost their place to look for.
 const FIND_W: f32 = 340.0;
 const FIND_H: f32 = 32.0;
-const FIND_TOP: f32 = 8.0;
+const FIND_TOP: f32 = TOPBAR_H + 8.0;
 /// Kept from the window's right edge -- more than the thumb's track needs, so that the
 /// one thing the reader has to grip is never under the thing that appeared by accident.
 const FIND_EDGE: f32 = 16.0;
@@ -2032,6 +2089,11 @@ pub fn run(mut source: String, path: Option<PathBuf>, extra: Vec<PathBuf>) -> Re
         tab_format: None,
         tab_labels: None,
         tab_hot: None,
+        cap_hot: None,
+        cap_pressed: None,
+        zoomed: false,
+        title_text: String::new(),
+        title_label: None,
         tracking_leave: false,
         pages: HashMap::new(),
         layout_epoch: 0,
@@ -2076,6 +2138,10 @@ pub fn run(mut source: String, path: Option<PathBuf>, extra: Vec<PathBuf>) -> Re
         find_label: Vec::new(),
         hit_brush: None,
         focus_brush: None,
+        cap_red_brush: None,
+        cap_red_press_brush: None,
+        cap_ink_brush: None,
+        cap_press_brush: None,
     });
 
     if view.lazy_text {
@@ -2125,6 +2191,19 @@ pub fn run(mut source: String, path: Option<PathBuf>, extra: Vec<PathBuf>) -> Re
 
         view.attach(hwnd);
         view.update_title(hwnd);
+        // The frame the creation messages laid down was answered for before there was a
+        // strip to answer; asking for it again makes the first show start from the
+        // frameless client area, instead of growing into it the first time the reader
+        // happens to touch the caption that should never have been there.
+        let _ = SetWindowPos(
+            hwnd,
+            Some(HWND_TOP),
+            0,
+            0,
+            0,
+            0,
+            SWP_FRAMECHANGED | SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE,
+        );
         // Straight to the maximised frame rather than to the normal one and then a state
         // change, because the second way shows the reader the window they did not leave.
         let _ = ShowWindow(hwnd, if frame.maximised { SW_SHOWMAXIMIZED } else { SW_SHOWNORMAL });
@@ -2395,6 +2474,26 @@ unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM)
             PostQuitMessage(0);
             LRESULT(0)
         }
+        // The caption is the strip's job, and the answer cannot wait for the view: the
+        // system asks while the window is being created, before `WM_NCCREATE` has hung
+        // anything on it, and again whenever the frame is reconsidered. Both answers
+        // are the same -- the client area is the whole window -- and neither reaches
+        // `DefWindowProcW`, whose answer would put the standard caption back. Only a
+        // maximised frame is handed back on every side, because a maximised window's
+        // rect reaches past the screen by the border it no longer shows -- without it
+        // the page's first and last letters would sit off the monitor's edge.
+        WM_NCCALCSIZE => {
+            if wp.0 != 0 && IsZoomed(hwnd).as_bool() {
+                let frame =
+                    GetSystemMetrics(SM_CXSIZEFRAME) + GetSystemMetrics(SM_CXPADDEDBORDER);
+                let r = &mut *(lp.0 as *mut RECT);
+                r.left += frame;
+                r.top += frame;
+                r.right -= frame;
+                r.bottom -= frame;
+            }
+            LRESULT(0)
+        }
         // Everything else that a created window can receive goes to the view, which
         // falls through to `DefWindowProcW` itself. Listing the routed messages here as
         // well was a second source of truth, and one the compiler could not check: a
@@ -2499,6 +2598,18 @@ impl View {
             &v as *const i32 as *const core::ffi::c_void,
             std::mem::size_of::<i32>() as u32,
         );
+        // The window's own border is drawn in the strip's colour, so the frame the
+        // system keeps around the window reads as the bar's edge rather than as a
+        // line drawn between two things. An attribute the running Windows does not
+        // know is answered with an error this ignores: a build without a border
+        // colour to set simply keeps the border it always had.
+        let border = colorref(self.palette.tab_strip);
+        let _ = DwmSetWindowAttribute(
+            hwnd,
+            DWMWA_BORDER_COLOR,
+            &border as *const COLORREF as *const core::ffi::c_void,
+            std::mem::size_of::<COLORREF>() as u32,
+        );
     }
 
     /// Create every brush the window can name, before drawing.
@@ -2561,15 +2672,86 @@ impl View {
             c.a = 0.45;
             self.focus_brush = unsafe { rt.CreateSolidColorBrush(&c, None).ok() };
         }
+        // The close control's red is the system's own, and the ink on it is white in
+        // either palette: a hue this far from the strip's greys is read as "the one
+        // that ends things" before its glyph is made out, and white on it is what the
+        // reader has practised on every window they have ever closed.
+        if self.cap_red_brush.is_none() {
+            let red = D2D1_COLOR_F { r: 0.906, g: 0.067, b: 0.137, a: 1.0 };
+            self.cap_red_brush = unsafe { rt.CreateSolidColorBrush(&red, None).ok() };
+        }
+        if self.cap_red_press_brush.is_none() {
+            let red = D2D1_COLOR_F { r: 0.773, g: 0.059, b: 0.122, a: 1.0 };
+            self.cap_red_press_brush = unsafe { rt.CreateSolidColorBrush(&red, None).ok() };
+        }
+        if self.cap_ink_brush.is_none() {
+            let ink = D2D1_COLOR_F { r: 1.0, g: 1.0, b: 1.0, a: 1.0 };
+            self.cap_ink_brush = unsafe { rt.CreateSolidColorBrush(&ink, None).ok() };
+        }
+        // A pressed control sinks a step below the hover it came down on: the same
+        // direction the palette's own hovers step, one step further.
+        if self.cap_press_brush.is_none() {
+            let h = self.palette.tab_hover;
+            let c = if self.palette.dark {
+                d2d(Rgb::gray(h.r + 0.05))
+            } else {
+                d2d(Rgb { r: h.r - 0.04, g: h.g - 0.04, b: h.b - 0.04 })
+            };
+            self.cap_press_brush = unsafe { rt.CreateSolidColorBrush(&c, None).ok() };
+        }
     }
 
     unsafe fn on_message(&mut self, hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRESULT {
         match msg {
+            WM_NCHITTEST => {
+                // The client now covers the window to its edges, so USER32's own answer
+                // would be HTCLIENT everywhere and the resize border would be gone with
+                // the caption. The frame band is rebuilt here against the live client
+                // rect -- it is asked all through a drag-resize, which is why the last
+                // WM_SIZE's numbers are not good enough -- and the strip's free space
+                // answers as caption, so moving, snapping, the double click and the
+                // system menu are the system's own work again.
+                let mut pt =
+                    POINT { x: (lp.0 & 0xFFFF) as i16 as i32, y: ((lp.0 >> 16) & 0xFFFF) as i16 as i32 };
+                let mut rc = RECT::default();
+                let _ = GetClientRect(hwnd, &mut rc);
+                let _ = ScreenToClient(hwnd, &mut pt);
+                if !IsZoomed(hwnd).as_bool() {
+                    let frame =
+                        GetSystemMetrics(SM_CXSIZEFRAME) + GetSystemMetrics(SM_CXPADDEDBORDER);
+                    let (w, h) = (rc.right, rc.bottom);
+                    let x_edge = if pt.x < frame { HTLEFT } else if pt.x >= w - frame { HTRIGHT } else { HTCLIENT };
+                    let y_edge = if pt.y < frame { HTTOP } else if pt.y >= h - frame { HTBOTTOM } else { HTCLIENT };
+                    if x_edge != HTCLIENT || y_edge != HTCLIENT {
+                        let ht = match (x_edge, y_edge) {
+                            (HTLEFT, HTTOP) => HTTOPLEFT,
+                            (HTRIGHT, HTTOP) => HTTOPRIGHT,
+                            (HTLEFT, HTBOTTOM) => HTBOTTOMLEFT,
+                            (HTRIGHT, HTBOTTOM) => HTBOTTOMRIGHT,
+                            (x, HTCLIENT) => x,
+                            (HTCLIENT, y) => y,
+                            _ => HTCLIENT,
+                        };
+                        return LRESULT(ht as isize);
+                    }
+                }
+                let (x, y) = (pt.x as f32, pt.y as f32);
+                if y < TOPBAR_H {
+                    // The strip's own controls answer as client ink; the room around
+                    // them is the caption they sit in.
+                    if self.caption_button_at(x, y).is_some() || self.tab_at(x, y).is_some() {
+                        return LRESULT(HTCLIENT as isize);
+                    }
+                    return LRESULT(HTCAPTION as isize);
+                }
+                LRESULT(HTCLIENT as isize)
+            }
             WM_SIZE => {
                 let w = (lp.0 & 0xFFFF) as u32;
                 let h = ((lp.0 >> 16) & 0xFFFF) as u32;
                 self.client_w = w.max(1) as f32;
                 self.client_h = h.max(1) as f32;
+                self.zoomed = IsZoomed(hwnd).as_bool();
                 if let Some(t) = &self.hwnd_target {
                     let _ = t.Resize(&D2D_SIZE_U { width: w.max(1), height: h.max(1) });
                 }
@@ -2904,7 +3086,16 @@ impl View {
                 // The strip answers for its own presses, and keeps the page's: a close
                 // zone first, then a pill, and a press on neither is a press on nothing
                 // at all.
-                if y < TABBAR_H {
+                if y < TOPBAR_H {
+                    // A window control lights where it was pressed and waits: the act
+                    // belongs to the release, and only if the release finds the press
+                    // again where it began.
+                    if let Some(btn) = self.caption_button_at(x, y) {
+                        self.cap_pressed = Some(btn);
+                        let _ = SetCapture(hwnd);
+                        let _ = InvalidateRect(Some(hwnd), None, false);
+                        return LRESULT(0);
+                    }
                     if let Some(id) = self.tab_close_at(x, y) {
                         self.apply_command(Command::CloseTab(id), hwnd);
                     } else if let Some(id) = self.tab_at(x, y) {
@@ -2976,9 +3167,10 @@ impl View {
                     let _ = GetCursorPos(&mut pt);
                     let _ = ScreenToClient(hwnd, &mut pt);
                     let (px, py) = (pt.x as f32, pt.y as f32);
-                    // The strip's controls are as much a hand as a link is.
-                    let over = if py < TABBAR_H {
-                        self.tab_at(px, py).is_some()
+                    // The strip's pills are as much a hand as a link is; the window
+                    // controls keep the arrow, the way the system's own do.
+                    let over = if py < TOPBAR_H {
+                        self.caption_button_at(px, py).is_none() && self.tab_at(px, py).is_some()
                     } else {
                         self.hot_at(px, py).is_some()
                     };
@@ -2996,8 +3188,10 @@ impl View {
                 // it no ink. A change costs an invalidate; an unchanged hover costs
                 // nothing.
                 let hot = self.tab_hot;
-                if y < TABBAR_H {
-                    self.tab_hot = self.tab_at(x, y);
+                let btn_hot = self.cap_hot;
+                if y < TOPBAR_H {
+                    self.cap_hot = self.caption_button_at(x, y);
+                    self.tab_hot = if self.cap_hot.is_none() { self.tab_at(x, y) } else { None };
                     if !self.tracking_leave {
                         let mut tme = TRACKMOUSEEVENT {
                             cbSize: std::mem::size_of::<TRACKMOUSEEVENT>() as u32,
@@ -3011,8 +3205,9 @@ impl View {
                     }
                 } else {
                     self.tab_hot = None;
+                    self.cap_hot = None;
                 }
-                if self.tab_hot != hot {
+                if self.tab_hot != hot || self.cap_hot != btn_hot {
                     let _ = InvalidateRect(Some(hwnd), None, false);
                 }
                 if self.tree_dragging {
@@ -3040,12 +3235,28 @@ impl View {
                 LRESULT(0)
             }
             WM_LBUTTONUP => {
+                // A window control's act is settled before the capture is given back:
+                // releasing the capture announces itself with `WM_CAPTURECHANGED` here
+                // and now, and a press read out after that announcement is a press
+                // already taken away. The control answers first, then the capture goes.
+                let button = self.cap_pressed.take();
                 // Captured on every press, so released on every release: a window that
                 // keeps the capture after a plain click takes the mouse away from the
                 // rest of the desktop, thumb drags being the only case it is meant for.
                 let _ = ReleaseCapture();
                 self.dragging = false;
                 self.tree_dragging = false;
+                if let Some(btn) = button {
+                    let x = ((lp.0 & 0xFFFF) as i16) as f32;
+                    let y = ((lp.0 >> 16) as i16) as f32;
+                    // The act, kept only where the press promised it: the release still
+                    // over the control the button went down on.
+                    if self.caption_button_at(x, y) == Some(btn) {
+                        self.caption_action(btn, hwnd);
+                    }
+                    let _ = InvalidateRect(Some(hwnd), None, false);
+                    return LRESULT(0);
+                }
                 // The drag is over, but what it drew stays selected: a reader lets go of
                 // the button to look at the selection, not to be quit out of it.
                 self.press_at = None;
@@ -3073,10 +3284,19 @@ impl View {
                 LRESULT(0)
             }
             WM_MOUSELEAVE => {
-                // The tab strip's hover lives only while the pointer is on the window.
+                // The strip's hovers live only while the pointer is on the window.
                 self.tracking_leave = false;
-                if self.tab_hot.is_some() {
-                    self.tab_hot = None;
+                let gone = self.tab_hot.take().is_some() | self.cap_hot.take().is_some();
+                if gone {
+                    let _ = InvalidateRect(Some(hwnd), None, false);
+                }
+                LRESULT(0)
+            }
+            WM_CAPTURECHANGED => {
+                // The capture a window control pressed was holding can be taken away
+                // -- a menu opening under the button, another window claiming the
+                // mouse -- and a press nobody watched to its end is no act at all.
+                if self.cap_pressed.take().is_some() {
                     let _ = InvalidateRect(Some(hwnd), None, false);
                 }
                 LRESULT(0)
@@ -3104,7 +3324,7 @@ impl View {
     /// window's client origin. The rectangles are stored against the top of the
     /// document, so the only translation the test needs is the scroll.
     fn hot_at(&self, x: f32, y: f32) -> Option<usize> {
-        if y < TABBAR_H || x < self.content_dx() { return None; }
+        if y < TOPBAR_H || x < self.content_dx() { return None; }
         let x = x - self.content_dx();
         let y = document_y(y, self.scroll, self.dpi);
         self.hotspots
@@ -3142,7 +3362,7 @@ impl View {
     }
 
     fn wide_region_at(&self, x: f32, y: f32) -> Option<usize> {
-        if y < TABBAR_H || x < self.content_dx() { return None; }
+        if y < TOPBAR_H || x < self.content_dx() { return None; }
         let x = x - self.content_dx();
         let y = document_y(y, self.scroll, self.dpi);
         self.wide_regions.iter().position(|r| {
@@ -3861,10 +4081,16 @@ impl View {
         self.remember();
     }
 
-    fn update_title(&self, hwnd: HWND) {
+    fn update_title(&mut self, hwnd: HWND) {
         let mut title = window_title(self.path.as_deref());
         if self.source_view { title.push_str(" [Source]"); }
         if self.encoding_guessed { title.push_str(&format!(" [{}?]", self.decoded_encoding.label())); }
+        // The strip draws this copy of the title; the taskbar's is written below and
+        // never read back. A new title is new ink in the bar, so the bar repaints.
+        if self.title_text != title {
+            self.title_text = title.clone();
+            let _ = unsafe { InvalidateRect(Some(hwnd), None, false) };
+        }
         let title = utf16(&title);
         let _ = unsafe { SetWindowTextW(hwnd, PCWSTR(title.as_ptr())) };
     }
@@ -3976,7 +4202,7 @@ impl View {
 
     /// A relayout can leave the offset past the end of a document that has just grown.
     fn clamp_scroll(&mut self) {
-        let view_h = (self.client_h - TABBAR_H).max(1.0) / scale_of(self.dpi);
+        let view_h = (self.client_h - TOPBAR_H).max(1.0) / scale_of(self.dpi);
         let max = (self.content_h + self.theme.base - view_h).max(0.0);
         self.scroll = self.scroll.clamp(0.0, max);
     }
@@ -5120,11 +5346,11 @@ impl View {
     /// Client-space height of one text page, in points: most of a window, so a reader
     /// keeps a little of the previous screen as a place to come back to.
     fn page_height(&self) -> Pt {
-        (self.client_h - TABBAR_H).max(1.0) / scale_of(self.dpi) * 0.85
+        (self.client_h - TOPBAR_H).max(1.0) / scale_of(self.dpi) * 0.85
     }
 
     fn thumb_rect(&self) -> Option<(f32, f32, f32, f32)> {
-        thumb_rect(self.content_h, self.client_w, (self.client_h - TABBAR_H).max(1.0), self.scroll, self.dpi)
+        thumb_rect(self.content_h, self.client_w, (self.client_h - TOPBAR_H).max(1.0), self.scroll, self.dpi)
     }
 
     fn tab_title(tab: &Tab) -> String {
@@ -5179,7 +5405,7 @@ impl View {
     }
 
     fn tab_at(&mut self, x: f32, y: f32) -> Option<TabId> {
-        if y >= TABBAR_H { return None; }
+        if y >= TOPBAR_H { return None; }
         self.tab_metrics()
             .into_iter()
             .find(|(_, left, width)| x >= *left && x < *left + *width)
@@ -5189,9 +5415,9 @@ impl View {
     /// The close zone of the hovered pill, which is the room its `×` is drawn in: the
     /// strip the pill grew for the purpose, and nowhere else.
     fn tab_close_at(&mut self, x: f32, y: f32) -> Option<TabId> {
-        if y >= TABBAR_H { return None; }
+        if y >= TOPBAR_H { return None; }
         let hot = self.tab_hot?;
-        let pill_top = (TABBAR_H - TAB_PILL_H) * 0.5;
+        let pill_top = (TOPBAR_H - TAB_PILL_H) * 0.5;
         let pill_band = pill_top..pill_top + TAB_PILL_H;
         self.tab_metrics()
             .into_iter()
@@ -5199,13 +5425,41 @@ impl View {
             .map(|(id, _, _)| id)
     }
 
+    /// The window control under the point, if the point is on one. The three live in
+    /// the strip's right-hand end and are the strip's own height tall, counted from
+    /// the corner inwards: close, maximise, minimise.
+    fn caption_button_at(&self, x: f32, y: f32) -> Option<CapBtn> {
+        if !(0.0..TOPBAR_H).contains(&y) { return None; }
+        match ((self.client_w - x) / CAPTION_BTN_W).floor() as i32 {
+            0 => Some(CapBtn::Close),
+            1 => Some(CapBtn::Max),
+            2 => Some(CapBtn::Min),
+            _ => None,
+        }
+    }
+
+    /// What a window control does, once its press has been kept to its release.
+    unsafe fn caption_action(&mut self, btn: CapBtn, hwnd: HWND) {
+        match btn {
+            CapBtn::Min => {
+                let _ = ShowWindow(hwnd, SW_MINIMIZE);
+            }
+            CapBtn::Max => {
+                let _ = ShowWindow(hwnd, if self.zoomed { SW_RESTORE } else { SW_MAXIMIZE });
+            }
+            CapBtn::Close => {
+                let _ = PostMessageW(Some(hwnd), WM_CLOSE, WPARAM(0), LPARAM(0));
+            }
+        }
+    }
+
     fn content_dx(&self) -> f32 {
         if self.tree_visible { self.tree_width } else { 0.0 }
     }
 
     fn tree_at(&self, x: f32, y: f32) -> Option<usize> {
-        if !self.tree_visible || x >= self.tree_width || y < TABBAR_H { return None; }
-        let row = ((y - TABBAR_H - 6.0) / TREE_ROW_H).floor();
+        if !self.tree_visible || x >= self.tree_width || y < TOPBAR_H { return None; }
+        let row = ((y - TOPBAR_H - 6.0) / TREE_ROW_H).floor();
         (row >= 0.0).then_some(row as usize).filter(|row| *row < self.tree.len())
     }
 
@@ -5214,7 +5468,7 @@ impl View {
         let surface = self.brushes.get(&ColorRole::Surface).cloned();
         let muted = self.brushes.get(&ColorRole::Muted).cloned();
         if let Some(brush) = surface.as_ref() {
-            let rect = D2D_RECT_F { left: 0.0, top: TABBAR_H, right: self.tree_width, bottom: self.client_h };
+            let rect = D2D_RECT_F { left: 0.0, top: TOPBAR_H, right: self.tree_width, bottom: self.client_h };
             target.FillRectangle(&rect, brush);
         }
         if self.tab_format.is_none() {
@@ -5223,7 +5477,7 @@ impl View {
         let entries = self.tree.clone();
         let format = self.tab_format.clone();
         for (i, entry) in entries.iter().enumerate() {
-            let top = TABBAR_H + 6.0 + i as f32 * TREE_ROW_H;
+            let top = TOPBAR_H + 6.0 + i as f32 * TREE_ROW_H;
             let rect = D2D_RECT_F { left: 8.0 + entry.depth as f32 * 12.0, top, right: self.tree_width - 6.0, bottom: top + TREE_ROW_H - 2.0 };
             if let (Some(format), Some(brush)) = (format.as_ref(), muted.as_ref()) {
                 let text = utf16(&entry.name);
@@ -5232,8 +5486,10 @@ impl View {
         }
     }
 
-    unsafe fn draw_tab_bar(&mut self, target: &ID2D1RenderTarget) {
-        if self.workspace.tabs.items().is_empty() { return; }
+    /// The bar the window's caption has become: tabs at the left, the window title in
+    /// the room between, and the window controls at the right. Always drawn -- it is
+    /// the title bar now, not an ornament on one -- whether or not a tab sits in it.
+    unsafe fn draw_top_bar(&mut self, target: &ID2D1RenderTarget) {
         let strip = self.brushes.get(&ColorRole::TabStrip).cloned();
         let pills = self.brushes.get(&ColorRole::TabInactive).cloned();
         let hover = self.brushes.get(&ColorRole::TabHover).cloned();
@@ -5241,35 +5497,43 @@ impl View {
         let on_accent = self.brushes.get(&ColorRole::OnAccent).cloned();
         let muted = self.brushes.get(&ColorRole::Muted).cloned();
         if let Some(brush) = strip.as_ref() {
-            let rect = D2D_RECT_F { left: 0.0, top: 0.0, right: self.client_w, bottom: TABBAR_H };
+            let rect = D2D_RECT_F { left: 0.0, top: 0.0, right: self.client_w, bottom: TOPBAR_H };
             target.FillRectangle(&rect, brush);
         }
         // The hairline between the strip and everything it governs. With it the tabs are
         // chrome resting over a page; without it they are paint on the page.
         if let Some(brush) = pills.as_ref() {
-            let rect = D2D_RECT_F { left: 0.0, top: TABBAR_H - 1.0, right: self.client_w, bottom: TABBAR_H };
+            let rect = D2D_RECT_F { left: 0.0, top: TOPBAR_H - 1.0, right: self.client_w, bottom: TOPBAR_H };
             target.FillRectangle(&rect, brush);
         }
         if self.tab_format.is_none() {
             self.tab_format = self.font.text_format("Segoe UI", 12.0).ok();
         }
         let format = self.tab_format.clone();
-        let rects = self.tab_metrics();
-        let active = self.workspace.tabs.active().id;
-        let labels = self.tab_labels.as_ref().map(|(_, l)| l).expect("tab_metrics built the labels").clone();
-        for ((id, left, width), label) in rects.into_iter().zip(labels) {
+        // A strip with no tabs in it still has a title and controls to draw, so the
+        // pills are measured only when there are any to measure.
+        let empty = self.workspace.tabs.items().is_empty();
+        let (rects, labels) = if empty {
+            (Vec::new(), Vec::new())
+        } else {
+            let rects = self.tab_metrics();
+            let labels = self.tab_labels.as_ref().map(|(_, l)| l).expect("tab_metrics built the labels").clone();
+            (rects, labels)
+        };
+        let active = (!empty).then(|| self.workspace.tabs.active().id);
+        for ((id, left, width), label) in rects.into_iter().zip(labels.iter()) {
             let hot = self.tab_hot == Some(id);
-            let pill_top = (TABBAR_H - TAB_PILL_H) * 0.5;
+            let pill_top = (TOPBAR_H - TAB_PILL_H) * 0.5;
             let pill = D2D1_ROUNDED_RECT {
                 rect: D2D_RECT_F { left, top: pill_top, right: left + width, bottom: pill_top + TAB_PILL_H },
                 radiusX: TAB_PILL_H * 0.5,
                 radiusY: TAB_PILL_H * 0.5,
             };
-            let fill = if id == active { accent.as_ref() } else if hot { hover.as_ref() } else { pills.as_ref() };
+            let fill = if active == Some(id) { accent.as_ref() } else if hot { hover.as_ref() } else { pills.as_ref() };
             if let Some(brush) = fill {
                 target.FillRoundedRectangle(&pill, brush);
             }
-            let ink = if id == active { on_accent.clone() } else { muted.clone() };
+            let ink = if active == Some(id) { on_accent.clone() } else { muted.clone() };
             // The label from the layout the measurement already shaped, so a repaint
             // neither re-shapes nor re-measures a file name.
             if let (Some(layout), Some(brush)) = (label.layout.as_ref(), ink.as_ref()) {
@@ -5303,13 +5567,150 @@ impl View {
                 }
             }
         }
+        self.draw_title(target, &labels);
+        self.draw_caption_buttons(target);
+    }
+
+    /// The window title, centred in the room the tabs leave and the controls spare.
+    ///
+    /// The room is measured against the tabs' resting extent -- a pill grown for its
+    /// close button does not shove the title sideways -- and a room too narrow to
+    /// read in stays empty: a title trimmed to three letters is less information
+    /// than none.
+    unsafe fn draw_title(&mut self, target: &ID2D1RenderTarget, labels: &[TabLabel]) {
+        let tabs_right = Self::tabs_resting_right(labels);
+        let band_left = tabs_right + 12.0;
+        let band_right = self.client_w - 3.0 * CAPTION_BTN_W - 12.0;
+        if band_right - band_left < 120.0 {
+            return;
+        }
+        let room = band_right - band_left;
+        let measured = match self.title_label.as_ref() {
+            Some(((text, was_room), _, _, _, _)) => *text == self.title_text && (was_room - room).abs() <= 1.0,
+            None => false,
+        };
+        if !measured {
+            let (layout, width, box_h) = self
+                .font
+                .ui_label(&self.title_text.clone(), "Segoe UI", 12.0, room)
+                .map(|(layout, w, h)| (Some(layout), w, h))
+                .unwrap_or((None, 0.0, 0.0));
+            self.title_label =
+                Some(((self.title_text.clone(), room), layout, width, box_h, utf16(&self.title_text)));
+        }
+        let Some(muted) = self.brushes.get(&ColorRole::Muted).cloned() else { return };
+        let (_, layout, width, box_h, text) =
+            self.title_label.as_ref().expect("the label was just made").clone();
+        if let Some(layout) = layout.as_ref() {
+            target.DrawTextLayout(
+                Vector2::new(band_left + (room - width) * 0.5, (TOPBAR_H - box_h) * 0.5),
+                layout,
+                &muted,
+                D2D1_DRAW_TEXT_OPTIONS(0),
+            );
+        } else if let Some(format) = self.tab_format.as_ref() {
+            let text_rect = D2D_RECT_F { left: band_left, top: 0.0, right: band_right, bottom: TOPBAR_H };
+            target.DrawText(&text, format, &text_rect, &muted, D2D1_DRAW_TEXT_OPTIONS_CLIP, DWRITE_MEASURING_MODE_NATURAL);
+        }
+    }
+
+    /// The three window controls, at the strip's right-hand end and the strip's own
+    /// height tall, close at the corner the way the system's own are. Their glyphs
+    /// are geometry rather than a font's, so they are the same shapes at every DPI.
+    unsafe fn draw_caption_buttons(&mut self, target: &ID2D1RenderTarget) {
+        let muted = self.brushes.get(&ColorRole::Muted).cloned();
+        let strip = self.brushes.get(&ColorRole::TabStrip).cloned();
+        let hover = self.brushes.get(&ColorRole::TabHover).cloned();
+        let pressed = self.cap_press_brush.clone();
+        let red = self.cap_red_brush.clone();
+        let red_pressed = self.cap_red_press_brush.clone();
+        let white = self.cap_ink_brush.clone();
+        for (i, btn) in [CapBtn::Close, CapBtn::Max, CapBtn::Min].iter().enumerate() {
+            let left = self.client_w - (i as f32 + 1.0) * CAPTION_BTN_W;
+            let cx = left + CAPTION_BTN_W * 0.5;
+            let cy = TOPBAR_H * 0.5;
+            let hot = self.cap_hot == Some(*btn);
+            // A control shows its press only while the pointer is still on it: that
+            // is the look the release is judged against.
+            let down = self.cap_pressed == Some(*btn) && hot;
+            if hot || down {
+                let fill = if *btn == CapBtn::Close {
+                    if down { red_pressed.as_ref() } else { red.as_ref() }
+                } else if down {
+                    pressed.as_ref()
+                } else {
+                    hover.as_ref()
+                };
+                if let Some(brush) = fill {
+                    let rect = D2D_RECT_F { left, top: 0.0, right: left + CAPTION_BTN_W, bottom: TOPBAR_H };
+                    target.FillRectangle(&rect, brush);
+                }
+            }
+            // The close control's ink turns white on its red, in both palettes; the
+            // other two keep the strip's own quiet ink.
+            let ink = if *btn == CapBtn::Close && hot {
+                white.as_ref().or(muted.as_ref())
+            } else {
+                muted.as_ref()
+            };
+            let Some(brush) = ink else { continue };
+            match *btn {
+                CapBtn::Min => {
+                    target.DrawLine(
+                        Vector2::new(cx - 5.0, cy), Vector2::new(cx + 5.0, cy), brush, 1.0, None,
+                    );
+                }
+                CapBtn::Max if self.zoomed => {
+                    // Restoring is two squares, the rear one up and to the right: the
+                    // front square's room is filled with the control's own background
+                    // first, so the rear one reads as being behind it.
+                    let back = D2D_RECT_F { left: cx - 1.5, top: cy - 5.5, right: cx + 5.5, bottom: cy + 1.5 };
+                    let front = D2D_RECT_F { left: cx - 5.5, top: cy - 1.5, right: cx + 1.5, bottom: cy + 5.5 };
+                    let background = if down {
+                        pressed.as_ref().or(strip.as_ref())
+                    } else if hot {
+                        hover.as_ref().or(strip.as_ref())
+                    } else {
+                        strip.as_ref()
+                    };
+                    if let Some(brush) = background {
+                        target.FillRectangle(&front, brush);
+                    }
+                    target.DrawRectangle(&back, brush, 1.0, None);
+                    target.DrawRectangle(&front, brush, 1.0, None);
+                }
+                CapBtn::Max => {
+                    let rect = D2D_RECT_F { left: cx - 4.5, top: cy - 4.5, right: cx + 4.5, bottom: cy + 4.5 };
+                    target.DrawRectangle(&rect, brush, 1.0, None);
+                }
+                CapBtn::Close => {
+                    target.DrawLine(
+                        Vector2::new(cx - 4.5, cy - 4.5), Vector2::new(cx + 4.5, cy + 4.5), brush, 1.0, None,
+                    );
+                    target.DrawLine(
+                        Vector2::new(cx - 4.5, cy + 4.5), Vector2::new(cx + 4.5, cy - 4.5), brush, 1.0, None,
+                    );
+                }
+            }
+        }
+    }
+
+    /// The right edge the tabs reach when nothing is hovered: the extent the title's
+    /// room is measured against, so a pill grown for its close button does not move
+    /// the title while the pointer is on it.
+    fn tabs_resting_right(labels: &[TabLabel]) -> f32 {
+        let mut right = TAB_FIRST_LEFT;
+        for label in labels {
+            right += label.width + TAB_GAP;
+        }
+        right - TAB_GAP
     }
 
     fn thumb_hit(&self, x: f32, y: f32) -> bool {
         let x = x - self.content_dx();
         match self.thumb_rect() {
             Some((tx, ty, _tw, th)) => {
-                let ty = ty + TABBAR_H;
+                let ty = ty + TOPBAR_H;
                 x >= tx - 8.0 && y >= ty - 8.0 && y <= ty + th + 8.0
             }
             None => false,
@@ -5318,10 +5719,10 @@ impl View {
 
     fn scroll_to_thumb(&mut self, pointer_y: f32) {
         let Some((_, _, _, th)) = self.thumb_rect() else { return };
-        let view = (self.client_h - TABBAR_H).max(1.0);
+        let view = (self.client_h - TOPBAR_H).max(1.0);
         let max_scroll = (self.content_h - view / scale_of(self.dpi)).max(0.0);
         let room = (view - th).max(1.0);
-        let centre = (pointer_y - TABBAR_H - th * 0.5).clamp(0.0, room);
+        let centre = (pointer_y - TOPBAR_H - th * 0.5).clamp(0.0, room);
         self.scroll = centre / room * max_scroll;
     }
 
@@ -5840,12 +6241,12 @@ impl View {
             target.BeginDraw();
             let bg = d2d(self.palette.bg);
             target.Clear(Some(&bg));
-            self.draw_tab_bar(&target);
+            self.draw_top_bar(&target);
             // The page lives below the strip, and nothing it draws may rise into the
             // strip's band, whatever a transform or a tall image does. The tree panel is
             // under the same law, so both are clipped to the viewport the strip leaves.
             target.PushAxisAlignedClip(
-                &D2D_RECT_F { left: 0.0, top: TABBAR_H, right: self.client_w, bottom: self.client_h },
+                &D2D_RECT_F { left: 0.0, top: TOPBAR_H, right: self.client_w, bottom: self.client_h },
                 D2D1_ANTIALIAS_MODE_PER_PRIMITIVE,
             );
             self.draw_tree_panel(&target);
@@ -5860,9 +6261,9 @@ impl View {
             let up = scroll_dip(self.scroll, self.dpi);
             // The document's two edges that the window is over. The strip's own height
             // belongs to the band the viewport shows, though not to where ink lands:
-            // document y = `top` is the first line under the strip, at client y = TABBAR_H.
-            let top = up + TABBAR_H;
-            let bottom = top + (self.client_h - TABBAR_H).max(1.0);
+            // document y = `top` is the first line under the strip, at client y = TOPBAR_H.
+            let top = up + TOPBAR_H;
+            let bottom = top + (self.client_h - TOPBAR_H).max(1.0);
             for op in self.ops.iter() {
                 match op {
                     Op::Rect { x, y, w, h, color } => {
@@ -6009,7 +6410,7 @@ impl View {
             // sign the reader has that the edge of the window can be gripped.
             if let Some((tx, ty, tw, th)) = self.thumb_rect() {
                 if let Some(brush) = self.brushes.get(&ColorRole::Muted).cloned() {
-                    let r = D2D_RECT_F { left: tx, top: ty + TABBAR_H, right: tx + tw, bottom: ty + th + TABBAR_H };
+                    let r = D2D_RECT_F { left: tx, top: ty + TOPBAR_H, right: tx + tw, bottom: ty + th + TOPBAR_H };
                     target.FillRectangle(&r, &brush);
                 }
             }
@@ -8066,7 +8467,7 @@ mod tests {
             let up = scroll_dip(scroll, DPI);
             let painted_y = sel[1].y - up;
             assert!(
-                (TABBAR_H..800.0).contains(&painted_y),
+                (TOPBAR_H..800.0).contains(&painted_y),
                 "the line is below the tab strip and still on screen: {painted_y}"
             );
             let under = document_y(painted_y, scroll, DPI);
