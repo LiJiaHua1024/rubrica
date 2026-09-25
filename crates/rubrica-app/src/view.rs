@@ -2014,6 +2014,19 @@ fn show_error(hwnd: HWND, message: &str) {
     unsafe { MessageBoxW(Some(hwnd), PCWSTR(message.as_ptr()), PCWSTR(title.as_ptr()), MB_OK | MB_ICONERROR); }
 }
 
+pub(crate) fn document_open_error(path: &Path, error: &std::io::Error) -> String {
+    match error.kind() {
+        std::io::ErrorKind::NotFound => format!(
+            "{} is no longer available; it may have been moved or deleted.",
+            path.display()
+        ),
+        std::io::ErrorKind::PermissionDenied => {
+            format!("Cannot read {}: permission denied.", path.display())
+        }
+        _ => format!("Cannot open {}: {error}", path.display()),
+    }
+}
+
 /// An error that stopped the reader before there was a window to show it in: a document
 /// named on the command line that could not be read, or a machine that could not give
 /// the reader its window. A GUI process has no console to print to -- without this box
@@ -2121,12 +2134,20 @@ pub fn run(mut source: String, path: Option<PathBuf>, extra: Vec<PathBuf>) -> Re
                             source = decoded.text.clone();
                             lazy_decoded = Some(decoded);
                         }
+                        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                            // The shell may have removed a file between its first read
+                            // and this chapter pass. Keep the text already in hand.
+                            initial_chapter = 0;
+                        }
                         Err(_) => {
                             initial_chapter = 0;
                             source = reading::read(path, preferences.encoding)?.text;
                         }
                     }
                     if lazy_text { Some(index) } else { Some(ChapterIndex::new(&source, true)) }
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                    Some(ChapterIndex::new(&source, true))
                 }
                 Err(_) => {
                     source = reading::read(path, preferences.encoding)?.text;
@@ -2153,7 +2174,7 @@ pub fn run(mut source: String, path: Option<PathBuf>, extra: Vec<PathBuf>) -> Re
             keep_line_breaks: preferences.line_breaks.unwrap_or(keep_line_breaks),
         }) };
 
-    let mut workspace = crate::settings::workspace().map(Workspace::restore).unwrap_or_default();
+    let mut workspace = crate::settings::restored_workspace();
     if let Some(path) = path.as_ref() {
         workspace.open_file(View::workspace_file(path), TabKind::Pinned);
     }
@@ -6245,7 +6266,14 @@ impl View {
             }
             None => {
                 let loaded = match document {
-                    DocumentRef::File(file) => self.show_document(&file.path, hwnd),
+                    DocumentRef::File(file) => match self.try_show_document(&file.path, hwnd) {
+                        Ok(()) => true,
+                        Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
+                        Err(error) => {
+                            show_error(hwnd, &document_open_error(&file.path, &error));
+                            false
+                        }
+                    },
                     DocumentRef::Sample => {
                         self.set_page(crate::sample::DOCUMENT.to_string(), None, hwnd);
                         true
@@ -6378,7 +6406,17 @@ impl View {
 
 
     /// Read a file and make it the page, saying whether that worked.
-    fn show_document(&mut self, path: &std::path::Path, hwnd: HWND) -> bool {
+    fn show_document(&mut self, path: &Path, hwnd: HWND) -> bool {
+        match self.try_show_document(path, hwnd) {
+            Ok(()) => true,
+            Err(error) => {
+                show_error(hwnd, &document_open_error(path, &error));
+                false
+            }
+        }
+    }
+
+    fn try_show_document(&mut self, path: &Path, hwnd: HWND) -> std::io::Result<()> {
         let preferences = crate::settings::document(path);
         let plain = preferences.plain.unwrap_or_else(|| reading::is_plain(Some(path)));
         if plain && preferences.text.chapters && !preferences.source
@@ -6397,23 +6435,16 @@ impl View {
                     self.cache_window(chapter, self.source.clone());
                     self.prefetch_next_chapter();
                     self.update_title(hwnd);
-                    return true;
+                    return Ok(());
                 }
             }
         }
-        match reading::read(path, preferences.encoding) {
-            Ok(decoded) => {
-                self.lazy_text = false;
-                self.decoded_encoding = decoded.encoding;
-                self.encoding_guessed = decoded.guessed;
-                self.set_page(decoded.text, Some(path.to_path_buf()), hwnd);
-                true
-            }
-            Err(e) => {
-                show_error(hwnd, &format!("Cannot open {}: {e}", path.display()));
-                false
-            }
-        }
+        let decoded = reading::read(path, preferences.encoding)?;
+        self.lazy_text = false;
+        self.decoded_encoding = decoded.encoding;
+        self.encoding_guessed = decoded.guessed;
+        self.set_page(decoded.text, Some(path.to_path_buf()), hwnd);
+        Ok(())
     }
 
     fn reset_chapter_cache(&self) {
@@ -6596,8 +6627,15 @@ impl View {
             // so the page is only loaded when it is a different one from the one being
             // stood on. Where it cannot be read at all, the place has come off a removed
             // drive since it was left, and the step is abandoned rather than faked.
-            if self.path.as_deref() != Some(path.as_path()) && !self.show_document(path, hwnd) {
-                return;
+            if self.path.as_deref() != Some(path.as_path()) {
+                match self.try_show_document(path, hwnd) {
+                    Ok(()) => {}
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => return,
+                    Err(error) => {
+                        show_error(hwnd, &document_open_error(path, &error));
+                        return;
+                    }
+                }
             }
         } else if self.path.is_some() {
             // The built-in sample, which is a page the reader can leave and be asked back
@@ -8947,6 +8985,22 @@ mod tests {
     use super::*;
 
     const DPI: f32 = 96.0;
+
+    #[test]
+    fn a_missing_document_gets_a_friendly_open_message() {
+        let path = Path::new("gone.md");
+        let error = std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            "The system cannot find the file specified.",
+        );
+        let message = document_open_error(path, &error);
+        assert!(message.contains("gone.md"));
+        assert!(message.contains("moved or deleted"));
+        assert!(!message.contains("system cannot find"));
+
+        let other = std::io::Error::new(std::io::ErrorKind::InvalidData, "bad encoding");
+        assert!(document_open_error(path, &other).contains("bad encoding"));
+    }
 
     /// The page poll's whole decision, taken without a file in the way.
     #[test]

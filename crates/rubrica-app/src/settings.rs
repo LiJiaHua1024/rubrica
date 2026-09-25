@@ -10,7 +10,7 @@
 //! that carry them, so what a stored number means can be read -- and tested -- without a
 //! live registry in the way.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use windows::core::PCWSTR;
 use windows::Win32::Foundation::RECT;
@@ -21,7 +21,7 @@ use windows::Win32::System::Registry::{
 
 use crate::theme::{Measure, TextFace, Zoom};
 use crate::view::utf16;
-use rubrica_workspace::{DocumentRef, FileRef, SessionSnapshot, SessionTab, TabKind, WorkspaceSnapshot};
+use rubrica_workspace::{DocumentRef, FileRef, SessionSnapshot, SessionTab, TabKind, Workspace, WorkspaceSnapshot};
 
 const SUBKEY: &str = "Software\\Rubrica";
 /// The names the numbers are stored under, in the order [`words`] writes them.
@@ -719,6 +719,25 @@ pub fn record_workspace(snapshot: &WorkspaceSnapshot) -> Result<(), String> {
 
 pub fn workspace() -> Option<WorkspaceSnapshot> {
     decode_workspace(&binary(SUBKEY, WORKSPACE_KEY)?)
+}
+
+pub(crate) fn restorable_path(path: &Path) -> bool {
+    match std::fs::metadata(path) {
+        Ok(metadata) => metadata.is_file(),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
+        // A permission or network error is not proof that the document is gone. Keep
+        // the remembered entry so a later navigation can report the real problem.
+        Err(_) => true,
+    }
+}
+
+/// Restore the saved workspace without bringing paths that are known to be gone back
+/// into the tab strip. The registry format stays raw and versioned; this is the host's
+/// file-system policy applied at the point where the pure state is handed to the UI.
+pub fn restored_workspace() -> Workspace {
+    workspace()
+        .map(|snapshot| Workspace::restore_with(snapshot, restorable_path))
+        .unwrap_or_default()
 }
 
 #[cfg(test)]

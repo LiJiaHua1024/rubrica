@@ -201,17 +201,56 @@ impl Workspace {
     }
 
     pub fn restore(snapshot: WorkspaceSnapshot) -> Self {
+        Self::restore_inner(snapshot, |_| true, false)
+    }
+
+    /// Restore a snapshot while letting the host discard paths that are no longer there.
+    ///
+    /// The state crate deliberately does not know what a file system can see. The host
+    /// supplies that small bit of policy, so a remembered tab can be treated as a hint
+    /// without teaching the pure state layer how to inspect a path.
+    pub fn restore_with<F>(snapshot: WorkspaceSnapshot, available: F) -> Self
+    where
+        F: Fn(&Path) -> bool,
+    {
+        Self::restore_inner(snapshot, available, true)
+    }
+
+    fn restore_inner<F>(snapshot: WorkspaceSnapshot, available: F, fallback_to_sample: bool) -> Self
+    where
+        F: Fn(&Path) -> bool,
+    {
+        let WorkspaceSnapshot { session: SessionSnapshot { tabs, active }, recent } = snapshot;
         let mut workspace = Self::default();
-        for file in snapshot.recent.into_iter().rev() {
-            workspace.recent.touch(file);
-        }
-        for tab in snapshot.session.tabs {
-            workspace.tabs.open_file(tab.document, tab.kind);
-        }
-        if let Some(active) = snapshot.session.active {
-            if let Some(index) = workspace.tabs.items().iter().position(|tab| tab.document == active) {
-                workspace.tabs.active = index;
+        for file in recent.into_iter().rev() {
+            if available(&file.path) {
+                workspace.recent.touch(file);
             }
+        }
+        for tab in tabs {
+            if available(&tab.document.path) {
+                workspace.tabs.open_file(tab.document, tab.kind);
+            }
+        }
+
+        let sample = workspace
+            .tabs
+            .items()
+            .iter()
+            .position(|tab| tab.document == DocumentRef::Sample);
+        let active = match active {
+            Some(DocumentRef::File(file)) if available(&file.path) => workspace
+                .tabs
+                .items()
+                .iter()
+                .position(|tab| matches!(&tab.document, DocumentRef::File(existing) if existing.same_file(&file))),
+            Some(DocumentRef::Sample) => sample,
+            None if !fallback_to_sample => None,
+            _ if fallback_to_sample => sample,
+            _ => None,
+        };
+        if let Some(index) = active.or(if fallback_to_sample { sample } else { None }) {
+            workspace.tabs.active = index;
         }
         workspace
     }
@@ -302,6 +341,37 @@ mod tests {
     }
 
     #[test]
+    fn restoring_drops_unavailable_tabs_and_recent_files() {
+        let mut workspace = Workspace::default();
+        workspace.open_file(file("gone.md"), TabKind::Pinned);
+        workspace.open_file(file("kept.md"), TabKind::Preview);
+        workspace.recent.touch(file("also-gone.md"));
+
+        let restored = Workspace::restore_with(workspace.snapshot(), |path| {
+            path == Path::new("kept.md")
+        });
+        assert_eq!(restored.tabs.items().len(), 2);
+        assert!(restored.tabs.items().iter().skip(1).all(|tab| {
+            matches!(&tab.document, DocumentRef::File(file) if file.path == Path::new("kept.md"))
+        }));
+        assert_eq!(restored.recent.items(), &[file("kept.md")]);
+    }
+
+    #[test]
+    fn restoring_an_unavailable_active_document_falls_back_to_sample() {
+        let mut workspace = Workspace::default();
+        let (gone, _) = workspace.open_file(file("gone.md"), TabKind::Pinned);
+        workspace.open_file(file("kept.md"), TabKind::Preview);
+        workspace.activate(gone);
+
+        let restored = Workspace::restore_with(workspace.snapshot(), |path| {
+            path == Path::new("kept.md")
+        });
+        assert_eq!(restored.tabs.active().document, DocumentRef::Sample);
+        assert_eq!(restored.tabs.items().len(), 2);
+    }
+
+    #[test]
     fn snapshot_restores_order_and_active_index_without_tab_ids() {
         let mut workspace = Workspace::default();
         workspace.open_file(file("a"), TabKind::Pinned);
@@ -311,6 +381,18 @@ mod tests {
         let restored = Workspace::restore(snapshot.clone());
         assert_eq!(restored.snapshot().session.tabs, snapshot.session.tabs);
         assert_eq!(restored.snapshot().session.active, snapshot.session.active);
+        assert_eq!(restored.tabs.active().document, workspace.tabs.active().document);
+    }
+
+    #[test]
+    fn restoring_without_an_active_marker_keeps_the_legacy_last_tab() {
+        let mut workspace = Workspace::default();
+        workspace.open_file(file("a"), TabKind::Pinned);
+        workspace.open_file(file("b"), TabKind::Pinned);
+        let mut snapshot = workspace.snapshot();
+        snapshot.session.active = None;
+
+        let restored = Workspace::restore(snapshot);
         assert_eq!(restored.tabs.active().document, workspace.tabs.active().document);
     }
 

@@ -189,7 +189,7 @@ fn main() -> Result<()> {
             };
             match read {
                 Ok(text) => opened.push((path.clone(), text)),
-                Err(e) => failures.push(format!("Cannot open {}: {e}", path.display())),
+                Err(e) => failures.push(view::document_open_error(path, &e)),
             }
         }
         if !failures.is_empty() {
@@ -221,7 +221,7 @@ fn reopen() -> (Option<PathBuf>, String) {
             Some(rubrica_workspace::DocumentRef::Sample) => {
                 return (None, sample::DOCUMENT.to_string());
             }
-            Some(rubrica_workspace::DocumentRef::File(file)) if file.path.is_file() => {
+            Some(rubrica_workspace::DocumentRef::File(file)) if settings::restorable_path(&file.path) => {
                 let path = file.path;
                 let prefs = settings::document(&path);
                 if should_window(&path, &prefs) {
@@ -234,7 +234,7 @@ fn reopen() -> (Option<PathBuf>, String) {
             _ => {}
         }
     }
-    if let Some((path, _)) = settings::reading().filter(|(path, _)| path.is_file()) {
+    if let Some((path, _)) = settings::reading().filter(|(path, _)| settings::restorable_path(path)) {
         let prefs = settings::document(&path);
         if should_window(&path, &prefs) {
             return (Some(path), String::new());
@@ -262,7 +262,7 @@ fn load(file: Option<&str>) -> Result<(Option<PathBuf>, String)> {
         .map(|d| d.text)
         {
             Ok(s) => Ok((Some(PathBuf::from(p)), s)),
-            Err(e) => Err(format!("cannot read {p}: {e}").into()),
+            Err(e) => Err(view::document_open_error(std::path::Path::new(p), &e).into()),
         },
     }
 }
