@@ -3991,6 +3991,10 @@ impl View {
         // profile -- typeset math depends on the profile's fonts, so each profile
         // keeps its own, and a tab switch that flips the profile back and forth keeps
         // both instead of re-setting what was set.
+        // The tree panel is shifted over the page at paint time, so the page is laid
+        // out for the width the panel leaves: measured against the full client, a wide
+        // table's reach into the right margin would land past the window's edge.
+        let page_w = (self.client_w - self.content_dx()).max(1.0);
         let profile = self.profile.clone();
         let math = self.maths.entry(profile).or_default();
         let mut objects =
@@ -3999,7 +4003,7 @@ impl View {
             &mut self.font,
             &self.theme,
             &self.doc,
-            self.client_w,
+            page_w,
             self.dpi,
             &mut objects,
             self.hyphenator.as_ref(),
@@ -6521,13 +6525,19 @@ fn layout_table(
     // Last, because a column rule spans a height the rows have only just told. The
     // boundaries are the widths themselves rather than `grid_w` divided up: a cell is
     // laid out at its column's measured width, and a rule between two other numbers
-    // would sit on top of somebody's ink.
+    // would sit on top of somebody's ink. The grid's own two edges are rules too --
+    // an open right side reads as a table cut off, not as a table ended.
+    ops.push(Op::Line {
+        x0: left * k,
+        y0: grid_top * k,
+        x1: left * k,
+        y1: y * k,
+        thickness: rule * 0.6 * k,
+        color: ColorRole::Faint,
+    });
     let mut x = left;
-    for (i, w) in widths.iter().enumerate() {
+    for w in widths.iter() {
         x += w;
-        if i + 1 == cols {
-            break;
-        }
         ops.push(Op::Line {
             x0: x * k,
             y0: grid_top * k,
