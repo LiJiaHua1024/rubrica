@@ -13,6 +13,7 @@ mod find;
 mod highlight;
 mod hyphen;
 mod images;
+mod instance;
 mod math;
 mod pagination;
 mod report;
@@ -153,24 +154,57 @@ fn main() -> Result<()> {
         return report::report(&source, shown, &options);
     }
     // A file named on the command line is what the reader asked for, and one that cannot
-    // be read is worth stopping on. Nothing named is not a request for the sample,
-    // though: the reader was here before, and the page they left is the one to come back
-    // to.
-    let arg = std::env::args_os().nth(1).map(PathBuf::from);
-    let (path, source) = match arg.as_ref().and_then(|p| p.to_str()) {
-        Some(p) => {
-            let path = PathBuf::from(p);
-            let prefs = settings::document(&path);
-            let source = if should_window(&path, &prefs) {
-                String::new()
-            } else {
-                reading::read(&path, prefs.encoding)?.text
-            };
-            (Some(path), source)
+    // be read is worth stopping on -- visibly, though: a reader with no window to show an
+    // error in would otherwise be a double-click that simply did nothing. Nothing named is
+    // not a request for the sample, either: the reader was here before, and the page they
+    // left is the one to come back to.
+    let paths: Vec<PathBuf> = positionals(&argv).into_iter().map(PathBuf::from).collect();
+    // One reader to a session: a second launch is what a double-click produces, but not
+    // what it means. The mutex is held to the end of the process, and the system lets it
+    // go if the process dies, so a crashed reader is never a locked one.
+    let reader = instance::acquire();
+    if reader.is_none() {
+        // Another reader owns this session. Its window gets what was asked for, and this
+        // launch becomes nothing; a bare launch is still a summons, an empty list that
+        // only brings the window forward.
+        if instance::forward(&paths) {
+            return Ok(());
         }
-        None => reopen(),
+        // The other reader never opened a window to receive anything, so the launch
+        // proceeds as a second one rather than wait out a start that may never land. The
+        // mutex stays with the first; this window simply lives without it.
+    }
+    let (path, source, extra) = if paths.is_empty() {
+        let (path, source) = reopen();
+        (path, source, Vec::new())
+    } else {
+        let mut opened: Vec<(PathBuf, String)> = Vec::new();
+        let mut failures: Vec<String> = Vec::new();
+        for path in &paths {
+            let prefs = settings::document(path);
+            let read = if should_window(path, &prefs) {
+                Ok(String::new())
+            } else {
+                reading::read(path, prefs.encoding).map(|d| d.text)
+            };
+            match read {
+                Ok(text) => opened.push((path.clone(), text)),
+                Err(e) => failures.push(format!("Cannot open {}: {e}", path.display())),
+            }
+        }
+        if !failures.is_empty() {
+            view::startup_error(&failures);
+            std::process::exit(1);
+        }
+        let mut docs = opened.into_iter();
+        let (path, source) = docs.next().expect("at least one document opened");
+        (Some(path), source, docs.map(|(p, _)| p).collect())
     };
-    view::run(source, path)
+    if let Err(e) = view::run(source, path, extra) {
+        view::startup_error(&[e.to_string()]);
+        std::process::exit(1);
+    }
+    Ok(())
 }
 
 /// What to show when nothing was named: the document the reader had open last, and the
@@ -233,14 +267,17 @@ fn load(file: Option<&str>) -> Result<(Option<PathBuf>, String)> {
     }
 }
 
-/// The document path, skipping the values that belong to `--width` and friends.
-fn positional(argv: &[String]) -> Option<String> {
+/// Every document path on the command line, in order, skipping the values that belong to
+/// `--width` and friends. A double-click names one; a multi-selection "open with" names
+/// several, and each of them is wanted.
+fn positionals(argv: &[String]) -> Vec<String> {
     const TAKES_VALUE: [&str; 12] = [
         "--width", "--dpi", "--zoom", "--face", "--measure", "--profile",
         "--export-png", "--export-width", "--export-scale", "--export-pdf",
         "--pdf-width", "--pdf-height",
     ];
     let mut skip_next = false;
+    let mut named = Vec::new();
     for a in argv.iter().skip(1) {
         if skip_next {
             skip_next = false;
@@ -253,9 +290,14 @@ fn positional(argv: &[String]) -> Option<String> {
         if a == "report" || a.starts_with("--") {
             continue;
         }
-        return Some(a.clone());
+        named.push(a.clone());
     }
-    None
+    named
+}
+
+/// The document path, skipping the values that belong to `--width` and friends.
+fn positional(argv: &[String]) -> Option<String> {
+    positionals(argv).into_iter().next()
 }
 
 fn text_flag(argv: &[String], name: &str) -> Option<String> {

@@ -81,14 +81,14 @@ use windows::Win32::UI::WindowsAndMessaging::{
     AppendMenuW, CS_DBLCLKS, CS_HREDRAW, CS_VREDRAW, CREATESTRUCTW, CreatePopupMenu,
     CreateWindowExW, DefWindowProcW, DestroyMenu, DispatchMessageW,
     GWLP_USERDATA, GetCaretBlinkTime, GetClientRect, GetCursorPos, GetWindowLongPtrW, GetMessageW, GetWindowPlacement,
-    HCURSOR, HMENU, HWND_TOP, HTCLIENT, IDC_ARROW, IDC_HAND, KillTimer, LoadCursorW, MF_CHECKED,
+    HCURSOR, HMENU, HWND_TOP, HTCLIENT, IDC_ARROW, IDC_HAND, IsIconic, KillTimer, LoadCursorW, MF_CHECKED,
     MF_GRAYED, MF_POPUP, MF_SEPARATOR, MF_STRING, MSG, PostMessageW, PostQuitMessage,
     RegisterClassExW, SetCursor, SetForegroundWindow, SetWindowTextW, SW_SHOWNORMAL, SetTimer,
-    SetWindowLongPtrW, SetWindowPos, ShowWindow, SW_SHOWMAXIMIZED, TPM_RETURNCMD,
+    SetWindowLongPtrW, SetWindowPos, ShowWindow, SW_SHOWMAXIMIZED, SW_RESTORE, TPM_RETURNCMD,
     TPM_RIGHTBUTTON, TrackPopupMenuEx, TranslateMessage, WM_CONTEXTMENU, WM_NULL, WNDCLASSEXW,
     WM_DESTROY, WM_DPICHANGED, WM_ERASEBKGND, WM_EXITSIZEMOVE, WM_KEYDOWN, WM_MOUSEWHEEL,
     WM_NCCREATE, WM_PAINT, WM_SETCURSOR, WM_SIZE, WM_TIMER, WS_EX_APPWINDOW, WS_OVERLAPPEDWINDOW,
-    SWP_NOACTIVATE, SWP_NOZORDER, WM_DROPFILES, WM_LBUTTONDOWN, WM_LBUTTONDBLCLK, WM_LBUTTONUP,
+    SWP_NOACTIVATE, SWP_NOZORDER, WM_COPYDATA, WM_DROPFILES, WM_LBUTTONDOWN, WM_LBUTTONDBLCLK, WM_LBUTTONUP,
     WM_MBUTTONDOWN, WM_MOUSEMOVE, WM_SYSKEYDOWN, CallWindowProcW, EN_CHANGE, ES_AUTOHSCROLL, GetParent,
     GetWindowTextW, GWLP_WNDPROC, MoveWindow, SendMessageW, SW_HIDE, SW_SHOW, WM_CHAR, WM_COMMAND,
     WM_CTLCOLOREDIT, WM_GETTEXTLENGTH, WM_SETFONT, WINDOWPLACEMENT, WINDOW_STYLE, WNDPROC,
@@ -1856,6 +1856,17 @@ fn show_error(hwnd: HWND, message: &str) {
     unsafe { MessageBoxW(Some(hwnd), PCWSTR(message.as_ptr()), PCWSTR(title.as_ptr()), MB_OK | MB_ICONERROR); }
 }
 
+/// An error that stopped the reader before there was a window to show it in: a document
+/// named on the command line that could not be read, or a machine that could not give
+/// the reader its window. A GUI process has no console to print to -- without this box
+/// the failure is a double-click that simply did nothing.
+pub fn startup_error(messages: &[String]) {
+    use windows::Win32::UI::WindowsAndMessaging::{MessageBoxW, MB_ICONERROR, MB_OK};
+    let message = utf16(&messages.join("\n"));
+    let title = utf16("Rubrica");
+    unsafe { MessageBoxW(None, PCWSTR(message.as_ptr()), PCWSTR(title.as_ptr()), MB_OK | MB_ICONERROR); }
+}
+
 /// Whether a modifier is down. Read from the keyboard state rather than from the
 /// message: `WM_KEYDOWN` carries no modifier flags of its own, and a key that only
 /// means something with `Ctrl` has to ask.
@@ -1863,7 +1874,7 @@ fn held(vk: VIRTUAL_KEY) -> bool {
     unsafe { (GetKeyState(vk.0 as i32) as u16 & 0x8000) != 0 }
 }
 
-pub fn run(mut source: String, path: Option<PathBuf>) -> Result<()> {
+pub fn run(mut source: String, path: Option<PathBuf>, extra: Vec<PathBuf>) -> Result<()> {
     // Must happen before the first window exists, or the process is already
     // bitmap-scaled and text on a secondary high-density monitor is soft.
     unsafe {
@@ -2134,6 +2145,14 @@ pub fn run(mut source: String, path: Option<PathBuf>) -> Result<()> {
         // tick with no caret, or one hidden behind a preview, flips a phase that nothing
         // reads and costs no repaint.
         let _ = SetTimer(Some(hwnd), CARET_TIMER, caret_tick_ms(), None);
+
+        // Documents named alongside the first, each opened as its own tab in the order
+        // named -- the walk a reader taking them by hand would take. Nothing has been
+        // drawn yet, so only the last of them is ever seen on screen, and no page is
+        // watched jumping.
+        for path in &extra {
+            view.load_document(path, hwnd);
+        }
 
         let mut msg = MSG::default();
         while GetMessageW(&mut msg, None, 0, 0).as_bool() {
@@ -2851,6 +2870,27 @@ impl View {
                     }
                 }
                 LRESULT(0)
+            }
+            WM_COPYDATA => {
+                // A second launch, made by a double-click in Explorer, hands the documents
+                // it was named to the window that already exists and quits: the reader is
+                // one to a session, and "open" meant a tab here, not another window. The
+                // payload is the sender's memory for this call alone, so the paths are
+                // copied out before anything can yield.
+                if let Some(paths) = crate::instance::take_forward(lp) {
+                    for path in &paths {
+                        self.load_document(path, hwnd);
+                    }
+                    // A hand-off is also a summons: the window the reader already had
+                    // comes forward, restored first if it was minimised.
+                    if IsIconic(hwnd).as_bool() {
+                        let _ = ShowWindow(hwnd, SW_RESTORE);
+                    }
+                    let _ = SetForegroundWindow(hwnd);
+                    LRESULT(1)
+                } else {
+                    LRESULT(0)
+                }
             }
             WM_DROPFILES => {
                 self.open_from_drop(hwnd, wp.0);
@@ -5285,19 +5325,19 @@ impl View {
         self.scroll = centre / room * max_scroll;
     }
 
-    /// Open the first dropped file; a reader shows one document at a time.
+    /// Open every dropped file, each as its own tab, in the order the drop named them;
+    /// the last of them is the one left on screen.
     unsafe fn open_from_drop(&mut self, hwnd: HWND, hdrop: usize) {
         let h = HDROP(hdrop as *mut _);
-        if DragQueryFileW(h, u32::MAX, None) < 1 {
-            DragFinish(h);
-            return;
-        }
+        let count = DragQueryFileW(h, u32::MAX, None);
         let mut buf = [0u16; 1024];
-        let written = DragQueryFileW(h, 0, Some(&mut buf)) as usize;
+        for index in 0..count {
+            let written = DragQueryFileW(h, index, Some(&mut buf)) as usize;
+            let path = String::from_utf16_lossy(&buf[..written]);
+            let path = path.trim_end_matches(char::from(0)).to_string();
+            self.load_document(std::path::Path::new(&path), hwnd);
+        }
         DragFinish(h);
-        let path = String::from_utf16_lossy(&buf[..written]);
-        let path = path.trim_end_matches(char::from(0)).to_string();
-        self.load_document(std::path::Path::new(&path), hwnd);
         let _ = InvalidateRect(Some(hwnd), None, false);
     }
 
