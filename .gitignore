@@ -1,5 +1,6 @@
 # Build output.
 /target
+/dist/
 *.pdb
 
 # Agent and editor state, local to whoever's working on this.

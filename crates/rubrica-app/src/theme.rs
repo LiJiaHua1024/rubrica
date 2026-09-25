@@ -103,6 +103,10 @@ pub enum ColorRole {
     /// A block surface (the code panel), not an ink: a text colour used as a fill
     /// reads as a smudge rather than a panel.
     Surface,
+    /// The paper a page-stack reader puts under the display list.
+    PageSurface,
+    /// The soft edge and shadow that lift a page-stack card off the reader background.
+    PageShadow,
     /// The five inks a code block's words are told apart by. They are roles rather than
     /// colours because a theme has to answer for both its pages: what reads as a string
     /// on paper the colour of is a dull brown, and the same brown on a night page is

@@ -111,12 +111,14 @@ wide accents, `\overset`/`\underset`/`\stackrel`/`\boxed`, the lettering styles
 Selection by mouse and keyboard with clipboard copy, a caret that follows the pointer,
 links and footnote citations as jump targets with back and forward history, an outline
 of the document's headings, find in page, zoom, light and dark themes, a reader-set
-measure, per-document reading position and window frame restored on reopen (clamped back
-onto a screen when the monitor setup changed), and a reload when the file changes on
-disk. Open documents are available as pinned/preview tabs (`Ctrl+Tab`, `Ctrl+W`), with
-recent files and a resizable docked workspace tree; the session is restored on the
-next launch. TXT files keep chapter boundaries and lay out the active chapter window,
-with `Ctrl+Alt+Up/Down` for chapter navigation. `Ctrl+3` switches source view, and
+measure, an optional vertical page-stack mode with a small peek at the next page and a
+soft page-turn fade, per-document reading position and window frame restored on reopen
+(clamped back onto a screen when the monitor setup changed), and a reload when the file
+changes on disk. Open documents are available as pinned/preview tabs (`Ctrl+Tab`,
+`Ctrl+W`), with recent files and a resizable docked workspace tree; the session is
+restored on the next launch. TXT files keep chapter boundaries and lay out the active
+chapter window, with `Ctrl+Alt+Up/Down` for chapter navigation. `Ctrl+3` switches
+source view, `Ctrl+4` switches between continuous scrolling and the page stack, and
 `Ctrl+Shift+O` opens the file in an editor at the current source position.
 
 Right-click opens the menu: navigation, copy, select all, find, the contents, zoom, the
@@ -126,6 +128,7 @@ workspace tree.
 | Key | |
 | --- | --- |
 | `Ctrl+O` / `Ctrl+R` | open a document · read it again from disk |
+| `Ctrl+4` | continuous scrolling · vertical page stack |
 | `Ctrl+Tab` / `Ctrl+W` | next/previous tab · close the active tab |
 | `Ctrl+Alt+Up/Down` | previous/next TXT chapter |
 | `Ctrl+F` / `F3` | find · next match |
@@ -133,8 +136,9 @@ workspace tree.
 | `Ctrl+D` | light, dark, follow the system |
 | `Ctrl` + `[` `]` | the measure: two margins moving apart, and together |
 | `+` `-` `0` | zoom in · out · actual size |
-| `←↑↓→` `Home` `End` `PgUp` `PgDn` | move the caret |
-| `Shift` + any of those | extend the selection |
+| `←↑↓→` `Home` `End` | move the caret · with no caret, first/last page in page-stack mode |
+| `PgUp` `PgDn` | previous/next page · previous/next screen in continuous mode |
+| `Shift` + arrows / `Home` / `End` | extend the selection |
 | `Alt` + `←` `→` | back and forward through where you have been |
 | `Enter` | step to the next find match |
 | `Esc` | give up the selection, the search, the page's marking |

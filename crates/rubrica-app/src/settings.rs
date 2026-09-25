@@ -215,22 +215,24 @@ pub struct DocumentSettings {
     pub line_breaks: Option<bool>,
     pub plain: Option<bool>,
     pub source: bool,
+    pub page_stack: bool,
     pub text: rubrica_doc::plain::TextOptions,
     pub encoding: crate::reading::Encoding,
 }
 
 impl DocumentSettings {
-    fn words(self) -> [u32; 6] {
+    fn words(self) -> [u32; 7] {
         [self.line_breaks.map_or(2, u32::from), self.plain.map_or(2, u32::from),
             u32::from(self.source), match self.text.paragraphs {
                 rubrica_doc::plain::ParagraphRule::Auto => 0,
                 rubrica_doc::plain::ParagraphRule::Lines => 1,
                 rubrica_doc::plain::ParagraphRule::BlankLines => 2,
             }, u32::from(self.text.chapters),
-            crate::reading::Encoding::ALL.iter().position(|e| *e == self.encoding).unwrap_or(0) as u32]
+            crate::reading::Encoding::ALL.iter().position(|e| *e == self.encoding).unwrap_or(0) as u32,
+            u32::from(self.page_stack)]
     }
 
-    fn from_words(w: [Option<u32>; 6]) -> Self {
+    fn from_words(w: [Option<u32>; 7]) -> Self {
         let optional = |v| match v { Some(0) => Some(false), Some(1) => Some(true), _ => None };
         Self {
             line_breaks: optional(w[0]), plain: optional(w[1]), source: w[2] == Some(1),
@@ -243,11 +245,12 @@ impl DocumentSettings {
                 chapters: w[4] != Some(0),
             },
             encoding: w[5].and_then(|v| crate::reading::Encoding::ALL.get(v as usize).copied()).unwrap_or_default(),
+            page_stack: w[6] == Some(1),
         }
     }
 }
 
-const DOCUMENT_NAMES: [&str; 6] = ["LineBreaks", "Plain", "Source", "Paragraphs", "Chapters", "Encoding"];
+const DOCUMENT_NAMES: [&str; 7] = ["LineBreaks", "Plain", "Source", "Paragraphs", "Chapters", "Encoding", "PageStack"];
 
 fn document_key(path: &std::path::Path) -> (String, String) {
     // Canonical paths make Explorer, relative links and the open dialog share a record.
@@ -724,15 +727,22 @@ mod tests {    use super::*;
     #[test]
     fn document_preferences_round_trip_and_reject_unknown_values() {
         let chosen = DocumentSettings {
-            line_breaks: Some(true), plain: Some(false), source: true,
+            line_breaks: Some(true), plain: Some(false), source: true, page_stack: true,
             text: rubrica_doc::plain::TextOptions {
                 paragraphs: rubrica_doc::plain::ParagraphRule::BlankLines, chapters: false,
             },
             encoding: crate::reading::Encoding::Big5,
         };
         assert_eq!(DocumentSettings::from_words(chosen.words().map(Some)), chosen);
-        assert_eq!(DocumentSettings::from_words([None; 6]), DocumentSettings::default());
-        assert_eq!(DocumentSettings::from_words([Some(u32::MAX); 6]), DocumentSettings::default());
+        assert_eq!(DocumentSettings::from_words([None; 7]), DocumentSettings::default());
+        assert_eq!(DocumentSettings::from_words([Some(u32::MAX); 7]), DocumentSettings::default());
+        let old = DocumentSettings::from_words([Some(0), Some(1), Some(1), Some(2), Some(0), Some(1), None]);
+        assert_eq!(old.line_breaks, Some(false));
+        assert_eq!(old.plain, Some(true));
+        assert!(old.source);
+        assert_eq!(old.text.paragraphs, rubrica_doc::plain::ParagraphRule::BlankLines);
+        assert!(!old.text.chapters);
+        assert!(!old.page_stack);
         for encoding in crate::reading::Encoding::ALL {
             let preferences = DocumentSettings { encoding, ..Default::default() };
             assert_eq!(DocumentSettings::from_words(preferences.words().map(Some)), preferences);

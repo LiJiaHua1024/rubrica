@@ -31,7 +31,7 @@ use windows::Win32::Graphics::Direct2D::Common::{
 };
 use windows::Win32::Graphics::Direct2D::{
     D2D1_BITMAP_INTERPOLATION_MODE_LINEAR, D2D1_FACTORY_TYPE_SINGLE_THREADED, D2D1_FEATURE_LEVEL_DEFAULT,
-    D2D1_HWND_RENDER_TARGET_PROPERTIES, D2D1_PRESENT_OPTIONS_NONE, D2D1_RENDER_TARGET_PROPERTIES,
+    D2D1_HWND_RENDER_TARGET_PROPERTIES, D2D1_LAYER_OPTIONS_INITIALIZE_FOR_CLEARTYPE, D2D1_LAYER_PARAMETERS, D2D1_PRESENT_OPTIONS_NONE, D2D1_RENDER_TARGET_PROPERTIES,
     D2D1_RENDER_TARGET_TYPE_DEFAULT, D2D1_RENDER_TARGET_USAGE_NONE, D2D1_ROUNDED_RECT,
     D2D1_DRAW_TEXT_OPTIONS, D2D1_DRAW_TEXT_OPTIONS_CLIP, D2D1_TEXT_ANTIALIAS_MODE_CLEARTYPE,
     D2D1_ANTIALIAS_MODE_PER_PRIMITIVE, ID2D1Factory, ID2D1HwndRenderTarget, ID2D1RenderTarget,
@@ -168,6 +168,74 @@ const DRAG_SLOP: f32 = 3.0;
 const FIRST_FRAME: crate::settings::Frame =
     crate::settings::Frame { left: 120, top: 100, width: 1080, height: 800, maximised: false };
 
+/// How the reader is choosing to move through the document. The two modes share the
+/// same display list; only the viewport and the navigation around it differ.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+enum ReadingMode {
+    #[default]
+    Scroll,
+    Stack,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PageDirection {
+    Previous,
+    Next,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PageButton {
+    Previous,
+    Next,
+}
+
+/// A page change kept outside `scroll` until the fade has finished, so a re-layout or a
+/// tab switch during the animation cannot leave the reader between two pages.
+struct PageTransition {
+    to: Pt,
+    from_index: usize,
+    to_index: usize,
+    direction: PageDirection,
+    started: std::time::Instant,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct PageStackLayout {
+    left: f32,
+    top: f32,
+    width: f32,
+    height: f32,
+    gap: f32,
+    content_height: f32,
+}
+
+const PAGE_STACK_INSET: f32 = 18.0;
+const PAGE_STACK_GAP: f32 = 12.0;
+const PAGE_STACK_PEEK: f32 = 10.0;
+const PAGE_FOOTER_H: f32 = 30.0;
+const PAGE_BUTTON_W: f32 = 30.0;
+const PAGE_TRANSITION_MS: u128 = 200;
+const PAGE_TIMER: usize = 0x5143;
+const PAGE_TICK_MS: u32 = 16;
+
+fn page_stack_layout_for(client_w: f32, client_h: f32, content_dx: f32) -> PageStackLayout {
+    let content_dx = content_dx.clamp(0.0, client_w.max(1.0));
+    let area_width = (client_w - content_dx).max(1.0);
+    let width = (area_width - PAGE_STACK_INSET * 2.0).max(1.0);
+    let left = content_dx + (area_width - width) * 0.5;
+    let top = TOPBAR_H + PAGE_STACK_INSET;
+    let content_height =
+        (client_h - top - PAGE_STACK_INSET - PAGE_STACK_PEEK - PAGE_FOOTER_H).max(1.0);
+    PageStackLayout {
+        left,
+        top,
+        width,
+        height: content_height + PAGE_FOOTER_H,
+        gap: PAGE_STACK_GAP,
+        content_height,
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq)]
 struct Rgb {
     r: f32,
@@ -192,6 +260,8 @@ struct Palette {
     muted: Rgb,
     accent: Rgb,
     code_bg: Rgb,
+    page_surface: Rgb,
+    page_shadow: Rgb,
     keyword: Rgb,
     string: Rgb,
     comment: Rgb,
@@ -213,6 +283,8 @@ impl Palette {
                 muted: Rgb { r: 0.60, g: 0.62, b: 0.66 },
                 accent: Rgb { r: 0.44, g: 0.67, b: 0.95 },
                 code_bg: Rgb { r: 0.155, g: 0.162, b: 0.178 },
+                page_surface: Rgb { r: 0.17, g: 0.175, b: 0.19 },
+                page_shadow: Rgb::gray(0.02),
                 // A code panel is darker than the page, so the inks on it are lit
                 // rather than dyed: the night page's own text is already 0.855, and a
                 // highlight that stayed below it would read as text that had gone off.
@@ -236,6 +308,8 @@ impl Palette {
                 muted: Rgb { r: 0.42, g: 0.44, b: 0.47 },
                 accent: Rgb { r: 0.12, g: 0.35, b: 0.66 },
                 code_bg: Rgb { r: 0.937, g: 0.935, b: 0.928 },
+                page_surface: Rgb { r: 0.995, g: 0.992, b: 0.982 },
+                page_shadow: Rgb::gray(0.48),
                 // All five are dark enough to hold their own against the panel's 0.93
                 // and far enough apart in hue that a keyword, a string and a number
                 // never pass for one another at a glance.
@@ -260,6 +334,8 @@ impl Palette {
             ColorRole::Muted | ColorRole::Faint => self.muted,
             ColorRole::Accent => self.accent,
             ColorRole::Surface => self.code_bg,
+            ColorRole::PageSurface => self.page_surface,
+            ColorRole::PageShadow => self.page_shadow,
             ColorRole::Keyword => self.keyword,
             ColorRole::String => self.string,
             ColorRole::Comment => self.comment,
@@ -968,6 +1044,11 @@ pub struct View {
     keep_line_breaks: bool,
     line_break_override: Option<bool>,
     ops: Vec<Op>,
+    reading_mode: ReadingMode,
+    page_starts: Vec<Pt>,
+    page_transition: Option<PageTransition>,
+    page_hot: Option<PageButton>,
+    page_pressed: Option<PageButton>,
     palette: Palette,
     /// The palette the reader asked for with `Ctrl`+`D`. `None` follows the system,
     /// which is what the appearance poll reports; a manual choice has to outrank that
@@ -1146,9 +1227,12 @@ struct TabPage {
     /// the view's means the window's width, DPI, size or face moved while this page
     /// slept, and the wrapping -- not the text -- is rebuilt before it is shown.
     epoch: u64,
+    layout_dpi: f32,
     source: String,
     doc: Document,
     ops: Vec<Op>,
+    reading_mode: ReadingMode,
+    page_starts: Vec<Pt>,
     sel_index: Vec<SelLine>,
     hotspots: Vec<Hot>,
     note_tops: Vec<Pt>,
@@ -1178,9 +1262,12 @@ impl TabPage {
     fn empty() -> Self {
         TabPage {
             epoch: 0,
+            layout_dpi: 96.0,
             source: String::new(),
             doc: Document { blocks: Vec::new(), footnotes: Vec::new() },
             ops: Vec::new(),
+            reading_mode: ReadingMode::Scroll,
+            page_starts: Vec::new(),
             sel_index: Vec::new(),
             hotspots: Vec::new(),
             note_tops: Vec::new(),
@@ -1466,6 +1553,10 @@ enum Command {
     ZoomIn,
     ZoomOut,
     ZoomReset,
+    TogglePageMode,
+    PageMode(bool),
+    PreviousPage,
+    NextPage,
     /// Set the page in one of the faces [`TextFace::ALL`] offers, by index.
     Face(usize),
     /// Widen or narrow the column, by index into [`Measure::ALL`].
@@ -1566,6 +1657,9 @@ struct MenuState {
     face: usize,
     /// Which entry of [`Measure::ALL`] the column is capped at right now.
     measure: usize,
+    reading_mode: ReadingMode,
+    page: usize,
+    page_count: usize,
     /// The page's own outline, which is a fact about the document rather than about the
     /// reader's choices, and is empty on a page with no headings in it.
     headings: Vec<Outline>,
@@ -1611,6 +1705,13 @@ fn menu_items(s: &MenuState) -> Vec<MenuRow> {
         row(Command::ZoomOut, "Decrease Text\tCtrl+-", true),
         row(Command::ZoomReset, "Actual Size\tCtrl+0", true),
     ]);
+    v.push(MenuRow::Sub { label: "Reading mode", items: vec![
+        check(Command::PageMode(false), "Continuous scroll", s.reading_mode == ReadingMode::Scroll),
+        check(Command::PageMode(true), "Page stack\tCtrl+4", s.reading_mode == ReadingMode::Stack),
+        MenuRow::Gap,
+        row(Command::PreviousPage, "Previous page\tPgUp", s.reading_mode == ReadingMode::Scroll || s.page > 0),
+        row(Command::NextPage, "Next page\tPgDn", s.reading_mode == ReadingMode::Scroll || s.page + 1 < s.page_count),
+    ] });
     let mut typography = vec![row(Command::Typography, "Edit / Save Preset...", true), MenuRow::Gap];
     typography.extend(s.profiles.iter().map(|name| check(Command::Profile(name.clone()), name, *name == s.profile)));
     v.push(MenuRow::Sub { label: "Typography", items: typography });
@@ -2083,6 +2184,11 @@ pub fn run(mut source: String, path: Option<PathBuf>, extra: Vec<PathBuf>) -> Re
         keep_line_breaks,
         line_break_override: preferences.line_breaks,
         ops: Vec::new(),
+        reading_mode: if preferences.page_stack { ReadingMode::Stack } else { ReadingMode::Scroll },
+        page_starts: Vec::new(),
+        page_transition: None,
+        page_hot: None,
+        page_pressed: None,
         palette: Palette::of(dark),
         dark_override: saved.dark,
         brushes: HashMap::new(),
@@ -2242,6 +2348,7 @@ pub fn run(mut source: String, path: Option<PathBuf>, extra: Vec<PathBuf>) -> Re
         let _ = KillTimer(Some(hwnd), APPEARANCE_TIMER);
         let _ = KillTimer(Some(hwnd), DOCUMENT_TIMER);
         let _ = KillTimer(Some(hwnd), CARET_TIMER);
+        let _ = KillTimer(Some(hwnd), PAGE_TIMER);
         // `view` is dropped here; the pointer stored in GWLP_USERDATA dies with it.
     }
     Ok(())
@@ -2621,13 +2728,15 @@ impl View {
     /// and every glyph run of every frame, and a fixed list is checked in nanoseconds.
     fn ensure_brushes(&mut self) {
         let Some(rt) = self.target.clone() else { return };
-        const ROLES: [ColorRole; 15] = [
+        const ROLES: [ColorRole; 17] = [
             ColorRole::Text,
             ColorRole::Muted,
             ColorRole::Accent,
             ColorRole::Code,
             ColorRole::Faint,
             ColorRole::Surface,
+            ColorRole::PageSurface,
+            ColorRole::PageShadow,
             ColorRole::Keyword,
             ColorRole::String,
             ColorRole::Comment,
@@ -2747,6 +2856,7 @@ impl View {
                 LRESULT(HTCLIENT as isize)
             }
             WM_SIZE => {
+                let anchor = anchor_at(&self.sel_index, self.scroll, scale_of(self.dpi));
                 let w = (lp.0 & 0xFFFF) as u32;
                 let h = ((lp.0 >> 16) & 0xFFFF) as u32;
                 self.client_w = w.max(1) as f32;
@@ -2758,7 +2868,7 @@ impl View {
                 self.dpi = GetDpiForWindow(hwnd).max(96) as f32;
                 // A new width is a new wrapping, for every tab and not only this one.
                 self.layout_epoch += 1;
-                self.relayout();
+                self.relayout_from_anchor(anchor);
                 self.layout_find();
                 let _ = InvalidateRect(Some(hwnd), None, false);
                 LRESULT(0)
@@ -2772,9 +2882,11 @@ impl View {
                 DefWindowProcW(hwnd, msg, wp, lp)
             }
             WM_DPICHANGED => {
+                let anchor = anchor_at(&self.sel_index, self.scroll, scale_of(self.dpi));
+                let new_dpi = GetDpiForWindow(hwnd).max(96) as f32;
                 let r = &*(lp.0 as *const RECT);
                 if let Some(t) = &self.hwnd_target {
-                    t.SetDpi(self.dpi.max(1.0), self.dpi.max(1.0));
+                    t.SetDpi(new_dpi, new_dpi);
                 }
                 self.client_w = (r.right - r.left).max(1) as f32;
                 self.client_h = (r.bottom - r.top).max(1) as f32;
@@ -2787,7 +2899,7 @@ impl View {
                     r.bottom - r.top,
                     SWP_NOZORDER | SWP_NOACTIVATE,
                 );
-                self.dpi = GetDpiForWindow(hwnd).max(96) as f32;
+                self.dpi = new_dpi;
                 // Filed again straight away: a window that has just crossed into another
                 // scale is standing at a frame in the new monitor's pixels, and the number
                 // remembered before the crossing is one that cannot be restored to anywhere
@@ -2801,7 +2913,7 @@ impl View {
                 self.drop_edit_font();
                 // New pixels are a new wrapping for every tab as well.
                 self.layout_epoch += 1;
-                self.relayout();
+                self.relayout_from_anchor(anchor);
                 self.layout_find();
                 let _ = InvalidateRect(Some(hwnd), None, false);
                 LRESULT(0)
@@ -2818,7 +2930,7 @@ impl View {
                     if self.pan_wide(ticks) {
                         let _ = InvalidateRect(Some(hwnd), None, false);
                     } else {
-                        self.scroll_by(-ticks / 120.0 * WHEEL_STEP);
+                        self.wheel_navigation(ticks, hwnd);
                         let _ = InvalidateRect(Some(hwnd), None, false);
                     }
                 } else if held(VK_CONTROL) {
@@ -2828,18 +2940,21 @@ impl View {
                     let zoom = if ticks > 0.0 { self.theme.zoom.up() } else { self.theme.zoom.down() };
                     self.zoom_to(zoom, hwnd);
                 } else {
-                    self.scroll_by(-ticks / 120.0 * WHEEL_STEP);
+                    self.wheel_navigation(ticks, hwnd);
                     let _ = InvalidateRect(Some(hwnd), None, false);
                 }
                 LRESULT(0)
             }
             WM_KEYDOWN => {
                 let step = self.theme.base * self.theme.body_leading.latin;
-                let page = self.page_height();
                 let ctrl = held(VK_CONTROL);
                 let shift = held(VK_SHIFT);
                 if ctrl && wp.0 == 0x33 {
                     self.apply_command(Command::SourceView, hwnd);
+                    return LRESULT(0);
+                }
+                if ctrl && wp.0 == 0x34 {
+                    self.apply_command(Command::TogglePageMode, hwnd);
                     return LRESULT(0);
                 }
                 if ctrl && wp.0 == VK_TAB.0 as usize {
@@ -2863,7 +2978,7 @@ impl View {
                     // `Shift` is the reader's own answer to "which caret?", so a marked
                     // page never moves by itself: the motion goes to the text even when the
                     // only place to mark from is the top of it.
-                    let page_moves = caretless && !shift && self.scroll_page(m, step);
+                    let page_moves = caretless && !shift && self.scroll_page(m, step, hwnd);
                     if !page_moves {
                         self.move_caret(m, shift);
                         self.restart_caret_beat(hwnd);
@@ -2872,8 +2987,8 @@ impl View {
                     return LRESULT(0);
                 }
                 match wp.0 as u32 {
-                    k if k == VK_PRIOR.0 as u32 => self.scroll_by(-page),
-                    k if k == VK_NEXT.0 as u32 => self.scroll_by(page),
+                    k if k == VK_PRIOR.0 as u32 => self.page_command(-1, hwnd),
+                    k if k == VK_NEXT.0 as u32 => self.page_command(1, hwnd),
                     // The way back out of a caret the reader has clicked into: while the
                     // page carries a marking, `Escape` gives it up -- and with it the
                     // arrows, which go back to being the scroll. Only an unmarked page
@@ -3040,6 +3155,7 @@ impl View {
                             let _ = InvalidateRect(Some(hwnd), None, false);
                         }
                     }
+                    PAGE_TIMER => self.tick_page_transition(hwnd),
                     _ => {
                         // A poll, not a push: there is no message for this setting. The
                         // reader's own choice outranks it, and `set_dark` does nothing when
@@ -3125,7 +3241,18 @@ impl View {
                     let _ = InvalidateRect(Some(hwnd), None, false);
                     return LRESULT(0);
                 }
-                if self.find.is_some() && in_find_panel(x - self.content_dx(), y, self.client_w) {
+                if self.find.is_some()
+                    && in_find_panel(x - self.content_dx(), y, (self.client_w - self.content_dx()).max(1.0))
+                {
+                    return LRESULT(0);
+                }
+                if let Some(button) = self.page_button_at(x, y) {
+                    self.page_pressed = Some(button);
+                    let _ = SetCapture(hwnd);
+                    let _ = InvalidateRect(Some(hwnd), None, false);
+                    return LRESULT(0);
+                }
+                if self.reading_mode == ReadingMode::Stack && self.page_point(x, y).is_none() {
                     return LRESULT(0);
                 }
                 self.pressed = None;
@@ -3172,7 +3299,7 @@ impl View {
                     let over = if py < TOPBAR_H {
                         self.caption_button_at(px, py).is_none() && self.tab_at(px, py).is_some()
                     } else {
-                        self.hot_at(px, py).is_some()
+                        self.page_button_at(px, py).is_some() || self.hot_at(px, py).is_some()
                     };
                     SetCursor(Some(if over { self.hand } else { self.arrow }));
                     LRESULT(1)
@@ -3189,6 +3316,7 @@ impl View {
                 // nothing.
                 let hot = self.tab_hot;
                 let btn_hot = self.cap_hot;
+                let page_hot = self.page_hot;
                 if y < TOPBAR_H {
                     self.cap_hot = self.caption_button_at(x, y);
                     self.tab_hot = if self.cap_hot.is_none() { self.tab_at(x, y) } else { None };
@@ -3203,16 +3331,21 @@ impl View {
                             self.tracking_leave = true;
                         }
                     }
+                    self.page_hot = None;
+                    self.page_pressed = None;
                 } else {
                     self.tab_hot = None;
                     self.cap_hot = None;
+                    self.page_hot = self.page_button_at(x, y);
                 }
-                if self.tab_hot != hot || self.cap_hot != btn_hot {
+                if self.tab_hot != hot || self.cap_hot != btn_hot || self.page_hot != page_hot {
                     let _ = InvalidateRect(Some(hwnd), None, false);
                 }
                 if self.tree_dragging {
                     self.tree_width = x.clamp(TREE_MIN_W, TREE_MAX_W);
-                    self.relayout();
+                    self.layout_epoch += 1;
+                    self.relayout_keeping_anchor();
+                    self.layout_find();
                     let _ = InvalidateRect(Some(hwnd), None, false);
                 } else if self.dragging {
                     self.scroll_to_thumb(y);
@@ -3226,7 +3359,7 @@ impl View {
                         .press_at
                         .is_some_and(|(px, py)| (x - px).abs() > DRAG_SLOP || (y - py).abs() > DRAG_SLOP);
                     if dragged {
-                        self.auto_scroll(y);
+                        self.auto_scroll(y, hwnd);
                         let to = self.caret_under(x, y);
                         self.selection = Some(Selection { from, to });
                         let _ = InvalidateRect(Some(hwnd), None, false);
@@ -3246,6 +3379,16 @@ impl View {
                 let _ = ReleaseCapture();
                 self.dragging = false;
                 self.tree_dragging = false;
+                let page_button = self.page_pressed.take();
+                if let Some(page_button) = page_button {
+                    let x = ((lp.0 & 0xFFFF) as i16) as f32;
+                    let y = ((lp.0 >> 16) as i16) as f32;
+                    if self.page_button_at(x, y) == Some(page_button) {
+                        self.page_command(if page_button == PageButton::Previous { -1 } else { 1 }, hwnd);
+                    }
+                    let _ = InvalidateRect(Some(hwnd), None, false);
+                    return LRESULT(0);
+                }
                 if let Some(btn) = button {
                     let x = ((lp.0 & 0xFFFF) as i16) as f32;
                     let y = ((lp.0 >> 16) as i16) as f32;
@@ -3286,7 +3429,9 @@ impl View {
             WM_MOUSELEAVE => {
                 // The strip's hovers live only while the pointer is on the window.
                 self.tracking_leave = false;
-                let gone = self.tab_hot.take().is_some() | self.cap_hot.take().is_some();
+                let gone = self.tab_hot.take().is_some()
+                    | self.cap_hot.take().is_some()
+                    | self.page_hot.take().is_some();
                 if gone {
                     let _ = InvalidateRect(Some(hwnd), None, false);
                 }
@@ -3296,7 +3441,7 @@ impl View {
                 // The capture a window control pressed was holding can be taken away
                 // -- a menu opening under the button, another window claiming the
                 // mouse -- and a press nobody watched to its end is no act at all.
-                if self.cap_pressed.take().is_some() {
+                if self.cap_pressed.take().is_some() || self.page_pressed.take().is_some() {
                     let _ = InvalidateRect(Some(hwnd), None, false);
                 }
                 LRESULT(0)
@@ -3320,13 +3465,124 @@ impl View {
         self.clamp_scroll();
     }
 
+    fn cancel_page_transition(&mut self) {
+        self.page_transition = None;
+    }
+
+    fn wheel_navigation(&mut self, ticks: f32, hwnd: HWND) {
+        if self.reading_mode == ReadingMode::Stack {
+            if ticks != 0.0 {
+                self.page_command(if ticks > 0.0 { -1 } else { 1 }, hwnd);
+            }
+        } else {
+            self.scroll_by(-ticks / 120.0 * WHEEL_STEP);
+        }
+    }
+
+    fn set_reading_mode(&mut self, stack: bool, hwnd: HWND) {
+        let mode = if stack { ReadingMode::Stack } else { ReadingMode::Scroll };
+        if self.reading_mode == mode {
+            return;
+        }
+        if self.page_transition.take().is_some() {
+            let _ = unsafe { KillTimer(Some(hwnd), PAGE_TIMER) };
+        }
+        self.reading_mode = mode;
+        self.page_hot = None;
+        self.page_pressed = None;
+        self.snap_to_page();
+        self.remember_document();
+        let _ = unsafe { InvalidateRect(Some(hwnd), None, false) };
+    }
+
+    fn toggle_reading_mode(&mut self, hwnd: HWND) {
+        let stack = self.reading_mode == ReadingMode::Scroll;
+        self.set_reading_mode(stack, hwnd);
+    }
+
+    fn page_command(&mut self, delta: i32, hwnd: HWND) {
+        if self.reading_mode == ReadingMode::Stack {
+            self.turn_page(delta, hwnd);
+        } else {
+            self.scroll_by(delta as Pt * self.page_height());
+        }
+    }
+
+    fn turn_page(&mut self, delta: i32, hwnd: HWND) {
+        if self.reading_mode != ReadingMode::Stack || self.page_transition.is_some() {
+            return;
+        }
+        let from_index = self.current_page_index();
+        let to_index = (from_index as isize + delta as isize)
+            .clamp(0, self.page_count() as isize - 1) as usize;
+        if to_index == from_index {
+            return;
+        }
+        let (Some(from), Some(to)) = (self.page_start(from_index), self.page_start(to_index)) else {
+            return;
+        };
+        self.scroll = from;
+        self.selection = None;
+        self.press_caret = None;
+        self.caret = None;
+        self.wide_active = None;
+        self.wide_offset = 0.0;
+        self.page_transition = Some(PageTransition {
+            to,
+            from_index,
+            to_index,
+            direction: if to_index > from_index { PageDirection::Next } else { PageDirection::Previous },
+            started: std::time::Instant::now(),
+        });
+        let _ = unsafe { SetTimer(Some(hwnd), PAGE_TIMER, PAGE_TICK_MS, None) };
+        let _ = unsafe { InvalidateRect(Some(hwnd), None, false) };
+    }
+
+    fn tick_page_transition(&mut self, hwnd: HWND) {
+        let Some(transition) = self.page_transition.as_ref() else {
+            let _ = unsafe { KillTimer(Some(hwnd), PAGE_TIMER) };
+            return;
+        };
+        let elapsed = transition.started.elapsed().as_millis();
+        if elapsed >= PAGE_TRANSITION_MS {
+            let to = transition.to;
+            self.page_transition = None;
+            self.scroll = to;
+            let _ = unsafe { KillTimer(Some(hwnd), PAGE_TIMER) };
+            self.remember_reading();
+        }
+        let _ = unsafe { InvalidateRect(Some(hwnd), None, false) };
+    }
+
+    fn page_transition_progress(&self) -> Option<f32> {
+        self.page_transition.as_ref().map(|transition| {
+            (transition.started.elapsed().as_millis() as f32 / PAGE_TRANSITION_MS as f32).clamp(0.0, 1.0)
+        })
+    }
+
+    fn page_point(&self, x: f32, y: f32) -> Option<(f32, f32)> {
+        if self.reading_mode == ReadingMode::Stack {
+            if self.page_transition.is_some() { return None; }
+            let layout = self.page_stack_layout();
+            let index = self.current_page_index();
+            if y < layout.top || y > layout.top + self.page_content_height(index) || x < layout.left || x > layout.left + layout.width {
+                return None;
+            }
+            let page_w = (self.client_w - self.content_dx()).max(1.0);
+            let tx = layout.left - (page_w - layout.width) * 0.5;
+            let start = self.page_start(index).unwrap_or(0.0);
+            Some((x - tx, y + start * scale_of(self.dpi) - layout.top))
+        } else {
+            if y < TOPBAR_H || x < self.content_dx() { return None; }
+            Some((x - self.content_dx(), document_y(y, self.scroll, self.dpi)))
+        }
+    }
+
     /// The target under a pointer position, given in device independent pixels from the
     /// window's client origin. The rectangles are stored against the top of the
     /// document, so the only translation the test needs is the scroll.
     fn hot_at(&self, x: f32, y: f32) -> Option<usize> {
-        if y < TOPBAR_H || x < self.content_dx() { return None; }
-        let x = x - self.content_dx();
-        let y = document_y(y, self.scroll, self.dpi);
+        let (x, y) = self.page_point(x, y)?;
         self.hotspots
             .iter()
             .position(|h| {
@@ -3362,9 +3618,7 @@ impl View {
     }
 
     fn wide_region_at(&self, x: f32, y: f32) -> Option<usize> {
-        if y < TOPBAR_H || x < self.content_dx() { return None; }
-        let x = x - self.content_dx();
-        let y = document_y(y, self.scroll, self.dpi);
+        let (x, y) = self.page_point(x, y)?;
         self.wide_regions.iter().position(|r| {
             let shift = self
                 .wide_active
@@ -3378,8 +3632,7 @@ impl View {
     /// The place in the page's text under a pointer position given in client pixels,
     /// translated into document pixels the same way [`View::hot_at`] translates.
     fn caret_under(&self, x: f32, y: f32) -> Caret {
-        let x = (x - self.content_dx()).max(0.0);
-        let y = document_y(y, self.scroll, self.dpi);
+        let Some((x, y)) = self.page_point(x, y) else { return Caret { line: 0, ch: 0 } };
         let shift = self.shift_at(x, y);
         caret_at(&self.sel_index, x - shift, y)
     }
@@ -3390,9 +3643,15 @@ impl View {
     /// The band is narrow and the step small because this runs on every pointer message
     /// while the button is down near an edge, including the ones that do not move: too
     /// fast reads as a page flipping under a stationary cursor.
-    fn auto_scroll(&mut self, y: f32) {
+    fn auto_scroll(&mut self, y: f32, _hwnd: HWND) {
         const EDGE: f32 = 20.0;
         const STEP: Pt = 6.0;
+        if self.reading_mode == ReadingMode::Stack {
+            // A page turn clears the transient drag state; letting edge auto-scroll start
+            // one half way through a selection would turn the next pointer message into a
+            // document-start caret. Cross-page selection is a separate gesture for now.
+            return;
+        }
         if y < EDGE {
             self.scroll_by(-STEP);
         } else if y > self.client_h - EDGE {
@@ -3455,8 +3714,10 @@ impl View {
     /// `false` for the sideways motions, which stay the reader's way of putting a caret on
     /// the page without a mouse -- and from then the same keys mean what they mean
     /// everywhere else.
-    fn scroll_page(&mut self, m: Motion, step: Pt) -> bool {
+    fn scroll_page(&mut self, m: Motion, step: Pt, hwnd: HWND) -> bool {
         match m {
+            Motion::Up if self.reading_mode == ReadingMode::Stack => self.page_command(-1, hwnd),
+            Motion::Down if self.reading_mode == ReadingMode::Stack => self.page_command(1, hwnd),
             Motion::Up => self.scroll_by(-step),
             Motion::Down => self.scroll_by(step),
             Motion::Home | Motion::DocStart => self.go_to_end(true),
@@ -3469,14 +3730,32 @@ impl View {
     /// Take the page to one of its ends, leaving no caret behind to be the next arrow's
     /// starting point.
     fn go_to_end(&mut self, top: bool) {
-        self.scroll = if top { 0.0 } else { Pt::MAX };
+        self.cancel_page_transition();
+        if self.reading_mode == ReadingMode::Stack {
+            let index = if top { 0 } else { self.page_count().saturating_sub(1) };
+            if let Some(scroll) = self.page_start(index) {
+                self.scroll = scroll;
+            }
+        } else {
+            self.scroll = if top { 0.0 } else { Pt::MAX };
+        }
         self.clamp_scroll();
     }
 
     /// Bring the line the caret is on into the window, by the least movement that does.
     fn scroll_to_caret(&mut self, c: Caret) {
+        self.cancel_page_transition();
         let Some(l) = self.sel_index.get(c.line) else { return };
         let k = scale_of(self.dpi);
+        if self.reading_mode == ReadingMode::Stack {
+            let y = l.y / k;
+            let index = page_index_at(&self.page_starts, y);
+            if let Some(scroll) = self.page_start(index) {
+                self.scroll = scroll;
+            }
+            self.clamp_scroll();
+            return;
+        }
         let (top, bottom) = (l.y / k, (l.y + l.h) / k);
         let view = self.client_h / k;
         if top < self.scroll {
@@ -3507,6 +3786,7 @@ impl View {
                 let _ = unsafe { InvalidateRect(Some(hwnd), None, false) };
             }
             HotKind::Document(target) => {
+                self.cancel_page_transition();
                 let from = self.here();
                 let same = self.path.as_deref() == Some(target.path.as_path());
                 if !same {
@@ -3514,10 +3794,14 @@ impl View {
                 }
                 if let Some(at) = target.fragment.as_deref().and_then(|f| heading_index(&self.doc, f)) {
                     if let Some(top) = self.anchor_tops.get(at) {
-                        self.scroll = (*top - self.theme.base).max(0.0);
+                        self.scroll = if self.reading_mode == ReadingMode::Stack {
+                            *top
+                        } else {
+                            (*top - self.theme.base).max(0.0)
+                        };
                     }
                 }
-                self.clamp_scroll();
+                self.snap_to_page();
                 if same && (self.scroll - from.scroll).abs() > 0.5 {
                     self.history.leave(from);
                 }
@@ -3534,9 +3818,14 @@ impl View {
     /// means being able to tell where one came from -- and to get back there.
     fn jump_to(&mut self, top: Option<Pt>, hwnd: HWND) {
         let Some(top) = top else { return };
+        self.cancel_page_transition();
         let from = self.here();
-        self.scroll = (top - self.theme.base).max(0.0);
-        self.clamp_scroll();
+        self.scroll = if self.reading_mode == ReadingMode::Stack {
+            top
+        } else {
+            (top - self.theme.base).max(0.0)
+        };
+        self.snap_to_page();
         // Only a jump that goes somewhere is a step, which keeps the deliberate ones --
         // a citation, a table of contents entry -- in the history and the aimless ones out
         // of it: a page whose every click on an already-visible heading added a rung would
@@ -3618,6 +3907,9 @@ impl View {
             text: !self.sel_index.is_empty(),
             face: self.theme.face,
             measure: self.theme.measure,
+            reading_mode: self.reading_mode,
+            page: self.current_page_index(),
+            page_count: self.page_count(),
             headings: outline(&self.doc, self.anchor_tops.len()),
             offered: TextFace::ALL.iter().map(|f| face_drawable(&self.font, f)).collect(),
         };
@@ -3672,6 +3964,10 @@ impl View {
                 self.zoom_to(z, hwnd);
             }
             Command::ZoomReset => self.zoom_to(Zoom::DESIGN, hwnd),
+            Command::TogglePageMode => self.toggle_reading_mode(hwnd),
+            Command::PageMode(stack) => self.set_reading_mode(stack, hwnd),
+            Command::PreviousPage => self.page_command(-1, hwnd),
+            Command::NextPage => self.page_command(1, hwnd),
             Command::Face(i) => self.set_face(i, hwnd),
             Command::Measure(i) => self.set_measure(i, hwnd),
             Command::Palette(dark) => {
@@ -3701,7 +3997,9 @@ impl View {
                         self.tree = tree::scan(root, 2);
                     }
                 }
-                self.relayout();
+                self.layout_epoch += 1;
+                self.relayout_keeping_anchor();
+                unsafe { self.layout_find() };
             }
             Command::OpenRecent(index) => {
                 if let Some(path) = self.workspace.recent.items().get(index).map(|file| file.path.clone()) {
@@ -3927,7 +4225,7 @@ impl View {
                 self.scroll = scroll;
             }
         }
-        self.clamp_scroll();
+        self.snap_to_page();
         self.prefetch_next_chapter();
         self.update_title(hwnd);
         let _ = unsafe { InvalidateRect(Some(hwnd), None, false) };
@@ -4038,7 +4336,7 @@ impl View {
 
     fn restore_source(&mut self, byte: usize) {
         if let Some(scroll) = scroll_for_source(&self.sel_index, byte, scale_of(self.dpi)) { self.scroll = scroll; }
-        self.clamp_scroll();
+        self.snap_to_page();
     }
 
     fn reload_text(&mut self, decoded: reading::Decoded, hwnd: HWND) {
@@ -4069,7 +4367,8 @@ impl View {
         if let Some(path) = self.path.as_deref() {
             crate::settings::record_document(path, crate::settings::DocumentSettings {
                 line_breaks: self.line_break_override, plain: self.plain_override,
-                source: self.source_view, text: self.text_options, encoding: self.encoding,
+                source: self.source_view, page_stack: self.reading_mode == ReadingMode::Stack,
+                text: self.text_options, encoding: self.encoding,
             });
         }
     }
@@ -4143,19 +4442,27 @@ impl View {
     /// [`View::zoom_to`] has, because the reflow is not uniform: a paragraph that was
     /// six lines is now eight. So the place is remembered as what the reader was looking
     /// at rather than as a distance, and found again where the new layout put it.
-    fn relayout_in_place(&mut self, hwnd: HWND) {
-        // Every caller has just changed something the wrapping answers to -- a face, a
-        // measure, the reading size, the profile -- so every cached page goes stale.
-        self.layout_epoch += 1;
-        let k = scale_of(self.dpi);
-        let anchor = anchor_at(&self.sel_index, self.scroll, k);
+    fn relayout_from_anchor(&mut self, anchor: Option<usize>) {
         self.relayout();
+        let k = scale_of(self.dpi);
         if let Some(a) = anchor {
             if let Some(scroll) = scroll_for_anchor(&self.sel_index, a, k) {
                 self.scroll = scroll;
             }
         }
-        self.clamp_scroll();
+        self.snap_to_page();
+    }
+
+    fn relayout_keeping_anchor(&mut self) {
+        let anchor = anchor_at(&self.sel_index, self.scroll, scale_of(self.dpi));
+        self.relayout_from_anchor(anchor);
+    }
+
+    fn relayout_in_place(&mut self, hwnd: HWND) {
+        // Every caller has just changed something the wrapping answers to -- a face, a
+        // measure, the reading size, the profile -- so every cached page goes stale.
+        self.layout_epoch += 1;
+        self.relayout_keeping_anchor();
         let _ = unsafe { InvalidateRect(Some(hwnd), None, false) };
     }
 
@@ -4171,7 +4478,7 @@ impl View {
         if let Some(scroll) = scroll_for_anchor(&self.sel_index, anchor, k) {
             self.scroll = scroll;
         }
-        self.clamp_scroll();
+        self.snap_to_page();
     }
 
     /// Write down where the reader is standing, for the next window on this page.
@@ -4200,8 +4507,24 @@ impl View {
         }
     }
 
+    fn snap_to_page(&mut self) {
+        if self.reading_mode == ReadingMode::Stack && !self.page_starts.is_empty() {
+            let index = self.current_page_index();
+            if let Some(top) = self.page_start(index) {
+                self.scroll = top;
+            }
+        }
+        self.clamp_scroll();
+    }
+
     /// A relayout can leave the offset past the end of a document that has just grown.
     fn clamp_scroll(&mut self) {
+        if self.reading_mode == ReadingMode::Stack {
+            if let Some(last) = self.page_starts.last().copied() {
+                self.scroll = self.scroll.clamp(0.0, last);
+            }
+            return;
+        }
         let view_h = (self.client_h - TOPBAR_H).max(1.0) / scale_of(self.dpi);
         let max = (self.content_h + self.theme.base - view_h).max(0.0);
         self.scroll = self.scroll.clamp(0.0, max);
@@ -4215,16 +4538,22 @@ impl View {
     /// a reader pressing `+` should never get.
     fn zoom_to(&mut self, zoom: Zoom, hwnd: HWND) {
         let before = self.theme.base;
+        let k = scale_of(self.dpi);
+        let anchor = anchor_at(&self.sel_index, self.scroll, k);
         self.theme.set_zoom(zoom);
         if (self.theme.base - before).abs() < 0.001 {
             // Already at an end of the ladder: nothing moved, so nothing repaints.
             return;
         }
-        self.scroll *= self.theme.base / before;
         self.remember();
         self.layout_epoch += 1;
         self.relayout();
-        self.clamp_scroll();
+        if let Some(a) = anchor {
+            if let Some(scroll) = scroll_for_anchor(&self.sel_index, a, k) {
+                self.scroll = scroll;
+            }
+        }
+        self.snap_to_page();
         let _ = unsafe { InvalidateRect(Some(hwnd), None, false) };
     }
 
@@ -4256,6 +4585,7 @@ impl View {
     }
 
     fn relayout(&mut self) {
+        self.page_transition = None;
         // Every field handed in is borrowed for its own reason: the decoder and the
         // document's directory for figures, and the profile's own math store, so a
         // resize does not reset the document's formulas. The store is picked by
@@ -4283,6 +4613,7 @@ impl View {
         // point at a paragraph rather than at a footnote.
         self.pressed = None;
         self.content_h = page.height;
+        self.page_starts = reader_page_starts(&page, self.stack_page_height(), scale_of(self.dpi));
         self.ops = page.ops;
         self.hotspots = page.hotspots;
         self.wide_regions = page.wide_regions;
@@ -4369,7 +4700,7 @@ impl View {
         if let Some(font) = self.edit_font {
             let _ = SendMessageW(edit, WM_SETFONT, Some(WPARAM(font.0 as usize)), Some(LPARAM(1)));
         }
-        let (x, y, w, h) = find_edit(self.client_w, self.dpi);
+        let (x, y, w, h) = find_edit((self.client_w - self.content_dx()).max(1.0), self.dpi);
         let _ = MoveWindow(edit, x + self.content_dx() as i32, y, w, h, true);
     }
 
@@ -4508,7 +4839,7 @@ impl View {
         };
         let runs = self.font.shape_runs(&text, 0..text.len(), &req, size, 0.02);
         let width: f32 = runs.iter().map(|r| r.width() * k).sum();
-        let (px, py, pw, ph) = find_panel(self.client_w);
+        let (px, py, pw, ph) = find_panel((self.client_w - self.content_dx()).max(1.0));
         // End against the bar's own right edge, so a count that grows from two figures to
         // five does not walk under the box.
         let mut at = px + pw - FIND_PAD - width;
@@ -5349,6 +5680,62 @@ impl View {
         (self.client_h - TOPBAR_H).max(1.0) / scale_of(self.dpi) * 0.85
     }
 
+    fn page_stack_layout(&self) -> PageStackLayout {
+        page_stack_layout_for(self.client_w, self.client_h, self.content_dx())
+    }
+
+    fn stack_page_height(&self) -> Pt {
+        self.page_stack_layout().content_height / scale_of(self.dpi)
+    }
+
+    fn current_page_index(&self) -> usize {
+        page_index_at(&self.page_starts, self.scroll)
+    }
+
+    fn page_start(&self, index: usize) -> Option<Pt> {
+        self.page_starts.get(index).copied()
+    }
+
+    fn page_count(&self) -> usize {
+        self.page_starts.len().max(1)
+    }
+
+    fn page_content_height(&self, index: usize) -> f32 {
+        let layout = self.page_stack_layout();
+        page_content_height_for(&self.page_starts, index, scale_of(self.dpi), layout.content_height)
+    }
+
+    fn page_button_rect(&self, button: PageButton) -> D2D_RECT_F {
+        let layout = self.page_stack_layout();
+        let center = layout.left + layout.width * 0.5;
+        let top = layout.top + layout.height - PAGE_FOOTER_H + 3.0;
+        let (left, right) = match button {
+            PageButton::Previous => (center - PAGE_BUTTON_W - 12.0, center - 12.0),
+            PageButton::Next => (center + 12.0, center + PAGE_BUTTON_W + 12.0),
+        };
+        D2D_RECT_F { left, top, right, bottom: top + PAGE_BUTTON_W - 6.0 }
+    }
+
+    fn page_button_enabled(&self, button: PageButton, index: usize) -> bool {
+        match button {
+            PageButton::Previous => index > 0,
+            PageButton::Next => index + 1 < self.page_count(),
+        }
+    }
+
+    fn page_button_at(&self, x: f32, y: f32) -> Option<PageButton> {
+        if self.reading_mode != ReadingMode::Stack || self.page_transition.is_some() {
+            return None;
+        }
+        let index = self.current_page_index();
+        [PageButton::Previous, PageButton::Next]
+            .into_iter()
+            .filter(|button| self.page_button_enabled(*button, index))
+            .find(|button| {
+                let r = self.page_button_rect(*button);
+                x >= r.left && x <= r.right && y >= r.top && y <= r.bottom
+            })
+    }
     fn thumb_rect(&self) -> Option<(f32, f32, f32, f32)> {
         thumb_rect(self.content_h, self.client_w, (self.client_h - TOPBAR_H).max(1.0), self.scroll, self.dpi)
     }
@@ -5707,6 +6094,7 @@ impl View {
     }
 
     fn thumb_hit(&self, x: f32, y: f32) -> bool {
+        if self.reading_mode == ReadingMode::Stack { return false; }
         let x = x - self.content_dx();
         match self.thumb_rect() {
             Some((tx, ty, _tw, th)) => {
@@ -5760,9 +6148,12 @@ impl View {
     /// page only records where in it its wrapping was built.
     fn take_page(&mut self, page: &mut TabPage) {
         page.epoch = self.layout_epoch;
+        page.layout_dpi = self.dpi;
         std::mem::swap(&mut page.source, &mut self.source);
         std::mem::swap(&mut page.doc, &mut self.doc);
         std::mem::swap(&mut page.ops, &mut self.ops);
+        std::mem::swap(&mut page.reading_mode, &mut self.reading_mode);
+        std::mem::swap(&mut page.page_starts, &mut self.page_starts);
         std::mem::swap(&mut page.sel_index, &mut self.sel_index);
         std::mem::swap(&mut page.hotspots, &mut self.hotspots);
         std::mem::swap(&mut page.note_tops, &mut self.note_tops);
@@ -5795,6 +6186,10 @@ impl View {
     /// What every way of putting another page under the reader has to do once the
     /// fields are in place: nothing of the last page survives but its reading position.
     fn after_switch(&mut self, hwnd: HWND) {
+        self.page_transition = None;
+        self.page_hot = None;
+        self.page_pressed = None;
+        let _ = unsafe { KillTimer(Some(hwnd), PAGE_TIMER) };
         self.preview = None;
         self.wide_active = None;
         self.wide_offset = 0.0;
@@ -5808,7 +6203,7 @@ impl View {
         if let Some(query) = self.find.as_ref().map(|f| f.query.clone()) {
             self.apply_find(&query, false);
         }
-        self.clamp_scroll();
+        self.snap_to_page();
         self.update_title(hwnd);
         let _ = unsafe { InvalidateRect(Some(hwnd), None, false) };
     }
@@ -5830,6 +6225,9 @@ impl View {
         match self.pages.remove(&id) {
             Some(mut page) => {
                 let warm = page.epoch == self.layout_epoch;
+                let anchor = (!warm)
+                    .then(|| anchor_at(&page.sel_index, page.scroll, scale_of(page.layout_dpi)))
+                    .flatten();
                 // The profile comes with the page: its wrapping was built under the
                 // theme its own profile asked for.
                 if page.profile != self.profile {
@@ -5839,7 +6237,7 @@ impl View {
                 self.give_page(&mut page);
                 if !warm {
                     // The text and the parse are kept; only the wrapping is rebuilt.
-                    self.relayout();
+                    self.relayout_from_anchor(anchor);
                 }
                 self.remember_reading();
                 self.after_switch(hwnd);
@@ -6124,6 +6522,7 @@ impl View {
         self.encoding = preferences.encoding;
         self.source = source;
         self.path = path;
+        self.reading_mode = if preferences.page_stack { ReadingMode::Stack } else { ReadingMode::Scroll };
         if self.path.is_none() {
             crate::settings::clear_reading();
         }
@@ -6190,6 +6589,7 @@ impl View {
 
     /// Stand on a remembered place: the page it was on, at the offset it was left at.
     fn reopen(&mut self, there: Visit, hwnd: HWND) {
+        self.cancel_page_transition();
         if let Some(path) = &there.path {
             // A step back to a heading on the page already open is the common kind of
             // jump, and re-reading that file would be the slowest way of doing nothing --
@@ -6205,7 +6605,7 @@ impl View {
             self.set_page(crate::sample::DOCUMENT.to_string(), None, hwnd);
         }
         self.scroll = there.scroll;
-        self.clamp_scroll();
+        self.snap_to_page();
         let _ = unsafe { InvalidateRect(Some(hwnd), None, false) };
     }
 
@@ -6250,6 +6650,24 @@ impl View {
                 D2D1_ANTIALIAS_MODE_PER_PRIMITIVE,
             );
             self.draw_tree_panel(&target);
+            if self.reading_mode == ReadingMode::Stack {
+                target.SetTransform(&Matrix3x2::identity());
+                self.draw_page_stack(&target);
+                self.draw_preview(&target);
+                target.PopAxisAlignedClip();
+                if self.find.is_some() {
+                    target.SetTransform(&Matrix3x2::translation(self.content_dx(), 0.0));
+                    let (px, py, pw, ph) = find_panel((self.client_w - self.content_dx()).max(1.0));
+                    if let Some(brush) = self.brushes.get(&ColorRole::Surface).cloned() {
+                        let r = D2D_RECT_F { left: px, top: py, right: px + pw, bottom: py + ph };
+                        target.FillRectangle(&r, &brush);
+                    }
+                    self.draw_runs(&target, &self.find_label, 0.0);
+                }
+                target.SetTransform(&Matrix3x2::identity());
+                let _ = target.EndDraw(None, None);
+                return;
+            }
             let content_dx = self.content_dx();
             target.SetTransform(&Matrix3x2::translation(content_dx, 0.0));
             // The display list is measured from the top of the document, so the whole of
@@ -6264,147 +6682,12 @@ impl View {
             // document y = `top` is the first line under the strip, at client y = TOPBAR_H.
             let top = up + TOPBAR_H;
             let bottom = top + (self.client_h - TOPBAR_H).max(1.0);
-            for op in self.ops.iter() {
-                match op {
-                    Op::Rect { x, y, w, h, color } => {
-                        let dx = self.shift_at(*x, *y);
-                        if y + h < top || *y > bottom {
-                            continue;
-                        }
-                        let role = *color;
-                        if let Some(brush) = self.brushes.get(&role).cloned() {
-                            let r = D2D_RECT_F {
-                                left: *x + dx,
-                                top: *y - up,
-                                right: x + w + dx,
-                                bottom: y + h - up,
-                            };
-                            target.FillRectangle(&r, &brush);
-                        }
-                    }
-                    Op::Line { x0, y0, x1, y1, thickness, color } => {
-                        let dx = self.shift_at(*x0, *y0);
-                        if (*y1).max(*y0) < top || (*y0).min(*y1) > bottom {
-                            continue;
-                        }
-                        let role = *color;
-                        if let Some(brush) = self.brushes.get(&role).cloned() {
-                            target.DrawLine(
-                                Vector2::new(*x0 + dx, y0 - up),
-                                Vector2::new(*x1 + dx, y1 - up),
-                                &brush,
-                                *thickness,
-                                None,
-                            );
-                        }
-                    }
-                    Op::Image { path, x, y, w, h } => {
-                        let dx = self.shift_at(*x, *y);
-                        if y + h < top || *y > bottom {
-                            continue;
-                        }
-                        let (Some(t), Some(store)) = (self.target.clone(), self.images.as_ref()) else {
-                            continue;
-                        };
-                        if let Some(bmp) = store.bitmap(&t, path) {
-                            let r = D2D_RECT_F {
-                                left: *x + dx,
-                                top: y - up,
-                                right: x + w + dx,
-                                bottom: y + h - up,
-                            };
-                            target.DrawBitmap(
-                                &bmp,
-                                Some(&r),
-                                1.0,
-                                D2D1_BITMAP_INTERPOLATION_MODE_LINEAR,
-                                None,
-                            );
-                        }
-                    }
-                    Op::Runs(runs) => {
-                        // Cloned, not borrowed: a run's x gains its wide region's shift
-                        // here, and the shift belongs to this frame's pointer. The band
-                        // test runs first, though -- off-screen lines are most of a long
-                        // document, and a clone per line of them is the cost of ignoring
-                        // that.
-                        let mut shifted = Vec::new();
-                        for run in runs {
-                            if run.baseline < top - 40.0 || run.baseline > bottom + 40.0 {
-                                continue;
-                            }
-                            let mut run = run.clone();
-                            run.x += self.shift_at(run.x, run.baseline);
-                            shifted.push(run);
-                        }
-                        self.draw_runs(&target, &shifted, up);
-                    }
-                }
-            }
+            self.draw_document(&target, up, top, bottom);
             self.draw_preview(&target);
-            // Every place the search found what the reader typed. Under their own
-            // selection and over the page's ink, because a hit is a suggestion and a drag
-            // is a decision.
-            if let Some(f) = self.find.as_ref() {
-                for (i, m) in f.marks.iter().enumerate() {
-                    let brush = if i == f.focus { &self.focus_brush } else { &self.hit_brush };
-                    let Some(brush) = brush.clone() else { continue };
-                    for (x, y, w, h) in selection_rects(&self.sel_index, *m) {
-                        if y + h < top || y > bottom {
-                            continue;
-                        }
-                        let r = D2D_RECT_F {
-                            left: x + self.shift_at(x, y),
-                            top: y - up,
-                            right: x + w + self.shift_at(x, y),
-                            bottom: y + h - up,
-                        };
-                        target.FillRectangle(&r, &brush);
-                    }
-                }
-            }
-            // The bands of a selection, over the ink and under nothing: their geometry
-            // is the character index's, so a drag never costs a relayout, and drawing
-            // them last is what keeps them visible inside a code panel.
-            if let Some(s) = self.selection {
-                if let Some(brush) = self.sel_brush.clone() {
-                    for (x, y, w, h) in selection_rects(&self.sel_index, s) {
-                        if y + h < top || y > bottom {
-                            continue;
-                        }
-                        let dx = self.shift_at(x, y);
-                        let r = D2D_RECT_F {
-                            left: x + dx,
-                            top: y - up,
-                            right: x + w + dx,
-                            bottom: y + h - up,
-                        };
-                        target.FillRectangle(&r, &brush);
-                    }
-                }
-            }
-            // The caret, when the reader has one and is not marking anything with it. An
-            // arrow that moves an invisible bar is an arrow the reader cannot aim. The
-            // beat is the timer's, which toggles the phase; here only the phase is read,
-            // and a caret under the preview overlay is left out of the panel's way until
-            // the preview is gone rather than dropped, so it comes back where it stood.
-            if self.selection.is_none() && self.caret_on && self.preview.is_none() {
-                if let (Some(c), Some(brush)) = (self.caret, self.brushes.get(&ColorRole::Text).cloned())
-                {
-                    if let Some((x, y, w, h)) = caret_rect(&self.sel_index, c) {
-                        if y + h >= top && y <= bottom {
-                            let dx = self.shift_at(x, y);
-                            let r = D2D_RECT_F {
-                                left: x + dx,
-                                top: y - up,
-                                right: x + w + dx,
-                                bottom: y + h - up,
-                            };
-                            target.FillRectangle(&r, &brush);
-                        }
-                    }
-                }
-            }
+            // Search marks, selection bands, and the caret all belong to the page that
+            // is currently in front. Their line indexes stay global, so snapping to a
+            // new page never changes what a selection means.
+            self.draw_page_overlays(&target, up, top, bottom);
             // The thumb is drawn from its geometry rather than as an op, because an op
             // would mean relaying out the document on every wheel tick. It is the only
             // sign the reader has that the edge of the window can be gripped.
@@ -6422,7 +6705,7 @@ impl View {
             // window, and a clip that begins below that band would erase the bar entire.
             target.PopAxisAlignedClip();
             if self.find.is_some() {
-                let (px, py, pw, ph) = find_panel(self.client_w);
+                let (px, py, pw, ph) = find_panel((self.client_w - self.content_dx()).max(1.0));
                 if let Some(brush) = self.brushes.get(&ColorRole::Surface).cloned() {
                     let r = D2D_RECT_F { left: px, top: py, right: px + pw, bottom: py + ph };
                     target.FillRectangle(&r, &brush);
@@ -6432,6 +6715,163 @@ impl View {
             target.SetTransform(&Matrix3x2::identity());
             let _ = target.EndDraw(None, None);
         }
+    }
+
+    unsafe fn draw_page_stack(&mut self, target: &ID2D1RenderTarget) {
+        let layout = self.page_stack_layout();
+        let current = self.current_page_index();
+        let count = self.page_count();
+        if let Some(transition) = self.page_transition.as_ref() {
+            let t = self.page_transition_progress().unwrap_or(0.0);
+            let t = t * t * (3.0 - 2.0 * t);
+            let distance = layout.height + layout.gap;
+            let (from_top, to_top) = match transition.direction {
+                PageDirection::Next => (layout.top - distance * t, layout.top + distance * (1.0 - t)),
+                PageDirection::Previous => (layout.top + distance * t, layout.top - distance * (1.0 - t)),
+            };
+            // The arriving card is behind the leaving one while the two overlap. That
+            // ordering is what makes the stack read as pages rather than two unrelated
+            // windows crossing on the glass.
+            self.draw_page_card(target, transition.to_index, to_top, t, false);
+            self.draw_page_card(target, transition.from_index, from_top, 1.0 - t, true);
+        } else {
+            if current + 1 < count {
+                let next_top = layout.top + layout.height + layout.gap;
+                self.draw_page_card(target, current + 1, next_top, 1.0, false);
+            }
+            self.draw_page_card(target, current, layout.top, 1.0, true);
+        }
+    }
+
+    unsafe fn draw_page_card(
+        &self,
+        target: &ID2D1RenderTarget,
+        index: usize,
+        top: f32,
+        opacity: f32,
+        with_overlays: bool,
+    ) {
+        if opacity <= 0.001 {
+            return;
+        }
+        let layout = self.page_stack_layout();
+        let Some(start) = self.page_start(index) else { return };
+        let card = D2D_RECT_F {
+            left: layout.left,
+            top,
+            right: layout.left + layout.width,
+            bottom: top + layout.height,
+        };
+        let rounded = D2D1_ROUNDED_RECT {
+            rect: card,
+            radiusX: 8.0,
+            radiusY: 8.0,
+        };
+        // A soft offset under the card gives the stack a little depth without turning
+        // the reader's page into a drop shadow effects panel.
+        let mut shadow_color = d2d(self.palette.page_shadow);
+        shadow_color.a = 0.18 * opacity;
+        if let Ok(shadow) = target.CreateSolidColorBrush(&shadow_color, None) {
+            let shadow_rect = D2D1_ROUNDED_RECT {
+                rect: D2D_RECT_F {
+                    left: card.left,
+                    top: card.top + 4.0,
+                    right: card.right,
+                    bottom: card.bottom + 4.0,
+                },
+                radiusX: 8.0,
+                radiusY: 8.0,
+            };
+            target.FillRoundedRectangle(&shadow_rect, &shadow);
+        }
+
+        target.PushAxisAlignedClip(&card, D2D1_ANTIALIAS_MODE_PER_PRIMITIVE);
+        let layer = D2D1_LAYER_PARAMETERS {
+            contentBounds: card,
+            opacity,
+            layerOptions: D2D1_LAYER_OPTIONS_INITIALIZE_FOR_CLEARTYPE,
+            ..Default::default()
+        };
+        target.PushLayer(&layer, None);
+        if let Some(surface) = self.brushes.get(&ColorRole::PageSurface) {
+            target.FillRoundedRectangle(&rounded, surface);
+        }
+
+        let page_w = (self.client_w - self.content_dx()).max(1.0);
+        let tx = layout.left - (page_w - layout.width) * 0.5;
+        target.SetTransform(&Matrix3x2::translation(tx, 0.0));
+        let up = start * scale_of(self.dpi) - top;
+        let content_height = self.page_content_height(index);
+        let bottom = up + content_height;
+        let content_rect = D2D_RECT_F {
+            left: layout.left,
+            top,
+            right: layout.left + layout.width,
+            bottom: top + content_height,
+        };
+        target.SetTransform(&Matrix3x2::identity());
+        target.PushAxisAlignedClip(&content_rect, D2D1_ANTIALIAS_MODE_PER_PRIMITIVE);
+        target.SetTransform(&Matrix3x2::translation(tx, 0.0));
+        self.draw_document(target, up, up, bottom);
+        if with_overlays {
+            self.draw_page_overlays(target, up, up, bottom);
+        }
+        target.PopAxisAlignedClip();
+        target.SetTransform(&Matrix3x2::identity());
+        if with_overlays && self.page_transition.is_none() {
+            self.draw_page_footer(target, index);
+        }
+        target.PopLayer();
+        target.PopAxisAlignedClip();
+        target.SetTransform(&Matrix3x2::identity());
+    }
+
+    unsafe fn draw_page_footer(&self, target: &ID2D1RenderTarget, index: usize) {
+        let Some(format) = self.tab_format.clone() else { return };
+        let muted = self.brushes.get(&ColorRole::Muted).cloned();
+        let hover = self.brushes.get(&ColorRole::TabHover).cloned();
+        let Some(ink) = muted.as_ref() else { return };
+        for (button, glyph) in [(PageButton::Previous, "\u{2191}"), (PageButton::Next, "\u{2193}")] {
+            let rect = self.page_button_rect(button);
+            let enabled = self.page_button_enabled(button, index);
+            let fill = if enabled && self.page_pressed == Some(button) {
+                self.brushes.get(&ColorRole::PageShadow)
+            } else if enabled && self.page_hot == Some(button) {
+                hover.as_ref()
+            } else {
+                None
+            };
+            if let Some(fill) = fill {
+                let rounded = D2D1_ROUNDED_RECT { rect, radiusX: 8.0, radiusY: 8.0 };
+                target.FillRoundedRectangle(&rounded, fill);
+            }
+            let text = utf16(glyph);
+            target.DrawText(
+                &text,
+                &format,
+                &rect,
+                ink,
+                D2D1_DRAW_TEXT_OPTIONS_CLIP,
+                DWRITE_MEASURING_MODE_NATURAL,
+            );
+        }
+        let layout = self.page_stack_layout();
+        let label = format!("{} / {}", index + 1, self.page_count());
+        let label_rect = D2D_RECT_F {
+            left: layout.left + layout.width * 0.5 - 42.0,
+            top: layout.top + layout.height - PAGE_FOOTER_H + 5.0,
+            right: layout.left + layout.width * 0.5 + 42.0,
+            bottom: layout.top + layout.height - 4.0,
+        };
+        let text = utf16(&label);
+        target.DrawText(
+            &text,
+            &format,
+            &label_rect,
+            ink,
+            D2D1_DRAW_TEXT_OPTIONS_CLIP,
+            DWRITE_MEASURING_MODE_NATURAL,
+        );
     }
 
     unsafe fn draw_preview(&mut self, target: &ID2D1RenderTarget) {
@@ -6503,7 +6943,146 @@ impl View {
         }
     }
 
-    /// One face's positioned glyphs, lifted by `up` into window coordinates.
+    /// Draw the display list into a clipped window. The same operation list serves the
+    /// continuous viewport and each card in the stack; only `up` and the visible band
+    /// change between them.
+    unsafe fn draw_document(
+        &self,
+        target: &ID2D1RenderTarget,
+        up: Pt,
+        top: Pt,
+        bottom: Pt,
+    ) {
+        for op in self.ops.iter() {
+            match op {
+                Op::Rect { x, y, w, h, color } => {
+                    let dx = self.shift_at(*x, *y);
+                    if y + h < top || *y > bottom {
+                        continue;
+                    }
+                    let role = *color;
+                    if let Some(brush) = self.brushes.get(&role).cloned() {
+                        let r = D2D_RECT_F {
+                            left: *x + dx,
+                            top: *y - up,
+                            right: x + w + dx,
+                            bottom: y + h - up,
+                        };
+                        target.FillRectangle(&r, &brush);
+                    }
+                }
+                Op::Line { x0, y0, x1, y1, thickness, color } => {
+                    let dx = self.shift_at(*x0, *y0);
+                    if (*y1).max(*y0) < top || (*y0).min(*y1) > bottom {
+                        continue;
+                    }
+                    let role = *color;
+                    if let Some(brush) = self.brushes.get(&role).cloned() {
+                        target.DrawLine(
+                            Vector2::new(*x0 + dx, y0 - up),
+                            Vector2::new(*x1 + dx, y1 - up),
+                            &brush,
+                            *thickness,
+                            None,
+                        );
+                    }
+                }
+                Op::Image { path, x, y, w, h } => {
+                    let dx = self.shift_at(*x, *y);
+                    if y + h < top || *y > bottom {
+                        continue;
+                    }
+                    let (Some(t), Some(store)) = (self.target.clone(), self.images.as_ref()) else {
+                        continue;
+                    };
+                    if let Some(bmp) = store.bitmap(&t, path) {
+                        let r = D2D_RECT_F {
+                            left: *x + dx,
+                            top: y - up,
+                            right: x + w + dx,
+                            bottom: y + h - up,
+                        };
+                        target.DrawBitmap(
+                            &bmp,
+                            Some(&r),
+                            1.0,
+                            D2D1_BITMAP_INTERPOLATION_MODE_LINEAR,
+                            None,
+                        );
+                    }
+                }
+                Op::Runs(runs) => {
+                    let mut shifted = Vec::new();
+                    for run in runs {
+                        if run.baseline < top - 40.0 || run.baseline > bottom + 40.0 {
+                            continue;
+                        }
+                        let mut run = run.clone();
+                        run.x += self.shift_at(run.x, run.baseline);
+                        shifted.push(run);
+                    }
+                    self.draw_runs(target, &shifted, up);
+                }
+            }
+        }
+    }
+
+    /// Draw the marks that belong to the current page only. They stay in the full
+    /// document's line index, so a page change never renumbers a selection.
+    unsafe fn draw_page_overlays(&self, target: &ID2D1RenderTarget, up: Pt, top: Pt, bottom: Pt) {
+        if let Some(f) = self.find.as_ref() {
+            for (i, m) in f.marks.iter().enumerate() {
+                let brush = if i == f.focus { &self.focus_brush } else { &self.hit_brush };
+                let Some(brush) = brush.clone() else { continue };
+                for (x, y, w, h) in selection_rects(&self.sel_index, *m) {
+                    if y + h < top || y > bottom {
+                        continue;
+                    }
+                    let r = D2D_RECT_F {
+                        left: x + self.shift_at(x, y),
+                        top: y - up,
+                        right: x + w + self.shift_at(x, y),
+                        bottom: y + h - up,
+                    };
+                    target.FillRectangle(&r, &brush);
+                }
+            }
+        }
+        if let Some(s) = self.selection {
+            if let Some(brush) = self.sel_brush.clone() {
+                for (x, y, w, h) in selection_rects(&self.sel_index, s) {
+                    if y + h < top || y > bottom {
+                        continue;
+                    }
+                    let dx = self.shift_at(x, y);
+                    let r = D2D_RECT_F {
+                        left: x + dx,
+                        top: y - up,
+                        right: x + w + dx,
+                        bottom: y + h - up,
+                    };
+                    target.FillRectangle(&r, &brush);
+                }
+            }
+        }
+        if self.selection.is_none() && self.caret_on && self.preview.is_none() {
+            if let (Some(c), Some(brush)) = (self.caret, self.brushes.get(&ColorRole::Text).cloned()) {
+                if let Some((x, y, w, h)) = caret_rect(&self.sel_index, c) {
+                    if y + h >= top && y <= bottom {
+                        let dx = self.shift_at(x, y);
+                        let r = D2D_RECT_F {
+                            left: x + dx,
+                            top: y - up,
+                            right: x + w + dx,
+                            bottom: y + h - up,
+                        };
+                        target.FillRectangle(&r, &brush);
+                    }
+                }
+            }
+        }
+    }
+
     ///
     /// Shared by the page's own runs and by the find bar's count, which is the only other
     /// thing this window writes letters of. Both are measured in their own space against
@@ -7702,26 +8281,49 @@ fn translate_pdf_op(op: &Op, dy: f32) -> Op {
     translated
 }
 
+fn page_index_at(starts: &[Pt], scroll: Pt) -> usize {
+    if starts.is_empty() { return 0; }
+    starts.partition_point(|top| *top <= scroll + 0.01).saturating_sub(1)
+}
+
+fn page_content_height_for(starts: &[Pt], index: usize, scale: Pt, nominal: Pt) -> Pt {
+    let Some(start) = starts.get(index).copied() else { return nominal };
+    starts
+        .get(index + 1)
+        .map(|next| ((next - start) * scale).clamp(1.0, nominal))
+        .unwrap_or(nominal)
+}
+
 fn pdf_page_starts(page: &Page, page_height: Pt) -> Vec<Pt> {
-    if !page_height.is_finite() || page_height <= 0.0 {
+    reader_page_starts(page, page_height, 1.0)
+}
+
+/// Line-safe page starts shared by the PDF writer and the on-screen page stack.
+///
+/// `Page::sel` is measured in DIPs at the live render target, while the document
+/// heights and heading anchors are points. `scale` is the one conversion between those
+/// two spaces; passing `1.0` keeps the PDF path at its 72dpi coordinate system.
+fn reader_page_starts(page: &Page, page_height: Pt, scale: Pt) -> Vec<Pt> {
+    if !page_height.is_finite() || page_height <= 0.0 || !scale.is_finite() || scale <= 0.0 {
         return vec![0.0];
     }
     if page.sel.is_empty() {
         let mut starts = vec![0.0];
         while *starts.last().unwrap_or(&0.0) + page_height < page.height {
-            let next = starts.last().copied().unwrap_or(0.0) + page_height;
-            starts.push(next);
+            starts.push(starts.last().copied().unwrap_or(0.0) + page_height);
         }
         return starts;
     }
     let mut starts = vec![0.0];
     let mut limit = page_height;
     for line in &page.sel {
-        if line.y + line.h <= limit + 0.01 {
+        let y = line.y / scale;
+        let height = line.h / scale;
+        if y + height <= limit + 0.01 {
             continue;
         }
         let previous = *starts.last().unwrap_or(&0.0);
-        if line.y <= previous + 0.01 {
+        if y <= previous + 0.01 {
             continue;
         }
         // A heading is kept with the lines that follow it. If the first line that
@@ -7731,8 +8333,8 @@ fn pdf_page_starts(page: &Page, page_height: Pt) -> Vec<Pt> {
             .anchor_tops
             .iter()
             .copied()
-            .find(|top| *top >= previous && *top < line.y && line.y - *top <= line.h * 2.0);
-        let start = heading.unwrap_or(line.y);
+            .find(|top| *top >= previous && *top < y && y - *top <= height * 2.0);
+        let start = heading.unwrap_or(y);
         if start > previous + 0.01 {
             starts.push(start);
             limit = start + page_height;
@@ -8512,6 +9114,67 @@ mod tests {
     }
 
     #[test]
+    fn live_page_starts_convert_display_pixels_to_points() {
+        let line = |y, h| SelLine {
+            source: None,
+            y,
+            h,
+            join: Join::None,
+            chars: Vec::new(),
+            copies: Vec::new(),
+            xs: Vec::new(),
+            ends: Vec::new(),
+        };
+        let page = Page {
+            ops: Vec::new(),
+            height: 1_000.0,
+            column: 400.0,
+            left: 0.0,
+            hotspots: Vec::new(),
+            note_tops: Vec::new(),
+            anchor_tops: Vec::new(),
+            sel: vec![line(500.0, 30.0), line(900.0, 30.0)],
+            hyphens: HyphenCount::default(),
+            wide_regions: Vec::new(),
+            table_headers: Vec::new(),
+            table_spans: Vec::new(),
+            note_spans: Vec::new(),
+            math_texts: Vec::new(),
+        };
+        assert_eq!(reader_page_starts(&page, 400.0, 2.0), vec![0.0, 450.0]);
+    }
+
+    #[test]
+    fn a_page_index_is_derived_from_the_nearest_start() {
+        let starts = [0.0, 240.0, 520.0];
+        assert_eq!(page_index_at(&starts, -20.0), 0);
+        assert_eq!(page_index_at(&starts, 0.0), 0);
+        assert_eq!(page_index_at(&starts, 239.9), 0);
+        assert_eq!(page_index_at(&starts, 240.0), 1);
+        assert_eq!(page_index_at(&starts, 700.0), 2);
+        assert_eq!(page_index_at(&[], 700.0), 0);
+    }
+
+    #[test]
+    fn a_protected_heading_does_not_make_adjacent_cards_overlap() {
+        let starts = [0.0, 350.0, 800.0];
+        assert_eq!(page_content_height_for(&starts, 0, 1.0, 400.0), 350.0);
+        assert_eq!(page_content_height_for(&starts, 1, 1.0, 400.0), 400.0);
+    }
+
+    #[test]
+    fn the_page_stack_stays_inside_the_reader_and_leaves_a_peek() {
+        for (w, h, dx) in [(320.0, 480.0, 0.0), (1080.0, 800.0, 220.0)] {
+            let layout = page_stack_layout_for(w, h, dx);
+            assert!(layout.left >= dx && layout.left + layout.width <= w);
+            assert!(layout.top >= TOPBAR_H);
+            assert!(layout.top + layout.height < h);
+            let next_top = layout.top + layout.height + layout.gap;
+            assert!(next_top < h && h - next_top > 0.0, "the next page has no visible corner");
+        }
+    }
+
+    #[test]
     fn pdf_rtl_glyph_positions_follow_visual_edges() {
         let advances = [10.0, 20.0];
         assert_eq!(pdf_glyph_x(100.0, &advances, 0, 0), 100.0);
@@ -8691,6 +9354,19 @@ mod tests {
             .collect();
         let ends = xs[1..].to_vec();
         SelLine { source: None, y, h: CHAR * 1.5, join: Join::None, chars, copies: Vec::new(), xs, ends }
+    }
+
+    #[test]
+    fn the_reading_mode_menu_names_both_modes_and_page_edges() {
+        let mut stack = state(false, None, None, false, true);
+        stack.reading_mode = ReadingMode::Stack;
+        stack.page = 0;
+        stack.page_count = 2;
+        let rows = all_rows(&stack);
+        assert!(rows.iter().any(|(cmd, _, checked)| *cmd == Command::PageMode(false) && !checked));
+        assert!(rows.iter().any(|(cmd, _, checked)| *cmd == Command::PageMode(true) && *checked));
+        assert!(rows.iter().any(|(cmd, enabled, _)| *cmd == Command::PreviousPage && !enabled));
+        assert!(rows.iter().any(|(cmd, enabled, _)| *cmd == Command::NextPage && *enabled));
     }
 
     #[test]
