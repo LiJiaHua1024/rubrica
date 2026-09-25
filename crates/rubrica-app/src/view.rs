@@ -5095,8 +5095,10 @@ impl View {
     /// answer to: left-aligned from the strip's left edge, each pill as wide as its
     /// label asks and no wider than the cap, a step apart.
     ///
-    /// The measurement is a laid-out label kept until the tab list changes, so a wheel
-    /// tick or a hover never shapes a file name twice.
+    /// The pill under the pointer is one close-button wider than its label, which is
+    /// where its `×` then lives: room the label never occupies, instead of an ink drawn
+    /// over the title's last letters. The measurement is a laid-out label kept until the
+    /// tab list changes, so a wheel tick or a hover never shapes a file name twice.
     fn tab_metrics(&mut self) -> Vec<(TabId, f32, f32)> {
         let titles = self.tab_titles();
         if self.tab_labels.as_ref().is_none_or(|(key, _)| *key != titles) {
@@ -5113,14 +5115,16 @@ impl View {
             }
             self.tab_labels = Some((titles, labels));
         }
+        let hot = self.tab_hot;
         let labels = self.tab_labels.as_ref().map(|(_, l)| l).expect("just built");
         let mut left = TAB_FIRST_LEFT;
         labels
             .iter()
             .map(|label| {
                 let here = left;
-                left += label.width + TAB_GAP;
-                (label.id, here, label.width)
+                let width = if hot == Some(label.id) { label.width + TAB_CLOSE_W } else { label.width };
+                left += width + TAB_GAP;
+                (label.id, here, width)
             })
             .collect()
     }
@@ -5133,14 +5137,16 @@ impl View {
             .map(|(id, _, _)| id)
     }
 
-    /// The close zone of the pill the pointer is on, which is where its `×` shows.
+    /// The close zone of the hovered pill, which is the room its `×` is drawn in: the
+    /// strip the pill grew for the purpose, and nowhere else.
     fn tab_close_at(&mut self, x: f32, y: f32) -> Option<TabId> {
         if y >= TABBAR_H { return None; }
+        let hot = self.tab_hot?;
         let pill_top = (TABBAR_H - TAB_PILL_H) * 0.5;
         let pill_band = pill_top..pill_top + TAB_PILL_H;
         self.tab_metrics()
             .into_iter()
-            .find(|(_, left, width)| x >= left + width - TAB_CLOSE_W && x < left + width && pill_band.contains(&y))
+            .find(|(id, left, width)| *id == hot && x >= left + width - TAB_CLOSE_W && x < left + width && pill_band.contains(&y))
             .map(|(id, _, _)| id)
     }
 
