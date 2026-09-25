@@ -3070,6 +3070,11 @@ impl View {
         self.hotspots
             .iter()
             .position(|h| {
+                // A wide table owns no click: its body is prose to select, and the pan
+                // gesture finds its region on its own when the shifted wheel asks for it.
+                if matches!(&h.kind, HotKind::Wide(i) if self.wide_regions.get(*i).is_some_and(|r| r.kind == WideKind::Table)) {
+                    return false;
+                }
                 let shift = self
                     .wide_active
                     .and_then(|i| self.wide_regions.get(i))
@@ -6480,18 +6485,29 @@ fn layout_table(
 
     let grid_w = total;
     let grid_top = y;
+    // Rules are fractions of the type size, not device pixels: at 200% dpi a hairline
+    // set in pixels is a bar.
+    let rule = size * 0.05;
     let header_start = ops.len();
     ops.push(Op::Rect { x: left * k, y: y * k, w: grid_w * k, h: 0.0, color: ColorRole::Surface });
     let panel = ops.len() - 1;
+    // The grid's top edge rides with the header block, so a pagination that carries the
+    // header to the next page carries the edge with it.
+    ops.push(Op::Line {
+        x0: left * k,
+        y0: grid_top * k,
+        x1: (left + grid_w) * k,
+        y1: grid_top * k,
+        thickness: rule * 0.6 * k,
+        color: ColorRole::Faint,
+    });
 
     let head_h = paint_row(&t.head, y, true, ops, hots, sel);
     y += head_h;
     // The header's rule is the one line a grid cannot do without, so it is the darkest
     // of them; the rules between rows only have to say where a row ends, and are drawn
     // lighter so that a page of tables reads as text with structure rather than as a
-    // spreadsheet. Both are fractions of the type size, since neither is a device
-    // pixel: at 200% dpi a hairline set in pixels is a bar.
-    let rule = size * 0.05;
+    // spreadsheet.
     ops.push(Op::Line {
         x0: left * k,
         y0: y * k,
