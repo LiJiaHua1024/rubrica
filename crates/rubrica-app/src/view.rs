@@ -125,8 +125,6 @@ const TAB_FIRST_LEFT: Pt = 8.0;
 const TAB_PAD_X: Pt = 11.0;
 const TAB_MIN_W: Pt = 72.0;
 const TAB_MAX_W: Pt = 220.0;
-/// The square the new-tab button answers in, after the last pill.
-const TAB_PLUS_SIZE: Pt = 24.0;
 /// The right-hand strip of a pill that closes it, once the pointer is on the pill.
 const TAB_CLOSE_W: Pt = 16.0;
 const TREE_ROW_H: Pt = 24.0;
@@ -947,10 +945,9 @@ pub struct View {
     /// Measured tab labels, keyed on the tab list that produced them: hit-testing and
     /// painting answer from one geometry, and a repaint never re-shapes a file name.
     tab_labels: Option<TabLabelCache>,
-    /// The pill, and the new-tab button, the pointer is over. Cleared when USER32 says
-    /// the pointer has left the window.
+    /// The pill the pointer is over. Cleared when USER32 says the pointer has left
+    /// the window.
     tab_hot: Option<TabId>,
-    plus_hot: bool,
     tracking_leave: bool,
     /// Other tabs' materialized pages; see [`TabPage`].
     pages: HashMap<TabId, TabPage>,
@@ -2005,7 +2002,6 @@ pub fn run(mut source: String, path: Option<PathBuf>) -> Result<()> {
         tab_format: None,
         tab_labels: None,
         tab_hot: None,
-        plus_hot: false,
         tracking_leave: false,
         pages: HashMap::new(),
         layout_epoch: 0,
@@ -2831,15 +2827,13 @@ impl View {
                 let x = ((lp.0 & 0xFFFF) as i16) as f32;
                 let y = ((lp.0 >> 16) as i16) as f32;
                 // The strip answers for its own presses, and keeps the page's: a close
-                // zone first, then a pill, then the new-tab button, and a press on none
-                // of them is a press on nothing at all.
+                // zone first, then a pill, and a press on neither is a press on nothing
+                // at all.
                 if y < TABBAR_H {
                     if let Some(id) = self.tab_close_at(x, y) {
                         self.apply_command(Command::CloseTab(id), hwnd);
                     } else if let Some(id) = self.tab_at(x, y) {
                         self.switch_to_tab(id, hwnd);
-                    } else if self.plus_at(x, y) {
-                        self.apply_command(Command::OpenFile, hwnd);
                     }
                     return LRESULT(0);
                 }
@@ -2908,7 +2902,7 @@ impl View {
                     let (px, py) = (pt.x as f32, pt.y as f32);
                     // The strip's controls are as much a hand as a link is.
                     let over = if py < TABBAR_H {
-                        self.tab_at(px, py).is_some() || self.plus_at(px, py)
+                        self.tab_at(px, py).is_some()
                     } else {
                         self.hot_at(px, py).is_some()
                     };
@@ -2921,15 +2915,13 @@ impl View {
             WM_MOUSEMOVE => {
                 let x = ((lp.0 & 0xFFFF) as i16) as f32;
                 let y = ((lp.0 >> 16) as i16) as f32;
-                // The strip's hovers -- a pill, its close button by way of the pill, the
-                // new-tab button -- are asked for before the drags below, since a pointer
-                // that has left the strip owes neither of them any ink. A change costs an
-                // invalidate; an unchanged hover costs nothing.
+                // The strip's hover -- which pill the pointer holds -- is asked for
+                // before the drags below, since a pointer that has left the strip owes
+                // it no ink. A change costs an invalidate; an unchanged hover costs
+                // nothing.
                 let hot = self.tab_hot;
-                let plus = self.plus_hot;
                 if y < TABBAR_H {
                     self.tab_hot = self.tab_at(x, y);
-                    self.plus_hot = self.plus_at(x, y);
                     if !self.tracking_leave {
                         let mut tme = TRACKMOUSEEVENT {
                             cbSize: std::mem::size_of::<TRACKMOUSEEVENT>() as u32,
@@ -2943,9 +2935,8 @@ impl View {
                     }
                 } else {
                     self.tab_hot = None;
-                    self.plus_hot = false;
                 }
-                if self.tab_hot != hot || self.plus_hot != plus {
+                if self.tab_hot != hot {
                     let _ = InvalidateRect(Some(hwnd), None, false);
                 }
                 if self.tree_dragging {
@@ -3006,11 +2997,10 @@ impl View {
                 LRESULT(0)
             }
             WM_MOUSELEAVE => {
-                // The tab strip's hovers live only while the pointer is on the window.
+                // The tab strip's hover lives only while the pointer is on the window.
                 self.tracking_leave = false;
-                if self.tab_hot.is_some() || self.plus_hot {
+                if self.tab_hot.is_some() {
                     self.tab_hot = None;
-                    self.plus_hot = false;
                     let _ = InvalidateRect(Some(hwnd), None, false);
                 }
                 LRESULT(0)
@@ -5099,22 +5089,6 @@ impl View {
             .map(|(id, _, _)| id)
     }
 
-    fn plus_rect(&mut self) -> D2D_RECT_F {
-        let left = self.tab_metrics().last().map_or(TAB_FIRST_LEFT, |(_, l, w)| l + w + TAB_GAP);
-        D2D_RECT_F {
-            left,
-            top: (TABBAR_H - TAB_PLUS_SIZE) * 0.5,
-            right: left + TAB_PLUS_SIZE,
-            bottom: (TABBAR_H + TAB_PLUS_SIZE) * 0.5,
-        }
-    }
-
-    fn plus_at(&mut self, x: f32, y: f32) -> bool {
-        if y >= TABBAR_H { return false; }
-        let r = self.plus_rect();
-        x >= r.left && x < r.right && y >= r.top && y < r.bottom
-    }
-
     fn content_dx(&self) -> f32 {
         if self.tree_visible { self.tree_width } else { 0.0 }
     }
@@ -5218,16 +5192,6 @@ impl View {
                     target.DrawText(&utf16("\u{00D7}"), format, &close, brush, D2D1_DRAW_TEXT_OPTIONS_CLIP, DWRITE_MEASURING_MODE_NATURAL);
                 }
             }
-        }
-        let plus = self.plus_rect();
-        if self.plus_hot {
-            if let Some(brush) = hover.as_ref() {
-                let round = D2D1_ROUNDED_RECT { rect: plus, radiusX: TAB_PLUS_SIZE * 0.5, radiusY: TAB_PLUS_SIZE * 0.5 };
-                target.FillRoundedRectangle(&round, brush);
-            }
-        }
-        if let (Some(format), Some(brush)) = (format.as_ref(), muted.as_ref()) {
-            target.DrawText(&utf16("+"), format, &plus, brush, D2D1_DRAW_TEXT_OPTIONS_CLIP, DWRITE_MEASURING_MODE_NATURAL);
         }
     }
 

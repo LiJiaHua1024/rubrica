@@ -24,7 +24,7 @@ mod analysis;
 use windows::Win32::Graphics::DirectWrite::{
     DWRITE_FACTORY_TYPE_SHARED, DWRITE_FONT_METRICS, DWRITE_FONT_STRETCH_NORMAL,
     DWRITE_FONT_STYLE_ITALIC, DWRITE_FONT_STYLE_NORMAL, DWRITE_FONT_WEIGHT,
-    DWRITE_PARAGRAPH_ALIGNMENT_CENTER, DWRITE_TEXT_ALIGNMENT_CENTER,
+    DWRITE_PARAGRAPH_ALIGNMENT_CENTER, DWRITE_TEXT_ALIGNMENT_CENTER, DWRITE_TEXT_ALIGNMENT_LEADING,
     DWRITE_TEXT_METRICS,
     DWRITE_GLYPH_METRICS, DWRITE_GLYPH_OFFSET, DWRITE_SCRIPT_ANALYSIS,
     DWRITE_SHAPING_GLYPH_PROPERTIES,
@@ -617,19 +617,25 @@ impl FontEngine {
     ///
     /// A label wider than `max_width` is trimmed with an ellipsis rather than run past
     /// the room it has, so the caller can size its control from the width alone. The
-    /// layout comes back ready to draw: the same object that answered the measurement
-    /// paints the glyphs, and nothing shapes the label a second time.
+    /// layout comes back left-aligned and ready to draw: the text starts at the origin
+    /// it is drawn at, which is what a control sized from `width` has to be able to
+    /// assume -- a centred layout would set a short label in the middle of the wide
+    /// measuring box and send it spilling out of the control that fits it.
     pub fn ui_label(&self, text: &str, family: &str, size: f32, max_width: f32) -> Option<(IDWriteTextLayout, f32, f32)> {
         let format = self.text_format(family, size).ok()?;
+        // A layout takes the string's length as its own, so the terminator that a
+        // PCWSTR would have wanted stays out of the measured text.
         let text = utf16(text);
+        let text = &text[..text.len() - 1];
         unsafe {
             let factory: IDWriteFactory = DWriteCreateFactory(DWRITE_FACTORY_TYPE_SHARED).ok()?;
             let layout: IDWriteTextLayout = factory.CreateTextLayout(
-                &text,
+                text,
                 &format,
                 max_width,
                 size * 2.0,
             ).ok()?;
+            layout.SetTextAlignment(DWRITE_TEXT_ALIGNMENT_LEADING).ok()?;
             let sign = factory.CreateEllipsisTrimmingSign(&format).ok()?;
             let trimming = DWRITE_TRIMMING {
                 granularity: DWRITE_TRIMMING_GRANULARITY_CHARACTER,
