@@ -112,8 +112,51 @@ const WM_APP_QUIT: u32 = WM_APP + 57;
 
 /// A space held at least this long is a glance: releasing it closes the preview.
 /// A quicker tap is a toggle instead -- press to open, press again to close -- which
-/// is how a preview is read for longer than a glance. QuickLook's own threshold.
-const HOLD_TO_CLOSE: Duration = Duration::from_millis(750);
+/// is how a preview is read for longer than a glance. A finger's own tap rarely
+/// outlives 250 milliseconds, so half a second -- the number long-press has settled
+/// on everywhere else -- says "held" without ever catching a tap on its way up.
+const HOLD_TO_CLOSE: Duration = Duration::from_millis(500);
+
+/// What a press of the space bar means, as the reader's menu states it.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum SpaceMode {
+    /// Press to show, press again to hide; releasing never hides.
+    Tap,
+    /// Hold to show; releasing hides, however briefly the key was held down.
+    Hold,
+    /// Both at once: a quick tap toggles, a held key hides on its release.
+    #[default]
+    Mixed,
+}
+
+/// The space bar's meaning, as it was last written down. A mode absent from the
+/// registry is no choice that was taken away -- it is the reader who has never
+/// opened the menu, and the mixed answer is what they have always had.
+pub fn space_mode() -> SpaceMode {
+    match settings::plain_word("PeekSpace") {
+        Some(0) => SpaceMode::Tap,
+        Some(1) => SpaceMode::Hold,
+        _ => SpaceMode::Mixed,
+    }
+}
+
+pub fn record_space_mode(mode: SpaceMode) {
+    let value = match mode {
+        SpaceMode::Tap => 0,
+        SpaceMode::Hold => 1,
+        SpaceMode::Mixed => 2,
+    };
+    settings::record_plain_word("PeekSpace", value);
+}
+
+/// Whether a preview lives only while the folder that opened it keeps the focus.
+pub fn focus_close() -> bool {
+    settings::plain_word("PeekFocusClose") == Some(1)
+}
+
+pub fn record_focus_close(on: bool) {
+    settings::record_plain_word("PeekFocusClose", u32::from(on));
+}
 
 /// A key outside the preview vocabulary starts a cooldown that silences space for a
 /// moment: a word typed into the rename box should not end in a preview an instant
@@ -182,7 +225,6 @@ pub fn daemon() -> crate::Result<()> {
     let mut service = Box::new(Service {
         window: hwnd,
         space_down: false,
-        preview_request: false,
         hold_started: None,
         invalid_at: None,
         shown: false,
@@ -291,10 +333,6 @@ struct Service {
     /// The physical space key is down; set once per press, so the repeats a held key
     /// generates are swallowed without re-triggering anything.
     space_down: bool,
-    /// Whether this press began as a preview request, decided once at keydown and
-    /// kept for the keyup: a finger that holds space while its focus moves elsewhere
-    /// still means the window it opened.
-    preview_request: bool,
     hold_started: Option<Instant>,
     /// The last non-preview key seen, for the cooldown.
     invalid_at: Option<Instant>,
@@ -348,20 +386,31 @@ unsafe extern "system" fn service_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPA
     match msg {
         WM_APP_SPACE => {
             if service.shown {
-                // A second press is the toggle's other half.
-                service.close_preview();
+                // The modes differ exactly here. A tap and the mix both treat a
+                // second press as the toggle's other half; hold-to-preview keeps
+                // the window up for as long as the key is down, and lets its own
+                // release be the thing that takes it away.
+                if space_mode() != SpaceMode::Hold {
+                    service.close_preview();
+                }
             } else if let Some(path) = unsafe { request_preview() } {
                 service.show_preview(path);
             }
             LRESULT(0)
         }
         WM_APP_RELEASE => {
-            // Only a long hold closes here; a quick tap has already done its work at
-            // keydown, and this release is merely the finger leaving the key.
-            if service.shown
-                && service.hold_started.is_some_and(|at| at.elapsed() >= HOLD_TO_CLOSE)
-            {
-                service.close_preview();
+            // The hook forwards every release of a key it swallowed; what a
+            // release means is the mode's to say. Hold hides on any release,
+            // the mix hides a long one, and a tap has already done its work
+            // at keydown, so its release is only the finger leaving the key.
+            let held_long = service
+                .hold_started
+                .take()
+                .is_some_and(|at| at.elapsed() >= HOLD_TO_CLOSE);
+            match space_mode() {
+                SpaceMode::Hold if service.shown => service.close_preview(),
+                SpaceMode::Mixed if service.shown && held_long => service.close_preview(),
+                _ => {}
             }
             LRESULT(0)
         }
@@ -439,7 +488,6 @@ impl Service {
             peek.close();
         }
         self.shown = false;
-        self.preview_request = false;
     }
 
     fn tray_menu(&mut self) {
@@ -544,32 +592,25 @@ unsafe extern "system" fn hook_proc(code: i32, wp: WPARAM, lp: LPARAM) -> LRESUL
             if modified || in_cooldown(service) {
                 return unsafe { CallNextHookEx(None, code, wp, lp) };
             }
-            // The keydown decides once, here, whether this press is a request. The
-            // keyup keeps the answer, whatever happens to the focus meanwhile.
-            let wants = service.shown || unsafe { foreground_reader().is_some() };
-            service.space_down = true;
-            service.preview_request = wants;
-            service.hold_started = Some(Instant::now());
-            if wants {
+            // A press that is not asking for a preview is not this watcher's: the
+            // shell keeps it whole, down and up, and no trace is kept here.
+            if service.shown || unsafe { foreground_reader().is_some() } {
+                service.space_down = true;
+                service.hold_started = Some(Instant::now());
                 let _ = unsafe { PostMessageW(Some(service.window), WM_APP_SPACE, WPARAM(0), LPARAM(0)) };
                 return LRESULT(1);
             }
             return unsafe { CallNextHookEx(None, code, wp, lp) };
         }
         let was_down = std::mem::replace(&mut service.space_down, false);
-        let was_request = std::mem::replace(&mut service.preview_request, false);
-        let held = service
-            .hold_started
-            .take()
-            .is_some_and(|at| at.elapsed() >= HOLD_TO_CLOSE);
         if was_down {
-            if was_request && held && service.shown {
-                let _ = unsafe {
-                    PostMessageW(Some(service.window), WM_APP_RELEASE, WPARAM(0), LPARAM(0))
-                };
-            }
             // The release of a key this service swallowed goes with it, so the shell
-            // never sees half a keystroke.
+            // never sees half a keystroke. What the release *means* -- a tap, a
+            // hold, a toggle -- is the mode's business, and the service's, where
+            // the choice is read rather than raced against.
+            let _ = unsafe {
+                PostMessageW(Some(service.window), WM_APP_RELEASE, WPARAM(0), LPARAM(0))
+            };
             return LRESULT(1);
         }
         return unsafe { CallNextHookEx(None, code, wp, lp) };
@@ -884,6 +925,10 @@ struct Peek {
     /// The window the selection is watched in; the timer only follows it while the
     /// foreground is still that window.
     source: Option<HWND>,
+    /// Whether the preview lives only while that window keeps the focus, read at
+    /// each reveal: a preference changed while a preview stands is a preference the
+    /// reader changed after walking away from a preview that was in the way.
+    focus_close: bool,
     scroll: f32,
 }
 
@@ -923,6 +968,7 @@ impl Peek {
                 images: None,
                 path: None,
                 source: None,
+                focus_close: false,
                 scroll: 0.0,
             });
             peek.hwnd = CreateWindowExW(
@@ -962,6 +1008,7 @@ impl Peek {
     /// Read, typeset, place, and show -- the whole reveal. A file that cannot be read
     /// leaves the previous state alone rather than showing an empty page over it.
     fn show(&mut self, path: &Path) {
+        self.focus_close = focus_close();
         unsafe { self.place() };
         if !self.load(path) {
             return;
@@ -1389,10 +1436,15 @@ unsafe extern "system" fn preview_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPA
         WM_TIMER if wp.0 == POLL_TIMER => unsafe {
             // The selection is only followed while the foreground is still the window
             // the preview came from. Anywhere else the preview keeps what it has,
-            // since a page the user walked away from is not wrong to stay put.
+            // since a page the user walked away from is not wrong to stay put --
+            // unless the reader has asked for a preview that lives only as long as
+            // the folder has the focus, in which case the focus's leaving is the
+            // same as the user's saying they are done.
             let fg = GetForegroundWindow();
             if !fg.is_invalid() && Some(fg) == peek.source {
                 peek.follow(fg);
+            } else if peek.focus_close && !fg.is_invalid() {
+                peek.close();
             }
             LRESULT(0)
         },

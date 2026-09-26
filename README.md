@@ -157,12 +157,15 @@ The switch lives in the reader's own menu, under **Spacebar peek** (next to *Ext
 editor*): turning it on starts the service detached and remembers the choice, so the
 next reader window starts it again if it is gone; turning it off takes the service
 down and clears the memory. That is the whole set-up, and the only command line worth
-typing is none. The preview never takes the focus, so the folder keeps the selection:
-the arrow keys keep moving it and the preview follows, `Enter` opens the file with its
-default program (Typora, say), and `Ctrl+Enter` hands it to a running reader as if it
-had been double-clicked. Space again, `Esc`, or releasing a space held longer than a
-moment puts the preview away; a quick tap toggles it instead. The tray menu offers
-launch-at-sign-in and the exit.
+typing is none. The same menu says what a press of the space bar means — *tap to
+toggle* (press to show, press again to hide), *hold to preview* (show while held, gone
+on release), or *tap or hold* (both, told apart by how long the key stayed down) — and
+whether a preview closes as soon as the folder that opened it loses the focus. The
+preview never takes the focus itself, so the folder keeps the selection: the arrow
+keys keep moving it and the preview follows, `Enter` opens the file with its default
+program (Typora, say), and `Ctrl+Enter` hands it to a running reader as if it had been
+double-clicked. Space again, `Esc`, or releasing a held space puts the preview away.
+The tray menu offers launch-at-sign-in and the exit.
 
 The service watches keys through a low-level hook that does almost nothing per stroke —
 a key code, a few `GetAsyncKeyState` reads, one window class — and keeps the shell's
@@ -173,7 +176,7 @@ typesetting) happens off the keystroke, after a posted message.
 
 | Key | in the peek |
 | --- | --- |
-| `Space` | press to show · again to hide · hold and release to dismiss |
+| `Space` | tap to toggle · hold to peek · or both, as the menu says |
 | `Esc` | put the preview away |
 | `←` `→` | (left to the folder) move the selection; the preview follows |
 | `Enter` | open the file with its default program |

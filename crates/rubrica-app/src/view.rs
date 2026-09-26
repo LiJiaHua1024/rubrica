@@ -1763,6 +1763,10 @@ enum Command {
     /// Turn the spacebar peek service on or off: start it and remember the choice,
     /// or take it down and un-remember.
     TogglePeek,
+    /// Say what a press of the space bar means to the peek service.
+    PeekSpace(crate::peek::SpaceMode),
+    /// Flip whether a preview closes when the folder loses the focus.
+    PeekFocusClose,
 }
 
 /// One row of that menu.
@@ -1810,6 +1814,9 @@ struct MenuState {
     line_break_override: Option<bool>,
     /// The spacebar peek's remembered preference, read when the menu was asked for.
     peek: bool,
+    /// The space bar's meaning and the focus rule, from the same place.
+    peek_space: crate::peek::SpaceMode,
+    peek_focus_close: bool,
     /// Whether a step back or forward has a page to land on. A reader who has opened one
     /// document and never followed a link out of it has no road behind them, and a `Back`
     /// that does nothing when pressed teaches them the menu is not to be believed.
@@ -1950,10 +1957,18 @@ fn menu_items(s: &MenuState) -> Vec<MenuRow> {
     ] });
     // An application-level switch among the document's own settings: it is placed
     // next to the editor for the same reason -- both are bridges to the rest of the
-    // machine -- and the checked state is the remembered preference, not a probe of
-    // whether the service is alive, so a watcher that has died still shows the truth
-    // about what was asked for.
-    v.insert(v.len() - 3, check(Command::TogglePeek, "Spacebar peek", s.peek));
+    // machine -- and the checked states are the remembered preferences, not probes
+    // of whether the service is alive, so a watcher that has died still shows the
+    // truth about what was asked for.
+    v.insert(v.len() - 3, MenuRow::Sub { label: "Spacebar peek", items: vec![
+        check(Command::TogglePeek, "Enabled", s.peek),
+        MenuRow::Gap,
+        check(Command::PeekSpace(crate::peek::SpaceMode::Tap), "Space bar: Tap to toggle", s.peek_space == crate::peek::SpaceMode::Tap),
+        check(Command::PeekSpace(crate::peek::SpaceMode::Hold), "Space bar: Hold to preview", s.peek_space == crate::peek::SpaceMode::Hold),
+        check(Command::PeekSpace(crate::peek::SpaceMode::Mixed), "Space bar: Tap or hold", s.peek_space == crate::peek::SpaceMode::Mixed),
+        MenuRow::Gap,
+        check(Command::PeekFocusClose, "Close when focus moves away", s.peek_focus_close),
+    ] });
     v.insert(v.len() - 3, MenuRow::Sub { label: "Text reading", items: vec![
         check(Command::PlainText(None), "Format: From file extension", s.plain_override.is_none()),
         check(Command::PlainText(Some(true)), "Format: Plain text", s.plain_override == Some(true)),
@@ -4118,6 +4133,8 @@ impl View {
             keep_line_breaks: self.keep_line_breaks,
             line_break_override: self.line_break_override,
             peek: crate::settings::peek_enabled(),
+            peek_space: crate::peek::space_mode(),
+            peek_focus_close: crate::peek::focus_close(),
             can_back: self.history.leads(true),
             can_forward: self.history.leads(false),
             link: self.pointer_link(pt.x as f32, pt.y as f32),
@@ -4348,6 +4365,13 @@ impl View {
                 } else {
                     crate::peek::request_exit();
                 }
+            }
+            // Preferences the service reads per keystroke and per reveal, so a
+            // change here needs no message sent anywhere: the next space press,
+            // the next preview, simply asks again.
+            Command::PeekSpace(mode) => crate::peek::record_space_mode(mode),
+            Command::PeekFocusClose => {
+                crate::peek::record_focus_close(!crate::peek::focus_close());
             }
             Command::Typography => {
                 let plain = self.plain_override.unwrap_or_else(|| reading::is_plain(self.path.as_deref()));

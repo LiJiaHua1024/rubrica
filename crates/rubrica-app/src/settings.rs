@@ -204,6 +204,16 @@ pub fn record_peek_enabled(on: bool) {
     write_word(SUBKEY, "Peek", u32::from(on));
 }
 
+/// One plain number under the reader's own key, for the peek's preferences, which
+/// are neither the four numbers of the appearance row nor any document's own.
+pub(crate) fn plain_word(name: &str) -> Option<u32> {
+    word(SUBKEY, name)
+}
+
+pub(crate) fn record_plain_word(name: &str, value: u32) {
+    write_word(SUBKEY, name, value);
+}
+
 pub fn editor() -> String {
     text(SUBKEY, "Editor").filter(|s| !s.is_empty()).unwrap_or_else(|| "notepad.exe".into())
 }
