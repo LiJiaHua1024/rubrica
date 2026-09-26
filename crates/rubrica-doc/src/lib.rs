@@ -36,8 +36,16 @@ pub struct SourceSpan {
     pub source: usize,
 }
 
+/// Map a displayed byte back to its original source byte.
+///
+/// Every writer appends to a block's `sources` in text order, and each span covers a
+/// run of adjacent characters in order, so the sequence is strictly ascending by
+/// `range.start`: the owning span is found by binary search rather than a scan.
+/// Laying out one line asks once per character, and a document that is a single long
+/// paragraph makes that scan the most expensive thing layout does.
 pub fn source_at(spans: &[SourceSpan], byte: usize) -> Option<usize> {
-    let span = spans.iter().rev().find(|s| s.range.start <= byte)?;
+    let index = spans.partition_point(|s| s.range.start <= byte);
+    let span = spans.get(index.checked_sub(1)?)?;
     Some(span.source + (byte.min(span.range.end) - span.range.start))
 }
 

@@ -2,7 +2,7 @@
 
 use std::io::{self, BufRead, BufReader, Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
-use rubrica_doc::plain::{Chapter, ChapterIndex, TextOptions, is_chapter};
+use rubrica_doc::plain::{Chapter, ChapterIndex, ParagraphRule, TextOptions, is_chapter};
 use windows::Win32::Globalization::{MultiByteToWideChar, MB_ERR_INVALID_CHARS, MULTI_BYTE_TO_WIDE_CHAR_FLAGS};
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -211,8 +211,43 @@ pub fn line_column(source: &str, byte: usize) -> (usize, usize) {
     (line, column)
 }
 
+/// A plain-text book: read without Markdown, one source line per paragraph unless
+/// blank lines say otherwise. A log file is the same thing -- lines that are meant
+/// to be read exactly as they were written -- so it is read the same way.
+/// The paragraph rule a plain-text document opens with.
+///
+/// A log file's lines are records, not wrapped prose: folding them together on a
+/// blank line's cue would bury every entry of a run but the first. The automatic
+/// rule stays the default for books, whose hard breaks are an artifact of their
+/// export rather than the shape of their sentences. A reader who has chosen a rule
+/// keeps it -- only the untouched default follows the file's kind.
+pub fn text_options_for(path: Option<&Path>, stored: TextOptions) -> TextOptions {
+    let is_log = path
+        .and_then(Path::extension)
+        .and_then(|ext| ext.to_str())
+        .is_some_and(|ext| ext.eq_ignore_ascii_case("log"));
+    if is_log && stored == TextOptions::default() {
+        TextOptions { paragraphs: ParagraphRule::Lines, chapters: false }
+    } else {
+        stored
+    }
+}
+
 pub fn is_plain(path: Option<&Path>) -> bool {
-    path.and_then(Path::extension).and_then(|s| s.to_str()).is_some_and(|e| e.eq_ignore_ascii_case("txt"))
+    path.and_then(Path::extension).and_then(|s| s.to_str())
+        .is_some_and(|e| e.eq_ignore_ascii_case("txt") || e.eq_ignore_ascii_case("log"))
+}
+
+/// A Markdown document, the one thing the reader sets rather than reads as text.
+pub fn is_markdown(path: Option<&Path>) -> bool {
+    path.and_then(Path::extension).and_then(|s| s.to_str())
+        .is_some_and(|e| e.eq_ignore_ascii_case("md") || e.eq_ignore_ascii_case("markdown"))
+}
+
+/// A file the reader opens: plain text or Markdown, which is the same set the
+/// workspace tree lists and a Markdown link may address.
+pub fn is_document(path: &Path) -> bool {
+    is_plain(Some(path)) || is_markdown(Some(path))
 }
 
 pub fn neighbor(path: &Path, forward: bool) -> Option<PathBuf> {
@@ -353,6 +388,34 @@ mod tests {
             assert_eq!(document.blocks[0].sources[0].source, 13, "{encoding:?}");
         }
         let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn a_log_file_is_plain_text_and_markdown_is_not() {
+        assert!(is_plain(Some(Path::new("notes.txt"))));
+        assert!(is_plain(Some(Path::new("mct.log"))));
+        assert!(!is_plain(Some(Path::new("readme.md"))));
+        assert!(is_markdown(Some(Path::new("readme.md"))));
+        assert!(is_markdown(Some(Path::new("notes.markdown"))));
+        assert!(is_document(Path::new("a.log")));
+        assert!(!is_document(Path::new("a.csv")));
+        // A neighbour walk stays within the same kind: a log is offered other logs
+        // and texts, never a Markdown file.
+        assert_eq!(neighbor(Path::new("dir/a.log"), true), None);
+    }
+
+    #[test]
+    fn a_log_file_reads_line_by_line_and_a_reader_keeps_their_rule() {
+        let log = Path::new("mct.log");
+        let opened = text_options_for(Some(log), TextOptions::default());
+        assert_eq!(opened.paragraphs, ParagraphRule::Lines);
+        assert!(!opened.chapters, "a log's lines are not chapter headings");
+        // A book keeps the wrapping rule its export expects.
+        let book = text_options_for(Some(Path::new("book.txt")), TextOptions::default());
+        assert_eq!(book.paragraphs, ParagraphRule::Auto);
+        // A rule the reader picked themselves is not overridden.
+        let picked = TextOptions { paragraphs: ParagraphRule::BlankLines, chapters: true };
+        assert_eq!(text_options_for(Some(log), picked), picked);
     }
 
     #[test]

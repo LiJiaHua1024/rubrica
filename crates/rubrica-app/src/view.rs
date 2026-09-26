@@ -8,11 +8,11 @@
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::sync::mpsc::{Receiver, Sender};
 use std::sync::{Arc, Mutex};
 
 use rubrica_doc::{Action, ActionKind, Align, Block, BlockKind, Document, InlineStyle};
-use rubrica_type::justification::place_bidi;
 use rubrica_type::paragraph::{Item, Spacing, StyleId, StyleSpan};
 use rubrica_type::units::Pt;
 use rubrica_type::{BreakOptions, Hyphenation, typeset, typeset_hyphenated};
@@ -78,7 +78,7 @@ use windows::Win32::UI::Controls::Dialogs::{
 };
 use windows::Win32::UI::Shell::{DragAcceptFiles, DragFinish, DragQueryFileW, ShellExecuteW, HDROP};
 use windows::Win32::UI::WindowsAndMessaging::{
-    AppendMenuW, CS_DBLCLKS, CS_HREDRAW, CS_VREDRAW, CREATESTRUCTW, CreatePopupMenu,
+    AppendMenuW, WM_APP, CS_DBLCLKS, CS_HREDRAW, CS_VREDRAW, CREATESTRUCTW, CreatePopupMenu,
     CreateWindowExW, DefWindowProcW, DestroyMenu, DispatchMessageW,
     GWLP_USERDATA, GetCaretBlinkTime, GetClientRect, GetCursorPos, GetSystemMetrics, GetWindowLongPtrW, GetMessageW, GetWindowPlacement,
     HCURSOR, HMENU, HWND_TOP, HTCLIENT, HTCAPTION, HTBOTTOM, HTBOTTOMLEFT, HTBOTTOMRIGHT, HTLEFT, HTRIGHT,
@@ -442,6 +442,155 @@ pub enum Op {
     Line { x0: f32, y0: f32, x1: f32, y1: f32, thickness: f32, color: ColorRole },
 }
 
+/// The op's topmost ink, in the display list's own coordinates.
+///
+/// The list is built in reading order and an op never rises above the line before
+/// it, so the sequence of tops is non-decreasing: the visible band is found by
+/// binary search instead of a walk over a whole document's worth of ops.
+pub fn op_top(op: &Op) -> f32 {
+    match op {
+        Op::Runs(runs) => runs.first().map_or(0.0, |r| r.baseline),
+        Op::Image { y, .. } | Op::Rect { y, .. } => *y,
+        Op::Line { y0, y1, .. } => y0.min(*y1),
+    }
+}
+
+/// DirectWrite's faces are free-threaded, so a run built on the layout thread can
+/// be drawn on the window thread; the rest of the run is plain data.
+unsafe impl Send for PaintRun {}
+
+/// Every layout run gets its own id, so batches that arrive for a run the window
+/// has stopped tending -- because the reader changed the width, or because the page
+/// was set aside while it slept -- are recognised and dropped.
+static LAYOUT_RUN: AtomicU64 = AtomicU64::new(1);
+
+/// The window message that carries a layout batch to the window thread.
+///
+/// The layout thread owns no window, so it asks the window to come and read its
+/// channel instead: a `PostMessageW` is the cheapest wake a worker thread has.
+const WM_APP_LAYOUT: u32 = WM_APP + 1;
+
+/// A layout running on a worker thread, and what the window thread needs to tend it.
+pub struct LayoutJob {
+    /// Identifies the run: batches from a run the window has abandoned carry an id
+    /// nobody claims any more and are dropped, including the ones a page saved while
+    /// it slept still owes.
+    epoch: u64,
+    /// Set when the window stops caring: the worker checks it between batches.
+    cancel: Arc<AtomicBool>,
+    /// The batches as they are laid out.
+    receiver: Receiver<LayoutMessage>,
+    /// Batches applied so far, and the blocks they covered.
+    blocks_done: usize,
+    blocks_total: usize,
+    /// Document y the last batch reached, and the average a block has cost so far.
+    y: Pt,
+    avg_block: Pt,
+}
+
+/// What a worker layout says to the window it wakes.
+pub enum LayoutMessage {
+    Batch { epoch: u64, chunk: LayoutChunk },
+    Finished { epoch: u64, finals: LayoutFinals },
+}
+
+/// The window a worker wakes, by address: `PostMessageW` takes any window, and the
+/// pointer is only read on the worker's side.
+struct WindowHandle(isize);
+unsafe impl Send for WindowHandle {}
+
+/// A sink that forwards every batch to the window as it is laid out.
+struct RemoteSink {
+    epoch: u64,
+    cancel: Arc<AtomicBool>,
+    sender: Sender<LayoutMessage>,
+    window: WindowHandle,
+}
+
+impl RemoteSink {
+    fn wake(&self) {
+        unsafe {
+            let _ = PostMessageW(
+                Some(HWND(self.window.0 as *mut std::ffi::c_void)),
+                WM_APP_LAYOUT,
+                WPARAM(0),
+                LPARAM(0),
+            );
+        }
+    }
+}
+
+impl LayoutSink for RemoteSink {
+    fn accept(&mut self, chunk: LayoutChunk) -> bool {
+        if self.cancel.load(Ordering::Relaxed) {
+            return false;
+        }
+        if self.sender.send(LayoutMessage::Batch { epoch: self.epoch, chunk }).is_err() {
+            return false;
+        }
+        self.wake();
+        true
+    }
+
+    fn finish(&mut self, finals: LayoutFinals) {
+        let _ = self.sender.send(LayoutMessage::Finished { epoch: self.epoch, finals });
+        self.wake();
+    }
+}
+
+/// Everything a worker layout is handed.
+struct LayoutRequest {
+    epoch: u64,
+    doc: Document,
+    theme: Theme,
+    page_w: f32,
+    dpi: f32,
+    hyphenate: bool,
+}
+
+/// Lay a document out on a worker thread, waking the window as batches land. The
+/// thread ends when the document is done or `cancel` is set by a newer layout.
+fn spawn_layout(
+    cancel: Arc<AtomicBool>,
+    sender: Sender<LayoutMessage>,
+    window: WindowHandle,
+    request: LayoutRequest,
+) {
+    std::thread::spawn(move || {
+        // DirectWrite and WIC both want COM on the thread that calls them.
+        unsafe {
+            let _ = CoInitializeEx(None, COINIT_MULTITHREADED);
+        }
+        let Ok(mut font) = FontEngine::new() else { return };
+        if !font.probe() {
+            return;
+        }
+        let images = ImageStore::new().ok();
+        let mut math = MathStore::new();
+        let hyphenator = if request.hyphenate { Hyphenator::english() } else { None };
+        // The profile's math store and the image sizes are the same work the window
+        // would do for this document; a relayout redoes them, which is why the
+        // caches that outlive a document live on the window's engine.
+        let mut objects = Objects::new(images.as_ref(), None, &mut math);
+        let mut sink = RemoteSink {
+            epoch: request.epoch,
+            cancel,
+            sender,
+            window,
+        };
+        build_in_chunks(
+            &mut font,
+            &request.theme,
+            &request.doc,
+            request.page_w,
+            request.dpi,
+            &mut objects,
+            hyphenator.as_ref(),
+            &mut sink,
+        );
+    });
+}
+
 /// A piece of content wider than the reading column and the interaction it owns.
 #[derive(Clone, Debug, PartialEq)]
 pub enum WideKind {
@@ -591,12 +740,12 @@ pub fn caret_at(sel: &[SelLine], x: f32, y: f32) -> Caret {
     let Some(_) = sel.first() else {
         return Caret { line: 0, ch: 0 };
     };
-    let mut line = sel.len() - 1;
-    for (i, l) in sel.iter().enumerate() {
-        if y < l.y + l.h {
-            line = i;
-            break;
-        }
+    // Lines run down the page without overlapping, so the first whose bottom
+    // passes `y` is found by binary search: a drag asks once per pointer move,
+    // and a long document's lines must not all be walked to answer it.
+    let mut line = sel.partition_point(|l| y >= l.y + l.h);
+    if line >= sel.len() {
+        line = sel.len() - 1;
     }
     let l = &sel[line];
     // The nearest boundary, because a character's own ink starts a point or two to the
@@ -1044,6 +1193,22 @@ pub struct View {
     keep_line_breaks: bool,
     line_break_override: Option<bool>,
     ops: Vec<Op>,
+    /// Whether [`Self::ops`] is non-decreasing by [`op_top`], which is what lets a
+    /// paint binary-search the visible band. Recomputed whenever ops are replaced.
+    ops_sorted: bool,
+    /// Bumped whenever `sel_index` is replaced, which is the only thing that can
+    /// make a cached find [`Needle`] stale. A keystroke in the find bar re-asks the
+    /// same page, and rebuilding the needle's characters for every one of them is
+    /// an allocation the size of the whole document.
+    sel_version: u64,
+    find_needle: Option<(u64, Needle)>,
+    /// The layout running on a worker thread, if this page is being laid out that
+    /// way: a document large enough that laying it out on the window thread would
+    /// stop the window answering for longer than a reader would forgive.
+    layout_job: Option<LayoutJob>,
+    /// This window, needed to wake it when a layout worker has batches, and for the
+    /// window's own bookkeeping. Set in [`Self::attach`], once there is a window.
+    hwnd: HWND,
     reading_mode: ReadingMode,
     page_starts: Vec<Pt>,
     page_transition: Option<PageTransition>,
@@ -1245,6 +1410,7 @@ struct TabPage {
     content_h: Pt,
     scroll: Pt,
     stamp: Option<Stamp>,
+    layout_job: Option<LayoutJob>,
     path: Option<PathBuf>,
     profile: String,
     plain_override: Option<bool>,
@@ -1280,6 +1446,7 @@ impl TabPage {
             content_h: 0.0,
             scroll: 0.0,
             stamp: None,
+            layout_job: None,
             path: None,
             profile: String::new(),
             plain_override: None,
@@ -2192,7 +2359,7 @@ pub fn run(mut source: String, path: Option<PathBuf>, extra: Vec<PathBuf>) -> Re
         doc,
         source,
         source_view: preferences.source,
-        text_options: preferences.text,
+        text_options: crate::reading::text_options_for(path.as_deref(), preferences.text),
         chapter_index,
         chapter: initial_chapter,
         chapter_cache: Arc::new(Mutex::new(HashMap::new())),
@@ -2205,6 +2372,11 @@ pub fn run(mut source: String, path: Option<PathBuf>, extra: Vec<PathBuf>) -> Re
         keep_line_breaks,
         line_break_override: preferences.line_breaks,
         ops: Vec::new(),
+        ops_sorted: true,
+        sel_version: 1,
+        find_needle: None,
+        layout_job: None,
+        hwnd: HWND(std::ptr::null_mut()),
         reading_mode: if preferences.page_stack { ReadingMode::Stack } else { ReadingMode::Scroll },
         page_starts: Vec::new(),
         page_transition: None,
@@ -2680,6 +2852,7 @@ unsafe fn edit_find_key(hwnd: HWND, vk: u32) -> Option<LRESULT> {
 
 impl View {
     unsafe fn attach(&mut self, hwnd: HWND) {
+        self.hwnd = hwnd;
         let mut r = RECT::default();
         let _ = GetClientRect(hwnd, &mut r);
         self.client_w = (r.right - r.left).max(1) as f32;
@@ -3188,6 +3361,11 @@ impl View {
                         }
                     }
                 }
+                LRESULT(0)
+            }
+            WM_APP_LAYOUT => {
+                // A worker layout has posted batches; the page watches them land.
+                self.layout_messages();
                 LRESULT(0)
             }
             WM_COPYDATA => {
@@ -4605,8 +4783,134 @@ impl View {
         true
     }
 
+    /// Start laying this page out on a worker thread. The batches arrive on the
+    /// window thread through [`Self::layout_messages`]; the document as it stands
+    /// is replaced by its own first batch, so the window keeps answering the whole
+    /// time and the reader watches the page build.
+    fn begin_layout_job(&mut self, page_w: f32) {
+        // A layout already running belongs to a page nobody will look at again: its
+        // batches are told to stop.
+        if let Some(job) = self.layout_job.take() {
+            job.cancel.store(true, Ordering::Relaxed);
+        }
+        let epoch = LAYOUT_RUN.fetch_add(1, Ordering::Relaxed);
+        let (sender, receiver) = std::sync::mpsc::channel();
+        let job = LayoutJob {
+            epoch,
+            cancel: Arc::new(AtomicBool::new(false)),
+            receiver,
+            blocks_done: 0,
+            blocks_total: self.doc.blocks.len(),
+            y: self.theme.base * 2.0,
+            avg_block: 0.0,
+        };
+        let window = WindowHandle(self.hwnd.0 as isize);
+        spawn_layout(
+            job.cancel.clone(),
+            sender,
+            window,
+            LayoutRequest {
+                epoch,
+                doc: self.doc.clone(),
+                theme: self.theme.clone(),
+                page_w,
+                dpi: self.dpi,
+                hyphenate: self.hyphenator.is_some(),
+            },
+        );
+        // The page on screen is the beginning of the document as it is being laid
+        // out: whatever was there belonged to a wrapping that no longer exists.
+        self.ops.clear();
+        self.sel_index.clear();
+        self.sel_version += 1;
+        self.hotspots.clear();
+        self.wide_regions.clear();
+        self.page_starts.clear();
+        self.selection = None;
+        self.press_caret = None;
+        self.caret = None;
+        self.pressed = None;
+        self.scroll = 0.0;
+        self.layout_job = Some(job);
+        unsafe { let _ = InvalidateRect(Some(self.hwnd), None, false); }
+    }
+
+    /// Take the batches a worker layout has posted since the last look, and finish
+    /// the page when the layout is done. `epoch` mismatches are a layout the window
+    /// abandoned; their batches are dropped on the floor.
+    fn layout_messages(&mut self) {
+        loop {
+            let Some(message) = self.layout_job.as_ref().map(|job| job.receiver.try_recv()) else {
+                break;
+            };
+            let Ok(message) = message else { break };
+            let Some(job) = self.layout_job.as_mut() else { break };
+            match message {
+                LayoutMessage::Batch { epoch, chunk } if epoch == job.epoch => {
+                    job.blocks_done += chunk.blocks;
+                    // The height the content reaches is known only when the layout
+                    // ends; until then it is what has been laid out plus what the
+                    // blocks so far say the rest will cost. The thumb moves once,
+                    // by the difference between that estimate and the truth.
+                    let blocks = chunk.blocks as Pt;
+                    if blocks > 0.0 {
+                        job.avg_block = (chunk.y - job.y) / blocks;
+                        job.y = chunk.y;
+                    }
+                    let rest = (job.blocks_total - job.blocks_done) as Pt * job.avg_block;
+                    self.content_h = job.y + rest;
+                    self.ops.extend(chunk.ops);
+                    self.sel_version += 1;
+                    self.sel_index.extend(chunk.sel);
+                    self.hotspots.extend(chunk.hots);
+                    self.wide_regions.extend(chunk.wide);
+                }
+                LayoutMessage::Finished { epoch, finals } if epoch == job.epoch => {
+                    self.content_h = finals.height;
+                    self.page_starts = reader_page_starts(
+                        &self.sel_index,
+                        &finals.anchor_tops,
+                        finals.height,
+                        self.stack_page_height(),
+                        scale_of(self.dpi),
+                    );
+                    self.note_tops = finals.note_tops;
+                    self.anchor_tops = finals.anchor_tops;
+                    self.layout_job = None;
+                    // The hits are places in lines that have just been built, so the
+                    // query is asked of the page that is finally there.
+                    if let Some(query) = self.find.as_ref().map(|f| f.query.clone()) {
+                        self.apply_find(&query, false);
+                    }
+                    unsafe { let _ = InvalidateRect(Some(self.hwnd), None, false); }
+                    break;
+                }
+                _ => break,
+            }
+        }
+        unsafe { let _ = InvalidateRect(Some(self.hwnd), None, false); }
+    }
+
+    /// A document bigger than this is laid out on a worker thread: below it the
+    /// whole layout is quicker than the thread's overhead, and the window answers
+    /// for the few milliseconds it costs either way.
+    const LAYOUT_ASYNC_BLOCKS: usize = 512;
+    /// A single block this large goes to a worker too, however few blocks the
+    /// document has.
+    const LAYOUT_ASYNC_BLOCK_BYTES: usize = 8 * 1024;
+
     fn relayout(&mut self) {
         self.page_transition = None;
+        // A worker takes the layout when there is a lot of it -- many blocks, or a
+        // few blocks so large they cost as much as many: a log folded into one
+        // paragraph by Markdown is one block and hundreds of kilobytes of work.
+        let heavy = self.doc.blocks.len() > Self::LAYOUT_ASYNC_BLOCKS
+            || self.doc.blocks.iter().any(|b| b.text.len() > Self::LAYOUT_ASYNC_BLOCK_BYTES);
+        if heavy {
+            let page_w = (self.client_w - self.content_dx()).max(1.0);
+            self.begin_layout_job(page_w);
+            return;
+        }
         // Every field handed in is borrowed for its own reason: the decoder and the
         // document's directory for figures, and the profile's own math store, so a
         // resize does not reset the document's formulas. The store is picked by
@@ -4634,8 +4938,15 @@ impl View {
         // point at a paragraph rather than at a footnote.
         self.pressed = None;
         self.content_h = page.height;
-        self.page_starts = reader_page_starts(&page, self.stack_page_height(), scale_of(self.dpi));
+        self.page_starts = reader_page_starts(
+            &page.sel,
+            &page.anchor_tops,
+            page.height,
+            self.stack_page_height(),
+            scale_of(self.dpi),
+        );
         self.ops = page.ops;
+        self.ops_sorted = self.ops.windows(2).all(|w| op_top(&w[0]) <= op_top(&w[1]));
         self.hotspots = page.hotspots;
         self.wide_regions = page.wide_regions;
         self.note_tops = page.note_tops;
@@ -4647,6 +4958,7 @@ impl View {
         self.press_caret = None;
         self.caret = None;
         self.sel_index = page.sel;
+        self.sel_version += 1;
         // The hits are pairs of places in lines that have just been broken apart and
         // joined up again, so the query has to be asked of the new page. Nothing is
         // scrolled to: the reader did not ask for a reflow, and the least it can cost
@@ -4784,14 +5096,20 @@ impl View {
             self.find_label.clear();
             return;
         }
-        let needle = Needle::of(&self.sel_index);
+        // The needle is the whole page's characters, and only the page being laid out
+        // again can change it: a query's keystrokes reuse the one already built.
+        if self.find_needle.as_ref().is_none_or(|(version, _)| *version != self.sel_version) {
+            self.find_needle = Some((self.sel_version, Needle::of(&self.sel_index)));
+        }
+        let needle = &self.find_needle.as_ref().unwrap().1;
         let marks: Vec<Selection> =
             needle.hits(query).iter().filter_map(|h| needle.span(h)).collect();
         // The first hit at or below the top edge of the window: a reader who has typed a
         // word wants the page's answer to start where they were looking, not at the first
-        // line of the document three screens above.
+        // line of the document three screens above. Hits stand in reading order, so the
+        // line they name only grows.
         let top = self.top_line();
-        let focus = marks.iter().position(|m| m.from.line >= top).unwrap_or(0);
+        let focus = marks.partition_point(|m| m.from.line < top);
         if scroll {
             if let Some(m) = marks.get(focus) {
                 self.scroll_to_caret(m.from);
@@ -4804,7 +5122,10 @@ impl View {
     /// The line the window is looking at, which is where a search begins.
     fn top_line(&self) -> usize {
         let top = scroll_dip(self.scroll, self.dpi);
-        self.sel_index.iter().position(|l| l.y + l.h > top).unwrap_or(0)
+        let line = self.sel_index.partition_point(|l| l.y + l.h <= top);
+        // Past the last line means the whole document scrolled by, which reports
+        // the same line the scan it replaces reported.
+        if line == self.sel_index.len() { 0 } else { line }
     }
 
     /// `Enter`, and `Shift`+`Enter`: walk the hits the search has already found, bringing
@@ -5208,13 +5529,7 @@ pub(crate) fn document_link(base: Option<&std::path::Path>, url: &str) -> Option
         return None;
     }
     let full = ImageStore::resolve(base, target);
-    if !matches!(
-        full.extension().and_then(|e| e.to_str()).map(|e| e.to_ascii_lowercase()).as_deref(),
-        Some("md") | Some("markdown") | Some("txt")
-    ) {
-        return None;
-    }
-    full.is_file().then_some(full)
+    crate::reading::is_document(&full).then_some(full).filter(|p| p.is_file())
 }
 
 /// Where each character of a shaped run begins, in points from the left of the page.
@@ -5436,6 +5751,9 @@ fn layout_block(
     // hangs in the margin it clears instead of shoving the body along.
     opts.hang_indent = hang;
 
+    // The paragraph under measurement, opened so that each word's width is looked
+    // up by the paragraph's address instead of by hashing the whole of it.
+    font.begin_paragraph(text);
     let (para, plan) = typeset_hyphenated(
         text,
         &spacing,
@@ -5459,9 +5777,10 @@ fn layout_block(
     let mut consumed = 0usize;
 
     let bidi = rubrica_type::BidiInfo::new(text, None);
+    let placer = rubrica_type::LinePlacer::new(&bidi);
     for line in &plan.lines {
         let top = y;
-        let placed = place_bidi(&para, line, &bidi);
+        let placed = placer.place_line(&para, line);
         if line.hyphen.is_some_and(|h| para.node(h).advance > 0.0) {
             hyphens.breaks += 1;
         }
@@ -6173,9 +6492,11 @@ impl View {
         std::mem::swap(&mut page.source, &mut self.source);
         std::mem::swap(&mut page.doc, &mut self.doc);
         std::mem::swap(&mut page.ops, &mut self.ops);
+        self.ops_sorted = self.ops.windows(2).all(|w| op_top(&w[0]) <= op_top(&w[1]));
         std::mem::swap(&mut page.reading_mode, &mut self.reading_mode);
         std::mem::swap(&mut page.page_starts, &mut self.page_starts);
         std::mem::swap(&mut page.sel_index, &mut self.sel_index);
+        self.sel_version += 1;
         std::mem::swap(&mut page.hotspots, &mut self.hotspots);
         std::mem::swap(&mut page.note_tops, &mut self.note_tops);
         std::mem::swap(&mut page.anchor_tops, &mut self.anchor_tops);
@@ -6184,6 +6505,7 @@ impl View {
         std::mem::swap(&mut page.chapter_index, &mut self.chapter_index);
         std::mem::swap(&mut page.chapter, &mut self.chapter);
         std::mem::swap(&mut page.lazy_text, &mut self.lazy_text);
+        std::mem::swap(&mut page.layout_job, &mut self.layout_job);
         std::mem::swap(&mut page.content_h, &mut self.content_h);
         std::mem::swap(&mut page.scroll, &mut self.scroll);
         std::mem::swap(&mut page.stamp, &mut self.stamp);
@@ -6549,7 +6871,7 @@ impl View {
         self.line_break_override = preferences.line_breaks;
         self.plain_override = preferences.plain;
         self.source_view = preferences.source;
-        self.text_options = preferences.text;
+        self.text_options = crate::reading::text_options_for(path.as_deref(), preferences.text);
         self.encoding = preferences.encoding;
         self.source = source;
         self.path = path;
@@ -6688,7 +7010,10 @@ impl View {
                 D2D1_ANTIALIAS_MODE_PER_PRIMITIVE,
             );
             self.draw_tree_panel(&target);
-            if self.reading_mode == ReadingMode::Stack {
+            // The stack needs every page start, which a layout in progress does not
+            // have yet; the reader watches the page build as a scroll instead, and the
+            // stack is back the moment the layout finishes.
+            if self.reading_mode == ReadingMode::Stack && self.layout_job.is_none() {
                 target.SetTransform(&Matrix3x2::identity());
                 self.draw_page_stack(&target);
                 self.draw_preview(&target);
@@ -6991,7 +7316,20 @@ impl View {
         top: Pt,
         bottom: Pt,
     ) {
-        for op in self.ops.iter() {
+        // The display list is in reading order and an op never rises above the one
+        // before it, so the visible band is a contiguous slice: find its ends by
+        // binary search rather than testing a whole document's ops per frame. The
+        // first op is stepped back one in case its ink is tall enough to reach into
+        // the band from above it.
+        let ops = &self.ops[..];
+        let (first, past) = if self.ops_sorted {
+            let first = ops.partition_point(|op| op_top(op) < top).saturating_sub(1);
+            (first, ops.partition_point(|op| op_top(op) <= bottom).max(first))
+        } else {
+            (0, ops.len())
+        };
+        let mut shifted: Vec<PaintRun> = Vec::new();
+        for op in &ops[first..past] {
             match op {
                 Op::Rect { x, y, w, h, color } => {
                     let dx = self.shift_at(*x, *y);
@@ -7030,10 +7368,8 @@ impl View {
                     if y + h < top || *y > bottom {
                         continue;
                     }
-                    let (Some(t), Some(store)) = (self.target.clone(), self.images.as_ref()) else {
-                        continue;
-                    };
-                    if let Some(bmp) = store.bitmap(&t, path) {
+                    let Some(store) = self.images.as_ref() else { continue };
+                    if let Some(bmp) = store.bitmap(target, path) {
                         let r = D2D_RECT_F {
                             left: *x + dx,
                             top: y - up,
@@ -7050,7 +7386,7 @@ impl View {
                     }
                 }
                 Op::Runs(runs) => {
-                    let mut shifted = Vec::new();
+                    shifted.clear();
                     for run in runs {
                         if run.baseline < top - 40.0 || run.baseline > bottom + 40.0 {
                             continue;
@@ -7320,8 +7656,9 @@ fn layout_table(
             let mut lines_out = 0usize;
             let mut ly = top + pad * 0.5;
             let bidi = rubrica_type::BidiInfo::new(&c.text, None);
+            let placer = rubrica_type::LinePlacer::new(&bidi);
             for line in &plan.lines {
-                let placed = place_bidi(&para, line, &bidi);
+                let placed = placer.place_line(&para, line);
                 if line.hyphen.is_some() {
                     hyphens.breaks += 1;
                 }
@@ -8333,7 +8670,7 @@ fn page_content_height_for(starts: &[Pt], index: usize, scale: Pt, nominal: Pt) 
 }
 
 fn pdf_page_starts(page: &Page, page_height: Pt) -> Vec<Pt> {
-    reader_page_starts(page, page_height, 1.0)
+    reader_page_starts(&page.sel, &page.anchor_tops, page.height, page_height, 1.0)
 }
 
 /// Line-safe page starts shared by the PDF writer and the on-screen page stack.
@@ -8341,20 +8678,20 @@ fn pdf_page_starts(page: &Page, page_height: Pt) -> Vec<Pt> {
 /// `Page::sel` is measured in DIPs at the live render target, while the document
 /// heights and heading anchors are points. `scale` is the one conversion between those
 /// two spaces; passing `1.0` keeps the PDF path at its 72dpi coordinate system.
-fn reader_page_starts(page: &Page, page_height: Pt, scale: Pt) -> Vec<Pt> {
+fn reader_page_starts(sel: &[SelLine], anchors: &[Pt], height: Pt, page_height: Pt, scale: Pt) -> Vec<Pt> {
     if !page_height.is_finite() || page_height <= 0.0 || !scale.is_finite() || scale <= 0.0 {
         return vec![0.0];
     }
-    if page.sel.is_empty() {
+    if sel.is_empty() {
         let mut starts = vec![0.0];
-        while *starts.last().unwrap_or(&0.0) + page_height < page.height {
+        while *starts.last().unwrap_or(&0.0) + page_height < height {
             starts.push(starts.last().copied().unwrap_or(0.0) + page_height);
         }
         return starts;
     }
     let mut starts = vec![0.0];
     let mut limit = page_height;
-    for line in &page.sel {
+    for line in sel {
         let y = line.y / scale;
         let height = line.h / scale;
         if y + height <= limit + 0.01 {
@@ -8367,8 +8704,7 @@ fn reader_page_starts(page: &Page, page_height: Pt, scale: Pt) -> Vec<Pt> {
         // A heading is kept with the lines that follow it. If the first line that
         // crosses the nominal boundary is a heading (or follows one closely), move the
         // break back to that heading instead of leaving it as the last line on a page.
-        let heading = page
-            .anchor_tops
+        let heading = anchors
             .iter()
             .copied()
             .find(|top| *top >= previous && *top < y && y - *top <= height * 2.0);
@@ -8697,6 +9033,85 @@ fn write_pdf(
     Ok(())
 }
 
+/// Blocks between two batches of the display list.
+///
+/// A batch is the unit the reader sees arrive: small enough that the window keeps
+/// painting between two of them, large enough that the per-batch overhead -- a
+/// message, an append, an invalidate -- disappears against the layout of the blocks.
+const LAYOUT_CHUNK_BLOCKS: usize = 48;
+
+/// One batch of a layout in progress: what the layout laid out since the last one.
+pub struct LayoutChunk {
+    pub ops: Vec<Op>,
+    pub hots: Vec<Hot>,
+    pub sel: Vec<SelLine>,
+    pub wide: Vec<WideRegion>,
+    pub table_headers: Vec<TableHeaderFragment>,
+    pub table_spans: Vec<TableSpan>,
+    pub note_spans: Vec<NoteSpan>,
+    pub math_texts: Vec<MathTextFragment>,
+    /// Document y the batch reached.
+    pub y: Pt,
+    /// Blocks this batch laid out.
+    pub blocks: usize,
+}
+
+/// Everything about a page that is only known once every block is laid out: the
+/// notes' positions, the headings' anchors, and the height the content ends at.
+pub struct LayoutFinals {
+    pub height: Pt,
+    pub column: Pt,
+    pub left: Pt,
+    pub note_tops: Vec<Pt>,
+    pub anchor_tops: Vec<Pt>,
+    pub hyphens: HyphenCount,
+    pub table_headers: Vec<TableHeaderFragment>,
+    pub table_spans: Vec<TableSpan>,
+    pub note_spans: Vec<NoteSpan>,
+    pub math_texts: Vec<MathTextFragment>,
+}
+
+/// Where a layout hands its batches.
+///
+/// `accept` returning false stops the layout, which is how a page whose width
+/// changed while it was being laid out gives up the one nobody will look at.
+pub trait LayoutSink: Send {
+    fn accept(&mut self, chunk: LayoutChunk) -> bool;
+    fn finish(&mut self, finals: LayoutFinals);
+}
+
+/// A sink that keeps every batch and assembles the finished [`Page`] -- what a
+/// caller that wants the whole page at once, such as an export, uses.
+struct PageSink {
+    ops: Vec<Op>,
+    hots: Vec<Hot>,
+    sel: Vec<SelLine>,
+    wide: Vec<WideRegion>,
+    table_headers: Vec<TableHeaderFragment>,
+    table_spans: Vec<TableSpan>,
+    note_spans: Vec<NoteSpan>,
+    math_texts: Vec<MathTextFragment>,
+    finals: Option<LayoutFinals>,
+}
+
+impl LayoutSink for PageSink {
+    fn accept(&mut self, chunk: LayoutChunk) -> bool {
+        self.ops.extend(chunk.ops);
+        self.hots.extend(chunk.hots);
+        self.sel.extend(chunk.sel);
+        self.wide.extend(chunk.wide);
+        self.table_headers.extend(chunk.table_headers);
+        self.table_spans.extend(chunk.table_spans);
+        self.note_spans.extend(chunk.note_spans);
+        self.math_texts.extend(chunk.math_texts);
+        true
+    }
+
+    fn finish(&mut self, finals: LayoutFinals) {
+        self.finals = Some(finals);
+    }
+}
+
 pub fn build_ops(
     font: &mut FontEngine,
     theme: &Theme,
@@ -8706,6 +9121,61 @@ pub fn build_ops(
     objects: &mut Objects<'_>,
     hyphenator: Option<&Hyphenator>,
 ) -> Page {
+    let mut sink = PageSink {
+        ops: Vec::new(),
+        hots: Vec::new(),
+        sel: Vec::new(),
+        wide: Vec::new(),
+        table_headers: Vec::new(),
+        table_spans: Vec::new(),
+        note_spans: Vec::new(),
+        math_texts: Vec::new(),
+        finals: None,
+    };
+    build_in_chunks(font, theme, doc, client_w, dpi, objects, hyphenator, &mut sink);
+    let finals = sink.finals.take().unwrap_or(LayoutFinals {
+        height: 0.0,
+        column: 0.0,
+        left: 0.0,
+        note_tops: Vec::new(),
+        anchor_tops: Vec::new(),
+        hyphens: HyphenCount::default(),
+        table_headers: Vec::new(),
+        table_spans: Vec::new(),
+        note_spans: Vec::new(),
+        math_texts: Vec::new(),
+    });
+    Page {
+        ops: sink.ops,
+        height: finals.height,
+        column: finals.column,
+        left: finals.left,
+        hotspots: sink.hots,
+        wide_regions: sink.wide,
+        note_tops: finals.note_tops,
+        anchor_tops: finals.anchor_tops,
+        sel: sink.sel,
+        hyphens: finals.hyphens,
+        table_headers: finals.table_headers,
+        table_spans: finals.table_spans,
+        note_spans: finals.note_spans,
+        math_texts: finals.math_texts,
+    }
+}
+
+/// Lay a document out, handing each batch of the display list to `sink` as it is
+/// finished. The whole page, in one call, is [`build_ops`].
+#[allow(clippy::too_many_arguments)]
+pub fn build_in_chunks(
+    font: &mut FontEngine,
+    theme: &Theme,
+    doc: &Document,
+    client_w: f32,
+    dpi: f32,
+    objects: &mut Objects<'_>,
+    hyphenator: Option<&Hyphenator>,
+    sink: &mut dyn LayoutSink,
+) {
     let k = scale_of(dpi);
     let margin = theme.base * MARGIN_EM;
     let client_pt = client_w / k;
@@ -8819,7 +9289,46 @@ pub fn build_ops(
         },
     };
 
-    for (b, p) in doc.blocks.iter().zip(prepared) {
+    // The layout's own buffers, drained into a batch every LAYOUT_CHUNK_BLOCKS blocks.
+    // The display list a batch carries is sorted by y before it leaves, because a
+    // table's cells are laid out column by column and the reader's line index is in
+    // reading order: the batch's own rows are ordered, and the batches themselves
+    // are in document order, so the whole index stays sorted once they are.
+    macro_rules! emit {
+        ($blocks:expr) => {{
+            let blocks = $blocks;
+            if blocks == 0 {
+                return;
+            }
+            let mut sel = std::mem::take(&mut sel);
+            sel.sort_by(|a, b| {
+                a.y.total_cmp(&b.y).then_with(|| {
+                    a.xs.first().copied().unwrap_or(0.0).total_cmp(&b.xs.first().copied().unwrap_or(0.0))
+                })
+            });
+            if !sink.accept(LayoutChunk {
+                ops: std::mem::take(&mut ops),
+                hots: std::mem::take(&mut hots),
+                sel,
+                wide: std::mem::take(&mut wide),
+                table_headers: std::mem::take(&mut table_headers),
+                table_spans: std::mem::take(&mut table_spans),
+                note_spans: std::mem::take(&mut note_spans),
+                math_texts: std::mem::take(&mut math_texts),
+                y,
+                blocks,
+            }) {
+                return;
+            }
+        }};
+    }
+    let mut laid = 0usize;
+    for (index, (b, p)) in doc.blocks.iter().zip(prepared).enumerate() {
+        if index > 0 && index % LAYOUT_CHUNK_BLOCKS == 0 {
+            let blocks = index - laid;
+            laid = index;
+            emit!(blocks);
+        }
         let base_left = left;
         // Offsets are computed against the block's own text, which already carries
         // the list marker, so they need no shifting.
@@ -8951,33 +9460,20 @@ pub fn build_ops(
         }
     }
 
-    // A grid paints one column at a time, so its lines reach the index column by
-    // column: the second line of a tall cell before the first line of the cell beside
-    // it. A drag crosses the page by line, and left to right within one, so the index
-    // is put back into the order the reader sees. The sort is stable, which is what
-    // keeps a row's cells in their column order.
-    sel.sort_by(|a, b| {
-        a.y.total_cmp(&b.y).then_with(|| {
-            a.xs.first().copied().unwrap_or(0.0).total_cmp(&b.xs.first().copied().unwrap_or(0.0))
-        })
-    });
-
-    Page {
-        ops,
+    // Whatever is left after the apparatus: the notes are part of the last batch.
+    emit!(doc.blocks.len() - laid + 1);
+    sink.finish(LayoutFinals {
         height: y + theme.base * 2.0,
         column,
         left,
-        hotspots: hots,
-        wide_regions: wide,
         note_tops,
         anchor_tops,
-        sel,
         hyphens: breaks,
-        table_headers,
-        table_spans,
-        note_spans,
-        math_texts,
-    }
+        table_headers: std::mem::take(&mut table_headers),
+        table_spans: std::mem::take(&mut table_spans),
+        note_spans: std::mem::take(&mut note_spans),
+        math_texts: std::mem::take(&mut math_texts),
+    });
 }
 
 #[cfg(test)]
@@ -9195,7 +9691,10 @@ mod tests {
             note_spans: Vec::new(),
             math_texts: Vec::new(),
         };
-        assert_eq!(reader_page_starts(&page, 400.0, 2.0), vec![0.0, 450.0]);
+        assert_eq!(
+            reader_page_starts(&page.sel, &page.anchor_tops, page.height, 400.0, 2.0),
+            vec![0.0, 450.0]
+        );
     }
 
     #[test]
@@ -10228,6 +10727,38 @@ mod tests {
 #[cfg(test)]
 mod bidi_tests {
     use super::*;
+    use rubrica_type::justification::place_bidi;
+
+    /// `caret_at` finds the line under `y` by binary search now; it must agree with
+    /// the first-line-whose-bottom-passes-y scan it replaced, for every y in and
+    /// around the document.
+    #[test]
+    fn caret_line_lookup_matches_a_linear_scan() {
+        let mut sel = Vec::new();
+        let mut y = 0.0;
+        for n in 0..200 {
+            let len = 3 + n % 7;
+            sel.push(SelLine {
+                source: None,
+                y,
+                h: 20.0,
+                join: Join::None,
+                chars: "x".repeat(len).chars().collect(),
+                copies: Vec::new(),
+                xs: (0..len).map(|i| i as f32 * 7.0).collect(),
+                ends: (1..=len).map(|i| i as f32 * 7.0).collect(),
+            });
+            y += 20.0;
+        }
+        for probe in (-40..4400).step_by(7) {
+            let y = probe as f32 * 0.5;
+            let scan = sel.iter().enumerate().find(|(_, l)| y < l.y + l.h)
+                .map_or(sel.len() - 1, |(i, _)| i);
+            let caret = caret_at(&sel, 3.0, y);
+            assert_eq!(caret.line, scan, "y {y}");
+        }
+        assert_eq!(caret_at(&[], 0.0, 0.0).line, 0);
+    }
 
     #[test]
     fn glyph_origins_and_disjoint_links_use_the_visual_geometry() {

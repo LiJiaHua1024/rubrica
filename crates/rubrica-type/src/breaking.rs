@@ -60,6 +60,17 @@ pub struct BreakOptions {
     /// A line earns this only when its final content is one or more closing marks;
     /// opening punctuation and prose at a line end receive nothing.
     pub hanging_punctuation: Pt,
+    /// Items a single piece may span before the paragraph is broken at an
+    /// ordinary break opportunity between two already-legal pieces.
+    ///
+    /// The dynamic program is quadratic in the worst case and its cost per break
+    /// opportunity grows with the paragraph's residual set, so a paragraph that
+    /// goes on for hundreds of kilobytes -- one a log file or a wrap-free export
+    /// produces -- is laid out in bounded pieces instead of one solver run that
+    /// never returns. Only the stretch distribution near a piece boundary can
+    /// differ from the whole-paragraph optimum; ordinary paragraphs are far below
+    /// the limit and never split at all. Set to [`usize::MAX`] to disable.
+    pub piece_limit: usize,
 }
 
 impl BreakOptions {
@@ -81,6 +92,10 @@ impl BreakOptions {
             ragged: false,
             tight_box: false,
             hanging_punctuation: 0.0,
+            // ~16K characters of Latin prose, or ~32K items of Han: far past any
+            // paragraph a document writes by hand, and small enough that one solver
+            // run over a piece stays in the milliseconds.
+            piece_limit: 32_768,
         }
     }
 
@@ -324,6 +339,50 @@ fn score(
     Some((bad, fit, (f64::from(adj.max(0)) / 100.0).powi(2)))
 }
 
+/// Cut an over-long piece at break opportunities until every piece is within
+/// `limit` items of another.
+///
+/// Cuts land on glue and discretionary penalties -- opportunities the solver may
+/// break at anyway -- never on the infinite-stretch glue that precedes a forced
+/// break, which would turn an ordinary line into a ragged one. A piece with no
+/// legal cut (a single unbreakable word, a line of code without `tight_box`)
+/// stays whole; the solver falls back to `desperate` for it, as it does for a
+/// paragraph that is overfull on its own.
+fn split_piece(items: &[Item], from: usize, end: usize, limit: usize) -> Vec<(usize, usize)> {
+    if end <= from || end - from <= limit {
+        return vec![(from, end)];
+    }
+    let soft = |i: usize| match items[i] {
+        // Only finite-stretch breakable glue: the infinite glue before a forced
+        // break is what keeps that line ragged, and cutting there would end every
+        // piece on a ragged line.
+        Item::Glue { breakable: true, stretch, .. } => stretch < INFINITY / 2.0,
+        Item::Penalty { forced: false, hyphen: None, .. } => true,
+        _ => false,
+    };
+    let mut out = Vec::new();
+    let mut start = from;
+    let mut last_cut: Option<usize> = None;
+    let mut i = from + 1;
+    while i < end {
+        if soft(i) {
+            if i - start >= limit {
+                let cut = last_cut.unwrap_or(i);
+                out.push((start, cut));
+                start = cut + 1;
+                last_cut = None;
+                continue;
+            }
+            last_cut = Some(i);
+        }
+        i += 1;
+    }
+    if start < end {
+        out.push((start, end));
+    }
+    out
+}
+
 /// Break one paragraph into lines.
 pub fn break_paragraph(para: &Paragraph, opts: &BreakOptions) -> Plan {
     let items = &para.items;
@@ -347,6 +406,17 @@ pub fn break_paragraph(para: &Paragraph, opts: &BreakOptions) -> Plan {
     } else if pieces.is_empty() {
         pieces.push((0, items.len() - 1));
     }
+    // A piece may still be unbounded: a log file folds into one block, and one
+    // hard-wrap-free paragraph of prose can be as long. Split each over-long piece
+    // at ordinary break opportunities so the solver's work per run stays bounded.
+    let pieces: Vec<(usize, usize)> = if opts.piece_limit < usize::MAX {
+        pieces
+            .into_iter()
+            .flat_map(|(from, end)| split_piece(items, from, end, opts.piece_limit))
+            .collect()
+    } else {
+        pieces
+    };
 
     let mut lines = Vec::new();
     let mut demerits = 0.0;

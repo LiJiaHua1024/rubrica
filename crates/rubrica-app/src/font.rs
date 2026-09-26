@@ -14,6 +14,7 @@
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::ops::Range;
+use std::rc::Rc;
 
 use rubrica_type::paragraph::{Measure, StyleId};
 use rubrica_type::units::Pt;
@@ -107,8 +108,8 @@ pub struct FontEngine {
     collection: IDWriteFontCollection,
     faces: RefCell<Vec<Face>>,
     resolved: RefCell<HashMap<(String, u16, bool), Option<usize>>>,
-    shaped: RefCell<HashMap<ShapeKey, Vec<GlyphRun>>>,
-    analyzed: RefCell<HashMap<String, Vec<TextRun>>>,
+    shaped: RefCell<LayeredMap<ShapeKey, Vec<GlyphRun>>>,
+    analyzed: RefCell<LayeredMap<String, Rc<Vec<TextRun>>>>,
     /// `(position, thickness)` of this face's strikeout rule, in design units, read
     /// from its file: a face is asked once, however many struck runs it carries.
     strikeout: RefCell<HashMap<usize, Option<(f32, f32)>>>,
@@ -116,6 +117,79 @@ pub struct FontEngine {
     /// needs an embeddable font rather than a COM draw handle.
     font_files: RefCell<HashMap<usize, (Vec<u8>, usize)>>,
     styles: RefCell<Vec<Style>>,
+    /// The paragraph whose itemization is current.
+    ///
+    /// Measurement arrives with the paragraph's text and a range inside it, once per
+    /// word. Looking the itemization up by hashing that text answers each word with a
+    /// pass over the whole paragraph, which is what makes one long paragraph cost the
+    /// square of its length. The layout opens a paragraph here, and while one is open
+    /// its itemization is found by the text's own address: the paragraph is alive for
+    /// as long as its words are measured, so an equal address and length can only be
+    /// the paragraph itself. Any other text -- a label, a marker, a table cell -- has
+    /// an address of its own and goes to the cache.
+    paragraph: RefCell<Option<OpenParagraph>>,
+}
+
+/// The paragraph [`FontEngine::begin_paragraph`] opened.
+struct OpenParagraph {
+    /// The open paragraph's address and length, which identify it while it lives.
+    owner: (*const u8, usize),
+    runs: Rc<Vec<TextRun>>,
+}
+
+/// A content-addressed cache that retires a whole generation at a time.
+///
+/// Clearing a cache on overflow is the usual cheap answer, but what it throws away
+/// is the half a long document is still using: the next layout re-measures every
+/// one of those runs, and a document that outruns the cap pays that cost on every
+/// pass. Two generations keep the entries a document is still using alive for one
+/// more pass around the cache, which is the difference between a book being set
+/// twice and being set once per generation.
+/// Runs kept shaped per generation. A run is a face, a size, a script and the text,
+/// so a page of prose repeats most of its runs and a second layout of the same page
+/// costs one lookup per run rather than one `GetGlyphs` per run.
+const SHAPED_CACHE_CAP: usize = 65_536;
+
+/// Itemized runs kept per generation. Keyed by the whole string handed to the
+/// itemizer, so a paragraph is analysed once however often its pieces are measured.
+const ANALYZED_CACHE_CAP: usize = 65_536;
+
+struct LayeredMap<K: std::hash::Hash + Eq, V> {
+    hot: HashMap<K, V>,
+    cold: HashMap<K, V>,
+}
+
+impl<K: std::hash::Hash + Eq, V> Default for LayeredMap<K, V> {
+    fn default() -> Self {
+        Self { hot: HashMap::new(), cold: HashMap::new() }
+    }
+}
+
+impl<K: std::hash::Hash + Eq, V> LayeredMap<K, V> {
+    fn get<Q>(&self, key: &Q) -> Option<&V>
+    where
+        K: std::borrow::Borrow<Q>,
+        Q: std::hash::Hash + Eq + ?Sized,
+    {
+        self.hot.get(key).or_else(|| self.cold.get(key))
+    }
+
+    fn len(&self) -> usize {
+        self.hot.len() + self.cold.len()
+    }
+
+    fn clear(&mut self) {
+        self.hot.clear();
+        self.cold.clear();
+    }
+
+    /// Offer `key` to the hot generation, retiring the one before it if it is full.
+    fn insert(&mut self, key: K, value: V, cap: usize) {
+        if self.hot.len() >= cap {
+            self.cold = std::mem::take(&mut self.hot);
+        }
+        self.hot.insert(key, value);
+    }
 }
 
 #[derive(Clone, Hash, PartialEq, Eq)]
@@ -155,8 +229,9 @@ impl FontEngine {
                 collection,
                 faces: RefCell::new(Vec::new()),
                 resolved: RefCell::new(HashMap::new()),
-                shaped: RefCell::new(HashMap::new()),
-                analyzed: RefCell::new(HashMap::new()),
+                shaped: RefCell::new(LayeredMap::default()),
+                analyzed: RefCell::new(LayeredMap::default()),
+                paragraph: RefCell::new(None),
                 strikeout: RefCell::new(HashMap::new()),
                 font_files: RefCell::new(HashMap::new()),
                 styles: RefCell::new(Vec::new()),
@@ -314,6 +389,47 @@ impl FontEngine {
         partial
     }
 
+    /// The itemization of the paragraph under measurement, or of any other text the
+    /// cache already holds.
+    fn itemization(&self, text: &str) -> Rc<Vec<TextRun>> {
+        if let Some(open) = self.paragraph.borrow().as_ref() {
+            if open.owner == (text.as_ptr(), text.len()) {
+                return open.runs.clone();
+            }
+        }
+        if let Some(hit) = self.analyzed.borrow().get(text) {
+            return hit.clone();
+        }
+        let language = east_asian_language(text);
+        let bidi = rubrica_type::BidiInfo::new(text, None);
+        let scripts =
+            analysis::scripts(&self.analyzer, text, locale_for_text(text, language)).unwrap_or_default();
+        let mut runs: Vec<TextRun> = Vec::new();
+        let mut unit = 0;
+        for (at, c) in text.char_indices() {
+            let level = bidi.levels[at].number();
+            let script = scripts.get(unit).copied().unwrap_or_default();
+            unit += c.len_utf16();
+            if let Some(last) = runs.last_mut().filter(|r| r.level == level && r.script == script) {
+                last.range.end = at + c.len_utf8();
+            } else {
+                runs.push(TextRun { range: at..at + c.len_utf8(), level, script, language });
+            }
+        }
+        let runs = Rc::new(runs);
+        self.analyzed.borrow_mut().insert(text.to_owned(), runs.clone(), ANALYZED_CACHE_CAP);
+        runs
+    }
+
+    /// Open a paragraph for measurement: its words are asked of [`Self::shape_runs`]
+    /// with the paragraph's own text, and the calls this saves are what keep a long
+    /// paragraph from costing its own length once per word.
+    pub fn begin_paragraph(&self, text: &str) {
+        let runs = self.itemization(text);
+        *self.paragraph.borrow_mut() =
+            Some(OpenParagraph { owner: (text.as_ptr(), text.len()), runs });
+    }
+
     /// Shape `text[range]`, starting a new run wherever the face must change.
     pub fn shape_runs(
         &self,
@@ -323,30 +439,15 @@ impl FontEngine {
         size: Pt,
         tracking: f32,
     ) -> Vec<GlyphRun> {
-        if !self.analyzed.borrow().contains_key(text) {
-            let language = east_asian_language(text);
-            let bidi = rubrica_type::BidiInfo::new(text, None);
-            let scripts =
-                analysis::scripts(&self.analyzer, text, locale_for_text(text, language)).unwrap_or_default();
-            let mut runs: Vec<TextRun> = Vec::new();
-            let mut unit = 0;
-            for (at, c) in text.char_indices() {
-                let level = bidi.levels[at].number();
-                let script = scripts.get(unit).copied().unwrap_or_default();
-                unit += c.len_utf16();
-                if let Some(last) = runs.last_mut().filter(|r| r.level == level && r.script == script) {
-                    last.range.end = at + c.len_utf8();
-                } else {
-                    runs.push(TextRun { range: at..at + c.len_utf8(), level, script, language });
-                }
-            }
-            self.analyzed.borrow_mut().insert(text.to_owned(), runs);
-        }
-        let analysis: Vec<_> = self.analyzed.borrow()[text].iter().filter_map(|r| {
-            let start = r.range.start.max(range.start);
-            let end = r.range.end.min(range.end);
-            (start < end).then(|| TextRun { range: start..end, ..r.clone() })
-        }).collect();
+        let runs = self.itemization(text);
+        let analysis: Vec<TextRun> = runs
+            .iter()
+            .filter_map(|r| {
+                let start = r.range.start.max(range.start);
+                let end = r.range.end.min(range.end);
+                (start < end).then(|| TextRun { range: start..end, ..r.clone() })
+            })
+            .collect();
         // Cache the paragraph language with its script analysis: measuring each
         // ideograph must not scan a whole book paragraph again.
         let mut localized = req.clone();
@@ -535,7 +636,7 @@ impl FontEngine {
             descent: metrics.descent as f32 * scale,
             line_gap: metrics.lineGap as f32 * scale,
         };
-        self.shaped.borrow_mut().insert(key, vec![run.clone()]);
+        self.shaped.borrow_mut().insert(key, vec![run.clone()], SHAPED_CACHE_CAP);
         vec![run]
     }
 

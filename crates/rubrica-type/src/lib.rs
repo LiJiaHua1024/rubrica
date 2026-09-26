@@ -12,7 +12,7 @@ pub mod units;
 pub use unicode_bidi::{BidiInfo, Level};
 
 pub use breaking::{BreakOptions, Line, Plan};
-pub use justification::{Placed, place};
+pub use justification::{LinePlacer, Placed, place};
 pub use paragraph::{Hyphenation, Item, Node, Paragraph, Spacing, StyleId};
 pub use units::Pt;
 

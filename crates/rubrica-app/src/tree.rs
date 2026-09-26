@@ -22,9 +22,7 @@ pub struct Entry {
 }
 
 pub fn is_document(path: &Path) -> bool {
-    path.extension()
-        .and_then(|ext| ext.to_str())
-        .is_some_and(|ext| matches!(ext.to_ascii_lowercase().as_str(), "md" | "markdown" | "txt"))
+    crate::reading::is_document(path)
 }
 
 fn name(path: &Path) -> String {
@@ -75,6 +73,7 @@ mod tests {
     fn document_extensions_are_case_insensitive() {
         assert!(is_document(Path::new("README.MD")));
         assert!(is_document(Path::new("book.txt")));
+        assert!(is_document(Path::new("build.LOG")));
         assert!(!is_document(Path::new("data.csv")));
     }
 

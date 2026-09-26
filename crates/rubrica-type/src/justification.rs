@@ -113,44 +113,131 @@ pub fn line_width(placed: &[Placed]) -> Pt {
 /// in visual order, with left-edge coordinates; glyph direction is still per run.
 /// Keeping the analysis outside this function lets all lines share one UBA pass.
 pub fn place_bidi(para: &Paragraph, line: &Line, bidi: &crate::BidiInfo<'_>) -> Vec<Placed> {
-    let mut slots = place(para, line);
-    let ranges: Vec<_> = slots.iter().filter_map(|s| s.node)
-        .map(|n| para.node(n).text.clone()).filter(|r| !r.is_empty()).collect();
-    let Some(first) = ranges.first() else { return slots };
-    let end = ranges.last().unwrap().end;
-    let Some(p) = bidi.paragraphs.iter().find(|p| p.range.contains(&first.start)) else {
-        return slots;
-    };
-    let levels = bidi.reordered_levels(p, first.start..end);
-    let mut cursor = first.start;
-    let mut slot_levels = Vec::new();
-    for i in 0..slots.len() {
-        let level = if let Some(n) = slots[i].node {
-            let r = &para.node(n).text;
-            cursor = r.end;
-            slots[i].source = Some((r.start, r.end));
-            let at = if r.is_empty() { r.start.saturating_sub(1) } else { r.start };
-            levels.get(at).copied().unwrap_or(p.level)
-        } else {
-            let next = slots[i + 1..].iter().filter_map(|s| s.node)
-                .map(|n| para.node(n).text.start).next().unwrap_or(cursor);
-            slots[i].source = Some((cursor, next));
-            let level = if cursor < next { levels[cursor] } else {
-                slot_levels.last().copied().unwrap_or(p.level)
-            };
-            cursor = next;
-            level
-        };
-        slots[i].bidi_level = level.number();
-        slot_levels.push(level);
+    LinePlacer::new(bidi).place_line(para, line)
+}
+
+/// One paragraph's bidirectional analysis, shared by every line laid out from it.
+///
+/// The expensive part of reordering a line is that the bidi crate rewrites a line by
+/// cloning the whole paragraph's level vector first. When the paragraph's levels are
+/// all zero -- plain Latin, code, Han text, and every other paragraph without
+/// explicit direction embeddings -- rules L1 and L2 leave the vector exactly as it
+/// is, so a line reads its levels straight from the analysis instead. The check runs
+/// once per paragraph, not once per line.
+pub struct LinePlacer<'a> {
+    bidi: &'a crate::BidiInfo<'a>,
+    flat: bool,
+}
+
+impl<'a> LinePlacer<'a> {
+    pub fn new(bidi: &'a crate::BidiInfo<'a>) -> Self {
+        let flat = bidi.levels.iter().all(|l| l.number() == 0);
+        Self { bidi, flat }
     }
-    let width: Pt = slots.iter().map(|s| s.w).sum();
-    let target = if line.natural > line.target { line.target + line.hang } else { line.target };
-    let mut x = if p.level.is_rtl() { (target - width).max(0.0) } else { 0.0 };
-    crate::BidiInfo::reorder_visual(&slot_levels).into_iter().map(|i| {
-        let mut slot = slots[i];
-        slot.x = x;
-        x += slot.w;
-        slot
-    }).collect()
+
+    pub fn place_line(&self, para: &Paragraph, line: &Line) -> Vec<Placed> {
+        let bidi = self.bidi;
+        let mut slots = place(para, line);
+        let ranges: Vec<_> = slots.iter().filter_map(|s| s.node)
+            .map(|n| para.node(n).text.clone()).filter(|r| !r.is_empty()).collect();
+        let Some(first) = ranges.first() else { return slots };
+        let end = ranges.last().unwrap().end;
+        let Some(p) = bidi.paragraphs.iter().find(|p| p.range.contains(&first.start)) else {
+            return slots;
+        };
+        let reordered;
+        let levels: &[crate::Level] = if self.flat {
+            &bidi.levels
+        } else {
+            reordered = bidi.reordered_levels(p, first.start..end);
+            &reordered
+        };
+        let mut cursor = first.start;
+        let mut slot_levels = Vec::new();
+        for i in 0..slots.len() {
+            let level = if let Some(n) = slots[i].node {
+                let r = &para.node(n).text;
+                cursor = r.end;
+                slots[i].source = Some((r.start, r.end));
+                let at = if r.is_empty() { r.start.saturating_sub(1) } else { r.start };
+                levels.get(at).copied().unwrap_or(p.level)
+            } else {
+                let next = slots[i + 1..].iter().filter_map(|s| s.node)
+                    .map(|n| para.node(n).text.start).next().unwrap_or(cursor);
+                slots[i].source = Some((cursor, next));
+                let level = if cursor < next { levels[cursor] } else {
+                    slot_levels.last().copied().unwrap_or(p.level)
+                };
+                cursor = next;
+                level
+            };
+            slots[i].bidi_level = level.number();
+            slot_levels.push(level);
+        }
+        let width: Pt = slots.iter().map(|s| s.w).sum();
+        let target = if line.natural > line.target { line.target + line.hang } else { line.target };
+        let mut x = if p.level.is_rtl() { (target - width).max(0.0) } else { 0.0 };
+        crate::BidiInfo::reorder_visual(&slot_levels).into_iter().map(|i| {
+            let mut slot = slots[i];
+            slot.x = x;
+            x += slot.w;
+            slot
+        }).collect()
+    }
+}
+
+#[cfg(test)]
+mod line_placer {
+    use super::*;
+    use crate::breaking::{BreakOptions, Plan};
+    use crate::paragraph::{MonospaceMeasure, Spacing, StyleId};
+
+    fn set(text: &str, column: Pt) -> (Paragraph, Plan) {
+        let mut measure = MonospaceMeasure { size: 16.0, factor: 0.5 };
+        let mut opts = BreakOptions::new(column);
+        opts.par_indent = 0.0;
+        crate::typeset(text, &Spacing::for_size(16.0), StyleId(0), &[], &opts, &mut measure)
+    }
+
+    /// A shared placer must place every line exactly as a fresh per-line call does,
+    /// on every script -- the fast path for all-zero levels included.
+    #[test]
+    fn a_shared_placer_matches_per_line_calls_on_every_script() {
+        let texts = [
+            "plain ascii words that wrap across several lines of the measure",
+            "中文排版测试一二三四五六七八九十排列成好多行",
+            "hello 世界 mixed 组 scripts 123 and more words to wrap",
+            "שלום עולם 123 ואהבה הבה ועוד מילים לרוב",
+            "مرحبا 123 بالعالم وكلمات أكثر لف الأسطر",
+        ];
+        for text in texts {
+            let (para, plan) = set(text, 8.0 * 16.0);
+            assert!(plan.lines.len() > 1, "{text:?} produced one line");
+            let bidi = crate::BidiInfo::new(text, None);
+            let placer = LinePlacer::new(&bidi);
+            for line in &plan.lines {
+                let fresh = place_bidi(&para, line, &bidi);
+                let shared = placer.place_line(&para, line);
+                assert_eq!(fresh.len(), shared.len(), "{text:?}");
+                for (a, b) in fresh.iter().zip(&shared) {
+                    assert_eq!((a.x, a.w, a.node, a.bidi_level), (b.x, b.w, b.node, b.bidi_level), "{text:?}");
+                    assert_eq!(a.source, b.source, "{text:?}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn a_flat_paragraph_needs_no_reordering_at_all() {
+        let text = "a flat paragraph has all-zero levels";
+        let (para, plan) = set(text, 6.0 * 16.0);
+        let bidi = crate::BidiInfo::new(text, None);
+        assert!(bidi.levels.iter().all(|l| l.number() == 0));
+        let placer = LinePlacer::new(&bidi);
+        for line in &plan.lines {
+            for slot in placer.place_line(&para, line) {
+                assert_eq!(slot.bidi_level, 0);
+            }
+        }
+    }
 }

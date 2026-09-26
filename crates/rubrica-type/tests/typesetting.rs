@@ -962,3 +962,66 @@ fn a_tight_box_breaks_where_a_loose_ragged_block_hangs() {
         assert!(w <= column + 0.5, "a tight line hangs {w} in a {column} box");
     }
 }
+
+
+/// Build a paragraph whose item count is well past any default piece limit.
+fn long_prose(words: usize) -> String {
+    (0..words).map(|i| format!("word{} ", i % 97)).collect()
+}
+
+#[test]
+fn ordinary_paragraphs_never_split_and_the_answer_is_unchanged() {
+    // Below the default piece limit the splitter is inert, so the plan is exactly
+    // what the whole-paragraph solver produced before it existed.
+    let src = long_prose(600);
+    let (para, split) = {
+        let mut measure = MonospaceMeasure { size: SIZE, factor: 0.5 };
+        let opts = BreakOptions::new(20.0 * SIZE);
+        typeset(&src, &Spacing::for_size(SIZE), StyleId(0), &[], &opts, &mut measure)
+    };
+    let (upara, whole) = {
+        let mut measure = MonospaceMeasure { size: SIZE, factor: 0.5 };
+        let mut opts = BreakOptions::new(20.0 * SIZE);
+        opts.piece_limit = usize::MAX;
+        typeset(&src, &Spacing::for_size(SIZE), StyleId(0), &[], &opts, &mut measure)
+    };
+    assert!(whole.lines.len() > 1);
+    assert_eq!(split.lines.len(), whole.lines.len());
+    // Spaces are glue and belong to no box, so the boxes are compared to the words.
+    let joined: String = split.lines.iter().map(|l| text_of(&para, &src, l)).collect();
+    assert_eq!(joined, src.replace(' ', ""));
+    let _ = upara;
+}
+
+#[test]
+fn a_paragraph_longer_than_one_piece_keeps_every_character() {
+    let src = long_prose(4000);
+    let (para, plan) = {
+        let mut measure = MonospaceMeasure { size: SIZE, factor: 0.5 };
+        let mut opts = BreakOptions::new(20.0 * SIZE);
+        opts.piece_limit = 400;
+        typeset(&src, &Spacing::for_size(SIZE), StyleId(0), &[], &opts, &mut measure)
+    };
+    assert!(para.items.len() > 400, "the case must outrun the piece limit");
+    assert!(plan.lines.len() > 20, "the case must wrap into many lines");
+    let joined: String = plan.lines.iter().map(|l| text_of(&para, &src, l)).collect();
+    assert_eq!(joined, src.replace(' ', ""), "a split paragraph lost or repeated content");
+    for line in &plan.lines {
+        assert!(!line.is_overfull(), "a split line hangs past the measure: natural {} target {}",
+            line.natural, line.target);
+    }
+}
+
+#[test]
+fn split_han_text_also_keeps_every_character() {
+    let src: String = "中文字符排版引擎的折行求解测试".repeat(400);
+    let (para, plan) = {
+        let mut measure = MonospaceMeasure { size: SIZE, factor: 0.5 };
+        let mut opts = BreakOptions::new(20.0 * SIZE);
+        opts.piece_limit = 300;
+        typeset(&src, &Spacing::for_size(SIZE), StyleId(0), &[], &opts, &mut measure)
+    };
+    let joined: String = plan.lines.iter().map(|l| text_of(&para, &src, l)).collect();
+    assert_eq!(joined, src, "a split Han paragraph lost or repeated content");
+    assert!(plan.lines.len() > 20);
+}

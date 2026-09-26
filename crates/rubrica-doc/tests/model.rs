@@ -1,6 +1,31 @@
 use rubrica_doc::{BlockKind, Document, InlineStyle};
 
 #[test]
+fn source_maps_every_displayed_byte_idempotently_by_binary_search() {
+    // A block's spans ascend by range.start, so a binary search must agree with the
+    // reverse scan it replaced for every byte in the block, gap or no gap.
+    let span = |start: usize, len: usize, source: usize| rubrica_doc::SourceSpan { range: start..start + len, source };
+    let spans = vec![span(0, 3, 100), span(3, 4, 200), span(7, 2, 500), span(9, 5, 900)];
+    let scan = |byte: usize| spans.iter().rev().find(|s| s.range.start <= byte)
+        .map(|s| s.source + (byte.min(s.range.end) - s.range.start));
+    for byte in 0..14 {
+        assert_eq!(rubrica_doc::source_at(&spans, byte), scan(byte), "byte {byte}");
+    }
+    assert_eq!(rubrica_doc::source_at(&[], 0), None);
+    // A document with a real source rewrite exercises the same path end to end.
+    let src = "one **two** three
+
+four";
+    let doc = Document::parse(src);
+    let block = doc.blocks.iter().find(|b| b.text.contains("three")).unwrap();
+    for at in 0..block.text.len() {
+        let scan = block.sources.iter().rev().find(|s| s.range.start <= at)
+            .map(|s| s.source + (at.min(s.range.end) - s.range.start));
+        assert_eq!(rubrica_doc::source_at(&block.sources, at), scan, "byte {at}");
+    }
+}
+
+#[test]
 fn source_positions_survive_metadata_delimiter_rewrites_and_definition_splits() {
     let src = "---\ntitle: book\n---\n\n# 标题\n\nRepeated **word** &amp; \\(x\\) after.\n\nTerm\n: definition here\n\n  \\[\nx^2\n  \\]\n\nFinal target.\n";
     let doc = Document::parse(src);

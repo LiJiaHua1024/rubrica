@@ -80,6 +80,13 @@ pub fn report(source: &str, path: Option<&str>, o: &Options) -> Result<()> {
         theme.set_measure(measure);
     }
     let plain = plain.unwrap_or_else(|| crate::reading::is_plain(path.map(std::path::Path::new)));
+    // The same paragraph rule the window opens the file with, so a report and a
+    // reader agree about where a log file's lines end.
+    let text_options = if source_view {
+        text_options
+    } else {
+        crate::reading::text_options_for(path.map(std::path::Path::new), text_options)
+    };
     let doc = if source_view {
         rubrica_doc::Document::source(source)
     } else if plain {
