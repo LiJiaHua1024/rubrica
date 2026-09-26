@@ -237,10 +237,10 @@ fn page_stack_layout_for(client_w: f32, client_h: f32, content_dx: f32) -> PageS
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
-struct Rgb {
-    r: f32,
-    g: f32,
-    b: f32,
+pub(crate) struct Rgb {
+    pub(crate) r: f32,
+    pub(crate) g: f32,
+    pub(crate) b: f32,
 }
 
 impl Rgb {
@@ -252,29 +252,30 @@ impl Rgb {
 /// Light and dark ink. The light paper is warm rather than pure white, and the dark
 /// text is a little under full contrast: both reduce glare over a long read, and a
 /// reader is read for pages at a time rather than glanced at.
+/// Shared with the peek window, which paints the same paper in its own frame.
 #[derive(Clone, Debug)]
-struct Palette {
-    dark: bool,
-    bg: Rgb,
-    text: Rgb,
-    muted: Rgb,
-    accent: Rgb,
-    code_bg: Rgb,
-    page_surface: Rgb,
-    page_shadow: Rgb,
-    keyword: Rgb,
-    string: Rgb,
-    comment: Rgb,
-    number: Rgb,
-    ty: Rgb,
-    tab_strip: Rgb,
-    tab_inactive: Rgb,
-    tab_hover: Rgb,
-    on_accent: Rgb,
+pub(crate) struct Palette {
+    pub(crate) dark: bool,
+    pub(crate) bg: Rgb,
+    pub(crate) text: Rgb,
+    pub(crate) muted: Rgb,
+    pub(crate) accent: Rgb,
+    pub(crate) code_bg: Rgb,
+    pub(crate) page_surface: Rgb,
+    pub(crate) page_shadow: Rgb,
+    pub(crate) keyword: Rgb,
+    pub(crate) string: Rgb,
+    pub(crate) comment: Rgb,
+    pub(crate) number: Rgb,
+    pub(crate) ty: Rgb,
+    pub(crate) tab_strip: Rgb,
+    pub(crate) tab_inactive: Rgb,
+    pub(crate) tab_hover: Rgb,
+    pub(crate) on_accent: Rgb,
 }
 
 impl Palette {
-    fn of(dark: bool) -> Palette {
+    pub(crate) fn of(dark: bool) -> Palette {
         if dark {
             Palette {
                 dark,
@@ -328,7 +329,7 @@ impl Palette {
         }
     }
 
-    fn ink(&self, role: ColorRole) -> Rgb {
+    pub(crate) fn ink(&self, role: ColorRole) -> Rgb {
         match role {
             ColorRole::Text | ColorRole::Code => self.text,
             ColorRole::Muted | ColorRole::Faint => self.muted,
@@ -349,7 +350,7 @@ impl Palette {
     }
 }
 
-fn d2d(c: Rgb) -> D2D1_COLOR_F {
+pub(crate) fn d2d(c: Rgb) -> D2D1_COLOR_F {
     D2D1_COLOR_F { r: c.r, g: c.g, b: c.b, a: 1.0 }
 }
 
@@ -2641,8 +2642,9 @@ fn relocated_source(old: &str, new: &str, byte: usize) -> usize {
 }
 
 /// Reads the same registry value the Settings app writes. There is no window
-/// message for this setting, so it is polled; see `WM_TIMER`.
-fn system_prefers_dark() -> bool {
+/// message for this setting, so it is polled; see `WM_TIMER`. The peek window
+/// polls it the same way, at each reveal rather than on a timer.
+pub(crate) fn system_prefers_dark() -> bool {
     let mut value: u32 = 1;
     let mut len = std::mem::size_of::<u32>() as u32;
     let r = unsafe {
@@ -5355,7 +5357,7 @@ fn unicode_by_glyph(source: &str, clusters: &[u16], glyph_count: usize) -> Vec<O
     out
 }
 
-fn paint_run(
+pub(crate) fn paint_run(
     font: &FontEngine,
     r: &GlyphRun,
     x: Pt,

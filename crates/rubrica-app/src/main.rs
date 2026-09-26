@@ -16,6 +16,7 @@ mod images;
 mod instance;
 mod math;
 mod pagination;
+mod peek;
 mod report;
 mod reading;
 mod profiles;
@@ -34,6 +35,12 @@ pub(crate) type Result<T> = std::result::Result<T, Error>;
 
 fn main() -> Result<()> {
     let argv: Vec<String> = std::env::args().collect();
+    if argv.iter().any(|a| a == "--peek") {
+        // The spacebar peek service: a background watcher that previews what the
+        // user has selected. It holds no mutex the reader wants and shares no
+        // window with it; two of these are one too many, and it knows that.
+        return peek::daemon();
+    }
     if argv.iter().any(|a| a == "--export-png") {
         let output = text_flag(&argv, "--export-png").ok_or("--export-png needs an output path")?;
         let width = flag(&argv, "--export-width").unwrap_or(1080.0);

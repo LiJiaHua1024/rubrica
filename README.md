@@ -146,6 +146,36 @@ workspace tree.
 
 Preferences live in `HKCU\Software\Rubrica`.
 
+## The spacebar peek
+
+`rubrica-app --peek` runs a small background service (a tray icon, no window) that adds
+a Quick Look to the machine: select a `.md`, `.markdown` or `.txt` file in Explorer —
+or on the desktop — and press space. The file is typeset by the same engine the reader
+uses and shown in a rounded, topmost window centred on the monitor the pointer is over.
+The preview never takes the focus, so the folder keeps the selection: the arrow keys
+keep moving it and the preview follows, `Enter` opens the file with its default program
+(Typora, say), and `Ctrl+Enter` hands it to a running reader as if it had been
+double-clicked. Space again, `Esc`, or releasing a space held longer than a moment puts
+the preview away; a quick tap toggles it instead. The tray menu offers launch-at-sign-in
+and the exit.
+
+The service watches keys through a low-level hook that does almost nothing per stroke —
+a key code, a few `GetAsyncKeyState` reads, one window class — and keeps the shell's
+own space bar behaviour wherever a user is typing: in the rename box, the address bar,
+or the search field, whose UWP control is judged by its focus window rather than by a
+caret. Everything slower (walking the shell for the selection, reading the file,
+typesetting) happens off the keystroke, after a posted message.
+
+| Key | in the peek |
+| --- | --- |
+| `Space` | press to show · again to hide · hold and release to dismiss |
+| `Esc` | put the preview away |
+| `←` `→` | (left to the folder) move the selection; the preview follows |
+| `Enter` | open the file with its default program |
+| `Ctrl+Enter` | open it in a running Rubrica reader |
+| `F5` | read the file again from disk |
+| mouse wheel | scroll the page |
+
 ## Layout of the code
 
 | Crate | |
@@ -153,7 +183,7 @@ Preferences live in `HKCU\Software\Rubrica`.
 | `rubrica-type` | the line breaker: paragraph model, Knuth–Plass solver, justification, script classification, hyphenation |
 | `rubrica-doc` | Markdown to blocks, spans, tables, footnotes and inline objects |
 | `rubrica-math` | a LaTeX subset to boxes, measured through a `MathMeasure` the caller implements |
-| `rubrica-app` | the window: Direct2D/DirectWrite painting, selection, hit-testing, themes, settings, workspace navigation, `--report`, PNG/PDF export |
+| `rubrica-app` | the window: Direct2D/DirectWrite painting, selection, hit-testing, themes, settings, workspace navigation, `--report`, PNG/PDF export, and the `--peek` spacebar service |
 | `rubrica-workspace` | tab identity, preview/pinned state, recent files, and versioned session snapshots |
 
 The first three have no dependency on Windows and no dependency on each other's
