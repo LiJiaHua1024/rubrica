@@ -82,13 +82,13 @@ The reader can export the same typeset display list without going through a prin
 
 ```
 rubrica-app --export-png page.png --export-width 1080 --export-scale 2 document.md
-rubrica-app --export-pdf document.pdf --pdf-width 612 --pdf-height 792 document.md
+cargo run --release --features pdf -p rubrica-app -- --export-pdf document.pdf --pdf-width 612 --pdf-height 792 document.md
 ```
 
 PNG uses the native WIC encoder and keeps the reader's colours, images, wide-content
 panning geometry, and typography. PDF embeds the DirectWrite font files, writes glyph
 positions and Unicode mappings, and wraps text runs in PDF `ActualText` spans so CJK,
-ligatures, emoji, and bidirectional text remain selectable. Page breaks are planned at line boundaries and keep headings with the lines that follow them. Tables repeat their header on continuation pages, and continued footnotes receive an explicit continuation marker. PDF images support the enabled PNG/JPEG/GIF/BMP/TIFF/WebP decoders; formula source is also carried in an accessible text layer for copying.
+ligatures, emoji, and bidirectional text remain selectable. Page breaks are planned at line boundaries and keep headings with the lines that follow them. Tables repeat their header on continuation pages, and continued footnotes receive an explicit continuation marker. PDF images support the enabled PNG/JPEG/GIF/BMP/TIFF/WebP decoders; formula source is also carried in an accessible text layer for copying. PDF export lives behind the `pdf` feature because the reading window never touches the font and image stack it pulls in, so a plain `cargo build --release` produces the smaller reader without it.
 
 ## What it reads
 

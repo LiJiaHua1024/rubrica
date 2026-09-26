@@ -1973,10 +1973,10 @@ mod tests {
             assert!(!t(lang, Key::MenuTypography).is_empty());
             assert!(!t(lang, Key::MenuLanguage).is_empty());
 
-            assert_eq!(font_label(lang, 0).is_empty(), false);
-            assert_eq!(font_label(lang, 18).is_empty(), false);
-            assert_eq!(number_label(lang, 0).is_empty(), false);
-            assert_eq!(number_label(lang, 16).is_empty(), false);
+            assert!(!font_label(lang, 0).is_empty());
+            assert!(!font_label(lang, 18).is_empty());
+            assert!(!number_label(lang, 0).is_empty());
+            assert!(!number_label(lang, 16).is_empty());
 
             assert!(!find_count(lang, 0, 0).is_empty());
             assert!(!find_count(lang, 0, 1).is_empty());

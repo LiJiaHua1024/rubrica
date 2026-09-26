@@ -10,13 +10,16 @@
 //! that carry them, so what a stored number means can be read -- and tested -- without a
 //! live registry in the way.
 
+use std::cell::RefCell;
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::sync::{LazyLock, Mutex};
 
 use windows::core::PCWSTR;
-use windows::Win32::Foundation::RECT;
+use windows::Win32::Foundation::{ERROR_SUCCESS, RECT};
 use windows::Win32::System::Registry::{
-    HKEY_CURRENT_USER, RegGetValueW, RegSetKeyValueW, RRF_RT_REG_BINARY, RRF_RT_REG_DWORD,
-    RRF_RT_REG_SZ, REG_BINARY, REG_DWORD, REG_SZ,
+    HKEY, HKEY_CURRENT_USER, KEY_READ, RegCloseKey, RegGetValueW, RegOpenKeyExW, RegQueryValueExW,
+    RegSetKeyValueW, RRF_RT_REG_BINARY, REG_BINARY, REG_DWORD, REG_SZ,
 };
 
 use crate::i18n::Language;
@@ -106,37 +109,114 @@ fn read(zoom: Option<u32>, dark: Option<u32>, face: Option<u32>, measure: Option
     }
 }
 
+/// One open handle on a subkey, and the several values asked of it on the way through.
+///
+/// `RegGetValueW` opens the key it reads from and shuts it again behind the caller's back,
+/// so a start-up that asks forty questions of one key pays for the opening forty times --
+/// and every one of those openings is a walk of the registry on the way in and the way
+/// out. Asking every value of one open handle costs the opening once.
+///
+/// Reads only: the writes further down still go through the value-only calls, which bring
+/// a missing key into being on a first run.
+pub(crate) struct Batch {
+    key: HKEY,
+}
+
+impl Batch {
+    /// Open `sub` under the reader's own key, or nothing when it is not there.
+    pub(crate) fn open(sub: &str) -> Option<Self> {
+        let wide = utf16(sub);
+        let mut key = HKEY::default();
+        let opened = unsafe {
+            RegOpenKeyExW(HKEY_CURRENT_USER, PCWSTR(wide.as_ptr()), None, KEY_READ, &mut key)
+        };
+        // A key that is not on this machine is a first run rather than a fault, which every
+        // reader above this one already treats as nothing stored.
+        (opened == ERROR_SUCCESS && !key.is_invalid()).then(|| Self { key })
+    }
+
+    /// One number, or `None` when this machine has nothing of that name to give.
+    pub(crate) fn word(&self, name: &str) -> Option<u32> {
+        let wide = utf16(name);
+        let mut value = 0u32;
+        let mut kind = REG_DWORD;
+        let mut len = std::mem::size_of::<u32>() as u32;
+        let read = unsafe {
+            RegQueryValueExW(
+                self.key,
+                PCWSTR(wide.as_ptr()),
+                None,
+                Some(&mut kind),
+                Some(&mut value as *mut u32 as *mut u8),
+                Some(&mut len),
+            )
+        };
+        // A short read is a value that is not a number this program wrote, and a value of
+        // another type is one this program never wrote at all.
+        (read == ERROR_SUCCESS && kind == REG_DWORD && len == std::mem::size_of::<u32>() as u32)
+            .then_some(value)
+    }
+
+    /// One string, or `None` when this machine has nothing of that name to give.
+    pub(crate) fn text(&self, name: &str) -> Option<String> {
+        let wide = utf16(name);
+        let mut kind = REG_SZ;
+        // The length is asked for first, because a path can be any length and the buffer it
+        // is read into has to be cut to size beforehand.
+        let mut len = 0u32;
+        let sought = unsafe {
+            RegQueryValueExW(
+                self.key,
+                PCWSTR(wide.as_ptr()),
+                None,
+                None,
+                None,
+                Some(&mut len),
+            )
+        };
+        if sought != ERROR_SUCCESS || len == 0 {
+            return None;
+        }
+        let mut units = vec![0u16; len as usize / 2];
+        let read = unsafe {
+            RegQueryValueExW(
+                self.key,
+                PCWSTR(wide.as_ptr()),
+                None,
+                Some(&mut kind),
+                Some(units.as_mut_ptr() as *mut u8),
+                Some(&mut len),
+            )
+        };
+        if read != ERROR_SUCCESS || kind != REG_SZ {
+            return None;
+        }
+        // `len` comes back as the bytes actually copied, terminator included, and a value
+        // written by something other than this program may not have one.
+        let taken = (len as usize / 2).min(units.len());
+        Some(String::from_utf16_lossy(&units[..taken]).trim_end_matches('\0').to_string())
+    }
+}
+
+impl Drop for Batch {
+    fn drop(&mut self) {
+        let _ = unsafe { RegCloseKey(self.key) };
+    }
+}
+
 /// One number, or `None` when this machine has nothing of that name to give.
 pub(crate) fn word(sub: &str, name: &str) -> Option<u32> {
-    let sub = utf16(sub);
-    let name = utf16(name);
-    let mut value = 0u32;
-    let mut len = std::mem::size_of::<u32>() as u32;
-    let r = unsafe {
-        RegGetValueW(
-            HKEY_CURRENT_USER,
-            PCWSTR(sub.as_ptr()),
-            PCWSTR(name.as_ptr()),
-            RRF_RT_REG_DWORD,
-            None,
-            Some(&mut value as *mut u32 as *mut core::ffi::c_void),
-            Some(&mut len),
-        )
-    };
-    // A short read is a value that is not a number this program wrote.
-    if r.is_err() || len != std::mem::size_of::<u32>() as u32 {
-        return None;
-    }
-    Some(value)
+    Batch::open(sub)?.word(name)
 }
 
 /// Whatever was written down under this key, or an empty state for a first run.
 fn read_words(sub: &str) -> Settings {
+    let Some(batch) = Batch::open(sub) else { return Settings::default() };
     read(
-        word(sub, NAMES[0]),
-        word(sub, NAMES[1]),
-        word(sub, NAMES[2]),
-        word(sub, NAMES[3]),
+        batch.word(NAMES[0]),
+        batch.word(NAMES[1]),
+        batch.word(NAMES[2]),
+        batch.word(NAMES[3]),
     )
 }
 
@@ -298,10 +378,44 @@ fn document_key(path: &std::path::Path) -> (String, String) {
     (format!("{SUBKEY}\\Documents\\{hash:016x}"), raw)
 }
 
+/// The canonical form of a path, remembered for as long as this process is running.
+///
+/// `canonicalize` is a trip through `GetFinalPathNameByHandleW`, which is a few
+/// milliseconds on a local path and tens of them on one that lives on a share, and one
+/// start-up asks about the same document four or five times over -- `main` on the way in,
+/// then the window for its place, its preferences and its chapter. Remembering the answer
+/// makes the trip once per path instead.
+///
+/// Only the readers of a document's record are allowed to remember it. A writer asks
+/// afresh, because a page that has moved while the reader had it open belongs in the
+/// record at its new home, and a remembered answer would keep sending the write to the
+/// old one.
+static CANONICAL: LazyLock<Mutex<HashMap<PathBuf, (String, String)>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+
+/// [`document_key`] for a reader of a document's record, which answers from the cache
+/// whenever this process has already asked about `path`.
+fn read_document_key(path: &Path) -> (String, String) {
+    let Ok(mut canonical) = CANONICAL.lock() else {
+        // A poisoned lock is no reason to look in the wrong place: the key is simply
+        // worked out afresh, as it was before there was anything to remember.
+        return document_key(path);
+    };
+    if let Some(known) = canonical.get(path) {
+        return known.clone();
+    }
+    let key = document_key(path);
+    canonical.insert(path.to_path_buf(), key.clone());
+    key
+}
+
 pub fn document(path: &std::path::Path) -> DocumentSettings {
-    let (sub, raw) = document_key(path);
-    if text(&sub, "Path").as_deref() != Some(raw.as_str()) { return DocumentSettings::default(); }
-    DocumentSettings::from_words(DOCUMENT_NAMES.map(|name| word(&sub, name)))
+    let (sub, raw) = read_document_key(path);
+    let Some(batch) = Batch::open(&sub) else { return DocumentSettings::default() };
+    if batch.text("Path").as_deref() != Some(raw.as_str()) {
+        return DocumentSettings::default();
+    }
+    DocumentSettings::from_words(DOCUMENT_NAMES.map(|name| batch.word(name)))
 }
 
 pub fn record_document(path: &std::path::Path, settings: DocumentSettings) {
@@ -311,59 +425,24 @@ pub fn record_document(path: &std::path::Path, settings: DocumentSettings) {
 }
 
 pub fn document_anchor(path: &std::path::Path) -> Option<usize> {
-    let (sub, raw) = document_key(path);
-    if text(&sub, "Path").as_deref() != Some(raw.as_str()) { return None; }
-    word(&sub, ANCHOR).map(|v| v as usize)
+    let (sub, raw) = read_document_key(path);
+    let batch = Batch::open(&sub)?;
+    if batch.text("Path").as_deref() != Some(raw.as_str()) { return None; }
+    batch.word(ANCHOR).map(|v| v as usize)
 }
 
 /// The chapter remembered for a windowed TXT document. Older settings have no value,
 /// which correctly falls back to the first chapter.
 pub fn document_chapter(path: &std::path::Path) -> Option<usize> {
-    let (sub, raw) = document_key(path);
-    if text(&sub, "Path").as_deref() != Some(raw.as_str()) { return None; }
-    word(&sub, CHAPTER).and_then(|value| (value != NO_CHAPTER).then_some(value as usize))
+    let (sub, raw) = read_document_key(path);
+    let batch = Batch::open(&sub)?;
+    if batch.text("Path").as_deref() != Some(raw.as_str()) { return None; }
+    batch.word(CHAPTER).and_then(|value| (value != NO_CHAPTER).then_some(value as usize))
 }
 
 /// One string, or `None` when this machine has nothing of that name to give.
 pub(crate) fn text(sub: &str, name: &str) -> Option<String> {
-    let sub = utf16(sub);
-    let name = utf16(name);
-    // The length is asked for first, because a path can be any length and the buffer it
-    // is read into has to be cut to size beforehand.
-    let mut len = 0u32;
-    let r = unsafe {
-        RegGetValueW(
-            HKEY_CURRENT_USER,
-            PCWSTR(sub.as_ptr()),
-            PCWSTR(name.as_ptr()),
-            RRF_RT_REG_SZ,
-            None,
-            None,
-            Some(&mut len),
-        )
-    };
-    if r.is_err() || len == 0 {
-        return None;
-    }
-    let mut units = vec![0u16; len as usize / 2];
-    let r = unsafe {
-        RegGetValueW(
-            HKEY_CURRENT_USER,
-            PCWSTR(sub.as_ptr()),
-            PCWSTR(name.as_ptr()),
-            RRF_RT_REG_SZ,
-            None,
-            Some(units.as_mut_ptr() as *mut core::ffi::c_void),
-            Some(&mut len),
-        )
-    };
-    if r.is_err() {
-        return None;
-    }
-    // `len` comes back as the bytes actually copied, terminator included, and a value
-    // written by something other than this program may not have one.
-    let taken = (len as usize / 2).min(units.len());
-    Some(String::from_utf16_lossy(&units[..taken]).trim_end_matches('\0').to_string())
+    Batch::open(sub)?.text(name)
 }
 
 /// One string, put under `name`, reporting whether Windows accepted it.
@@ -454,8 +533,11 @@ pub(crate) fn try_write_binary(sub: &str, name: &str, data: &[u8]) -> Result<(),
 }
 
 /// The path written down under this key, if it is still a file.
-fn read_opened(sub: &str) -> Option<PathBuf> {
-    text(sub, OPENED).map(PathBuf::from).filter(|p| p.is_file())
+///
+/// Being a file is the whole test: a directory is what a path with its last part cut off
+/// reads as rather than anything else.
+fn read_opened(batch: &Batch) -> Option<PathBuf> {
+    batch.text(OPENED).map(PathBuf::from).filter(|p| p.is_file())
 }
 
 /// The page and the place in it, written under this key as one pair.
@@ -476,8 +558,9 @@ fn write_reading(sub: &str, path: &std::path::Path, anchor: usize) {
 /// since grown shorter names no line here, and the window that cannot find it stays where
 /// it would have started anyway.
 fn read_reading(sub: &str) -> Option<(PathBuf, usize)> {
-    let path = read_opened(sub)?;
-    Some((path, word(sub, ANCHOR).unwrap_or(0) as usize))
+    let batch = Batch::open(sub)?;
+    let path = read_opened(&batch)?;
+    Some((path, batch.word(ANCHOR).unwrap_or(0) as usize))
 }
 
 /// Write down what the reader has open and where in it they are standing, so that the
@@ -643,7 +726,8 @@ fn write_frame(sub: &str, frame: Frame) {
 
 /// The frame written under `sub`, or `None` when the numbers there were never a window.
 fn read_frame(sub: &str) -> Option<Frame> {
-    frame_of(FRAME.map(|name| word(sub, name)), word(sub, MAXIMISED))
+    let batch = Batch::open(sub)?;
+    frame_of(FRAME.map(|name| batch.word(name)), batch.word(MAXIMISED))
 }
 
 /// Write down where the window was left, for the next one to be put there.
@@ -771,9 +855,15 @@ pub(crate) fn restorable_path(path: &Path) -> bool {
 /// into the tab strip. The registry format stays raw and versioned; this is the host's
 /// file-system policy applied at the point where the pure state is handed to the UI.
 pub fn restored_workspace() -> Workspace {
-    workspace()
-        .map(|snapshot| Workspace::restore_with(snapshot, restorable_path))
-        .unwrap_or_default()
+    let Some(snapshot) = workspace() else { return Workspace::default() };
+    // The same document is offered three times over -- as the active tab, as one of the
+    // tabs and as one of the recent -- and a `metadata` call on a path that lives on a
+    // share is not free to repeat. Each distinct path is asked about once.
+    let asked: RefCell<HashMap<PathBuf, bool>> = RefCell::new(HashMap::new());
+    Workspace::restore_with(snapshot, |path| {
+        let mut asked = asked.borrow_mut();
+        *asked.entry(path.to_path_buf()).or_insert_with(|| restorable_path(path))
+    })
 }
 
 #[cfg(test)]
@@ -912,6 +1002,12 @@ mod tests {    use super::*;
         clear(sub);
     }
 
+    /// What a reader of this key would see under it, asked the way the program asks: through
+    /// one open key rather than one value of it at a time.
+    fn opened_under(sub: &str) -> Option<PathBuf> {
+        Batch::open(sub).and_then(|batch| read_opened(&batch))
+    }
+
     /// The values that belong to a document rather than to the page: which one to come
     /// back to, and where in it.
     #[test]
@@ -924,11 +1020,11 @@ mod tests {    use super::*;
 
         let sub = "Software\\Rubrica Test Document";
         clear(sub);
-        assert_eq!(read_opened(sub), None, "nothing written is nothing to reopen");
+        assert_eq!(opened_under(sub), None, "nothing written is nothing to reopen");
         write_text(sub, OPENED, file.to_str().expect("a path in unicode"));
         // The path survives the trip through UTF-16 with its space in it, which is the
         // part a fixed-size numeric buffer could never get wrong.
-        assert_eq!(read_opened(sub).as_deref(), Some(file.as_path()));
+        assert_eq!(opened_under(sub).as_deref(), Some(file.as_path()));
 
         // A page written without a place is a page at its top, which is what the reader of
         // a document they have only just opened deserves.
@@ -939,11 +1035,11 @@ mod tests {    use super::*;
         // A page the reader has moved or deleted is not a thing to start an error over;
         // it is simply no document, and the window opens on the sample.
         std::fs::remove_file(&file).expect("the page taken away again");
-        assert_eq!(read_opened(sub), None);
+        assert_eq!(opened_under(sub), None);
         assert_eq!(read_reading(sub), None, "nor a place in it");
         // So is a directory, which is what a path with its last part cut off reads as.
         write_text(sub, OPENED, dir.to_str().expect("a path in unicode"));
-        assert_eq!(read_opened(sub), None, "a folder is not a document");
+        assert_eq!(opened_under(sub), None, "a folder is not a document");
 
         let _ = std::fs::remove_dir_all(&dir);
         clear(sub);

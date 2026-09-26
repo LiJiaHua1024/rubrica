@@ -10,13 +10,15 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::mpsc::{Receiver, Sender};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, LazyLock, Mutex};
+use std::time::Instant;
 
 use crate::i18n::{self, Key, Language};
 use rubrica_doc::{Action, ActionKind, Align, Block, BlockKind, Document, InlineStyle};
 use rubrica_type::paragraph::{Item, Spacing, StyleId, StyleSpan};
 use rubrica_type::units::Pt;
 use rubrica_type::{BreakOptions, Hyphenation, typeset, typeset_hyphenated};
+#[cfg(feature = "pdf")]
 use printpdf::{
     Actions as PdfActions, BuiltinFont, Color as PdfColor, Codepoint, FontId as PdfFontId,
     LinkAnnotation as PdfLinkAnnotation, Op as PdfOp, ParsedFont, PdfDocument,
@@ -51,7 +53,7 @@ use windows::Win32::Graphics::Dwm::{DwmSetWindowAttribute, DWMWA_BORDER_COLOR, D
 use windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_B8G8R8A8_UNORM;
 use windows::Win32::Graphics::Gdi::{
     CLIP_DEFAULT_PRECIS, CreateFontW, CreateSolidBrush, DEFAULT_CHARSET, DEFAULT_QUALITY,
-    DeleteObject, EnumDisplayMonitors, GetMonitorInfoW, HBRUSH, HDC, HFONT, HGDIOBJ, HMONITOR,
+    DeleteObject, EnumDisplayMonitors, FillRect, GetMonitorInfoW, HBRUSH, HDC, HFONT, HGDIOBJ, HMONITOR,
     InvalidateRect, MONITORINFO, OUT_DEFAULT_PRECIS, ScreenToClient, SetBkColor, SetTextColor,
     ValidateRect,
 };
@@ -88,7 +90,7 @@ use windows::Win32::UI::WindowsAndMessaging::{
     RegisterClassExW, SetCursor, SetForegroundWindow, SetWindowTextW, SM_CXPADDEDBORDER, SM_CXSIZEFRAME,
     SW_MAXIMIZE, SW_MINIMIZE, SW_SHOWNORMAL, SetTimer,
     SetWindowLongPtrW, SetWindowPos, ShowWindow, SW_SHOWMAXIMIZED, SW_RESTORE, TPM_RETURNCMD,
-    SWP_FRAMECHANGED, SWP_NOMOVE, SWP_NOSIZE, TPM_RIGHTBUTTON, TrackPopupMenuEx, TranslateMessage, WM_CONTEXTMENU, WM_NULL, WNDCLASSEXW,
+    SWP_FRAMECHANGED, SWP_NOMOVE, SWP_NOSIZE, TPM_RIGHTBUTTON, TrackPopupMenuEx, PeekMessageW, PM_REMOVE, TranslateMessage, WM_CONTEXTMENU, WM_NULL, WNDCLASSEXW,
     WM_DESTROY, WM_DPICHANGED, WM_ERASEBKGND, WM_EXITSIZEMOVE, WM_KEYDOWN, WM_MOUSEWHEEL,
     WM_CAPTURECHANGED, WM_CLOSE, WM_NCCALCSIZE, WM_NCCREATE, WM_NCHITTEST, WM_PAINT, WM_SETCURSOR, WM_SIZE, WM_TIMER, WS_EX_APPWINDOW, WS_OVERLAPPEDWINDOW,
     SWP_NOACTIVATE, SWP_NOZORDER, WM_COPYDATA, WM_DROPFILES, WM_LBUTTONDOWN, WM_LBUTTONDBLCLK, WM_LBUTTONUP,
@@ -402,6 +404,9 @@ enum ObjectSource {
 pub struct PaintRun {
     pub bidi_level: u8,
     pub(crate) face: IDWriteFontFace,
+    /// Which resolved face carried this run. Written by every layout; read only by the
+    /// PDF exporter, which has to name the face program it embeds.
+    #[cfg_attr(not(feature = "pdf"), allow(dead_code))]
     pub(crate) face_index: usize,
     /// Resolved family, recorded at layout time so the report can show which face
     /// actually carried each run without a COM round trip per frame.
@@ -413,10 +418,12 @@ pub struct PaintRun {
     /// The source slice that produced this run, when it came from document text.
     /// PDF export needs it to give each glyph a Unicode value; a formula's synthetic
     /// assembly has no one-to-one source range and leaves it empty.
+    #[cfg_attr(not(feature = "pdf"), allow(dead_code))]
     pub(crate) source: Option<String>,
     /// DirectWrite's raw UTF-16-unit → glyph map. It is compact and is interpreted only by
     /// the PDF exporter, so normal window layout does not allocate one Unicode string per
     /// glyph.
+    #[cfg_attr(not(feature = "pdf"), allow(dead_code))]
     pub(crate) clusters: Vec<u16>,
     pub x: f32,
     pub baseline: f32,
@@ -471,6 +478,9 @@ static LAYOUT_RUN: AtomicU64 = AtomicU64::new(1);
 /// The layout thread owns no window, so it asks the window to come and read its
 /// channel instead: a `PostMessageW` is the cheapest wake a worker thread has.
 const WM_APP_LAYOUT: u32 = WM_APP + 1;
+/// The window's own follow-up work: documents named alongside the first, and the peek
+/// service, once the reader has a window to look at.
+const WM_APP_DEFERRED: u32 = WM_APP + 2;
 
 /// A layout running on a worker thread, and what the window thread needs to tend it.
 pub struct LayoutJob {
@@ -569,7 +579,7 @@ fn spawn_layout(
         }
         let images = ImageStore::new().ok();
         let mut math = MathStore::new();
-        let hyphenator = if request.hyphenate { Hyphenator::english() } else { None };
+        let hyphenator = if request.hyphenate { crate::hyphen::shared() } else { None };
         // The profile's math store and the image sizes are the same work the window
         // would do for this document; a relayout redoes them, which is why the
         // caches that outlive a document live on the window's engine.
@@ -587,7 +597,7 @@ fn spawn_layout(
             request.page_w,
             request.dpi,
             &mut objects,
-            hyphenator.as_ref(),
+            hyphenator,
             &mut sink,
         );
     });
@@ -1106,6 +1116,9 @@ fn caret_tick_ms() -> u32 {
     }
 }
 
+/// A table's repeated header, recorded for the PDF exporter to lay out again on the
+/// pages the table continues onto.
+#[cfg_attr(not(feature = "pdf"), allow(dead_code))]
 #[derive(Clone)]
 pub(crate) struct TableHeaderFragment {
     pub y: Pt,
@@ -1113,12 +1126,14 @@ pub(crate) struct TableHeaderFragment {
     pub ops: Vec<Op>,
 }
 
+#[cfg_attr(not(feature = "pdf"), allow(dead_code))]
 pub(crate) struct TableSpan {
     pub y: Pt,
     pub height: Pt,
     pub header: usize,
 }
 
+#[cfg_attr(not(feature = "pdf"), allow(dead_code))]
 pub(crate) struct NoteSpan {
     pub number: String,
     pub y: Pt,
@@ -1127,6 +1142,9 @@ pub(crate) struct NoteSpan {
 
 type ChapterCache = Arc<Mutex<HashMap<usize, String>>>;
 
+/// A formula's source text with the box the layout gave it, recorded for the PDF
+/// exporter to draw as selectable text under the typeset assembly.
+#[cfg_attr(not(feature = "pdf"), allow(dead_code))]
 pub(crate) struct MathTextFragment {
     pub source: String,
     pub x: Pt,
@@ -1161,9 +1179,13 @@ pub struct Page {
     /// Regions whose natural width exceeds the visible column, or whose object has a
     /// click action even when it fits.
     pub wide_regions: Vec<WideRegion>,
+    #[cfg_attr(not(feature = "pdf"), allow(dead_code))]
     pub(crate) table_headers: Vec<TableHeaderFragment>,
+    #[cfg_attr(not(feature = "pdf"), allow(dead_code))]
     pub(crate) table_spans: Vec<TableSpan>,
+    #[cfg_attr(not(feature = "pdf"), allow(dead_code))]
     pub(crate) note_spans: Vec<NoteSpan>,
+    #[cfg_attr(not(feature = "pdf"), allow(dead_code))]
     pub(crate) math_texts: Vec<MathTextFragment>,
 }
 
@@ -1174,6 +1196,15 @@ pub struct View {
     font: FontEngine,
     theme: Theme,
     profile: String,
+    /// Whether the window has a document to lay out. The window is created before its
+    /// page is read and parsed, so the messages that arrive in between -- the
+    /// `WM_SIZE` that creation itself sends, the first `WM_PAINT` -- find a View with
+    /// an empty page, and a layout of nothing is a layout that must not run.
+    started: bool,
+    /// The reading position the last window left behind, honoured once the first
+    /// layout has lines to point it at. A worker layout answers in batches, so the
+    /// place cannot be stood in until the layout that owns it is finished.
+    pending_anchor: Option<usize>,
     doc: Document,
     source: String,
     source_view: bool,
@@ -1297,10 +1328,17 @@ pub struct View {
     client_h: f32,
     dpi: f32,
     path: Option<PathBuf>,
+    /// Documents named on the command line alongside the first. They are opened as
+    /// tabs after the window is answering for the reader, which is the only order in
+    /// which a multi-select open shows its first page instead of a frozen frame.
+    extra: Vec<PathBuf>,
     /// Open documents and their stable tab identities. The window keeps one materialized
     /// document at a time; this is the authority for what can be switched to next.
     workspace: Workspace,
     tree: Vec<TreeEntry>,
+    /// The directory the entries above were listed from. `None` means they never
+    /// were: the panel starts closed and unread, because no reader has asked for it.
+    tree_root: Option<PathBuf>,
     tree_visible: bool,
     tree_width: f32,
     tree_dragging: bool,
@@ -1328,7 +1366,7 @@ pub struct View {
     /// back and forth keeps each profile's work; see [`View::math_for`].
     maths: HashMap<String, MathStore>,
     /// English word breaks, when the embedded dictionary loaded.
-    hyphenator: Option<Hyphenator>,
+    hyphenator: Option<&'static Hyphenator>,
     /// What the reader is looking for, and everywhere the page has it. `Some` while the
     /// bar is on the window, whether or not anything has been typed into it yet.
     find: Option<Find>,
@@ -2257,7 +2295,16 @@ fn held(vk: VIRTUAL_KEY) -> bool {
     unsafe { (GetKeyState(vk.0 as i32) as u16 & 0x8000) != 0 }
 }
 
-pub fn run(mut source: String, path: Option<PathBuf>, extra: Vec<PathBuf>) -> Result<()> {
+/// Stand the reader's window up.
+///
+/// The window comes first and the page second, and not by preference: a double-click
+/// is answered with a frame milliseconds after the process starts, while the
+/// document's settings, read, parse and layout all run afterwards against a window
+/// that is already there. DirectWrite's system font collection -- the most expensive
+/// single thing a start used to pay for before there was anything to show -- is
+/// enumerated by the first face the page resolves, which is also the first thing
+/// that needs it.
+pub fn run(path: Option<PathBuf>, extra: Vec<PathBuf>) -> Result<()> {
     // Must happen before the first window exists, or the process is already
     // bitmap-scaled and text on a secondary high-density monitor is soft.
     unsafe {
@@ -2266,11 +2313,10 @@ pub fn run(mut source: String, path: Option<PathBuf>, extra: Vec<PathBuf>) -> Re
         // call fails and figures silently degrade to their placeholder.
         let _ = CoInitializeEx(None, COINIT_APARTMENTTHREADED | COINIT_DISABLE_OLE1DDE);
     }
+    trace("begin");
 
     let font = FontEngine::new().map_err(|e| -> Error { format!("DirectWrite: {e}").into() })?;
-    if !font.probe() {
-        return Err("could not open any installed font face".into());
-    }
+    trace("dwrite-engine");
     let d2d: ID2D1Factory = unsafe { D2D1CreateFactory(D2D1_FACTORY_TYPE_SINGLE_THREADED, None) }
         .map_err(|e| -> Error { format!("Direct2D: {e}").into() })?;
 
@@ -2281,22 +2327,14 @@ pub fn run(mut source: String, path: Option<PathBuf>, extra: Vec<PathBuf>) -> Re
     let hand = unsafe { LoadCursorW(None, IDC_HAND).unwrap_or(arrow) };
 
     // The reader's own appearance, from the last window, applied before the first layout
-    // so a start-up never shows one page and then changes its face.
-    //
-    // A remembered family that has since left the machine is dropped rather than set:
-    // DirectWrite would answer it with a substitute, and a preference that quietly becomes
-    // a different font is worse than no preference at all. The size, the width and the
-    // palette are kept regardless, since none of them depends on anything installed.
+    // so a start-up never shows one page and then changes its face. The size, the width
+    // and the palette are the parts of it that depend on nothing installed; the
+    // remembered family waits for the window, because asking DirectWrite whether it is
+    // still there is what costs the font collection.
     let saved = crate::settings::load();
     let mut theme = Theme::default();
     if let Some(zoom) = saved.zoom {
         theme.set_zoom(zoom);
-    }
-    let remembered = saved.face.filter(|i| {
-        TextFace::ALL.get(*i).is_some_and(|f| face_drawable(&font, f))
-    });
-    if let Some(face) = remembered {
-        theme.set_face(face);
     }
     // A remembered width the window cannot fit is still the reader's own choice, so it
     // comes back: the layout caps a column at what is available, so a wide measure in a
@@ -2305,94 +2343,6 @@ pub fn run(mut source: String, path: Option<PathBuf>, extra: Vec<PathBuf>) -> Re
         theme.set_measure(measure);
     }
     let dark = saved.dark.unwrap_or_else(system_prefers_dark);
-
-    // Where the reader stood the last time this page was open, if this window is the
-    // continuation of that one rather than a page chosen afresh. The path decides rather
-    // than the route here: a document named on the command line comes back to its place
-    // too, which is what double-clicking it in Explorer is. A sample page has no path, and
-    // so no place.
-    let restore = path.as_deref().and_then(crate::settings::document_anchor).or_else(|| crate::settings::reading()
-        .filter(|(left, _)| Some(left.as_path()) == path.as_deref())
-        .map(|(_, anchor)| anchor));
-
-    // The file the text above came out of, as it stands at this moment. `main` has already
-    // read it, so this is the stamp of the page on the screen rather than of some text that
-    // arrived afterwards -- and if a save did land in between, the first poll finds it a
-    // fraction of a second later.
-    let stamp = path.as_deref().and_then(stamp_of);
-    let keep_line_breaks = crate::settings::keep_line_breaks();
-    let preferences = path.as_deref().map(crate::settings::document).unwrap_or_default();
-    let profile = crate::profiles::selected(preferences.plain.unwrap_or_else(|| reading::is_plain(path.as_deref())));
-    if profile != "Default" { crate::profiles::load(&profile).apply(&mut theme); }
-    let plain = preferences.plain.unwrap_or_else(|| reading::is_plain(path.as_deref()));
-    let can_window = plain && !preferences.source && path.as_deref().is_some_and(|p| {
-        preferences.text.chapters && reading::can_window_text(p, preferences.encoding)
-    });
-    let mut lazy_text = false;
-    let mut initial_chapter = path
-        .as_deref()
-        .and_then(crate::settings::document_chapter)
-        .unwrap_or(0);
-    let mut lazy_decoded: Option<reading::Decoded> = None;
-    let chapter_index = if plain && preferences.text.chapters {
-        if can_window {
-            let path = path.as_deref().expect("window path");
-            match reading::scan_chapters(path, preferences.encoding, true) {
-                Ok(index) => {
-                    initial_chapter = initial_chapter.min(index.chapters().len().saturating_sub(1));
-                    match reading::read_chapter_source(path, &index, initial_chapter, preferences.encoding) {
-                        Ok(decoded) => {
-                            lazy_text = true;
-                            source = decoded.text.clone();
-                            lazy_decoded = Some(decoded);
-                        }
-                        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                            // The shell may have removed a file between its first read
-                            // and this chapter pass. Keep the text already in hand.
-                            initial_chapter = 0;
-                        }
-                        Err(_) => {
-                            initial_chapter = 0;
-                            source = reading::read(path, preferences.encoding)?.text;
-                        }
-                    }
-                    if lazy_text { Some(index) } else { Some(ChapterIndex::new(&source, true)) }
-                }
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                    Some(ChapterIndex::new(&source, true))
-                }
-                Err(_) => {
-                    source = reading::read(path, preferences.encoding)?.text;
-                    Some(ChapterIndex::new(&source, true))
-                }
-            }
-        } else {
-            Some(ChapterIndex::new(&source, preferences.text.chapters))
-        }
-    } else { None };
-    let decoded = if lazy_text {
-        lazy_decoded
-    } else {
-        path.as_deref().and_then(|p| reading::read(p, preferences.encoding).ok())
-    };
-    let doc = if preferences.source { Document::source(&source) }
-        else if let Some(index) = chapter_index.as_ref() {
-            if lazy_text {
-                index.window_text(&source, initial_chapter, preferences.text)
-            } else {
-                index.window(&source, 0, preferences.text)
-            }
-        } else { Document::parse_with(&source, rubrica_doc::ParseOptions {
-            keep_line_breaks: preferences.line_breaks.unwrap_or(keep_line_breaks),
-        }) };
-
-    let mut workspace = crate::settings::restored_workspace();
-    if let Some(path) = path.as_ref() {
-        workspace.open_file(View::workspace_file(path), TabKind::Pinned);
-    }
-    let tree = path.as_deref().and_then(Path::parent)
-        .map(|root| tree::scan(root, 2))
-        .unwrap_or_default();
 
     let lang_choice = crate::settings::language();
     let lang = lang_choice.unwrap_or_else(Language::system_language);
@@ -2403,29 +2353,31 @@ pub fn run(mut source: String, path: Option<PathBuf>, extra: Vec<PathBuf>) -> Re
         hwnd_target: None,
         font,
         theme,
-        profile,
-        doc,
-        source,
-        source_view: preferences.source,
-        text_options: crate::reading::text_options_for(path.as_deref(), preferences.text),
-        chapter_index,
-        chapter: initial_chapter,
+        profile: "Default".to_string(),
+        started: false,
+        pending_anchor: None,
+        doc: Document::source(""),
+        source: String::new(),
+        source_view: false,
+        text_options: TextOptions::default(),
+        chapter_index: None,
+        chapter: 0,
         chapter_cache: Arc::new(Mutex::new(HashMap::new())),
         chapter_generation: Arc::new(AtomicU64::new(0)),
-        lazy_text,
-        plain_override: preferences.plain,
-        encoding: preferences.encoding,
-        decoded_encoding: decoded.as_ref().map_or(Encoding::Utf8, |d| d.encoding),
-        encoding_guessed: decoded.is_some_and(|d| d.guessed),
-        keep_line_breaks,
-        line_break_override: preferences.line_breaks,
+        lazy_text: false,
+        plain_override: None,
+        encoding: Encoding::Auto,
+        decoded_encoding: Encoding::Utf8,
+        encoding_guessed: false,
+        keep_line_breaks: false,
+        line_break_override: None,
         ops: Vec::new(),
         ops_sorted: true,
         sel_version: 1,
         find_needle: None,
         layout_job: None,
         hwnd: HWND(std::ptr::null_mut()),
-        reading_mode: if preferences.page_stack { ReadingMode::Stack } else { ReadingMode::Scroll },
+        reading_mode: ReadingMode::Scroll,
         page_starts: Vec::new(),
         page_transition: None,
         page_hot: None,
@@ -2466,12 +2418,14 @@ pub fn run(mut source: String, path: Option<PathBuf>, extra: Vec<PathBuf>) -> Re
         client_h: 1.0,
         dpi: 96.0,
         path,
-        workspace,
-        tree,
+        extra,
+        workspace: Workspace::default(),
+        tree: Vec::new(),
+        tree_root: None,
         tree_visible: false,
         tree_width: 220.0,
         tree_dragging: false,
-        stamp,
+        stamp: None,
         history: History::default(),
         dragging: false,
         wide_offset: 0.0,
@@ -2479,7 +2433,7 @@ pub fn run(mut source: String, path: Option<PathBuf>, extra: Vec<PathBuf>) -> Re
         press_at: None,
         images: None,
         maths: HashMap::new(),
-        hyphenator: Hyphenator::english(),
+        hyphenator: None,
         find: None,
         edit: None,
         edit_font: None,
@@ -2492,11 +2446,6 @@ pub fn run(mut source: String, path: Option<PathBuf>, extra: Vec<PathBuf>) -> Re
         cap_ink_brush: None,
         cap_press_brush: None,
     });
-
-    if view.lazy_text {
-        view.cache_window(view.chapter, view.source.clone());
-    }
-    view.prefetch_next_chapter();
 
     const CLASS: &str = "Rubrica.Main";
     unsafe {
@@ -2537,13 +2486,12 @@ pub fn run(mut source: String, path: Option<PathBuf>, extra: Vec<PathBuf>) -> Re
             Some(&mut *view as *mut View as *const core::ffi::c_void),
         )
         .map_err(|e| -> Error { format!("CreateWindowExW: {e}").into() })?;
-
-        view.attach(hwnd);
-        view.update_title(hwnd);
-        // The frame the creation messages laid down was answered for before there was a
-        // strip to answer; asking for it again makes the first show start from the
-        // frameless client area, instead of growing into it the first time the reader
-        // happens to touch the caption that should never have been there.
+        trace("window-created");
+        // While the window is still hidden, settle the frame the reader's own strip
+        // draws. The creation messages laid it down before there was a strip to answer
+        // them, and asked for again before the show it starts from the frameless client
+        // area instead of growing into it the first time the reader touches the caption
+        // that should never have been there.
         let _ = SetWindowPos(
             hwnd,
             Some(HWND_TOP),
@@ -2553,17 +2501,32 @@ pub fn run(mut source: String, path: Option<PathBuf>, extra: Vec<PathBuf>) -> Re
             0,
             SWP_FRAMECHANGED | SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE,
         );
+        // The frame first, and the page second. The system draws the window the moment
+        // it is shown, and everything that follows -- the render target, whose first
+        // creation asks the display driver to wake up, and the title's text format --
+        // runs against a window the reader already has. A double-click is answered with
+        // their window, not with a wait behind nothing.
         // Straight to the maximised frame rather than to the normal one and then a state
         // change, because the second way shows the reader the window they did not leave.
         let _ = ShowWindow(hwnd, if frame.maximised { SW_SHOWMAXIMIZED } else { SW_SHOWNORMAL });
-        // After the show, because a window that is about to be maximised is resized by being
-        // shown -- and a place is a fact about the layout, which that resize has only just
-        // redone. Nothing has been drawn yet either way: `WM_PAINT` is a queued message and
-        // the first one is not reached until the loop below starts, so the reader still never
-        // watches their page begin at the top and move down.
-        if let Some(anchor) = restore {
-            view.restore_to(anchor);
+        trace("shown");
+
+        view.attach(hwnd);
+        trace("attached");
+        view.update_title(hwnd);
+        // The show queued the messages that size and paint the window, and no loop has
+        // run yet to answer them. Running one pass here -- before the document is read,
+        // parsed or laid out -- is what puts the frame itself on screen while all of
+        // that is still to come: the reader sees their window open, not a process
+        // working behind nothing.
+        let mut msg = MSG::default();
+        while PeekMessageW(&mut msg, None, 0, 0, PM_REMOVE).as_bool() {
+            if crate::typography::route(&msg) { continue; }
+            let _ = TranslateMessage(&msg);
+            DispatchMessageW(&msg);
         }
+        trace("window-visible");
+
         let _ = SetTimer(Some(hwnd), APPEARANCE_TIMER, APPEARANCE_TICK_MS, None);
         // Armed even for a page with no file behind it: the sample has no path to poll, and
         // the tick costs a branch, while a document opened later by the dialog or a drop has
@@ -2574,20 +2537,17 @@ pub fn run(mut source: String, path: Option<PathBuf>, extra: Vec<PathBuf>) -> Re
         // reads and costs no repaint.
         let _ = SetTimer(Some(hwnd), CARET_TIMER, caret_tick_ms(), None);
 
-        // Documents named alongside the first, each opened as its own tab in the order
-        // named -- the walk a reader taking them by hand would take. Nothing has been
-        // drawn yet, so only the last of them is ever seen on screen, and no page is
-        // watched jumping.
-        for path in &extra {
-            view.load_document(path, hwnd);
-        }
+        // The page itself, with everything about it the window was created without: the
+        // reader's settings for this document, the text, the parse. A failure here still
+        // refuses to start -- through `main`, which shows why -- but by now there is a
+        // window for the reason to be shown beside.
+        view.finish_startup(saved)?;
 
-        // A peek preference left on is honoured here, at the one moment a reader is
-        // alive to check: the service outlives the reader's windows, and a watcher
-        // the last session started has no reason still to be watching.
-        if crate::settings::peek_enabled() {
-            crate::peek::ensure_running();
-        }
+        // Documents named alongside the first, each opened as its own tab in the order
+        // named -- the walk a reader taking them by hand would take. They wait for the
+        // window to be answering, so the first of them is read while the rest arrive one
+        // by one, rather than all of them landing after a freeze nobody asked for.
+        let _ = PostMessageW(Some(hwnd), WM_APP_DEFERRED, WPARAM(0), LPARAM(0));
 
         let mut msg = MSG::default();
         while GetMessageW(&mut msg, None, 0, 0).as_bool() {
@@ -2602,6 +2562,19 @@ pub fn run(mut source: String, path: Option<PathBuf>, extra: Vec<PathBuf>) -> Re
         // `view` is dropped here; the pointer stored in GWLP_USERDATA dies with it.
     }
     Ok(())
+}
+
+/// The path as it is shown, not as it is named. `canonicalize` answers in the Windows
+/// verbatim form, and a title is copied and read by people, who want the drive letter
+/// A mark on the start-up path, printed to stderr when the run is asked for one with
+/// `RUBRICA_STARTUP_TRACE` in the environment. A cold start's cost is otherwise
+/// something to guess at; with this it is four lines to read.
+static PROCESS_START: LazyLock<Instant> = LazyLock::new(Instant::now);
+
+fn trace(label: &str) {
+    if std::env::var_os("RUBRICA_STARTUP_TRACE").is_some() {
+        eprintln!("startup {}: +{:?}", label, PROCESS_START.elapsed());
+    }
 }
 
 /// The path as it is shown, not as it is named. `canonicalize` answers in the Windows
@@ -2816,7 +2789,22 @@ unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM)
             }
             DefWindowProcW(hwnd, msg, wp, lp)
         }
-        WM_ERASEBKGND => LRESULT(1),
+        WM_ERASEBKGND => {
+            // The window is answered before its page is: until the render target paints
+            // for the first time, this is what the reader is looking at. Filling it with
+            // the palette's own paper keeps a start-up from flashing the system's idea
+            // of a background at them, and costs a rectangle.
+            if let Some(v) = view {
+                let brush = unsafe { CreateSolidBrush(colorref(v.palette.bg)) };
+                let mut r = RECT::default();
+                unsafe {
+                    let _ = GetClientRect(hwnd, &mut r);
+                    let _ = FillRect(HDC(wp.0 as *mut core::ffi::c_void), &r, brush);
+                    let _ = DeleteObject(brush.into());
+                }
+            }
+            LRESULT(1)
+        }
         WM_DESTROY => {
             // The last thing the view is asked to do, since after this its lines are
             // already gone and its place with them.
@@ -2909,6 +2897,158 @@ unsafe fn edit_find_key(hwnd: HWND, vk: u32) -> Option<LRESULT> {
 }
 
 impl View {
+    /// Read the page, and everything about it the window was created without: the
+    /// reader's settings for this document, the text, the parse, and the layout that
+    /// follows. The window is already showing and answering while this runs, and the
+    /// first layout goes to a worker whatever the document's size, so even a document
+    /// that takes a while never stops the window replying.
+    fn finish_startup(&mut self, saved: crate::settings::Settings) -> Result<()> {
+        // The one check start-up cannot do without a font face for, now asked of a
+        // window that could show the answer. This is also where the system font
+        // collection is enumerated, which the frame no longer waits on.
+        if !self.font.probe() {
+            return Err("could not open any installed font face".into());
+        }
+        // A remembered family that has since left the machine is dropped rather than set:
+        // DirectWrite would answer it with a substitute, and a preference that quietly becomes
+        // a different font is worse than no preference at all. The size, the width and the
+        // palette are kept regardless, since none of them depends on anything installed.
+        if let Some(face) = saved.face.filter(|i| {
+            TextFace::ALL.get(*i).is_some_and(|f| face_drawable(&self.font, f))
+        }) {
+            self.theme.set_face(face);
+        }
+
+        // Where the reader stood the last time this page was open, if this window is the
+        // continuation of that one rather than a page chosen afresh. The path decides rather
+        // than the route here: a document named on the command line comes back to its place
+        // too, which is what double-clicking it in Explorer is. A sample page has no path, and
+        // so no place.
+        let restore = self.path.as_deref().and_then(crate::settings::document_anchor).or_else(|| crate::settings::reading()
+            .filter(|(left, _)| Some(left.as_path()) == self.path.as_deref())
+            .map(|(_, anchor)| anchor));
+
+        let path = self.path.clone();
+        // The file the text below came out of, as it stands at this moment, so the first poll
+        // compares the page on screen against the file it was read from rather than against
+        // whatever arrives afterwards.
+        self.stamp = path.as_deref().and_then(stamp_of);
+        self.keep_line_breaks = crate::settings::keep_line_breaks();
+        let preferences = path.as_deref().map(crate::settings::document).unwrap_or_default();
+        let profile = crate::profiles::selected(preferences.plain.unwrap_or_else(|| reading::is_plain(path.as_deref())));
+        if profile != "Default" { crate::profiles::load(&profile).apply(&mut self.theme); }
+        self.profile = profile;
+        let plain = preferences.plain.unwrap_or_else(|| reading::is_plain(path.as_deref()));
+        let can_window = plain && !preferences.source && path.as_deref().is_some_and(|p| {
+            preferences.text.chapters && reading::can_window_text(p, preferences.encoding)
+        });
+
+        // A file named on the command line is what the reader asked for, and one that cannot
+        // be read is worth stopping on -- visibly, though: now there is a window to show the
+        // reason beside. Nothing named is not a request for the sample, either: the reader was
+        // here before, and the page they left is the one to come back to.
+        let (mut source, mut decoded) = match path.as_deref() {
+            None => (crate::sample::DOCUMENT.to_string(), None),
+        Some(p) => {
+            let mut d = reading::read(p, preferences.encoding)
+                .map_err(|e| document_open_error_in(p, &e, self.lang))?;
+            let text = std::mem::take(&mut d.text);
+            (text, Some(d))
+        }
+        };
+
+        let mut lazy_text = false;
+        let mut initial_chapter = path
+            .as_deref()
+            .and_then(crate::settings::document_chapter)
+            .unwrap_or(0);
+        let mut lazy_decoded: Option<reading::Decoded> = None;
+        let chapter_index = if plain && preferences.text.chapters {
+            if can_window {
+                let path = path.as_deref().expect("window path");
+                match reading::scan_chapters(path, preferences.encoding, true) {
+                    Ok(index) => {
+                        initial_chapter = initial_chapter.min(index.chapters().len().saturating_sub(1));
+                        match reading::read_chapter_source(path, &index, initial_chapter, preferences.encoding) {
+                            Ok(d) => {
+                                lazy_text = true;
+                                source = d.text.clone();
+                                lazy_decoded = Some(d);
+                            }
+                            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                                // The shell may have removed a file between its first read
+                                // and this chapter pass. Keep the text already in hand.
+                                initial_chapter = 0;
+                            }
+                            Err(_) => {
+                                initial_chapter = 0;
+                                source = reading::read(path, preferences.encoding)?.text;
+                            }
+                        }
+                        if lazy_text { Some(index) } else { Some(ChapterIndex::new(&source, true)) }
+                    }
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                        Some(ChapterIndex::new(&source, true))
+                    }
+                    Err(_) => {
+                        source = reading::read(path, preferences.encoding)?.text;
+                        Some(ChapterIndex::new(&source, true))
+                    }
+                }
+            } else {
+                Some(ChapterIndex::new(&source, preferences.text.chapters))
+            }
+        } else { None };
+        if lazy_text { decoded = lazy_decoded; }
+        let doc = if preferences.source { Document::source(&source) }
+            else if let Some(index) = chapter_index.as_ref() {
+                if lazy_text {
+                    index.window_text(&source, initial_chapter, preferences.text)
+                } else {
+                    index.window(&source, 0, preferences.text)
+                }
+        } else { Document::parse_with(&source, rubrica_doc::ParseOptions {
+            keep_line_breaks: preferences.line_breaks.unwrap_or(self.keep_line_breaks),
+        }) };
+        trace("page-ready");
+
+        let mut workspace = crate::settings::restored_workspace();
+        if let Some(path) = path.as_ref() {
+            workspace.open_file(View::workspace_file(path), TabKind::Pinned);
+        }
+        self.doc = doc;
+        self.source = source;
+        self.source_view = preferences.source;
+        self.text_options = crate::reading::text_options_for(path.as_deref(), preferences.text);
+        self.chapter_index = chapter_index;
+        self.chapter = initial_chapter;
+        self.lazy_text = lazy_text;
+        self.plain_override = preferences.plain;
+        self.encoding = preferences.encoding;
+        self.decoded_encoding = decoded.as_ref().map_or(Encoding::Utf8, |d| d.encoding);
+        self.encoding_guessed = decoded.is_some_and(|d| d.guessed);
+        self.line_break_override = preferences.line_breaks;
+        self.reading_mode = if preferences.page_stack { ReadingMode::Stack } else { ReadingMode::Scroll };
+        self.workspace = workspace;
+        // The hyphenation dictionary is a process-wide one deserialize away, shared with
+        // every later layout and the peek service; the page only ever borrows it.
+        self.hyphenator = crate::hyphen::shared();
+        self.started = true;
+        if self.lazy_text {
+            self.cache_window(self.chapter, self.source.clone());
+        }
+        self.prefetch_next_chapter();
+        // The first layout of a start-up goes to a worker whatever the document's size. The
+        // window is already showing by now, so a worker means the frame keeps answering
+        // while the page is built -- for a large document the difference between a window
+        // that fills in and a window that is not there.
+        let page_w = (self.client_w - self.content_dx()).max(1.0);
+        self.begin_layout_job(page_w);
+        self.pending_anchor = restore;
+        trace("layout-started");
+        Ok(())
+    }
+
     unsafe fn attach(&mut self, hwnd: HWND) {
         self.hwnd = hwnd;
         let mut r = RECT::default();
@@ -2941,12 +3081,7 @@ impl View {
             Err(e) => eprintln!("render target: {e}"),
         }
         DragAcceptFiles(hwnd, true);
-        // Sizing needs only WIC; bitmaps are made later against the render target.
-        if self.target.is_some() && self.images.is_none() {
-            self.images = ImageStore::new().ok();
-        }
         self.apply_dark_titlebar(hwnd);
-        self.relayout();
     }
 
     unsafe fn apply_dark_titlebar(&self, hwnd: HWND) {
@@ -3426,6 +3561,23 @@ impl View {
                 self.layout_messages();
                 LRESULT(0)
             }
+            WM_APP_DEFERRED => {
+                // Documents named alongside the first, each opened as its own tab in the
+                // order named -- the walk a reader taking them by hand would take. They
+                // waited for the window to be answering, so the first of them is read
+                // while the rest arrive one by one rather than all at once.
+                let extra = std::mem::take(&mut self.extra);
+                for path in &extra {
+                    self.load_document(path, hwnd);
+                }
+                // A peek preference left on is honoured here, at the one moment a reader is
+                // alive to check: the service outlives the reader's windows, and a watcher
+                // the last session started has no reason still to be watching.
+                if crate::settings::peek_enabled() {
+                    crate::peek::ensure_running();
+                }
+                LRESULT(0)
+            }
             WM_COPYDATA => {
                 // A second launch, made by a double-click in Explorer, hands the documents
                 // it was named to the window that already exists and quits: the reader is
@@ -3484,6 +3636,7 @@ impl View {
                     if let Some(entry) = self.tree.get(index).cloned() {
                         if entry.kind == TreeEntryKind::Directory {
                             self.tree = tree::scan(&entry.path, 2);
+                            self.tree_root = Some(entry.path);
                         } else {
                             self.load_document(&entry.path, hwnd);
                         }
@@ -4254,10 +4407,11 @@ impl View {
             }
             Command::ToggleTree => {
                 self.tree_visible = !self.tree_visible;
-                if self.tree.is_empty() {
-                    if let Some(root) = self.path.as_deref().and_then(Path::parent) {
-                        self.tree = tree::scan(root, 2);
-                    }
+                if self.tree_visible {
+                    // First opened, or opened onto another document's folder: the
+                    // listing is made now, against a reader who asked for it, rather
+                    // than at start-up against a panel nobody is looking at.
+                    self.refresh_tree();
                 }
                 self.layout_epoch += 1;
                 self.relayout_keeping_anchor();
@@ -4276,6 +4430,7 @@ impl View {
             Command::TreeDirectory(index) => {
                 if let Some(path) = self.tree.get(index).map(|entry| entry.path.clone()) {
                     self.tree = tree::scan(&path, 2);
+                    self.tree_root = Some(path);
                 }
             }
             Command::ActivateTab(id) => { self.switch_to_tab(id, hwnd); }
@@ -4971,6 +5126,7 @@ impl View {
                     if let Some(query) = self.find.as_ref().map(|f| f.query.clone()) {
                         self.apply_find(&query, false);
                     }
+                    self.take_pending_anchor();
                     unsafe { let _ = InvalidateRect(Some(self.hwnd), None, false); }
                     break;
                 }
@@ -4989,7 +5145,17 @@ impl View {
     const LAYOUT_ASYNC_BLOCK_BYTES: usize = 8 * 1024;
 
     fn relayout(&mut self) {
+        // Until the document is read there is nothing to lay out: the window exists
+        // before its page does, and the messages that arrive in between must find a
+        // layout of nothing rather than a layout of the wrong page.
+        if !self.started { return; }
         self.page_transition = None;
+        // The image decoder rides along with the first layout rather than the window's
+        // creation: by the time a page is laid out the frame is already up, and a
+        // document that never shows a figure still pays only the factory.
+        if self.images.is_none() {
+            self.images = ImageStore::new().ok();
+        }
         // A worker takes the layout when there is a lot of it -- many blocks, or a
         // few blocks so large they cost as much as many: a log folded into one
         // paragraph by Markdown is one block and hundreds of kilobytes of work.
@@ -5021,7 +5187,7 @@ impl View {
             page_w,
             self.dpi,
             &mut objects,
-            self.hyphenator.as_ref(),
+            self.hyphenator,
         );
         // A relayout moves the notes, so a jump still held down from before would now
         // point at a paragraph rather than at a footnote.
@@ -5054,6 +5220,17 @@ impl View {
         // them is the paragraph they were already looking at.
         if let Some(query) = self.find.as_ref().map(|f| f.query.clone()) {
             self.apply_find(&query, false);
+        }
+        // A place was waiting for lines to point it at, which this layout has just made.
+        self.take_pending_anchor();
+    }
+
+    /// Stand where the last window left off, if a page has just been laid out to stand
+    /// in. A start-up remembers the place before there are any lines, and the layout
+    /// that owns the page -- a worker's, in batches -- is what makes the place real.
+    fn take_pending_anchor(&mut self) {
+        if let Some(anchor) = self.pending_anchor.take() {
+            self.restore_to(anchor);
         }
     }
 
@@ -5429,6 +5606,7 @@ fn fit_punctuation_runs(runs: &mut [GlyphRun], width: Pt) {
     }
 }
 
+#[cfg(feature = "pdf")]
 fn unicode_by_glyph(source: &str, clusters: &[u16], glyph_count: usize) -> Vec<Option<String>> {
     let mut out = vec![None; glyph_count];
     let mut unit = 0usize;
@@ -6819,6 +6997,18 @@ impl View {
     }
 
 
+    /// The directory listing behind the panel, brought up to date with the document
+    /// on screen. A listing that already belongs to this document's directory is left
+    /// as it is: the panel is a view onto the reader's own folder, not a fresh read of
+    /// it on every page.
+    fn refresh_tree(&mut self) {
+        let want = self.path.as_deref().and_then(Path::parent).map(Path::to_path_buf);
+        if want != self.tree_root {
+            self.tree_root = want.clone();
+            self.tree = want.map(|root| tree::scan(&root, 2)).unwrap_or_default();
+        }
+    }
+
     /// Read a file and make it the page, saying whether that worked.
     fn show_document(&mut self, path: &Path, hwnd: HWND) -> bool {
         match self.try_show_document(path, hwnd) {
@@ -6974,9 +7164,11 @@ impl View {
         if let Some(path) = self.path.as_deref() {
             self.workspace.open_file(Self::workspace_file(path), TabKind::Pinned);
         }
-        self.tree = self.path.as_deref().and_then(Path::parent)
-            .map(|root| tree::scan(root, 2))
-            .unwrap_or_default();
+        if self.tree_visible {
+            // The panel is showing this document's folder; a document from another
+            // one gets the listing it would have asked for on opening the panel.
+            self.refresh_tree();
+        }
         let profile = crate::profiles::selected(self.plain_override.unwrap_or_else(|| reading::is_plain(self.path.as_deref())));
         if profile != self.profile {
             crate::profiles::load(&profile).apply(&mut self.theme);
@@ -8651,6 +8843,7 @@ unsafe fn write_png(
 /// point. Glyphs are emitted as positioned glyph ids with a ToUnicode value rather
 /// than flattened to a screenshot: copying from the PDF therefore sees the document's
 /// Unicode, including CJK, while the embedded sfnt keeps the exact DirectWrite shapes.
+#[cfg(feature = "pdf")]
 #[allow(clippy::too_many_arguments)]
 pub fn export_pdf(
     source: &str,
@@ -8711,18 +8904,22 @@ pub fn export_pdf(
     write_pdf(&page, &font, output, width, height, dark)
 }
 
+#[cfg(feature = "pdf")]
 fn pdf_rgb(c: Rgb) -> PdfColor {
     PdfColor::Rgb(PdfRgb::new(c.r, c.g, c.b, None))
 }
 
+#[cfg(feature = "pdf")]
 fn pdf_color(role: ColorRole, dark: bool) -> PdfColor {
     pdf_rgb(Palette::of(dark).ink(role))
 }
 
+#[cfg(feature = "pdf")]
 fn pdf_point(x: f32, y: f32) -> PdfPoint {
     PdfPoint { x: printpdf::Pt(x), y: printpdf::Pt(y) }
 }
 
+#[cfg(feature = "pdf")]
 fn pdf_text_face(font: &FontEngine, preferred: usize, source: &str) -> usize {
     let mut candidates = vec![preferred];
     for name in ["Segoe UI", "Microsoft YaHei", "Arial", "Cambria Math"] {
@@ -8738,6 +8935,7 @@ fn pdf_text_face(font: &FontEngine, preferred: usize, source: &str) -> usize {
     }).unwrap_or(preferred)
 }
 
+#[cfg(feature = "pdf")]
 fn translate_pdf_op(op: &Op, dy: f32) -> Op {
     let mut translated = op.clone();
     match &mut translated {
@@ -8761,6 +8959,7 @@ fn page_content_height_for(starts: &[Pt], index: usize, scale: Pt, nominal: Pt) 
         .unwrap_or(nominal)
 }
 
+#[cfg(feature = "pdf")]
 fn pdf_page_starts(page: &Page, page_height: Pt) -> Vec<Pt> {
     reader_page_starts(&page.sel, &page.anchor_tops, page.height, page_height, 1.0)
 }
@@ -8809,6 +9008,7 @@ fn reader_page_starts(sel: &[SelLine], anchors: &[Pt], height: Pt, page_height: 
     starts
 }
 
+#[cfg(feature = "pdf")]
 fn pdf_glyph_x(base: f32, advances: &[f32], level: u8, index: usize) -> f32 {
     let before: f32 = advances.iter().take(index).sum();
     let after: f32 = advances.iter().take(index + 1).sum();
@@ -8819,6 +9019,7 @@ fn pdf_glyph_x(base: f32, advances: &[f32], level: u8, index: usize) -> f32 {
     }
 }
 
+#[cfg(feature = "pdf")]
 fn actual_text_span(text: &str) -> PdfOp {
     let mut data = vec![0xFE, 0xFF];
     for unit in text.encode_utf16() {
@@ -8837,11 +9038,12 @@ fn actual_text_span(text: &str) -> PdfOp {
 
 /// The Unicode value attached to one DirectWrite glyph, including the characters
 /// represented by a ligature's shared cluster.
-#[cfg(test)]
+#[cfg(all(test, feature = "pdf"))]
 fn unicode_for_glyph(source: &str, clusters: &[u16], glyph_count: usize, index: usize) -> Option<String> {
     unicode_by_glyph(source, clusters, glyph_count).get(index).cloned().flatten()
 }
 
+#[cfg(feature = "pdf")]
 fn write_pdf(
     page: &Page,
     font: &FontEngine,
@@ -9723,6 +9925,7 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "pdf")]
     #[test]
     fn pdf_page_starts_break_at_lines_and_keep_a_heading_with_following_text() {
         let line = |y, h| SelLine {
@@ -9819,6 +10022,7 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "pdf")]
     #[test]
     fn pdf_rtl_glyph_positions_follow_visual_edges() {
         let advances = [10.0, 20.0];
@@ -9828,6 +10032,7 @@ mod tests {
         assert_eq!(pdf_glyph_x(100.0, &advances, 1, 1), 100.0);
     }
 
+    #[cfg(feature = "pdf")]
     #[test]
     fn pdf_glyph_clusters_keep_ligature_text_selectable() {
         assert_eq!(unicode_for_glyph("fi", &[0, 0], 1, 0).as_deref(), Some("fi"));

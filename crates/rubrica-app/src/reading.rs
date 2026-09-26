@@ -149,10 +149,12 @@ pub fn read_chapter(
 }
 
 pub fn read(path: &Path, requested: Encoding) -> std::io::Result<Decoded> {
-    decode(&std::fs::read(path)?, requested)
+    decode_owned(std::fs::read(path)?, requested)
 }
 
-pub fn decode(bytes: &[u8], requested: Encoding) -> std::io::Result<Decoded> {
+/// BOM and automatic detection for a buffer, returning the BOM encoding, the byte
+/// offset past it, the resolved encoding, and whether the text had to be guessed.
+fn detect_encoding(bytes: &[u8], requested: Encoding) -> (Option<Encoding>, usize, Encoding, bool) {
     let (bom, offset) = if bytes.starts_with(&[0xef, 0xbb, 0xbf]) { (Some(Encoding::Utf8), 3) }
         else if bytes.starts_with(&[0xff, 0xfe]) { (Some(Encoding::Utf16Le), 2) }
         else if bytes.starts_with(&[0xfe, 0xff]) { (Some(Encoding::Utf16Be), 2) }
@@ -162,17 +164,25 @@ pub fn decode(bytes: &[u8], requested: Encoding) -> std::io::Result<Decoded> {
         else if std::str::from_utf8(bytes).is_ok() { Encoding::Utf8 }
         else { Encoding::Gb18030 };
     let guessed = requested == Encoding::Auto && bom.is_none() && encoding == Encoding::Gb18030;
+    (bom, offset, encoding, guessed)
+}
+
+fn decode_error(encoding: Encoding) -> io::Error {
+    std::io::Error::new(std::io::ErrorKind::InvalidData,
+        format!("Cannot decode as {}. Choose another text encoding.", encoding.label()))
+}
+
+pub fn decode(bytes: &[u8], requested: Encoding) -> std::io::Result<Decoded> {
+    let (bom, offset, encoding, guessed) = detect_encoding(bytes, requested);
     let bytes = if bom == Some(encoding) { &bytes[offset..] } else { bytes };
-    let error = || std::io::Error::new(std::io::ErrorKind::InvalidData,
-        format!("Cannot decode as {}. Choose another text encoding.", encoding.label()));
     let text = match encoding {
-        Encoding::Utf8 => std::str::from_utf8(bytes).map_err(|_| error())?.to_string(),
+        Encoding::Utf8 => std::str::from_utf8(bytes).map_err(|_| decode_error(encoding))?.to_string(),
         Encoding::Utf16Le | Encoding::Utf16Be => {
-            if bytes.len() % 2 != 0 { return Err(error()); }
+            if bytes.len() % 2 != 0 { return Err(decode_error(encoding)); }
             let units: Vec<_> = bytes.as_chunks::<2>().0.iter().map(|p| if encoding == Encoding::Utf16Le {
                 u16::from_le_bytes([p[0], p[1]])
             } else { u16::from_be_bytes([p[0], p[1]]) }).collect();
-            String::from_utf16(&units).map_err(|_| error())?
+            String::from_utf16(&units).map_err(|_| decode_error(encoding))?
         }
         Encoding::Gb18030 | Encoding::Big5 | Encoding::ShiftJis | Encoding::EucKr => {
             if bytes.is_empty() { String::new() } else {
@@ -185,15 +195,30 @@ pub fn decode(bytes: &[u8], requested: Encoding) -> std::io::Result<Decoded> {
                 let flags = if encoding == Encoding::EucKr { MULTI_BYTE_TO_WIDE_CHAR_FLAGS(0) }
                     else { MB_ERR_INVALID_CHARS };
                 let len = unsafe { MultiByteToWideChar(cp, flags, bytes, None) };
-                if len == 0 { return Err(error()); }
+                if len == 0 { return Err(decode_error(encoding)); }
                 let mut units = vec![0; len as usize];
                 let read = unsafe { MultiByteToWideChar(cp, flags, bytes, Some(&mut units)) };
-                if read != len { return Err(error()); }
-                String::from_utf16(&units).map_err(|_| error())?
+                if read != len { return Err(decode_error(encoding)); }
+                String::from_utf16(&units).map_err(|_| decode_error(encoding))?
             }
         }
         Encoding::Auto => unreachable!(),
     };
+    Ok(Decoded { text, encoding, guessed })
+}
+
+/// `read`'s decoder: the UTF-8 path converts the buffer in place, so a whole book
+/// is never validated, copied and validated again; every other encoding decodes
+/// `decode`'s borrowed slice.
+fn decode_owned(mut bytes: Vec<u8>, requested: Encoding) -> io::Result<Decoded> {
+    let (bom, offset, encoding, guessed) = detect_encoding(&bytes, requested);
+    if encoding != Encoding::Utf8 {
+        return decode(&bytes, requested);
+    }
+    if bom == Some(encoding) {
+        bytes.drain(..offset);
+    }
+    let text = String::from_utf8(bytes).map_err(|_| decode_error(encoding))?;
     Ok(Decoded { text, encoding, guessed })
 }
 

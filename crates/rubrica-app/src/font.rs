@@ -15,6 +15,7 @@ use std::cell::RefCell;
 use std::collections::HashMap;
 use std::ops::Range;
 use std::rc::Rc;
+use std::sync::OnceLock;
 
 use rubrica_type::paragraph::{Measure, StyleId};
 use rubrica_type::units::Pt;
@@ -105,7 +106,9 @@ pub struct Style {
 
 pub struct FontEngine {
     analyzer: IDWriteTextAnalyzer,
-    collection: IDWriteFontCollection,
+    /// The system font collection this engine resolves faces against, resolved
+    /// from the process-wide one on first use.
+    collection: OnceLock<Option<&'static IDWriteFontCollection>>,
     faces: RefCell<Vec<Face>>,
     resolved: RefCell<HashMap<(String, u16, bool), Option<usize>>>,
     shaped: RefCell<LayeredMap<ShapeKey, Vec<GlyphRun>>>,
@@ -114,7 +117,9 @@ pub struct FontEngine {
     /// from its file: a face is asked once, however many struck runs it carries.
     strikeout: RefCell<HashMap<usize, Option<(f32, f32)>>>,
     /// The source sfnt bytes behind a face, read through DirectWrite when an export
-    /// needs an embeddable font rather than a COM draw handle.
+    /// needs an embeddable font rather than a COM draw handle. The reader window draws
+    /// through COM and never asks for the file itself.
+    #[cfg_attr(not(feature = "pdf"), allow(dead_code))]
     font_files: RefCell<HashMap<usize, (Vec<u8>, usize)>>,
     styles: RefCell<Vec<Style>>,
     /// The paragraph whose itemization is current.
@@ -216,17 +221,35 @@ struct TextRun {
     script: DWRITE_SCRIPT_ANALYSIS,
 }
 
+/// The one system font collection the process builds, on first use.
+///
+/// Enumerating every installed font costs tens to hundreds of milliseconds on a
+/// fresh process -- and that was paid once per engine, so also on every relayout
+/// of the async layout worker's. One collection answers every engine for the life
+/// of the process; a machine where the enumeration fails keeps the `None`, so the
+/// cost is not paid again on every call.
+static SYSTEM_FONTS: OnceLock<Option<IDWriteFontCollection>> = OnceLock::new();
+
+/// The shared system font collection, building it on first call.
+fn system_font_collection() -> Option<&'static IDWriteFontCollection> {
+    SYSTEM_FONTS
+        .get_or_init(|| unsafe {
+            let factory: IDWriteFactory = DWriteCreateFactory(DWRITE_FACTORY_TYPE_SHARED).ok()?;
+            let mut collection = None;
+            factory.GetSystemFontCollection(&mut collection, false).ok()?;
+            collection
+        })
+        .as_ref()
+}
+
 impl FontEngine {
     pub fn new() -> WResult<FontEngine> {
         unsafe {
             let factory: IDWriteFactory = DWriteCreateFactory(DWRITE_FACTORY_TYPE_SHARED)?;
             let analyzer = factory.CreateTextAnalyzer()?;
-            let mut collection: Option<IDWriteFontCollection> = None;
-            factory.GetSystemFontCollection(&mut collection, false)?;
-            let collection = collection.ok_or_else(|| windows::core::Error::from(E_FAIL))?;
             Ok(FontEngine {
                 analyzer,
-                collection,
+                collection: OnceLock::new(),
                 faces: RefCell::new(Vec::new()),
                 resolved: RefCell::new(HashMap::new()),
                 shaped: RefCell::new(LayeredMap::default()),
@@ -237,6 +260,11 @@ impl FontEngine {
                 styles: RefCell::new(Vec::new()),
             })
         }
+    }
+
+    /// The system font collection behind face resolution, shared by the process.
+    fn collection(&self) -> Option<&'static IDWriteFontCollection> {
+        *self.collection.get_or_init(system_font_collection)
     }
 
     /// Look up the style a `StyleId` denotes.
@@ -282,8 +310,9 @@ impl FontEngine {
         let w = utf16(name);
         let mut index = 0u32;
         let mut exists = BOOL(0);
+        let collection = self.collection()?;
         unsafe {
-            self.collection.FindFamilyName(PCWSTR(w.as_ptr()), &mut index, &mut exists).ok()?
+            collection.FindFamilyName(PCWSTR(w.as_ptr()), &mut index, &mut exists).ok()?
         };
         (exists.0 != 0).then_some(index)
     }
@@ -304,7 +333,8 @@ impl FontEngine {
         }
         let found = (|| {
             let index = self.find_family(family)?;
-            let fam = unsafe { self.collection.GetFontFamily(index).ok()? };
+            let collection = self.collection()?;
+            let fam = unsafe { collection.GetFontFamily(index).ok()? };
             let font: IDWriteFont = unsafe {
                 fam.GetFirstMatchingFont(
                     DWRITE_FONT_WEIGHT(weight as i32),
@@ -651,6 +681,7 @@ impl FontEngine {
     /// that its glyphs remain visible on another machine. Reading the same face through
     /// DirectWrite keeps the PDF's glyph ids and advances tied to the ones the reader
     /// actually painted, instead of guessing from a family name and a second font file.
+    #[cfg_attr(not(feature = "pdf"), allow(dead_code))]
     pub(crate) fn font_file(&self, idx: usize) -> Option<(Vec<u8>, usize)> {
         if let Some(hit) = self.font_files.borrow().get(&idx) {
             return Some(hit.clone());
@@ -696,11 +727,14 @@ impl FontEngine {
     pub(crate) fn text_format(&self, family: &str, size: f32) -> WResult<IDWriteTextFormat> {
         let family = utf16(family);
         let locale = utf16("en-us");
+        let Some(collection) = self.collection() else {
+            return Err(windows::core::Error::from(E_FAIL));
+        };
         unsafe {
             let factory: IDWriteFactory = DWriteCreateFactory(DWRITE_FACTORY_TYPE_SHARED)?;
             let format = factory.CreateTextFormat(
                 PCWSTR(family.as_ptr()),
-                Some(&self.collection),
+                Some(collection),
                 DWRITE_FONT_WEIGHT(400),
                 DWRITE_FONT_STYLE_NORMAL,
                 DWRITE_FONT_STRETCH_NORMAL,

@@ -79,6 +79,10 @@ fn main() -> Result<()> {
             !argv.iter().any(|a| a == "--no-hyphenate"),
         );
     }
+    // PDF export lives behind the `pdf` feature, which carries the whole font and
+    // image stack the reader window itself never touches. A build without it simply
+    // has no `--export-pdf` to answer.
+    #[cfg(feature = "pdf")]
     if argv.iter().any(|a| a == "--export-pdf") {
         let output = text_flag(&argv, "--export-pdf").ok_or("--export-pdf needs an output path")?;
         let width = flag(&argv, "--pdf-width").or_else(|| flag(&argv, "--export-width")).unwrap_or(612.0);
@@ -162,10 +166,11 @@ fn main() -> Result<()> {
         return report::report(&source, shown, &options);
     }
     // A file named on the command line is what the reader asked for, and one that cannot
-    // be read is worth stopping on -- visibly, though: a reader with no window to show an
-    // error in would otherwise be a double-click that simply did nothing. Nothing named is
-    // not a request for the sample, either: the reader was here before, and the page they
-    // left is the one to come back to.
+    // be read is worth stopping on -- visibly, though: the window the reader gets shows
+    // the reason rather than closing silently. Nothing named is not a request for the
+    // sample, either: the reader was here before, and the page they left is the one to
+    // come back to. What is named is handed to the window unread: the reader is answered
+    // with a window first and a page second, which is the only order that opens fast.
     let paths: Vec<PathBuf> = positionals(&argv).into_iter().map(PathBuf::from).collect();
     // One reader to a session: a second launch is what a double-click produces, but not
     // what it means. The mutex is held to the end of the process, and the system lets it
@@ -182,33 +187,13 @@ fn main() -> Result<()> {
         // proceeds as a second one rather than wait out a start that may never land. The
         // mutex stays with the first; this window simply lives without it.
     }
-    let (path, source, extra) = if paths.is_empty() {
-        let (path, source) = reopen();
-        (path, source, Vec::new())
+    let (path, extra) = if paths.is_empty() {
+        (reopen(), Vec::new())
     } else {
-        let mut opened: Vec<(PathBuf, String)> = Vec::new();
-        let mut failures: Vec<String> = Vec::new();
-        for path in &paths {
-            let prefs = settings::document(path);
-            let read = if should_window(path, &prefs) {
-                Ok(String::new())
-            } else {
-                reading::read(path, prefs.encoding).map(|d| d.text)
-            };
-            match read {
-                Ok(text) => opened.push((path.clone(), text)),
-                Err(e) => failures.push(view::document_open_error(path, &e)),
-            }
-        }
-        if !failures.is_empty() {
-            view::startup_error(&failures);
-            std::process::exit(1);
-        }
-        let mut docs = opened.into_iter();
-        let (path, source) = docs.next().expect("at least one document opened");
-        (Some(path), source, docs.map(|(p, _)| p).collect())
+        let mut named = paths.into_iter();
+        (named.next(), named.collect())
     };
-    if let Err(e) = view::run(source, path, extra) {
+    if let Err(e) = view::run(path, extra) {
         view::startup_error(&[e.to_string()]);
         std::process::exit(1);
     }
@@ -223,40 +208,25 @@ fn main() -> Result<()> {
 /// cannot be honoured is dropped rather than argued about. The place in the page is not
 /// taken from here: the window asks for it against the path it ended up with, so that a
 /// document named on the command line gets the same treatment.
-fn reopen() -> (Option<PathBuf>, String) {
+fn reopen() -> Option<PathBuf> {
     if let Some(snapshot) = settings::workspace() {
         match snapshot.session.active {
-            Some(rubrica_workspace::DocumentRef::Sample) => {
-                return (None, sample::DOCUMENT.to_string());
-            }
+            Some(rubrica_workspace::DocumentRef::Sample) => None,
             Some(rubrica_workspace::DocumentRef::File(file)) if settings::restorable_path(&file.path) => {
-                let path = file.path;
-                let prefs = settings::document(&path);
-                if should_window(&path, &prefs) {
-                    return (Some(path), String::new());
-                }
-                if let Ok(source) = reading::read(&path, prefs.encoding).map(|d| d.text) {
-                    return (Some(path), source);
-                }
+                Some(file.path)
             }
-            _ => {}
+            _ => restorable_reading(),
         }
+    } else {
+        restorable_reading()
     }
-    if let Some((path, _)) = settings::reading().filter(|(path, _)| settings::restorable_path(path)) {
-        let prefs = settings::document(&path);
-        if should_window(&path, &prefs) {
-            return (Some(path), String::new());
-        }
-        if let Ok(source) = reading::read(&path, prefs.encoding).map(|d| d.text) {
-            return (Some(path), source);
-        }
-    }
-    (None, sample::DOCUMENT.to_string())
 }
 
-fn should_window(path: &std::path::Path, prefs: &settings::DocumentSettings) -> bool {
-    let plain = prefs.plain.unwrap_or_else(|| reading::is_plain(Some(path)));
-    plain && !prefs.source && prefs.text.chapters && reading::can_window_text(path, prefs.encoding)
+/// The document the reader was last reading, if it is still where it was left.
+fn restorable_reading() -> Option<PathBuf> {
+    settings::reading()
+        .filter(|(path, _)| settings::restorable_path(path))
+        .map(|(path, _)| path)
 }
 
 /// Read a document, falling back to the built-in sample.

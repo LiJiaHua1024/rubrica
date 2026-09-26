@@ -107,7 +107,7 @@ pub fn report(source: &str, path: Option<&str>, o: &Options) -> Result<()> {
     let mut math = crate::math::MathStore::new();
     let mut objects = crate::view::Objects::new(store.as_ref(), base, &mut math);
     let hyphenator = if hyphenate {
-        crate::hyphen::Hyphenator::english()
+        crate::hyphen::shared()
     } else {
         None
     };
@@ -118,7 +118,7 @@ pub fn report(source: &str, path: Option<&str>, o: &Options) -> Result<()> {
         width,
         dpi,
         &mut objects,
-        hyphenator.as_ref(),
+        hyphenator,
     );
     let ops = &page.ops;
     let (height, column_pt, left_pt) = (page.height, page.column, page.left);

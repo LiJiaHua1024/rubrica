@@ -1,5 +1,8 @@
 //! Named typography presets. Values are validated before reaching layout arithmetic.
 
+use std::collections::HashMap;
+use std::sync::{LazyLock, Mutex};
+
 use crate::{
     i18n::{self, Language},
     settings,
@@ -233,6 +236,10 @@ fn key(name: &str) -> String {
 }
 
 pub fn names() -> Vec<String> {
+    remembered(|memory| &mut memory.names, read_names)
+}
+
+fn read_names() -> Vec<String> {
     let mut names = vec!["Default".into(), "Book".into()];
     for name in settings::text(ROOT, "Names").unwrap_or_default().lines().take(100) {
         if !name.is_empty() && !names.iter().any(|n: &String| n.eq_ignore_ascii_case(name)) {
@@ -243,6 +250,10 @@ pub fn names() -> Vec<String> {
 }
 
 pub fn load(name: &str) -> Profile {
+    remembered(|memory| memory.profiles.entry(name.to_string()).or_insert(None), || read_profile(name))
+}
+
+fn read_profile(name: &str) -> Profile {
     if name == "Book" {
         return Profile::book();
     }
@@ -251,21 +262,29 @@ pub fn load(name: &str) -> Profile {
         return p;
     }
     let sub = key(name);
+    // A name that is in the list but has no key of its own is a preset an earlier version
+    // knew about, or one whose key was taken away by hand. It reads as the defaults --
+    // including the East Asian policy, which is on for a key that was never written as
+    // much as for a theme that never chose anything else.
+    let Some(batch) = settings::Batch::open(&sub) else {
+        p.keep_korean_words = true;
+        return p;
+    };
     for (i, value) in p.fonts.iter_mut().enumerate() {
-        if let Some(saved) = settings::text(&sub, &format!("FontV2{i}")) {
+        if let Some(saved) = batch.text(&format!("FontV2{i}")) {
             *value = saved;
         } else if let Some(old) = LEGACY_FONT_SLOT[i] {
-            if let Some(saved) = settings::text(&sub, &format!("Font{old}")) {
+            if let Some(saved) = batch.text(&format!("Font{old}")) {
                 *value = saved;
             }
         }
     }
     for (i, value) in p.numbers.iter_mut().enumerate() {
-        if let Some(saved) = settings::text(&sub, &format!("Number{i}")).and_then(|s| s.parse().ok()) {
+        if let Some(saved) = batch.text(&format!("Number{i}")).and_then(|s| s.parse().ok()) {
             *value = saved;
         }
     }
-    p.keep_korean_words = settings::word(&sub, "KeepKoreanWords") != Some(0);
+    p.keep_korean_words = batch.word("KeepKoreanWords") != Some(0);
     if p.validate().is_ok() { p } else { Profile::default() }
 }
 
@@ -275,6 +294,15 @@ pub fn save(name: &str, p: &Profile) -> Result<(), String> {
 }
 
 pub fn save_with_lang(name: &str, p: &Profile, lang: Language) -> Result<(), String> {
+    let saved = write_profile(name, p, lang);
+    // Whether it landed or not: a write has just gone through the lists, so nothing
+    // remembered about them can be trusted, and the typography form's own page has to see
+    // the preset it just saved.
+    forget();
+    saved
+}
+
+fn write_profile(name: &str, p: &Profile, lang: Language) -> Result<(), String> {
     let name = name.trim();
     if name.is_empty() || name.len() > 80 || name.chars().any(char::is_control)
         || ["Default", "Book"].iter().any(|n| name.eq_ignore_ascii_case(n))
@@ -302,6 +330,10 @@ pub fn save_with_lang(name: &str, p: &Profile, lang: Language) -> Result<(), Str
 }
 
 pub fn selected(plain: bool) -> String {
+    remembered(|memory| memory.selected.entry(plain).or_insert(None), || read_selected(plain))
+}
+
+fn read_selected(plain: bool) -> String {
     let name = if plain { settings::text(ROOT, "PlainText") } else { None }
         .or_else(|| settings::text(ROOT, "Selected"))
         .unwrap_or_else(|| "Default".into());
@@ -309,7 +341,55 @@ pub fn selected(plain: bool) -> String {
 }
 
 pub fn select(name: &str, plain: bool) -> Result<(), String> {
-    settings::try_write_text(ROOT, if plain { "PlainText" } else { "Selected" }, name)
+    let picked = settings::try_write_text(ROOT, if plain { "PlainText" } else { "Selected" }, name);
+    // A different profile is now the selected one, which is what every reader of this
+    // module is asking about.
+    forget();
+    picked
+}
+
+/// What this process has already been told about the presets on this machine.
+///
+/// A start-up asks the same questions several times over -- which preset is selected, what
+/// the list of names is, and then what the preset it is about to apply holds -- and each
+/// answer is a dozen registry values. So the answers are kept, and every write throws them
+/// all away rather than trying to say which of them changed.
+static REMEMBERED: LazyLock<Mutex<Memory>> = LazyLock::new(|| Mutex::new(Memory::default()));
+
+#[derive(Default)]
+struct Memory {
+    names: Option<Vec<String>>,
+    selected: HashMap<bool, Option<String>>,
+    profiles: HashMap<String, Option<Profile>>,
+}
+
+/// Take everything remembered away, so the next question is asked of the registry rather
+/// than of a stale answer.
+fn forget() {
+    if let Ok(mut memory) = REMEMBERED.lock() {
+        *memory = Memory::default();
+    }
+}
+
+/// Answer from `slot` when this process has already asked, and remember what `read` says
+/// when it has not.
+fn remembered<T: Clone>(
+    slot: impl Fn(&mut Memory) -> &mut Option<T>,
+    read: impl FnOnce() -> T,
+) -> T {
+    // The lock is let go of while the registry is being asked again, because one question
+    // asks another: which preset is selected asks what the names are. Holding it across a
+    // read would be the same lock twice, which is a deadlock rather than a cache.
+    if let Ok(mut memory) = REMEMBERED.lock() {
+        if let Some(known) = slot(&mut memory) {
+            return known.clone();
+        }
+    }
+    let found = read();
+    if let Ok(mut memory) = REMEMBERED.lock() {
+        *slot(&mut memory) = Some(found.clone());
+    }
+    found
 }
 
 #[cfg(test)]

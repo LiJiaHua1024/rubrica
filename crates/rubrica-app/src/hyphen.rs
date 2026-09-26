@@ -11,14 +11,31 @@
 //! block's text, so a rewritten word would invalidate every span downstream. This
 //! returns the byte offsets to offer, the only form that composes.
 
+use std::sync::OnceLock;
+
 use hyphenation::{Hyphenator as _, Language, Load, Standard};
 
 /// A word shorter than this is not worth splitting; the crate's own edge rules
 /// (keep two characters at the start, three at the end) apply on top.
 const MIN_WORD: usize = 6;
 
+/// The one dictionary the process builds, on first use.
+///
+/// Constructing a `Standard` deserializes the embedded pattern file into a trie,
+/// which the startup path and every async relayout were each paying for. Built
+/// once here; a machine that shipped without the embedded dictionary keeps the
+/// `None`, so a load that cannot succeed is not retried on every call.
+static SHARED: OnceLock<Option<Hyphenator>> = OnceLock::new();
+
 pub struct Hyphenator {
     inner: Standard,
+}
+
+/// The process-wide hyphenator, built from [`Hyphenator::english`] on first use.
+/// Callers that can hold a reference should prefer this over building their own,
+/// which pays for the whole dictionary again.
+pub fn shared() -> Option<&'static Hyphenator> {
+    SHARED.get_or_init(Hyphenator::english).as_ref()
 }
 
 impl Hyphenator {

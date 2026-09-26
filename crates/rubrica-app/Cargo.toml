@@ -42,4 +42,10 @@ windows = { version = "0.62", features = [
 windows-numerics = "0.3"
 windows-core = "0.62"
 hyphenation = { version = "0.8", features = ["embed_en-us"] }
-printpdf = { version = "0.12.8", default-features = false, features = ["images", "png", "jpeg", "gif", "bmp", "tiff", "webp"] }
+# Only the CLI's `--export-pdf` path writes a PDF, so the option to build one at all
+# lives behind a feature: the reader window never pays for the font and image stack.
+printpdf = { version = "0.12.8", default-features = false, features = ["images", "png", "jpeg", "gif", "bmp", "tiff", "webp"], optional = true }
+
+[features]
+default = []
+pdf = ["dep:printpdf"]

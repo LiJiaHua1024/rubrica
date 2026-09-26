@@ -917,7 +917,7 @@ struct Peek {
     dark: bool,
     brushes: HashMap<ColorRole, ID2D1SolidColorBrush>,
     font: Option<crate::font::FontEngine>,
-    hyphenator: Option<hyphen::Hyphenator>,
+    hyphenator: Option<&'static hyphen::Hyphenator>,
     theme: Theme,
     page: Option<crate::view::Page>,
     title: Vec<crate::view::PaintRun>,
@@ -1120,7 +1120,7 @@ impl Peek {
             if !font.probe() {
                 return false;
             }
-            self.hyphenator = hyphen::Hyphenator::english();
+            self.hyphenator = hyphen::shared();
             self.font = Some(font);
         }
         let font = self.font.as_mut().expect("font loaded above");
@@ -1140,7 +1140,7 @@ impl Peek {
             client_w,
             dpi,
             &mut objects,
-            self.hyphenator.as_ref(),
+            self.hyphenator,
         ));
         self.scroll = 0.0;
         self.shape_bar(client_w / k, k);
