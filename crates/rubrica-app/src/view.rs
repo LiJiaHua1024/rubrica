@@ -12,6 +12,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::mpsc::{Receiver, Sender};
 use std::sync::{Arc, Mutex};
 
+use crate::i18n::{self, Key, Language};
 use rubrica_doc::{Action, ActionKind, Align, Block, BlockKind, Document, InlineStyle};
 use rubrica_type::paragraph::{Item, Spacing, StyleId, StyleSpan};
 use rubrica_type::units::Pt;
@@ -1241,6 +1242,8 @@ pub struct View {
     /// `SetWindowTextW` writes the taskbar's copy, which this view cannot read back,
     /// so its own is kept here.
     title_text: String,
+    lang: Language,
+    lang_choice: Option<Language>,
     /// The title's measured label, keyed on the text and the room it was measured
     /// for: a repaint neither re-shapes nor re-measures what it can look up.
     title_label: Option<TitleLabelCache>,
@@ -1684,12 +1687,13 @@ fn in_find_panel(x: f32, y: f32, client_w: f32) -> bool {
 /// on. One place rather than a format string in the painter, because the sentence is the
 /// only answer a reader gets to "is the word I meant even here", and it has to read as well
 /// at one hit as at nine hundred.
+#[cfg(test)]
 fn find_count(focus: usize, hits: usize) -> String {
-    match hits {
-        0 => "no match".to_string(),
-        1 => "1 match".to_string(),
-        n => format!("{} of {}", focus + 1, n),
-    }
+    find_count_in(Language::EnUs, focus, hits)
+}
+
+fn find_count_in(lang: Language, focus: usize, hits: usize) -> String {
+    i18n::find_count(lang, focus, hits)
 }
 
 /// An 8-bit colour, the shape GDI wants for the one window this painter cannot reach.
@@ -1767,6 +1771,8 @@ enum Command {
     PeekSpace(crate::peek::SpaceMode),
     /// Flip whether a preview closes when the folder loses the focus.
     PeekFocusClose,
+    /// Set the GUI language, or follow system.
+    Language(Option<Language>),
 }
 
 /// One row of that menu.
@@ -1796,6 +1802,8 @@ fn check(cmd: Command, label: impl Into<String>, on: bool) -> MenuRow {
 /// distrust the whole list.
 #[derive(Default)]
 struct MenuState {
+    lang: Language,
+    lang_choice: Option<Language>,
     profiles: Vec<String>,
     profile: String,
     source_view: bool,
@@ -1858,140 +1866,150 @@ fn menu_items(s: &MenuState) -> Vec<MenuRow> {
     // is standing next to, and the bracket keys step the measure rather than settling on
     // a rung, so a hint on either would promise a different thing from the one it keeps.
     let mut v = vec![
-        row(Command::GoBack, "Back\tAlt+\u{2190}", s.can_back),
-        row(Command::GoForward, "Forward\tAlt+\u{2192}", s.can_forward),
+        row(Command::GoBack, format!("{}\tAlt+\u{2190}", i18n::t(s.lang, Key::MenuBack)), s.can_back),
+        row(Command::GoForward, format!("{}\tAlt+\u{2192}", i18n::t(s.lang, Key::MenuForward)), s.can_forward),
         MenuRow::Gap,
-        row(Command::Copy, "Copy\tCtrl+C", s.selected),
-        row(Command::SelectAll, "Select All\tCtrl+A", s.text),
+        row(Command::Copy, format!("{}\tCtrl+C", i18n::t(s.lang, Key::MenuCopy)), s.selected),
+        row(Command::SelectAll, format!("{}\tCtrl+A", i18n::t(s.lang, Key::MenuSelectAll)), s.text),
         // The one item on this menu a reader needs on a page too long to read at once,
         // and lit by the same question as `Select All`: is there any text here at all.
-        row(Command::Find, "Find in Document\tCtrl+F", s.text),
+        row(Command::Find, format!("{}\tCtrl+F", i18n::t(s.lang, Key::MenuFind)), s.text),
     ];
     if let Some(url) = &s.link {
         v.push(MenuRow::Gap);
-        v.push(row(Command::OpenUrl(url.clone()), "Open Link", true));
-        v.push(row(Command::CopyUrl(url.clone()), "Copy Link Address", true));
+        v.push(row(Command::OpenUrl(url.clone()), i18n::t(s.lang, Key::MenuOpenLink), true));
+        v.push(row(Command::CopyUrl(url.clone()), i18n::t(s.lang, Key::MenuCopyLink), true));
     }
     // The document's own shape, one level down, where a long page needs it and a short one
     // gets nothing -- an outline of three lines is quicker to scroll past than to open.
     let contents = outline_rows(&s.headings);
     if !contents.is_empty() {
         v.push(MenuRow::Gap);
-        v.push(MenuRow::Sub { label: "Contents", items: contents });
+        v.push(MenuRow::Sub { label: i18n::t(s.lang, Key::MenuContents), items: contents });
     }
     v.push(MenuRow::Gap);
     v.extend([
-        row(Command::ZoomIn, "Increase Text\tCtrl++", true),
-        row(Command::ZoomOut, "Decrease Text\tCtrl+-", true),
-        row(Command::ZoomReset, "Actual Size\tCtrl+0", true),
+        row(Command::ZoomIn, format!("{}\tCtrl++", i18n::t(s.lang, Key::MenuZoomIn)), true),
+        row(Command::ZoomOut, format!("{}\tCtrl+-", i18n::t(s.lang, Key::MenuZoomOut)), true),
+        row(Command::ZoomReset, format!("{}\tCtrl+0", i18n::t(s.lang, Key::MenuZoomReset)), true),
     ]);
-    v.push(MenuRow::Sub { label: "Reading mode", items: vec![
-        check(Command::PageMode(false), "Continuous scroll", s.reading_mode == ReadingMode::Scroll),
-        check(Command::PageMode(true), "Page stack\tCtrl+4", s.reading_mode == ReadingMode::Stack),
+    v.push(MenuRow::Sub { label: i18n::t(s.lang, Key::MenuReadingMode), items: vec![
+        check(Command::PageMode(false), i18n::t(s.lang, Key::MenuContinuousScroll), s.reading_mode == ReadingMode::Scroll),
+        check(Command::PageMode(true), format!("{}\tCtrl+4", i18n::t(s.lang, Key::MenuPageStack)), s.reading_mode == ReadingMode::Stack),
         MenuRow::Gap,
-        row(Command::PreviousPage, "Previous page\tPgUp", s.reading_mode == ReadingMode::Scroll || s.page > 0),
-        row(Command::NextPage, "Next page\tPgDn", s.reading_mode == ReadingMode::Scroll || s.page + 1 < s.page_count),
+        row(Command::PreviousPage, format!("{}\tPgUp", i18n::t(s.lang, Key::MenuPreviousPage)), s.reading_mode == ReadingMode::Scroll || s.page > 0),
+        row(Command::NextPage, format!("{}\tPgDn", i18n::t(s.lang, Key::MenuNextPage)), s.reading_mode == ReadingMode::Scroll || s.page + 1 < s.page_count),
     ] });
-    let mut typography = vec![row(Command::Typography, "Edit / Save Preset...", true), MenuRow::Gap];
-    typography.extend(s.profiles.iter().map(|name| check(Command::Profile(name.clone()), name, *name == s.profile)));
-    v.push(MenuRow::Sub { label: "Typography", items: typography });
+    let mut typography = vec![row(Command::Typography, i18n::t(s.lang, Key::MenuEditSavePreset), true), MenuRow::Gap];
+    typography.extend(s.profiles.iter().map(|name| check(Command::Profile(name.clone()), i18n::preset_display_name(s.lang, name), *name == s.profile)));
+    v.push(MenuRow::Sub { label: i18n::t(s.lang, Key::MenuTypography), items: typography });
     v.push(MenuRow::Gap);
-    for (i, f) in TextFace::ALL.iter().enumerate().filter(|_| s.profile.is_empty() || s.profile == "Default") {
+    for (i, _) in TextFace::ALL.iter().enumerate().filter(|_| s.profile.is_empty() || s.profile == "Default") {
         let on = i == s.face;
         let ok = s.offered.get(i).copied().unwrap_or(false);
         // The face in use is always clickable: a machine that has lost a family since it
         // was chosen still has to be able to choose away from it.
-        v.push(if on { check(Command::Face(i), f.label, true) } else { row(Command::Face(i), f.label, ok) });
+        let label = i18n::face_label(s.lang, i);
+        v.push(if on { check(Command::Face(i), label, true) } else { row(Command::Face(i), label, ok) });
     }
     v.push(MenuRow::Gap);
-    for (i, m) in Measure::ALL.iter().enumerate().filter(|_| s.profile.is_empty() || s.profile == "Default") {
-        v.push(check(Command::Measure(i), m.label, i == s.measure));
+    for (i, _) in Measure::ALL.iter().enumerate().filter(|_| s.profile.is_empty() || s.profile == "Default") {
+        let label = i18n::measure_label(s.lang, i);
+        v.push(check(Command::Measure(i), label, i == s.measure));
     }
     v.push(MenuRow::Gap);
     v.extend([
-        check(Command::Palette(false), "Light", s.dark == Some(false)),
-        check(Command::Palette(true), "Dark", s.dark == Some(true)),
-        check(Command::FollowSystem, "Follow System", s.dark.is_none()),
+        check(Command::Palette(false), i18n::t(s.lang, Key::MenuLight), s.dark == Some(false)),
+        check(Command::Palette(true), i18n::t(s.lang, Key::MenuDark), s.dark == Some(true)),
+        check(Command::FollowSystem, i18n::t(s.lang, Key::MenuFollowSystem), s.dark.is_none()),
     ]);
     v.push(MenuRow::Gap);
     v.extend([
-        row(Command::ToggleTree, "Workspace tree", true),
-        row(Command::OpenFile, "Open\u{2026}\tCtrl+O", true),
-        row(Command::Reload, "Reload\tCtrl+R", s.from_file),
+        row(Command::ToggleTree, i18n::t(s.lang, Key::MenuWorkspaceTree), true),
+        row(Command::OpenFile, format!("{}\tCtrl+O", i18n::t(s.lang, Key::MenuOpenFile)), true),
+        row(Command::Reload, format!("{}\tCtrl+R", i18n::t(s.lang, Key::MenuReload)), s.from_file),
     ]);
     if !s.tabs.is_empty() {
         let mut tab_items = Vec::new();
         for (id, title, active) in &s.tabs {
             tab_items.push(row(Command::ActivateTab(*id), format!("{} {}", if *active { "●" } else { "○" }, title), true));
-            tab_items.push(row(Command::PinTab(*id), "Pin", !*active));
-            tab_items.push(row(Command::CloseTab(*id), "Close", !*active));
+            tab_items.push(row(Command::PinTab(*id), i18n::t(s.lang, Key::MenuPinTab), !*active));
+            tab_items.push(row(Command::CloseTab(*id), i18n::t(s.lang, Key::MenuCloseTab), !*active));
         }
         v.push(MenuRow::Gap);
-        v.push(MenuRow::Sub { label: "Open tabs", items: tab_items });
+        v.push(MenuRow::Sub { label: i18n::t(s.lang, Key::MenuOpenTabs), items: tab_items });
     }
     if !s.recent.is_empty() {
         let recent_items = s.recent.iter()
             .map(|(i, path)| row(Command::OpenRecent(*i), path.clone(), true))
             .collect();
-        v.push(MenuRow::Sub { label: "Recent documents", items: recent_items });
+        v.push(MenuRow::Sub { label: i18n::t(s.lang, Key::MenuRecentDocuments), items: recent_items });
     }
     if !s.tree.is_empty() {
         let tree_items = s.tree.iter().map(|(i, name, is_dir)| {
             let command = if *is_dir { Command::TreeDirectory(*i) } else { Command::OpenTree(*i) };
             row(command, name.clone(), true)
         }).collect();
-        v.push(MenuRow::Sub { label: "Workspace tree", items: tree_items });
+        v.push(MenuRow::Sub { label: i18n::t(s.lang, Key::MenuWorkspaceTree), items: tree_items });
     }
-    v.insert(v.len() - 3, MenuRow::Sub { label: "Single newlines", items: vec![
-        check(Command::DefaultLineBreaks(false), "Default: Merge into paragraph", !s.keep_line_breaks),
-        check(Command::DefaultLineBreaks(true), "Default: Keep line breaks", s.keep_line_breaks),
+    v.insert(v.len() - 3, MenuRow::Sub { label: i18n::t(s.lang, Key::MenuSingleNewlines), items: vec![
+        check(Command::DefaultLineBreaks(false), i18n::t(s.lang, Key::MenuNewlineDefaultMerge), !s.keep_line_breaks),
+        check(Command::DefaultLineBreaks(true), i18n::t(s.lang, Key::MenuNewlineDefaultKeep), s.keep_line_breaks),
         MenuRow::Gap,
-        check(Command::DocumentLineBreaks(None), "This document: Follow default", s.line_break_override.is_none()),
-        check(Command::DocumentLineBreaks(Some(false)), "This document: Merge", s.line_break_override == Some(false)),
-        check(Command::DocumentLineBreaks(Some(true)), "This document: Keep", s.line_break_override == Some(true)),
+        check(Command::DocumentLineBreaks(None), i18n::t(s.lang, Key::MenuNewlineDocDefault), s.line_break_override.is_none()),
+        check(Command::DocumentLineBreaks(Some(false)), i18n::t(s.lang, Key::MenuNewlineDocMerge), s.line_break_override == Some(false)),
+        check(Command::DocumentLineBreaks(Some(true)), i18n::t(s.lang, Key::MenuNewlineDocKeep), s.line_break_override == Some(true)),
     ] });
-    v.insert(v.len() - 3, check(Command::SourceView, "Read Source\tCtrl+3", s.source_view));
-    v.insert(v.len() - 3, MenuRow::Sub { label: "External editor", items: vec![
-        row(Command::OpenEditor, "Open in Editor\tCtrl+Shift+O", s.from_file),
-        row(Command::ChooseEditor, "Choose Editor\u{2026}", true),
+    v.insert(v.len() - 3, check(Command::SourceView, format!("{}\tCtrl+3", i18n::t(s.lang, Key::MenuReadSource)), s.source_view));
+    v.insert(v.len() - 3, MenuRow::Sub { label: i18n::t(s.lang, Key::MenuExternalEditor), items: vec![
+        row(Command::OpenEditor, format!("{}\tCtrl+Shift+O", i18n::t(s.lang, Key::MenuOpenInEditor)), s.from_file),
+        row(Command::ChooseEditor, i18n::t(s.lang, Key::MenuChooseEditor), true),
     ] });
     // An application-level switch among the document's own settings: it is placed
     // next to the editor for the same reason -- both are bridges to the rest of the
     // machine -- and the checked states are the remembered preferences, not probes
     // of whether the service is alive, so a watcher that has died still shows the
     // truth about what was asked for.
-    v.insert(v.len() - 3, MenuRow::Sub { label: "Spacebar peek", items: vec![
-        check(Command::TogglePeek, "Enabled", s.peek),
+    v.insert(v.len() - 3, MenuRow::Sub { label: i18n::t(s.lang, Key::MenuSpacebarPeek), items: vec![
+        check(Command::TogglePeek, i18n::t(s.lang, Key::MenuPeekEnabled), s.peek),
         MenuRow::Gap,
-        check(Command::PeekSpace(crate::peek::SpaceMode::Tap), "Space bar: Tap to toggle", s.peek_space == crate::peek::SpaceMode::Tap),
-        check(Command::PeekSpace(crate::peek::SpaceMode::Hold), "Space bar: Hold to preview", s.peek_space == crate::peek::SpaceMode::Hold),
-        check(Command::PeekSpace(crate::peek::SpaceMode::Mixed), "Space bar: Tap or hold", s.peek_space == crate::peek::SpaceMode::Mixed),
+        check(Command::PeekSpace(crate::peek::SpaceMode::Tap), i18n::t(s.lang, Key::MenuPeekTap), s.peek_space == crate::peek::SpaceMode::Tap),
+        check(Command::PeekSpace(crate::peek::SpaceMode::Hold), i18n::t(s.lang, Key::MenuPeekHold), s.peek_space == crate::peek::SpaceMode::Hold),
+        check(Command::PeekSpace(crate::peek::SpaceMode::Mixed), i18n::t(s.lang, Key::MenuPeekMixed), s.peek_space == crate::peek::SpaceMode::Mixed),
         MenuRow::Gap,
-        check(Command::PeekFocusClose, "Close when focus moves away", s.peek_focus_close),
+        check(Command::PeekFocusClose, i18n::t(s.lang, Key::MenuPeekFocusClose), s.peek_focus_close),
     ] });
-    v.insert(v.len() - 3, MenuRow::Sub { label: "Text reading", items: vec![
-        check(Command::PlainText(None), "Format: From file extension", s.plain_override.is_none()),
-        check(Command::PlainText(Some(true)), "Format: Plain text", s.plain_override == Some(true)),
-        check(Command::PlainText(Some(false)), "Format: Markdown", s.plain_override == Some(false)),
+    v.insert(v.len() - 3, MenuRow::Sub { label: i18n::t(s.lang, Key::MenuTextReading), items: vec![
+        check(Command::PlainText(None), i18n::t(s.lang, Key::MenuFormatExt), s.plain_override.is_none()),
+        check(Command::PlainText(Some(true)), i18n::t(s.lang, Key::MenuFormatPlain), s.plain_override == Some(true)),
+        check(Command::PlainText(Some(false)), i18n::t(s.lang, Key::MenuFormatMarkdown), s.plain_override == Some(false)),
         MenuRow::Gap,
-        check(Command::TextParagraphs(ParagraphRule::Auto), "Paragraphs: Automatic", s.text_options.paragraphs == ParagraphRule::Auto),
-        check(Command::TextParagraphs(ParagraphRule::Lines), "Paragraphs: Each line", s.text_options.paragraphs == ParagraphRule::Lines),
-        check(Command::TextParagraphs(ParagraphRule::BlankLines), "Paragraphs: Blank lines", s.text_options.paragraphs == ParagraphRule::BlankLines),
-        check(Command::DetectChapters(!s.text_options.chapters), "Detect chapter headings", s.text_options.chapters),
+        check(Command::TextParagraphs(ParagraphRule::Auto), i18n::t(s.lang, Key::MenuParagraphsAuto), s.text_options.paragraphs == ParagraphRule::Auto),
+        check(Command::TextParagraphs(ParagraphRule::Lines), i18n::t(s.lang, Key::MenuParagraphsLines), s.text_options.paragraphs == ParagraphRule::Lines),
+        check(Command::TextParagraphs(ParagraphRule::BlankLines), i18n::t(s.lang, Key::MenuParagraphsBlank), s.text_options.paragraphs == ParagraphRule::BlankLines),
+        check(Command::DetectChapters(!s.text_options.chapters), i18n::t(s.lang, Key::MenuDetectChapters), s.text_options.chapters),
         MenuRow::Gap,
-        row(Command::PreviousChapter, "Previous chapter\tCtrl+Alt+Up", s.chapter > 0),
-        row(Command::NextChapter, "Next chapter\tCtrl+Alt+Down", s.chapter + 1 < s.chapter_titles.len()),
-        row(Command::WideTableNarrow, "Wide table: Borrow less margin", true),
-        row(Command::WideTableWiden, "Wide table: Borrow more margin", true),
-        row(Command::Neighbor(false), "Previous file\tCtrl+Alt+Left", s.previous),
-        row(Command::Neighbor(true), "Next file\tCtrl+Alt+Right", s.next),
+        row(Command::PreviousChapter, format!("{}\tCtrl+Alt+Up", i18n::t(s.lang, Key::MenuPreviousChapter)), s.chapter > 0),
+        row(Command::NextChapter, format!("{}\tCtrl+Alt+Down", i18n::t(s.lang, Key::MenuNextChapter)), s.chapter + 1 < s.chapter_titles.len()),
+        row(Command::WideTableNarrow, i18n::t(s.lang, Key::MenuWideTableNarrow), true),
+        row(Command::WideTableWiden, i18n::t(s.lang, Key::MenuWideTableWiden), true),
+        row(Command::Neighbor(false), format!("{}\tCtrl+Alt+Left", i18n::t(s.lang, Key::MenuPreviousFile)), s.previous),
+        row(Command::Neighbor(true), format!("{}\tCtrl+Alt+Right", i18n::t(s.lang, Key::MenuNextFile)), s.next),
     ] });
     let mut encodings: Vec<_> = Encoding::ALL.into_iter().map(|e|
         check(Command::TextEncoding(e), e.label(), e == s.encoding)).collect();
     if let Some(notice) = &s.encoding_notice {
         encodings.insert(0, row(Command::TextEncoding(s.encoding), notice, false));
     }
-    v.insert(v.len() - 3, MenuRow::Sub { label: "Text encoding", items: encodings });
+    v.insert(v.len() - 3, MenuRow::Sub { label: i18n::t(s.lang, Key::MenuTextEncoding), items: encodings });
+    let mut lang_items = vec![
+        check(Command::Language(None), i18n::t(s.lang, Key::MenuFollowSystem), s.lang_choice.is_none()),
+        MenuRow::Gap,
+    ];
+    for l in Language::ALL {
+        lang_items.push(check(Command::Language(Some(l)), l.native_name(), s.lang_choice == Some(l)));
+    }
+    v.insert(v.len() - 3, MenuRow::Sub { label: i18n::t(s.lang, Key::MenuLanguage), items: lang_items });
     v
 }
 
@@ -2204,20 +2222,20 @@ fn open_path(path: &str) {
 fn show_error(hwnd: HWND, message: &str) {
     use windows::Win32::UI::WindowsAndMessaging::{MessageBoxW, MB_ICONERROR, MB_OK};
     let message = utf16(message);
-    let title = utf16("Rubrica");
+    let title = utf16(i18n::t(Language::EnUs, Key::DialogTitle));
     unsafe { MessageBoxW(Some(hwnd), PCWSTR(message.as_ptr()), PCWSTR(title.as_ptr()), MB_OK | MB_ICONERROR); }
 }
 
 pub(crate) fn document_open_error(path: &Path, error: &std::io::Error) -> String {
+    document_open_error_in(path, error, Language::EnUs)
+}
+
+pub(crate) fn document_open_error_in(path: &Path, error: &std::io::Error, lang: Language) -> String {
+    let p = path.display().to_string();
     match error.kind() {
-        std::io::ErrorKind::NotFound => format!(
-            "{} is no longer available; it may have been moved or deleted.",
-            path.display()
-        ),
-        std::io::ErrorKind::PermissionDenied => {
-            format!("Cannot read {}: permission denied.", path.display())
-        }
-        _ => format!("Cannot open {}: {error}", path.display()),
+        std::io::ErrorKind::NotFound => i18n::error_doc_not_found(lang, &p),
+        std::io::ErrorKind::PermissionDenied => i18n::error_doc_permission_denied(lang, &p),
+        _ => i18n::error_doc_cannot_open(lang, &p, &error.to_string()),
     }
 }
 
@@ -2376,6 +2394,9 @@ pub fn run(mut source: String, path: Option<PathBuf>, extra: Vec<PathBuf>) -> Re
         .map(|root| tree::scan(root, 2))
         .unwrap_or_default();
 
+    let lang_choice = crate::settings::language();
+    let lang = lang_choice.unwrap_or_else(Language::system_language);
+
     let mut view = Box::new(View {
         d2d,
         target: None,
@@ -2419,6 +2440,8 @@ pub fn run(mut source: String, path: Option<PathBuf>, extra: Vec<PathBuf>) -> Re
         cap_pressed: None,
         zoomed: false,
         title_text: String::new(),
+        lang,
+        lang_choice,
         title_label: None,
         tracking_leave: false,
         pages: HashMap::new(),
@@ -2494,7 +2517,7 @@ pub fn run(mut source: String, path: Option<PathBuf>, extra: Vec<PathBuf>) -> Re
         if RegisterClassExW(&wc) == 0 {
             return Err("RegisterClassExW failed".into());
         }
-        let title = utf16(&window_title(view.path.as_deref()));
+        let title = utf16(&window_title(view.path.as_deref(), view.lang));
         // Where the reader left the window, brought back onto the screens there are today.
         let frame = crate::settings::window()
             .map(|f| crate::settings::placed(f, &work_areas()))
@@ -2592,10 +2615,10 @@ fn display_path(path: &Path) -> String {
     s.strip_prefix(r"\\?\").map(str::to_owned).unwrap_or_else(|| s.into_owned())
 }
 
-fn window_title(path: Option<&std::path::Path>) -> String {
+fn window_title(path: Option<&std::path::Path>, lang: Language) -> String {
     match path {
         Some(p) => format!("Rubrica \u{2014} {}", display_path(p)),
-        None => "Rubrica \u{2014} sample".to_string(),
+        None => format!("Rubrica \u{2014} {}", i18n::t(lang, Key::SampleTitle)),
     }
 }
 
@@ -4092,6 +4115,8 @@ impl View {
         let mut pt = POINT { x, y };
         let _ = unsafe { ScreenToClient(hwnd, &mut pt) };
         let state = MenuState {
+            lang: self.lang,
+            lang_choice: self.lang_choice,
             profiles: crate::profiles::names(),
             profile: self.profile.clone(),
             source_view: self.source_view,
@@ -4110,7 +4135,7 @@ impl View {
                 .iter()
                 .map(|tab| {
                     let title = match &tab.document {
-                        DocumentRef::Sample => "Sample".to_string(),
+                        DocumentRef::Sample => i18n::t(self.lang, Key::SampleTitle).to_string(),
                         DocumentRef::File(file) => file.path.file_name()
                             .map(|name| name.to_string_lossy().into_owned())
                             .unwrap_or_else(|| file.path.to_string_lossy().into_owned()),
@@ -4127,7 +4152,7 @@ impl View {
                 .collect(),
             encoding: self.encoding,
             encoding_notice: Some(format!("{}{}", self.decoded_encoding.label(),
-                if self.encoding_guessed { " (detected by guess; choose if incorrect)" } else { "" })),
+                if self.encoding_guessed { format!(" ({})", i18n::t(self.lang, Key::MenuEncodingGuessed)) } else { String::new() })),
             previous: self.path.as_deref().and_then(|p| reading::neighbor(p, false)).is_some(),
             next: self.path.as_deref().and_then(|p| reading::neighbor(p, true)).is_some(),
             keep_line_breaks: self.keep_line_breaks,
@@ -4347,11 +4372,11 @@ impl View {
                     };
                     if let Err(error) = std::process::Command::new(editor)
                         .args(args).creation_flags(0x08000000).spawn()
-                    { show_error(hwnd, &format!("Cannot start editor: {error}")); }
+                    { show_error(hwnd, &format!("{}: {error}", i18n::t(self.lang, Key::ErrorCannotStartEditor))); }
                 }
             }
             Command::ChooseEditor => {
-                if let Some(path) = unsafe { self.prompt_file(hwnd, "Applications\0*.exe\0All files\0*.*\0\0") } {
+                if let Some(path) = unsafe { self.prompt_file(hwnd, &crate::i18n::filter_applications(self.lang)) } {
                     crate::settings::record_editor(&path);
                 }
             }
@@ -4373,9 +4398,17 @@ impl View {
             Command::PeekFocusClose => {
                 crate::peek::record_focus_close(!crate::peek::focus_close());
             }
+            Command::Language(choice) => {
+                crate::settings::record_language(choice);
+                self.lang_choice = choice;
+                self.lang = choice.unwrap_or_else(crate::i18n::Language::system_language);
+                self.update_title(hwnd);
+                unsafe { self.update_find_cue(); }
+                self.shape_find_label();
+            }
             Command::Typography => {
                 let plain = self.plain_override.unwrap_or_else(|| reading::is_plain(self.path.as_deref()));
-                if let Err(error) = crate::typography::show(hwnd, &self.theme, plain) { show_error(hwnd, &error.to_string()); }
+                if let Err(error) = crate::typography::show(hwnd, &self.theme, plain, self.lang) { show_error(hwnd, &error.to_string()); }
             }
             Command::Profile(name) => {
                 let plain = self.plain_override.unwrap_or_else(|| reading::is_plain(self.path.as_deref()));
@@ -4460,7 +4493,7 @@ impl View {
                         decoded.text
                     }
                     Err(error) => {
-                        show_error(hwnd, &format!("Cannot read chapter: {error}"));
+                        show_error(hwnd, &format!("{}: {error}", i18n::t(self.lang, Key::ErrorCannotReadChapter)));
                         return;
                     }
                 }
@@ -4516,7 +4549,7 @@ impl View {
         }
         self.refresh_chapter_index();
         if self.lazy_text && plain && self.text_options.chapters && self.chapter_index.is_none() {
-            show_error(hwnd, "Cannot index the TXT chapters after the file changed.");
+            show_error(hwnd, i18n::t(self.lang, Key::ErrorCannotIndexTxtChapters));
             return;
         }
         if self.lazy_text {
@@ -4534,7 +4567,7 @@ impl View {
                             self.cache_window(target, decoded.text);
                         }
                         Err(error) => {
-                            show_error(hwnd, &format!("Cannot read the changed TXT chapter: {error}"));
+                            show_error(hwnd, &format!("{}: {error}", i18n::t(self.lang, Key::ErrorCannotReadChangedChapter)));
                             return;
                         }
                     }
@@ -4552,7 +4585,7 @@ impl View {
                     self.cache_window(self.chapter, decoded.text);
                 }
                 Err(error) => {
-                    show_error(hwnd, &format!("Cannot read the TXT chapter: {error}"));
+                    show_error(hwnd, &format!("{}: {error}", i18n::t(self.lang, Key::ErrorCannotReadTxtChapter)));
                     return;
                 }
             }
@@ -4636,8 +4669,8 @@ impl View {
     }
 
     fn update_title(&mut self, hwnd: HWND) {
-        let mut title = window_title(self.path.as_deref());
-        if self.source_view { title.push_str(" [Source]"); }
+        let mut title = window_title(self.path.as_deref(), self.lang);
+        if self.source_view { title.push_str(&format!(" [{}]", i18n::t(self.lang, Key::SourceTag))); }
         if self.encoding_guessed { title.push_str(&format!(" [{}?]", self.decoded_encoding.label())); }
         // The strip draws this copy of the title; the taskbar's is written below and
         // never read back. A new title is new ink in the bar, so the bar repaints.
@@ -5061,19 +5094,22 @@ impl View {
         ) else {
             return;
         };
-        // The words shown while the box is empty, drawn and erased by the control itself,
-        // and shown even while the box has the keyboard: this window has nothing else
-        // saying what the box is for.
-        let cue = utf16("Find in document");
+        let previous = SetWindowLongPtrW(edit, GWLP_WNDPROC, edit_proc as *const () as isize);
+        EDIT_PROC.store(previous as usize, Ordering::Relaxed);
+        self.edit = Some(edit);
+        self.update_find_cue();
+    }
+
+    /// Update the cue banner text for the find edit box to the current language.
+    unsafe fn update_find_cue(&self) {
+        let Some(edit) = self.edit else { return };
+        let cue = utf16(i18n::t(self.lang, Key::FindCue));
         let _ = SendMessageW(
             edit,
             EM_SETCUEBANNER,
             Some(WPARAM(1)),
             Some(LPARAM(cue.as_ptr() as isize)),
         );
-        let previous = SetWindowLongPtrW(edit, GWLP_WNDPROC, edit_proc as *const () as isize);
-        EDIT_PROC.store(previous as usize, Ordering::Relaxed);
-        self.edit = Some(edit);
     }
 
     /// Where the box belongs now that the window has changed: moved, and its letters made
@@ -5222,7 +5258,7 @@ impl View {
         if f.query.is_empty() {
             return;
         }
-        let text = find_count(f.focus, f.marks.len());
+        let text = find_count_in(self.lang, f.focus, f.marks.len());
         let k = scale_of(self.dpi);
         let size = self.theme.base * 0.85;
         let req = FaceRequest {
@@ -6648,7 +6684,7 @@ impl View {
                         Ok(()) => true,
                         Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
                         Err(error) => {
-                            show_error(hwnd, &document_open_error(&file.path, &error));
+                            show_error(hwnd, &document_open_error_in(&file.path, &error, self.lang));
                             false
                         }
                     },
@@ -6788,7 +6824,7 @@ impl View {
         match self.try_show_document(path, hwnd) {
             Ok(()) => true,
             Err(error) => {
-                show_error(hwnd, &document_open_error(path, &error));
+                show_error(hwnd, &document_open_error_in(path, &error, self.lang));
                 false
             }
         }
@@ -7010,7 +7046,7 @@ impl View {
                     Ok(()) => {}
                     Err(error) if error.kind() == std::io::ErrorKind::NotFound => return,
                     Err(error) => {
-                        show_error(hwnd, &document_open_error(path, &error));
+                        show_error(hwnd, &document_open_error_in(path, &error, self.lang));
                         return;
                     }
                 }
@@ -7027,7 +7063,7 @@ impl View {
 
     /// The common dialog. Returns the chosen path, if the user did not cancel.
     unsafe fn prompt_for_file(&self, hwnd: HWND) -> Option<PathBuf> {
-        self.prompt_file(hwnd, "Documents\0*.md;*.markdown;*.txt\0All files\0*.*\0\0")
+        self.prompt_file(hwnd, &i18n::filter_documents(self.lang))
     }
 
     unsafe fn prompt_file(&self, hwnd: HWND, filter: &str) -> Option<PathBuf> {
@@ -10357,7 +10393,7 @@ mod tests {
         menu_items(s)
             .into_iter()
             .find_map(|r| match r {
-                MenuRow::Sub { label: "Contents", items } => Some(items),
+                MenuRow::Sub { label, items } if label == "Contents" || label == crate::i18n::t(s.lang, Key::MenuContents) => Some(items),
                 _ => None,
             })
             .unwrap_or_default()
@@ -10575,7 +10611,10 @@ mod tests {
         let s = state(false, None, None, false, true);
         assert!(contents(&s).is_empty(), "nothing to name");
         assert!(
-            !menu_items(&s).iter().any(|r| matches!(r, MenuRow::Sub { label: "Contents", .. })),
+            !menu_items(&s).iter().any(|r| match r {
+                MenuRow::Sub { label, .. } => *label == "Contents" || *label == crate::i18n::t(s.lang, Key::MenuContents),
+                _ => false,
+            }),
             "no group offering an empty rectangle"
         );
 
@@ -10778,6 +10817,47 @@ mod tests {
         // The gaps divide the list into groups rather than padding it, and the link's own
         // group is one of them.
         assert!(menu_items(&s).windows(2).any(|w| matches!(&w[0], MenuRow::Gap) && matches!(&w[1], MenuRow::Row { cmd: Command::OpenUrl(_), .. })));
+    }
+
+    #[test]
+    fn menu_items_support_multilingual_labels_and_switching() {
+        let mut s = state(true, None, None, true, true);
+        s.lang = Language::ZhCn;
+        let items = menu_items(&s);
+
+        let copy_row = items.iter().find_map(|r| match r {
+            MenuRow::Row { cmd: Command::Copy, label, .. } => Some(label.as_str()),
+            _ => None,
+        });
+        assert_eq!(copy_row, Some("复制\tCtrl+C"));
+
+        let lang_sub = items.iter().find_map(|r| match r {
+            MenuRow::Sub { label, items } if *label == crate::i18n::t(s.lang, Key::MenuLanguage) => Some(items),
+            _ => None,
+        });
+        assert!(lang_sub.is_some());
+        let lang_items = lang_sub.unwrap();
+        // Follow system + Gap + 11 languages = 13 items
+        assert_eq!(lang_items.len(), 13);
+
+        // Verify Japanese labels
+        s.lang = Language::JaJp;
+        let ja_items = menu_items(&s);
+        let ja_copy = ja_items.iter().find_map(|r| match r {
+            MenuRow::Row { cmd: Command::Copy, label, .. } => Some(label.as_str()),
+            _ => None,
+        });
+        assert_eq!(ja_copy, Some("コピー\tCtrl+C"));
+
+        // Verify find_count in multiple languages
+        assert_eq!(find_count_in(Language::EnUs, 0, 0), "no match");
+        assert_eq!(find_count_in(Language::ZhCn, 0, 0), "无匹配项");
+        assert_eq!(find_count_in(Language::JaJp, 0, 0), "一致なし");
+        assert_eq!(find_count_in(Language::ZhCn, 0, 5), "第 1 / 5 个");
+
+        // Verify window title localization
+        assert!(window_title(None, Language::ZhCn).contains("示例"));
+        assert!(window_title(None, Language::EnUs).contains("sample"));
     }
 }
 #[cfg(test)]
@@ -10983,6 +11063,6 @@ mod document_interaction_tests {
         let doc = Document::parse("# Start\n\n## 第二章\n\n## A *bold* heading\n");
         assert_eq!(heading_index(&doc, "%E7%AC%AC%E4%BA%8C%E7%AB%A0"), Some(1));
         assert_eq!(heading_index(&doc, "a-bold-heading"), Some(2));
-        assert_eq!(heading_index(&doc, "missing"), None);
+        assert!(heading_index(&doc, "missing").is_none());
     }
 }

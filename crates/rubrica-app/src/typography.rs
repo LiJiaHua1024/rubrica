@@ -7,7 +7,13 @@ use windows::Win32::{Foundation::{HWND, LPARAM, LRESULT, WPARAM},
     Graphics::Gdi::{GetStockObject, DEFAULT_GUI_FONT, COLOR_WINDOW},
     System::LibraryLoader::GetModuleHandleW,
     UI::WindowsAndMessaging::*};
-use crate::{profiles::{self, Profile, FONT_LABELS, NUMBER_LABELS}, settings, theme::Theme, view::utf16};
+use crate::{
+    i18n::{self, Key, Language},
+    profiles::{self, Profile, FONT_LABELS},
+    settings,
+    theme::Theme,
+    view::utf16,
+};
 
 pub const APPLIED: u32 = WM_APP + 41;
 thread_local! { static OPEN: Cell<Option<HWND>> = const { Cell::new(None) }; }
@@ -19,6 +25,7 @@ struct Form {
     korean: HWND,
     bind: HWND,
     editor_args: HWND,
+    lang: Language,
 }
 
 pub fn route(msg: &MSG) -> bool {
@@ -27,14 +34,15 @@ pub fn route(msg: &MSG) -> bool {
     })
 }
 
-pub fn show(owner: HWND, theme: &Theme, plain: bool) -> crate::Result<()> {
+pub fn show(owner: HWND, theme: &Theme, plain: bool, lang: Language) -> crate::Result<()> {
     if let Some(hwnd) = OPEN.with(|h| h.get()) {
         let _ = unsafe { SetForegroundWindow(hwnd) };
         return Ok(());
     }
     unsafe {
         let class = utf16("Rubrica.Typography");
-        let title = utf16("Typography — Rubrica");
+        let title_text = format!("{} \u{2014} Rubrica", i18n::t(lang, Key::TypoTitle));
+        let title = utf16(&title_text);
         let instance = GetModuleHandleW(None)?;
         let wc = WNDCLASSEXW {
             cbSize: std::mem::size_of::<WNDCLASSEXW>() as u32,
@@ -48,41 +56,46 @@ pub fn show(owner: HWND, theme: &Theme, plain: bool) -> crate::Result<()> {
             WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU, CW_USEDEFAULT, CW_USEDEFAULT, 900, 820,
             Some(owner), None, Some(instance.into()), None)?;
         let mut state = Box::new(Form { owner, name: HWND::default(), fields: Vec::new(),
-            korean: HWND::default(), bind: HWND::default(), editor_args: HWND::default() });
+            korean: HWND::default(), bind: HWND::default(), editor_args: HWND::default(), lang });
         let build = (|| -> windows::core::Result<()> {
-            label(hwnd, "Preset name", 18, 16, 150)?;
+            label(hwnd, i18n::t(lang, Key::TypoPresetName), 18, 16, 150)?;
             let selected = profiles::selected(plain);
-            state.name = child(hwnd, "EDIT", if selected == "Default" || selected == "Book" { "Custom" } else { &selected },
+            let default_name = if selected == "Default" || selected == "Book" {
+                i18n::t(lang, Key::TypoCustom)
+            } else {
+                &selected
+            };
+            state.name = child(hwnd, "EDIT", default_name,
                 [178, 14, 504, 25], 100, WS_BORDER | WS_TABSTOP | WINDOW_STYLE(ES_AUTOHSCROLL as u32))?;
             let p = Profile::from_theme(theme);
-            for (i, (name, value)) in FONT_LABELS.iter().zip(&p.fonts).enumerate() {
+            for (i, value) in p.fonts.iter().enumerate() {
                 let column = i / 10;
                 let row = i % 10;
                 let x = 18 + column as i32 * 436;
                 let y = 54 + row as i32 * 29;
-                label(hwnd, name, x, y + 3, 170)?;
+                label(hwnd, profiles::font_label(i, lang), x, y + 3, 170)?;
                 state.fields.push(child(hwnd, "EDIT", value, [x + 178, y, 246, 25], 110 + i,
                     WS_BORDER | WS_TABSTOP | WINDOW_STYLE(ES_AUTOHSCROLL as u32))?);
             }
-            for (i, (name, value)) in NUMBER_LABELS.iter().zip(p.numbers).enumerate() {
+            for (i, value) in p.numbers.iter().enumerate() {
                 let x = 18 + (i % 2) as i32 * 436;
                 let y = 370 + (i / 2) as i32 * 30;
-                label(hwnd, name, x, y + 3, 190)?;
+                label(hwnd, profiles::number_label(i, lang), x, y + 3, 190)?;
                 state.fields.push(child(hwnd, "EDIT", &value.to_string(), [x + 198, y, 118, 25], 120 + i,
                     WS_BORDER | WS_TABSTOP | WINDOW_STYLE(ES_AUTOHSCROLL as u32))?);
             }
-            state.korean = child(hwnd, "BUTTON", "Keep Korean words together", [18, 640, 330, 26], 130,
+            state.korean = child(hwnd, "BUTTON", i18n::t(lang, Key::TypoKeepKorean), [18, 640, 330, 26], 130,
                 WS_TABSTOP | WINDOW_STYLE(BS_AUTOCHECKBOX as u32))?;
             SendMessageW(state.korean, BM_SETCHECK, Some(WPARAM(usize::from(p.keep_korean_words))), None);
-            state.bind = child(hwnd, "BUTTON", "Use this preset for TXT documents", [454, 640, 330, 26], 131,
+            state.bind = child(hwnd, "BUTTON", i18n::t(lang, Key::TypoBindTxt), [454, 640, 330, 26], 131,
                 WS_TABSTOP | WINDOW_STYLE(BS_AUTOCHECKBOX as u32))?;
             SendMessageW(state.bind, BM_SETCHECK, Some(WPARAM(usize::from(plain))), None);
-            label(hwnd, "Use installed font family names. Missing fonts use the fallback families.", 18, 682, 820)?;
-            label(hwnd, "Editor arguments ({file}, {line}, {column})", 18, 716, 250)?;
+            label(hwnd, i18n::t(lang, Key::TypoFontNotice), 18, 682, 820)?;
+            label(hwnd, i18n::t(lang, Key::TypoEditorArgs), 18, 716, 250)?;
             state.editor_args = child(hwnd, "EDIT", &settings::editor_args(), [278, 712, 604, 25], 140,
                 WS_BORDER | WS_TABSTOP | WINDOW_STYLE(ES_AUTOHSCROLL as u32))?;
-            child(hwnd, "BUTTON", "Save and apply", [628, 758, 130, 30], 1, WS_TABSTOP | WINDOW_STYLE(BS_DEFPUSHBUTTON as u32))?;
-            child(hwnd, "BUTTON", "Cancel", [770, 758, 112, 30], 2, WS_TABSTOP)?;
+            child(hwnd, "BUTTON", i18n::t(lang, Key::TypoSaveApply), [628, 758, 130, 30], 1, WS_TABSTOP | WINDOW_STYLE(BS_DEFPUSHBUTTON as u32))?;
+            child(hwnd, "BUTTON", i18n::t(lang, Key::TypoCancel), [770, 758, 112, 30], 2, WS_TABSTOP)?;
             Ok(())
         })();
         if let Err(error) = build { let _ = DestroyWindow(hwnd); return Err(error.into()); }
@@ -128,7 +141,7 @@ unsafe extern "system" fn proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> 
                 p.keep_korean_words = unsafe { SendMessageW(state.korean, BM_GETCHECK, None, None) }.0 == 1;
                 settings::record_editor_args(&text(state.editor_args));
                 let name = text(state.name);
-                match profiles::save(&name, &p) {
+                match profiles::save_with_lang(&name, &p, state.lang) {
                     Ok(()) => {
                         if let Err(error) = profiles::select(&name, false) {
                             eprintln!("typography: {error}");
@@ -142,7 +155,7 @@ unsafe extern "system" fn proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> 
                         let _ = unsafe { DestroyWindow(hwnd) };
                     }
                     Err(error) => {
-                        let (error, title) = (utf16(&error), utf16("Typography"));
+                        let (error, title) = (utf16(&error), utf16(i18n::t(state.lang, Key::TypoTitle)));
                         unsafe { MessageBoxW(Some(hwnd), PCWSTR(error.as_ptr()), PCWSTR(title.as_ptr()), MB_OK | MB_ICONERROR); }
                     }
                 }

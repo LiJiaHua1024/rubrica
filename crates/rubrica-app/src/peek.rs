@@ -493,11 +493,12 @@ impl Service {
     fn tray_menu(&mut self) {
         unsafe {
             let Ok(menu) = CreatePopupMenu() else { return };
+            let lang = crate::settings::current_language();
             let check = if autostart_enabled() { MF_CHECKED } else { MENU_ITEM_FLAGS(0) };
-            let label = utf16("Launch at sign-in");
+            let label = utf16(crate::i18n::t(lang, crate::i18n::Key::TrayLaunchAtSignIn));
             let _ = AppendMenuW(menu, check | MF_STRING, MENU_AUTOSTART, PCWSTR(label.as_ptr()));
             let _ = AppendMenuW(menu, MF_SEPARATOR, 0, PCWSTR::null());
-            let exit = utf16("Exit");
+            let exit = utf16(crate::i18n::t(lang, crate::i18n::Key::TrayExit));
             let _ = AppendMenuW(menu, MF_STRING, MENU_EXIT, PCWSTR(exit.as_ptr()));
             let mut pt = POINT::default();
             let _ = GetCursorPos(&mut pt);
@@ -876,7 +877,9 @@ fn clear_autostart() {
 
 unsafe fn tray_icon(hwnd: HWND) -> NOTIFYICONDATAW {
     let mut tip = [0u16; 128];
-    for (slot, ch) in tip.iter_mut().zip("Rubrica peek\0".encode_utf16()) {
+    let lang = crate::settings::current_language();
+    let tip_text = crate::i18n::t(lang, crate::i18n::Key::TrayPeekTooltip);
+    for (slot, ch) in tip.iter_mut().zip(format!("{tip_text}\0").encode_utf16()) {
         *slot = ch;
     }
     NOTIFYICONDATAW {

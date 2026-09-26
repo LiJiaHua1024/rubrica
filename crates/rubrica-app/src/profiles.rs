@@ -1,9 +1,18 @@
 //! Named typography presets. Values are validated before reaching layout arithmetic.
 
 use crate::{
+    i18n::{self, Language},
     settings,
     theme::{Leading, Theme},
 };
+
+pub fn font_label(index: usize, lang: Language) -> &'static str {
+    i18n::font_label(lang, index)
+}
+
+pub fn number_label(index: usize, lang: Language) -> &'static str {
+    i18n::number_label(lang, index)
+}
 
 const ROOT: &str = "Software\\Rubrica\\Typography";
 
@@ -30,6 +39,7 @@ pub const FONT_LABELS: [&str; 19] = [
     "Math fallback",
     "Font fallback",
 ];
+#[allow(dead_code)]
 pub const NUMBER_LABELS: [&str; 17] = [
     "Size (pt)",
     "Latin body leading",
@@ -152,16 +162,22 @@ impl Profile {
     }
 
     pub fn validate(&self) -> Result<(), String> {
+        self.validate_with_lang(Language::EnUs)
+    }
+
+    pub fn validate_with_lang(&self, lang: Language) -> Result<(), String> {
         for (i, font) in self.fonts.iter().enumerate() {
             let optional = (12..16).contains(&i);
             if (!optional && font.trim().is_empty()) || font.len() > 200 || font.chars().any(char::is_control) {
-                return Err(format!("Enter a font family for {}.", FONT_LABELS[i]));
+                let label = i18n::font_label(lang, i);
+                return Err(i18n::error_font_required(lang, label));
             }
         }
         for (i, value) in self.numbers.iter().enumerate() {
             let (min, max) = BOUNDS[i];
             if !value.is_finite() || !(min..=max).contains(value) {
-                return Err(format!("{} must be between {min} and {max}.", NUMBER_LABELS[i]));
+                let label = i18n::number_label(lang, i);
+                return Err(i18n::error_number_between(lang, label, min, max));
             }
         }
         Ok(())
@@ -253,20 +269,25 @@ pub fn load(name: &str) -> Profile {
     if p.validate().is_ok() { p } else { Profile::default() }
 }
 
+#[allow(dead_code)]
 pub fn save(name: &str, p: &Profile) -> Result<(), String> {
+    save_with_lang(name, p, Language::EnUs)
+}
+
+pub fn save_with_lang(name: &str, p: &Profile, lang: Language) -> Result<(), String> {
     let name = name.trim();
     if name.is_empty() || name.len() > 80 || name.chars().any(char::is_control)
         || ["Default", "Book"].iter().any(|n| name.eq_ignore_ascii_case(n))
     {
-        return Err("Choose a name other than Default or Book (up to 80 bytes).".into());
+        return Err(i18n::t(lang, i18n::Key::ErrorChooseAnotherName).into());
     }
-    p.validate()?;
+    p.validate_with_lang(lang)?;
     let mut names = names();
     if !names.iter().any(|n| n == name) {
         names.push(name.into());
     }
     if names.len() > 102 {
-        return Err("There are already 100 saved typography presets.".into());
+        return Err(i18n::t(lang, i18n::Key::ErrorTooManyPresets).into());
     }
     let sub = key(name);
     for (i, value) in p.fonts.iter().enumerate() {

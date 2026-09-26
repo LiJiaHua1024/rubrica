@@ -12,6 +12,7 @@ mod font;
 mod find;
 mod highlight;
 mod hyphen;
+mod i18n;
 mod images;
 mod instance;
 mod math;

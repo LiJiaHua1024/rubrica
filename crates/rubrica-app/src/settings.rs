@@ -19,6 +19,7 @@ use windows::Win32::System::Registry::{
     RRF_RT_REG_SZ, REG_BINARY, REG_DWORD, REG_SZ,
 };
 
+use crate::i18n::Language;
 use crate::theme::{Measure, TextFace, Zoom};
 use crate::view::utf16;
 use rubrica_workspace::{DocumentRef, FileRef, SessionSnapshot, SessionTab, TabKind, Workspace, WorkspaceSnapshot};
@@ -228,6 +229,21 @@ pub fn editor_args() -> String {
 
 pub fn record_editor_args(args: &str) {
     write_text(SUBKEY, "EditorArgs", args);
+}
+
+pub fn language() -> Option<Language> {
+    text(SUBKEY, "Language")
+        .filter(|s| !s.is_empty())
+        .and_then(|code| Language::from_code(&code))
+}
+
+pub fn current_language() -> Language {
+    language().unwrap_or_else(Language::system_language)
+}
+
+pub fn record_language(lang: Option<Language>) {
+    let code = lang.map_or("", |l| l.code());
+    write_text(SUBKEY, "Language", code);
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
