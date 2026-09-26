@@ -56,7 +56,10 @@ use windows::Win32::System::Ole::{CF_HDROP, ReleaseStgMedium};
 use windows::Win32::System::Registry::{
     RegDeleteKeyValueW, RegGetValueW, RegSetKeyValueW, HKEY_CURRENT_USER, REG_SZ, RRF_RT_REG_SZ,
 };
-use windows::Win32::System::Threading::{AttachThreadInput, CreateMutexW, GetCurrentThreadId};
+use windows::Win32::System::Threading::{
+    AttachThreadInput, CreateMutexW, CreateProcessW, GetCurrentThreadId, PROCESS_INFORMATION,
+    STARTUPINFOW, CREATE_NEW_PROCESS_GROUP, DETACHED_PROCESS,
+};
 use windows::Win32::System::Variant::{VARIANT, VARIANT_0, VARIANT_0_0, VARIANT_0_0_0, VT_I4};
 use windows::Win32::UI::Accessibility::{SetWinEventHook, UnhookWinEvent, HWINEVENTHOOK};
 use windows::Win32::UI::Controls::MARGINS;
@@ -79,7 +82,7 @@ use windows::Win32::UI::WindowsAndMessaging::{
     CREATESTRUCTW, DefWindowProcW, DestroyMenu, DestroyWindow, DispatchMessageW,
     FindWindowExW, GetClassNameW, GetClientRect, GetCursorPos, GetForegroundWindow,
     GetMessageW, GetGUIThreadInfo, GetShellWindow, GetWindowLongPtrW, GetWindowThreadProcessId,
-    KillTimer, LoadCursorW, LoadIconW, PostMessageW, PostQuitMessage, RegisterClassExW,
+    FindWindowW, KillTimer, LoadCursorW, LoadIconW, PostMessageW, PostQuitMessage, RegisterClassExW,
     RegisterWindowMessageW, SetForegroundWindow, SetTimer, SetWindowLongPtrW, SetWindowsHookExW,
     SetWindowPos, ShowWindow, TrackPopupMenu, TranslateMessage, UnhookWindowsHookEx,
     EVENT_SYSTEM_FOREGROUND, GWLP_USERDATA, GUITHREADINFO, GUITHREADINFO_FLAGS, HWND_TOPMOST,
@@ -104,6 +107,8 @@ const WM_APP_ESCAPE: u32 = WM_APP + 53;
 const WM_APP_OPEN: u32 = WM_APP + 54;
 const WM_APP_RELOAD: u32 = WM_APP + 55;
 const WM_APP_TRAY: u32 = WM_APP + 56;
+/// The reader's menu turning its peek switch off sends this to the service window.
+const WM_APP_QUIT: u32 = WM_APP + 57;
 
 /// A space held at least this long is a glance: releasing it closes the preview.
 /// A quicker tap is a toggle instead -- press to open, press again to close -- which
@@ -218,6 +223,60 @@ fn acquire() -> Option<()> {
         return None;
     }
     Some(())
+}
+
+/// Whether a peek service is watching this session, judged by the window it is
+/// named by: the mutex alone would say yes to a service still starting up, and a
+/// window that answers is one that can be messaged.
+pub fn is_running() -> bool {
+    let class = utf16(SERVICE_CLASS);
+    unsafe { FindWindowW(PCWSTR(class.as_ptr()), PCWSTR::null()) }.is_ok()
+}
+
+/// Ask a running service to end itself. A service that is not there stays not
+/// there, and one that is takes its tray icon with it through `WM_DESTROY`.
+pub fn request_exit() {
+    let class = utf16(SERVICE_CLASS);
+    unsafe {
+        let Ok(hwnd) = FindWindowW(PCWSTR(class.as_ptr()), PCWSTR::null()) else { return };
+        let _ = PostMessageW(Some(hwnd), WM_APP_QUIT, WPARAM(0), LPARAM(0));
+    }
+}
+
+/// Start the service as its own detached process. The reader's lifetime is the
+/// reader's -- windows close, sessions end -- and the watcher must outlive every
+/// one of them, so it is not a thread of the reader's but a program of its own.
+/// A service already running is left alone: the mutex makes the launch a no-op.
+pub fn ensure_running() {
+    if is_running() {
+        return;
+    }
+    let mut exe = [0u16; 1024];
+    let len = unsafe { GetModuleFileNameW(None, &mut exe) } as usize;
+    let command = format!("\"{}\" --peek", String::from_utf16_lossy(&exe[..len]));
+    let mut wide: Vec<u16> = command.encode_utf16().chain(std::iter::once(0)).collect();
+    unsafe {
+        let si = STARTUPINFOW {
+            cb: std::mem::size_of::<STARTUPINFOW>() as u32,
+            ..Default::default()
+        };
+        let mut pi = PROCESS_INFORMATION::default();
+        let started = CreateProcessW(
+            None,
+            Some(windows::core::PWSTR(wide.as_mut_ptr())),
+            None,
+            None,
+            false,
+            DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP,
+            None,
+            None,
+            &si,
+            &mut pi,
+        );
+        if let Err(error) = started {
+            eprintln!("peek: {error}");
+        }
+    }
 }
 
 thread_local! {
@@ -335,6 +394,12 @@ unsafe extern "system" fn service_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPA
         }
         // In the icon's original protocol the mouse message rides in lParam, with
         // the icon's own id in wParam.
+        // The reader's own switch, turned off: the same exit its tray menu offers,
+        // arriving as a message instead of a menu pick.
+        WM_APP_QUIT => {
+            let _ = unsafe { DestroyWindow(hwnd) };
+            LRESULT(0)
+        }
         WM_APP_TRAY if lp.0 as u32 == WM_RBUTTONUP => {
             service.tray_menu();
             LRESULT(0)

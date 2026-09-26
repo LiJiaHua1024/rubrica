@@ -194,6 +194,16 @@ pub fn record_line_breaks(keep: bool) {
     write_word(SUBKEY, "KeepLineBreaks", u32::from(keep));
 }
 
+/// Whether the reader wants the spacebar peek watching: a choice of the reader's
+/// own menu, honoured again the next time a reader window opens.
+pub fn peek_enabled() -> bool {
+    word(SUBKEY, "Peek") == Some(1)
+}
+
+pub fn record_peek_enabled(on: bool) {
+    write_word(SUBKEY, "Peek", u32::from(on));
+}
+
 pub fn editor() -> String {
     text(SUBKEY, "Editor").filter(|s| !s.is_empty()).unwrap_or_else(|| "notepad.exe".into())
 }

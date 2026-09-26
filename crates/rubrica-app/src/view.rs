@@ -1760,6 +1760,9 @@ enum Command {
     NextChapter,
     OpenEditor,
     ChooseEditor,
+    /// Turn the spacebar peek service on or off: start it and remember the choice,
+    /// or take it down and un-remember.
+    TogglePeek,
 }
 
 /// One row of that menu.
@@ -1805,6 +1808,8 @@ struct MenuState {
     next: bool,
     keep_line_breaks: bool,
     line_break_override: Option<bool>,
+    /// The spacebar peek's remembered preference, read when the menu was asked for.
+    peek: bool,
     /// Whether a step back or forward has a page to land on. A reader who has opened one
     /// document and never followed a link out of it has no road behind them, and a `Back`
     /// that does nothing when pressed teaches them the menu is not to be believed.
@@ -1943,6 +1948,12 @@ fn menu_items(s: &MenuState) -> Vec<MenuRow> {
         row(Command::OpenEditor, "Open in Editor\tCtrl+Shift+O", s.from_file),
         row(Command::ChooseEditor, "Choose Editor\u{2026}", true),
     ] });
+    // An application-level switch among the document's own settings: it is placed
+    // next to the editor for the same reason -- both are bridges to the rest of the
+    // machine -- and the checked state is the remembered preference, not a probe of
+    // whether the service is alive, so a watcher that has died still shows the truth
+    // about what was asked for.
+    v.insert(v.len() - 3, check(Command::TogglePeek, "Spacebar peek", s.peek));
     v.insert(v.len() - 3, MenuRow::Sub { label: "Text reading", items: vec![
         check(Command::PlainText(None), "Format: From file extension", s.plain_override.is_none()),
         check(Command::PlainText(Some(true)), "Format: Plain text", s.plain_override == Some(true)),
@@ -2531,6 +2542,13 @@ pub fn run(mut source: String, path: Option<PathBuf>, extra: Vec<PathBuf>) -> Re
         // watched jumping.
         for path in &extra {
             view.load_document(path, hwnd);
+        }
+
+        // A peek preference left on is honoured here, at the one moment a reader is
+        // alive to check: the service outlives the reader's windows, and a watcher
+        // the last session started has no reason still to be watching.
+        if crate::settings::peek_enabled() {
+            crate::peek::ensure_running();
         }
 
         let mut msg = MSG::default();
@@ -4099,6 +4117,7 @@ impl View {
             next: self.path.as_deref().and_then(|p| reading::neighbor(p, true)).is_some(),
             keep_line_breaks: self.keep_line_breaks,
             line_break_override: self.line_break_override,
+            peek: crate::settings::peek_enabled(),
             can_back: self.history.leads(true),
             can_forward: self.history.leads(false),
             link: self.pointer_link(pt.x as f32, pt.y as f32),
@@ -4317,6 +4336,17 @@ impl View {
             Command::ChooseEditor => {
                 if let Some(path) = unsafe { self.prompt_file(hwnd, "Applications\0*.exe\0All files\0*.*\0\0") } {
                     crate::settings::record_editor(&path);
+                }
+            }
+            // The peek is not this window's to run, only to ask for: the service is
+            // its own detached process, outliving every window the reader closes.
+            Command::TogglePeek => {
+                let on = !crate::settings::peek_enabled();
+                crate::settings::record_peek_enabled(on);
+                if on {
+                    crate::peek::ensure_running();
+                } else {
+                    crate::peek::request_exit();
                 }
             }
             Command::Typography => {

@@ -152,12 +152,17 @@ Preferences live in `HKCU\Software\Rubrica`.
 a Quick Look to the machine: select a `.md`, `.markdown` or `.txt` file in Explorer —
 or on the desktop — and press space. The file is typeset by the same engine the reader
 uses and shown in a rounded, topmost window centred on the monitor the pointer is over.
-The preview never takes the focus, so the folder keeps the selection: the arrow keys
-keep moving it and the preview follows, `Enter` opens the file with its default program
-(Typora, say), and `Ctrl+Enter` hands it to a running reader as if it had been
-double-clicked. Space again, `Esc`, or releasing a space held longer than a moment puts
-the preview away; a quick tap toggles it instead. The tray menu offers launch-at-sign-in
-and the exit.
+
+The switch lives in the reader's own menu, under **Spacebar peek** (next to *External
+editor*): turning it on starts the service detached and remembers the choice, so the
+next reader window starts it again if it is gone; turning it off takes the service
+down and clears the memory. That is the whole set-up, and the only command line worth
+typing is none. The preview never takes the focus, so the folder keeps the selection:
+the arrow keys keep moving it and the preview follows, `Enter` opens the file with its
+default program (Typora, say), and `Ctrl+Enter` hands it to a running reader as if it
+had been double-clicked. Space again, `Esc`, or releasing a space held longer than a
+moment puts the preview away; a quick tap toggles it instead. The tray menu offers
+launch-at-sign-in and the exit.
 
 The service watches keys through a low-level hook that does almost nothing per stroke —
 a key code, a few `GetAsyncKeyState` reads, one window class — and keeps the shell's
