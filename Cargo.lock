@@ -829,6 +829,7 @@ name = "rubrica-doc"
 version = "0.8.3"
 dependencies = [
  "pulldown-cmark",
+ "rubrica-type",
 ]
 
 [[package]]

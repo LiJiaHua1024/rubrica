@@ -172,6 +172,100 @@ fn emphasis_nesting_combines_both_flags() {
 }
 
 #[test]
+fn cjk_emphasis_against_a_quote_is_read_as_strong() {
+    // `在**“超级增长”` is flanking by neither CommonMark test: the quote is
+    // punctuation and the ideograph is neither punctuation nor a space, so the
+    // parser hands the asterisks back as text and the reader is shown them.
+    let src = "锁死在**“超级增长”与“超级不平等”**。\n";
+    let doc = Document::parse(src);
+    let b = &doc.blocks[0];
+    assert_eq!(b.text, "锁死在“超级增长”与“超级不平等”。");
+    let strong: Vec<&str> = b.spans.iter().filter(|s| s.style.contains(InlineStyle::STRONG))
+        .map(|s| &b.text[s.range.clone()]).collect();
+    assert_eq!(strong, ["“超级增长”与“超级不平等”"], "{strong:?}");
+    // Two deleted runs have to leave the block's bookkeeping whole: the spans
+    // still tile the text, and every visible byte still points at the source byte
+    // holding that same character, or copying and jumping both drift by two.
+    let mut cursor = 0usize;
+    for s in &b.spans {
+        assert_eq!(s.range.start, cursor, "gap at {:?}", &b.text[s.range.clone()]);
+        cursor = s.range.end;
+    }
+    assert_eq!(cursor, b.text.len(), "text after the last span");
+    for (at, c) in b.text.char_indices() {
+        let source = rubrica_doc::source_at(&b.sources, at).unwrap();
+        assert_eq!(src[source..].chars().next(), Some(c), "{c} at {at}");
+    }
+}
+
+#[test]
+fn cjk_emphasis_is_read_wherever_the_ink_it_wraps_is_chinese() {
+    for (src, want) in [
+        ("他说“**粗体**”。\n", "他说“粗体”。"),
+        ("见**《书名》**一节。\n", "见《书名》一节。"),
+        ("【**要点**】如下。\n", "【要点】如下。"),
+        ("**（括号）**\n", "（括号）"),
+    ] {
+        let doc = Document::parse(src);
+        let b = &doc.blocks[0];
+        assert_eq!(b.text, want, "{src}");
+        assert!(b.spans.iter().any(|s| s.style.contains(InlineStyle::STRONG)), "{src}");
+    }
+}
+
+#[test]
+fn a_star_run_wrapping_ink_that_is_not_chinese_stays_literal() {
+    // The rule is about the characters a run would wrap, not about there being
+    // no space beside it: read loosely, this would style an exponent and a glob.
+    let doc = Document::parse("当 x**\"y\"** 与 **未闭合的星号还在时。\n");
+    let b = &doc.blocks[0];
+    assert_eq!(b.text, "当 x**\"y\"** 与 **未闭合的星号还在时。");
+    assert!(!b.spans.iter().any(|s| s.style.contains(InlineStyle::STRONG | InlineStyle::EMPHASIS)));
+    // A letter is punctuation to nobody, and the spec lets `*` open inside a word,
+    // so a run wrapped around a hanzi was never the problem. The gap is punctuation.
+    let mixed = Document::parse("AI**模型**很好。\n");
+    assert_eq!(mixed.blocks[0].text, "AI模型很好。");
+    assert!(mixed.blocks[0].spans.iter().any(|s| s.style.contains(InlineStyle::STRONG)));
+}
+
+#[test]
+fn asterisks_inside_code_are_the_authors_to_print() {
+    let inline = Document::parse("行内 `这是**代码**`，不能变粗。\n");
+    assert_eq!(inline.blocks[0].text, "行内 这是**代码**，不能变粗。");
+    let code = inline.blocks[0].spans.iter().find(|s| s.style.contains(InlineStyle::CODE)).unwrap();
+    assert_eq!(&inline.blocks[0].text[code.range.clone()], "这是**代码**");
+    assert!(!inline.blocks[0].spans.iter().any(|s| s.style.contains(InlineStyle::STRONG)));
+    let fenced = Document::parse("```\n这是**代码**\n```\n");
+    assert_eq!(fenced.blocks[0].text, "这是**代码**");
+    assert!(!fenced.blocks[0].spans.iter().any(|s| s.style.contains(InlineStyle::STRONG)));
+}
+
+#[test]
+fn a_link_keeps_its_target_across_removed_asterisks() {
+    let doc = Document::parse("见[第**“一”**章](https://example.com/x)。\n");
+    let b = &doc.blocks[0];
+    assert_eq!(b.text, "见第“一”章。");
+    assert_eq!(b.actions.len(), 1);
+    assert_eq!(&b.text[b.actions[0].range.clone()], "第“一”章");
+    assert!(b.spans.iter().any(|s| s.style.contains(InlineStyle::STRONG)));
+}
+
+#[test]
+fn a_definition_and_a_table_cell_read_their_own_emphasis() {
+    // Both are cut out of a paragraph before anything else sees them, and each
+    // keeps its own text rather than the block's, so the pass has to reach both.
+    let def = Document::parse("术语\n: 见**“释义”**一节\n");
+    assert_eq!(def.blocks[1].kind, BlockKind::Definition);
+    assert_eq!(def.blocks[1].text, "见“释义”一节");
+    assert!(def.blocks[1].spans.iter().any(|s| s.style.contains(InlineStyle::STRONG)));
+    let src = "| 词条 | 释义 |\n| --- | --- |\n| 见**“书”** | 排版 |\n";
+    let doc = Document::parse(src);
+    let cell = &doc.blocks[0].table.as_ref().unwrap().rows[0][0];
+    assert_eq!(cell.text.trim(), "见“书”");
+    assert!(cell.spans.iter().any(|s| s.style.contains(InlineStyle::STRONG)));
+    assert_eq!(rubrica_doc::source_at(&cell.sources, cell.text.find('书').unwrap()), src.find('书'));
+}
+#[test]
 fn list_items_carry_markers_and_nesting_depth() {
     // The nested bullet must sit *inside* an item: two spaces of indent after a
     // blank line is a new top-level list to CommonMark, not a child.

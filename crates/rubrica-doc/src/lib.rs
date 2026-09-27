@@ -20,6 +20,7 @@ use pulldown_cmark::{
     CodeBlockKind, Event, HeadingLevel, Options, Parser, Tag, TagEnd,
 };
 
+mod emphasis;
 pub mod plain;
 
 /// Byte range into [`Block::text`], plus the style it carries.
@@ -236,6 +237,20 @@ pub struct Cell {
     pub objects: Vec<ObjectSpan>,
 }
 
+impl Cell {
+    /// The text and everything ranged against it, for a pass that edits the one
+    /// and has to move the rest.
+    fn body(&mut self) -> emphasis::Text<'_> {
+        emphasis::Text {
+            text: &mut self.text,
+            spans: &mut self.spans,
+            sources: &mut self.sources,
+            objects: &mut self.objects,
+            actions: &mut self.actions,
+        }
+    }
+}
+
 /// Where a cell's content sits within its column.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum Align {
@@ -279,6 +294,37 @@ impl Block {
     /// Spans covering the whole block, for callers that only need one style.
     pub fn whole_span(&self) -> Span {
         Span { range: 0..self.text.len(), style: InlineStyle::EMPTY }
+    }
+
+    /// The text and everything ranged against it, for a pass that edits the one
+    /// and has to move the rest.
+    fn body(&mut self) -> emphasis::Text<'_> {
+        emphasis::Text {
+            text: &mut self.text,
+            spans: &mut self.spans,
+            sources: &mut self.sources,
+            objects: &mut self.objects,
+            actions: &mut self.actions,
+        }
+    }
+
+    /// Read the emphasis a Chinese author wrote and the parser would not, once
+    /// the block is otherwise finished: see [`emphasis`].
+    ///
+    /// It runs after [`split_definitions`] has cut the block, so an emphasis that
+    /// straddles a term and its definition pairs with neither half and is left as
+    /// the text it already was. Running earlier would be worse: the cut would
+    /// clip the style off the tail of it, and the emphasis would end silently at
+    /// the definition's first line.
+    fn relax_emphasis(&mut self) {
+        if self.kind != BlockKind::Code {
+            emphasis::relax(&mut self.body());
+        }
+        // A table keeps its prose in cells rather than in `text`, so the block
+        // itself is the one kind here whose reading lives somewhere else.
+        for cell in self.table.iter_mut().flat_map(|t| t.head.iter_mut().chain(t.rows.iter_mut().flatten())) {
+            emphasis::relax(&mut cell.body());
+        }
     }
 }
 
@@ -1081,7 +1127,8 @@ impl Builder<'_> {
                 // A definition's blocks belong to the definition, not to the page's
                 // reading order, so they leave `blocks` here rather than being
                 // filtered out of it later.
-                for b in split_definitions(b, breaks) {
+                for mut b in split_definitions(b, breaks) {
+                    b.relax_emphasis();
                     if !worth_setting(&b) {
                         continue;
                     }

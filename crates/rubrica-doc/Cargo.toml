@@ -9,3 +9,4 @@ description = "Markdown parsing into structured blocks, tables, footnotes, and i
 
 [dependencies]
 pulldown-cmark = "0.13.4"
+rubrica-type.workspace = true
