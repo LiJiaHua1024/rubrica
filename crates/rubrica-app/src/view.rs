@@ -248,6 +248,38 @@ const BUBBLE_MEASURE_EM: f32 = 26.0;
 const BUBBLE_MAX_LINES: f32 = 5.0;
 const BUBBLE_MAX_SCREEN: f32 = 0.5;
 
+/// What a card in the stack is being drawn for, which is how much of it is painted.
+///
+/// The card at rest below the window is why this exists. The stack keeps the next
+/// page's edge showing under the one in front, and a page always starts at the top of
+/// a line, so the sliver on show is the head of that line: half a row of glyph tops,
+/// sliced by the window's own edge. Half a line promises nothing a reader can use, and
+/// reads as a fault rather than as more, so the edge carries its paper and nothing else.
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum CardPaint {
+    /// The page in front of the reader: its text, and the marks that sit on it.
+    Page,
+    /// The page arriving under a turn: its text, but no marks -- those stay with the
+    /// page in front until the turn is done.
+    Turning,
+    /// The page leaving under a turn: its text and its marks, both of which travel
+    /// with it.
+    Leaving,
+    /// The next page's edge below the window: paper, a corner, a shadow, no text.
+    Edge,
+}
+
+impl CardPaint {
+    /// Whether this card's own text is painted at all.
+    fn paints_text(self) -> bool {
+        self != CardPaint::Edge
+    }
+    /// Whether the marks that sit on a page travel with this card.
+    fn paints_marks(self) -> bool {
+        matches!(self, CardPaint::Page | CardPaint::Leaving)
+    }
+}
+
 fn page_stack_layout_for(client_w: f32, client_h: f32, content_dx: f32) -> PageStackLayout {
     let content_dx = content_dx.clamp(0.0, client_w.max(1.0));
     let area_width = (client_w - content_dx).max(1.0);
@@ -7932,14 +7964,14 @@ impl View {
             // The arriving card is behind the leaving one while the two overlap. That
             // ordering is what makes the stack read as pages rather than two unrelated
             // windows crossing on the glass.
-            self.draw_page_card(target, transition.to_index, to_top, t, false);
-            self.draw_page_card(target, transition.from_index, from_top, 1.0 - t, true);
+            self.draw_page_card(target, transition.to_index, to_top, t, CardPaint::Turning);
+            self.draw_page_card(target, transition.from_index, from_top, 1.0 - t, CardPaint::Leaving);
         } else {
             if current + 1 < count {
                 let next_top = layout.top + layout.height + layout.gap;
-                self.draw_page_card(target, current + 1, next_top, 1.0, false);
+                self.draw_page_card(target, current + 1, next_top, 1.0, CardPaint::Edge);
             }
-            self.draw_page_card(target, current, layout.top, 1.0, true);
+            self.draw_page_card(target, current, layout.top, 1.0, CardPaint::Page);
         }
     }
 
@@ -7949,7 +7981,7 @@ impl View {
         index: usize,
         top: f32,
         opacity: f32,
-        with_overlays: bool,
+        paint: CardPaint,
     ) {
         if opacity <= 0.001 {
             return;
@@ -8011,14 +8043,16 @@ impl View {
         };
         target.SetTransform(&Matrix3x2::identity());
         target.PushAxisAlignedClip(&content_rect, D2D1_ANTIALIAS_MODE_PER_PRIMITIVE);
-        target.SetTransform(&Matrix3x2::translation(tx, 0.0));
-        self.draw_document(target, &self.ops, up, band_top, band_bottom, true);
-        if with_overlays {
-            self.draw_page_overlays(target, up, band_top, band_bottom);
+        if paint.paints_text() {
+            target.SetTransform(&Matrix3x2::translation(tx, 0.0));
+            self.draw_document(target, &self.ops, up, band_top, band_bottom, true);
+            if paint.paints_marks() {
+                self.draw_page_overlays(target, up, band_top, band_bottom);
+            }
         }
         target.PopAxisAlignedClip();
         target.SetTransform(&Matrix3x2::identity());
-        if with_overlays && self.page_transition.is_none() {
+        if paint.paints_marks() && self.page_transition.is_none() {
             self.draw_page_footer(target, index);
         }
         target.PopLayer();
@@ -11030,6 +11064,27 @@ mod tests {
             let next_top = layout.top + layout.height + layout.gap;
             assert!(next_top < h && h - next_top > 0.0, "the next page has no visible corner");
         }
+    }
+
+    #[test]
+    fn the_next_page_shows_below_the_window_as_paper_and_never_as_text() {
+        // The edge the stack leaves showing is always the same sliver, whatever the
+        // window: the layout keeps an inset and a peek below the last card and the gap
+        // between cards eats the difference. Holding it to a sliver is what lets the
+        // edge stay paper -- grow it past a line and the text there is worth reading,
+        // which is a different design and has to be argued for rather than inherited.
+        for (w, h, dx) in [(320.0, 480.0, 0.0), (1100.0, 1000.0, 0.0), (1920.0, 1080.0, 260.0)] {
+            let layout = page_stack_layout_for(w, h, dx);
+            let edge = h - (layout.top + layout.height + layout.gap);
+            assert!(edge > 0.0 && edge < 24.0, "the window shows {edge}px of the next page");
+        }
+        assert!(!CardPaint::Edge.paints_text(), "the edge paints no text");
+        assert!(!CardPaint::Edge.paints_marks(), "the edge paints no marks");
+        for role in [CardPaint::Page, CardPaint::Turning, CardPaint::Leaving] {
+            assert!(role.paints_text(), "{role:?} lost its text");
+        }
+        assert!(CardPaint::Page.paints_marks() && CardPaint::Leaving.paints_marks());
+        assert!(!CardPaint::Turning.paints_marks(), "the marks stay with the page in front");
     }
 
     #[cfg(feature = "pdf")]
