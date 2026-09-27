@@ -87,10 +87,11 @@ use windows::Win32::UI::WindowsAndMessaging::{
     SetWindowPos, ShowWindow, TrackPopupMenu, TranslateMessage, UnhookWindowsHookEx,
     EVENT_SYSTEM_FOREGROUND, GWLP_USERDATA, GUITHREADINFO, GUITHREADINFO_FLAGS, HWND_TOPMOST,
     IDC_ARROW, IDI_APPLICATION, KBDLLHOOKSTRUCT, LLKHF_INJECTED,
+    MA_NOACTIVATE,
     MENU_ITEM_FLAGS, MF_CHECKED, MF_SEPARATOR, MF_STRING, MSG, SW_HIDE, SW_SHOWNOACTIVATE, SW_SHOWNORMAL,
     SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, TPM_RETURNCMD, TPM_RIGHTBUTTON, WH_KEYBOARD_LL,
     WINEVENT_OUTOFCONTEXT, WNDCLASSEXW, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_TOPMOST,
-    WS_POPUP, WM_APP, WM_DESTROY, WM_ERASEBKGND, WM_KEYDOWN, WM_MOUSEWHEEL, WM_NCCREATE,
+    WS_POPUP, WM_APP, WM_DESTROY, WM_ERASEBKGND, WM_KEYDOWN, WM_MOUSEACTIVATE, WM_MOUSEWHEEL, WM_NCCREATE,
     WM_PAINT, WM_RBUTTONUP, WM_SYSKEYDOWN, WM_TIMER,
 };
 use windows_numerics::{Matrix3x2, Vector2};
@@ -109,6 +110,10 @@ const WM_APP_RELOAD: u32 = WM_APP + 55;
 const WM_APP_TRAY: u32 = WM_APP + 56;
 /// The reader's menu turning its peek switch off sends this to the service window.
 const WM_APP_QUIT: u32 = WM_APP + 57;
+/// The foreground moving away under a preview that lives only as long as its
+/// source has the focus: posted by the foreground hook, which hears the change
+/// the moment it happens instead of waiting for the next poll.
+const WM_APP_FOCUS: u32 = WM_APP + 58;
 
 /// A space held at least this long is a glance: releasing it closes the preview.
 /// A quicker tap is a toggle instead -- press to open, press again to close -- which
@@ -449,6 +454,20 @@ unsafe extern "system" fn service_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPA
             let _ = unsafe { DestroyWindow(hwnd) };
             LRESULT(0)
         }
+        // The foreground left the preview's source while a preview stood that
+        // lives only as long as that source holds the focus: the same close the
+        // poll would have reached, only the moment the move happened.
+        WM_APP_FOCUS => {
+            let moved = service
+                .peek
+                .as_ref()
+                .and_then(|p| p.source)
+                .is_some_and(|src| unsafe { GetForegroundWindow() } != src);
+            if service.shown && moved && focus_close() {
+                service.close_preview();
+            }
+            LRESULT(0)
+        }
         WM_APP_TRAY if lp.0 as u32 == WM_RBUTTONUP => {
             service.tray_menu();
             LRESULT(0)
@@ -529,6 +548,18 @@ impl Service {
                 _ => {}
             }
         }
+    }
+}
+
+/// The close the preview window itself asks for -- a poll noticing the focus
+/// left, or a click landing on a preview that lives no longer than the focus.
+/// The service owns the shown flag and the timer, so the close goes through it
+/// rather than around it: a preview closed any other way leaves the service
+/// believing one still stands, and the next space press closes it again instead
+/// of showing a new one.
+fn close_preview_service() {
+    if let Some(service) = SERVICE.with(|slot| slot.get()) {
+        unsafe { (*service).close_preview() };
     }
 }
 
@@ -659,7 +690,15 @@ unsafe extern "system" fn foreground_changed(
     _time: u32,
 ) {
     if let Some(service) = SERVICE.with(|slot| slot.get()) {
-        unsafe { &mut *service }.invalid_at = None;
+        let service = unsafe { &mut *service };
+        service.invalid_at = None;
+        // A preview that lives only while its source holds the focus hears the
+        // change here, the moment it happens, rather than at the next poll.
+        if service.shown && focus_close() {
+            let _ = unsafe {
+                PostMessageW(Some(service.window), WM_APP_FOCUS, WPARAM(0), LPARAM(0))
+            };
+        }
     }
 }
 
@@ -928,10 +967,6 @@ struct Peek {
     /// The window the selection is watched in; the timer only follows it while the
     /// foreground is still that window.
     source: Option<HWND>,
-    /// Whether the preview lives only while that window keeps the focus, read at
-    /// each reveal: a preference changed while a preview stands is a preference the
-    /// reader changed after walking away from a preview that was in the way.
-    focus_close: bool,
     scroll: f32,
 }
 
@@ -971,7 +1006,6 @@ impl Peek {
                 images: None,
                 path: None,
                 source: None,
-                focus_close: false,
                 scroll: 0.0,
             });
             peek.hwnd = CreateWindowExW(
@@ -1011,7 +1045,6 @@ impl Peek {
     /// Read, typeset, place, and show -- the whole reveal. A file that cannot be read
     /// leaves the previous state alone rather than showing an empty page over it.
     fn show(&mut self, path: &Path) {
-        self.focus_close = focus_close();
         unsafe { self.place() };
         if !self.load(path) {
             return;
@@ -1143,8 +1176,8 @@ impl Peek {
             self.hyphenator,
         ));
         self.scroll = 0.0;
-        self.shape_bar(client_w / k, k);
         self.path = Some(path.to_owned());
+        self.shape_bar(client_w / k, k);
         true
     }
 
@@ -1442,15 +1475,27 @@ unsafe extern "system" fn preview_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPA
             // since a page the user walked away from is not wrong to stay put --
             // unless the reader has asked for a preview that lives only as long as
             // the folder has the focus, in which case the focus's leaving is the
-            // same as the user's saying they are done.
+            // same as the user's saying they are done. The choice is read fresh:
+            // a preview may have been standing since before it was made.
             let fg = GetForegroundWindow();
             if !fg.is_invalid() && Some(fg) == peek.source {
                 peek.follow(fg);
-            } else if peek.focus_close && !fg.is_invalid() {
-                peek.close();
+            } else if !fg.is_invalid() && focus_close() {
+                close_preview_service();
             }
             LRESULT(0)
         },
+        // A click on the window never moves the focus anywhere: the window is a
+        // topmost WS_EX_NOACTIVATE popup, so the press is swallowed here and
+        // neither the folder nor the desktop ever gains the foreground. A
+        // preview that lives no longer than the focus hears the press as the
+        // user's leaving anyway -- the click they aimed away may well have
+        // landed on the preview itself, a window three quarters of a screen
+        // tall sitting where a click meant for the desk would fall.
+        WM_MOUSEACTIVATE if focus_close() => {
+            close_preview_service();
+            LRESULT(MA_NOACTIVATE as isize)
+        }
         WM_MOUSEWHEEL => {
             // The window never holds the focus, so this arrives only through the
             // system's "scroll under the pointer" courtesy; honour it by scrolling.
