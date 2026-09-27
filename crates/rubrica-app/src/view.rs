@@ -55,7 +55,7 @@ use windows::Win32::Graphics::Gdi::{
     CLIP_DEFAULT_PRECIS, CreateFontW, CreateSolidBrush, DEFAULT_CHARSET, DEFAULT_QUALITY,
     DeleteObject, EnumDisplayMonitors, FillRect, GetMonitorInfoW, HBRUSH, HDC, HFONT, HGDIOBJ, HMONITOR,
     InvalidateRect, MONITORINFO, OUT_DEFAULT_PRECIS, ScreenToClient, SetBkColor, SetTextColor,
-    ValidateRect,
+    UpdateWindow, ValidateRect,
 };
 use windows::Win32::System::Com::{
     CoInitializeEx, COINIT_APARTMENTTHREADED, COINIT_DISABLE_OLE1DDE, COINIT_MULTITHREADED,
@@ -98,7 +98,7 @@ use windows::Win32::UI::WindowsAndMessaging::{
     WM_MBUTTONDOWN, WM_MOUSEMOVE, WM_SYSKEYDOWN, CallWindowProcW, EN_CHANGE, ES_AUTOHSCROLL, GetParent,
     GetWindowTextW, GWLP_WNDPROC, MoveWindow, SendMessageW, SW_HIDE, SW_SHOW, WM_CHAR, WM_COMMAND,
     WM_CTLCOLOREDIT, WM_GETTEXTLENGTH, WM_SETFONT, WINDOWPLACEMENT, WINDOW_STYLE, WNDPROC,
-    WS_BORDER, WS_CHILD, WS_VISIBLE,
+    WS_CHILD, WS_VISIBLE,
 };
 use windows_numerics::{Matrix3x2, Vector2};
 
@@ -1610,8 +1610,12 @@ pub struct View {
     edit: Option<HWND>,
     edit_font: Option<HFONT>,
     /// The box's background, which the painter has no say in: USER32 paints a child
-    /// window, and asks this window what colours to use.
+    /// window, and asks this window what colours to use. It is the panel's own colour,
+    /// so the two read as one bar rather than as a field set into a slab of another.
     edit_brush: Option<HBRUSH>,
+    /// The hairline the box is read inside, drawn by this view because the control will
+    /// not draw a flat one.
+    frame_brush: Option<ID2D1SolidColorBrush>,
     /// How many there are, next to the box.
     find_label: Vec<PaintRun>,
     hit_brush: Option<ID2D1SolidColorBrush>,
@@ -1759,6 +1763,16 @@ fn thumb_rect(content_h: Pt, client_w: f32, client_h: f32, scroll: Pt, dpi: f32)
 #[inline]
 fn scale_of(dpi: f32) -> f32 {
     dpi / 72.0
+}
+
+/// The render target's own unit, in the physical pixels a child window is placed by.
+///
+/// Not `scale_of`: that one counts points in units of a 1/dpi inch, and a child window
+/// is placed in pixels of a 1/96 inch. The two agree at a dpi of about 83, which no
+/// monitor reports, and a box placed by the wrong one of them lands off the window.
+#[inline]
+fn unit_px(dpi: f32) -> f32 {
+    96.0 / dpi
 }
 
 /// How far the document's top sits above the window's, in device independent pixels,
@@ -1918,7 +1932,10 @@ struct Find {
 /// where nothing overlaps it: a bar the prose has to make room for is a page that reflows
 /// when a key is pressed, and a reader searching has already lost their place to look for.
 const FIND_W: f32 = 340.0;
-const FIND_H: f32 = 32.0;
+/// Tall enough that the box inside it has a line of air above and below its own words.
+/// The bar hangs over the page, so every unit of it is a unit of prose the reader cannot
+/// read while the bar is up -- which is the price of the bar, not a thing to skimp on.
+const FIND_H: f32 = 36.0;
 const FIND_TOP: f32 = TOPBAR_H + 8.0;
 /// Kept from the window's right edge -- more than the thumb's track needs, so that the
 /// one thing the reader has to grip is never under the thing that appeared by accident.
@@ -1927,6 +1944,9 @@ const FIND_EDGE: f32 = 16.0;
 /// a query is read from its start, and the number belongs out of the way of that.
 const FIND_COUNT: f32 = 96.0;
 const FIND_PAD: f32 = 6.0;
+/// The size of what is written in the bar, as a fraction of the reader's: the query in
+/// the box and the count beside it are one sentence, so they are set at one size.
+const FIND_TEXT: f32 = 0.85;
 /// The id the box's notifications come back with, since a child window has no other way
 /// to say which of its parent's children is speaking.
 const FIND_EDIT_ID: usize = 0x5141;
@@ -1940,18 +1960,19 @@ fn find_panel(client_w: f32) -> (f32, f32, f32, f32) {
     (client_w - FIND_EDGE - w, FIND_TOP, w, FIND_H)
 }
 
-/// The text box inside the panel, in the physical pixels `MoveWindow` wants: a child
-/// window is placed by the window manager, which knows nothing of this view's scale.
-fn find_edit(client_w: f32, dpi: f32) -> (i32, i32, i32, i32) {
-    let k = scale_of(dpi);
+/// The text box inside the panel, in the panel's own units -- the ones `find_panel`
+/// hands back, so the two can be asked of each other whether they agree. A child window
+/// is placed in physical pixels, which is a different thing; `position_edit` is where
+/// the two are turned into one another.
+fn find_edit(client_w: f32) -> (i32, i32, i32, i32) {
     let (x, y, w, h) = find_panel(client_w);
     let box_w = (w - 2.0 * FIND_PAD - FIND_COUNT).max(48.0);
     let box_h = (h - 2.0 * FIND_PAD).max(12.0);
     (
-        ((x + FIND_PAD) * k) as i32,
-        ((y + FIND_PAD) * k) as i32,
-        (box_w * k) as i32,
-        (box_h * k) as i32,
+        (x + FIND_PAD) as i32,
+        (y + FIND_PAD) as i32,
+        box_w as i32,
+        box_h as i32,
     )
 }
 
@@ -2684,6 +2705,7 @@ pub fn run(path: Option<PathBuf>, extra: Vec<PathBuf>) -> Result<()> {
         edit: None,
         edit_font: None,
         edit_brush: None,
+        frame_brush: None,
         find_label: Vec::new(),
         hit_brush: None,
         focus_brush: None,
@@ -3468,6 +3490,14 @@ impl View {
             c.a = 0.45;
             self.focus_brush = unsafe { rt.CreateSolidColorBrush(&c, None).ok() };
         }
+        // The frame has to be quiet. It is there to say where a field begins and stops,
+        // which a reader reads before they read anything written in it, and an edge
+        // that announces itself is an edge they look at instead of through.
+        if self.frame_brush.is_none() {
+            let mut c = d2d(self.palette.muted);
+            c.a = 0.30;
+            self.frame_brush = unsafe { rt.CreateSolidColorBrush(&c, None).ok() };
+        }
         // The close control's red is the system's own, and the ink on it is white in
         // either palette: a hue this far from the strip's greys is read as "the one
         // that ends things" before its glyph is made out, and white on it is what the
@@ -3811,13 +3841,16 @@ impl View {
                 }
             }
             // The one piece of this window the painter cannot reach: a child control is
-            // erased by USER32, which asks here what ink to use for it.
+            // erased by USER32, which asks here what ink to use for it. The paper's own
+            // colour would be the obvious answer and the wrong one: this box sits on the
+            // bar's panel, not on the page, and a field of page-white inside a grey bar
+            // is a slab the reader sees before the words they are typing.
             WM_CTLCOLOREDIT => {
                 let dc = HDC(wp.0 as *mut core::ffi::c_void);
                 SetTextColor(dc, cref(self.palette.text));
-                SetBkColor(dc, cref(self.palette.bg));
+                SetBkColor(dc, cref(self.palette.code_bg));
                 if self.edit_brush.is_none() {
-                    self.edit_brush = Some(CreateSolidBrush(cref(self.palette.bg)));
+                    self.edit_brush = Some(CreateSolidBrush(cref(self.palette.code_bg)));
                 }
                 LRESULT(self.edit_brush.map_or(0, |b| b.0 as isize))
             }
@@ -4174,6 +4207,19 @@ impl View {
             }
             WM_PAINT => {
                 self.paint();
+                // The present above wrote every pixel of the client area, the box on it
+                // included, and a child window is only asked to paint again when it has
+                // something of its own that moved -- a query sitting still since the last
+                // keystroke never does. So the words in the box, and the caret among them,
+                // are handed back to it here, once the ink underneath them is down.
+                if self.find.is_some() {
+                    if let Some(edit) = self.edit {
+                        unsafe {
+                            let _ = InvalidateRect(Some(edit), None, true);
+                            let _ = UpdateWindow(edit);
+                        }
+                    }
+                }
                 // A D2D present clears nothing of USER32's update region: without
                 // this, the window would be told to paint again every time its queue
                 // emptied, forever -- a full-scene redraw at the refresh rate whether or
@@ -5505,6 +5551,7 @@ impl View {
         self.sel_brush = None;
         self.hit_brush = None;
         self.focus_brush = None;
+        self.frame_brush = None;
         // The find box is USER32's to erase, and it will ask this window what colour to
         // use -- but only if it is asked to repaint, and only with the brush it is given
         // now rather than the one it was given for the last palette.
@@ -5813,7 +5860,10 @@ impl View {
     /// what the reader typed into it, which is the only thing worth keeping there.
     unsafe fn create_edit(&mut self, parent: HWND) {
         let Ok(module) = GetModuleHandleW(None) else { return };
-        let style = WS_CHILD | WS_VISIBLE | WINDOW_STYLE(ES_AUTOHSCROLL as u32) | WS_BORDER;
+        // No `WS_BORDER`: the system draws that as a sunken bevel, which is a shape from
+        // another decade and does not sit flat on a bar this view paints itself. The
+        // hairline the bar draws instead is `draw_find`'s, and it is ours to keep quiet.
+        let style = WS_CHILD | WS_VISIBLE | WINDOW_STYLE(ES_AUTOHSCROLL as u32);
         let Ok(edit) = CreateWindowExW(
             Default::default(),
             w!("EDIT"),
@@ -5861,8 +5911,21 @@ impl View {
         if let Some(font) = self.edit_font {
             let _ = SendMessageW(edit, WM_SETFONT, Some(WPARAM(font.0 as usize)), Some(LPARAM(1)));
         }
-        let (x, y, w, h) = find_edit((self.client_w - self.content_dx()).max(1.0), self.dpi);
-        let _ = MoveWindow(edit, x + self.content_dx() as i32, y, w, h, true);
+        let (x, y, w, h) = find_edit((self.client_w - self.content_dx()).max(1.0));
+        // The bar and the box are drawn in the render target's unit, and the window
+        // manager places a child in pixels of its own. The tree's width is in that same
+        // unit as the bar, so it is carried across with the rest of it rather than added
+        // to a number already in pixels.
+        let k = unit_px(self.dpi);
+        let at = |u: i32| (u as f32 * k) as i32;
+        let _ = MoveWindow(
+            edit,
+            at(x + self.content_dx() as i32),
+            at(y),
+            at(w),
+            at(h),
+            true,
+        );
     }
 
     /// The box's letters, made at the size this window is drawn at.
@@ -5879,7 +5942,13 @@ impl View {
         // only way to ask for a size that matches the text beside it. Weight 400 is
         // regular; the character set is left to the system, so a reader whose locale is
         // not Latin gets a face that can hold their own words.
-        let height = -((self.theme.base * 0.9 * scale_of(self.dpi)).round() as i32);
+        // A point is 4/3 of a pixel whatever the monitor says, because a pixel is a
+        // 1/96 inch and a point is a 1/72 inch. Letting the dpi into this instead makes
+        // the box's letters half again as tall as the count beside them on any screen
+        // scaled past 100%, and a reader types into a box too small to show it in.
+        // `FIND_TEXT` is the count's own scale (`shape_find_label`): a query and the
+        // number of what it found are one sentence, and two sizes say they are not.
+        let height = -((self.theme.base * FIND_TEXT * 4.0 / 3.0).round() as i32);
         let font = CreateFontW(
             height,
             0,
@@ -5987,6 +6056,34 @@ impl View {
         let _ = InvalidateRect(Some(hwnd), None, false);
     }
 
+    /// The bar: its panel, the frame its box is read inside, and the count beside it.
+    ///
+    /// Drawn in the render target's own units, which are the panel's own -- the box is
+    /// placed by `position_edit` in physical pixels, and the two agree because both
+    /// start from the same rectangle.
+    unsafe fn draw_find(&self, target: &ID2D1RenderTarget) {
+        let panel_w = (self.client_w - self.content_dx()).max(1.0);
+        let Some(brush) = self.brushes.get(&ColorRole::Surface).cloned() else { return };
+        let (px, py, pw, ph) = find_panel(panel_w);
+        let r = D2D_RECT_F { left: px, top: py, right: px + pw, bottom: py + ph };
+        target.FillRectangle(&r, &brush);
+        // The frame is painted whole and the control covers the middle of it, so what
+        // is left showing is a line of exactly one unit, with no half of one to blur.
+        // Stroking the path instead would put a half-unit on each side of it, which on
+        // a bar this small reads as a smudge rather than an edge.
+        if let Some(frame) = self.frame_brush.clone() {
+            let (ex, ey, ew, eh) = find_edit(panel_w);
+            let r = D2D_RECT_F {
+                left: ex as f32 - 1.0,
+                top: ey as f32 - 1.0,
+                right: (ex + ew) as f32 + 1.0,
+                bottom: (ey + eh) as f32 + 1.0,
+            };
+            target.FillRectangle(&r, &frame);
+        }
+        self.draw_runs(target, &self.find_label, 0.0);
+    }
+
     /// How many there are, and which one this is, set in the space kept at the bar's right.
     fn shape_find_label(&mut self) {
         self.find_label.clear();
@@ -5996,7 +6093,7 @@ impl View {
         }
         let text = find_count_in(self.lang, f.focus, f.marks.len());
         let k = scale_of(self.dpi);
-        let size = self.theme.base * 0.85;
+        let size = self.theme.base * FIND_TEXT;
         let req = FaceRequest {
             family: self.theme.fonts.family(Role::Body, false).to_string(),
             cjk_family: self.theme.fonts.family(Role::Body, true).to_string(),
@@ -7884,12 +7981,7 @@ impl View {
                 target.PopAxisAlignedClip();
                 if self.find.is_some() {
                     target.SetTransform(&Matrix3x2::translation(self.content_dx(), 0.0));
-                    let (px, py, pw, ph) = find_panel((self.client_w - self.content_dx()).max(1.0));
-                    if let Some(brush) = self.brushes.get(&ColorRole::Surface).cloned() {
-                        let r = D2D_RECT_F { left: px, top: py, right: px + pw, bottom: py + ph };
-                        target.FillRectangle(&r, &brush);
-                    }
-                    self.draw_runs(&target, &self.find_label, 0.0);
+                    self.draw_find(&target);
                 }
                 target.SetTransform(&Matrix3x2::identity());
                 let _ = target.EndDraw(None, None);
@@ -7937,12 +8029,7 @@ impl View {
             // window, and a clip that begins below that band would erase the bar entire.
             target.PopAxisAlignedClip();
             if self.find.is_some() {
-                let (px, py, pw, ph) = find_panel((self.client_w - self.content_dx()).max(1.0));
-                if let Some(brush) = self.brushes.get(&ColorRole::Surface).cloned() {
-                    let r = D2D_RECT_F { left: px, top: py, right: px + pw, bottom: py + ph };
-                    target.FillRectangle(&r, &brush);
-                }
-                self.draw_runs(&target, &self.find_label, 0.0);
+                self.draw_find(&target);
             }
             target.SetTransform(&Matrix3x2::identity());
             let _ = target.EndDraw(None, None);
@@ -11132,12 +11219,29 @@ mod tests {
         let (tx, _, track, _) = thumb_rect(2400.0, 1080.0, 800.0, 0.0, DPI).unwrap();
         assert!(px + pw <= tx, "the bar is over the thumb's track: {} > {}", px + pw, tx);
         assert!(!in_find_panel(tx + track / 2.0, py + ph / 2.0, 1080.0), "and the grip is still a press");
-        // The box sits inside the panel, with the count's room left at its right.
-        let k = scale_of(DPI);
-        let (ex, ey, ew, eh) = find_edit(1080.0, DPI);
-        assert!(ex as f32 >= px * k - 1.0, "the box left the bar: {ex}");
-        assert!((ex + ew) as f32 <= (px + pw - FIND_COUNT) * k + 1.0, "the box took the count's room");
-        assert!(ey as f32 >= py * k - 1.0 && (ey + eh) as f32 <= (py + ph) * k + 1.0);
+        // The box sits inside the panel, with the count's room left at its right -- in
+        // the panel's own units, which are the only ones the two of them share.
+        let (ex, ey, ew, eh) = find_edit(1080.0);
+        assert!(ex as f32 >= px - 1.0, "the box left the bar: {ex}");
+        assert!((ex + ew) as f32 <= (px + pw - FIND_COUNT) + 1.0, "the box took the count's room");
+        assert!(ey as f32 >= py - 1.0 && (ey + eh) as f32 <= (py + ph) + 1.0);
+    }
+
+    /// A box placed by the render target's unit read as a count of pixels is a box the
+    /// window manager puts a third of a window further right than the one it was drawn
+    /// over, and off the edge of the window besides -- still taking the query, still
+    /// focused, and showing the reader nothing at all of what they have typed.
+    #[test]
+    fn the_box_lands_inside_the_window_the_manager_will_place_it_in() {
+        for w in [640.0, 1080.0, 1920.0] {
+            let (ex, ey, ew, eh) = find_edit(w);
+            let k = unit_px(DPI);
+            assert!((ex as f32 + ew as f32) * k <= w + 1.0, "the box went over the edge at {w}px");
+            assert!(
+                (ey as f32 + eh as f32) * k <= FIND_TOP + FIND_H + 1.0,
+                "and the box left the bar's own height"
+            );
+        }
     }
 
     #[test]
@@ -11145,10 +11249,21 @@ mod tests {
         for w in [180.0, 320.0, 1080.0] {
             let (px, _, pw, _) = find_panel(w);
             assert!(px >= 0.0 && px + pw <= w, "the bar left the window at {w}px: {px}+{pw}");
-            let (ex, _, ew, _) = find_edit(w, DPI);
+            let (ex, _, ew, _) = find_edit(w);
             assert!(ew > 40, "and left nothing to type into at {w}px");
-            assert!((ex + ew) as f32 <= w * scale_of(DPI) + 1.0, "the box went over the edge at {w}px");
+            assert!((ex + ew) as f32 <= w + 1.0, "the box went over the edge at {w}px");
         }
+    }
+
+    /// A single-line edit centres its one line in whatever height it is given, so a box
+    /// barely taller than the line puts the reader's own words against the frame with no
+    /// air at either end -- which is where a bar stops reading as somewhere to type and
+    /// starts reading as somewhere a thing has been typed.
+    #[test]
+    fn the_box_is_taller_than_the_line_it_holds() {
+        let (_, _, _, eh) = find_edit(1080.0);
+        let line = Theme::DESIGN_BASE * FIND_TEXT * 4.0 / 3.0;
+        assert!(eh as f32 >= line + 6.0, "the box is {eh}px for a {line:.1}px line");
     }
 
     #[test]
