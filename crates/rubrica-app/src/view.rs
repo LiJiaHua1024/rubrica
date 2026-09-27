@@ -2330,7 +2330,6 @@ fn held(vk: VIRTUAL_KEY) -> bool {
 /// is answered with a frame milliseconds after the process starts, while the
 /// document's settings, read, parse and layout all run afterwards against a window
 /// that is already there.
-
 pub fn run(path: Option<PathBuf>, extra: Vec<PathBuf>) -> Result<()> {
     // Must happen before the first window exists, or the process is already
     // bitmap-scaled and text on a secondary high-density monitor is soft.
