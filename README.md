@@ -114,7 +114,12 @@ of the document's headings, find in page, zoom, light and dark themes, a reader-
 measure, an optional vertical page-stack mode with a small peek at the next page and a
 soft page-turn fade, per-document reading position and window frame restored on reopen
 (clamped back onto a screen when the monitor setup changed), and a reload when the file
-changes on disk. Open documents are available as pinned/preview tabs (`Ctrl+Tab`,
+changes on disk. Resting the pointer on a footnote citation opens the note itself in a
+bubble, set at the same scale and by the same rules as the apparatus at the foot of the
+page; a note too long for the bubble is cut with an ellipsis, and a click on the citation
+still goes to the whole of it. Every jump is undone with `Ctrl+Z`, so a reader who has
+followed a citation to the end of a long document has one keypress back to the sentence
+they left. Open documents are available as pinned/preview tabs (`Ctrl+Tab`,
 `Ctrl+W`), with recent files and a resizable docked workspace tree; the session is
 restored on the next launch. TXT files keep chapter boundaries and lay out the active
 chapter window, with `Ctrl+Alt+Up/Down` for chapter navigation. `Ctrl+3` switches

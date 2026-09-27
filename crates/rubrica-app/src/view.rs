@@ -69,11 +69,12 @@ use windows::Win32::UI::Input::KeyboardAndMouse::{
     GetKeyState, ReleaseCapture, SetCapture, SetFocus, VK_CONTROL, VK_O, VK_UP,
     TrackMouseEvent, TME_LEAVE, TRACKMOUSEEVENT,
 };
+use windows::Win32::System::SystemInformation::GetTickCount;
 use windows::Win32::UI::Input::KeyboardAndMouse::{VK_DOWN, VK_ESCAPE, VK_NEXT, VK_PRIOR};
 use windows::Win32::UI::Input::KeyboardAndMouse::{
     VK_0, VK_A, VK_ADD, VK_C, VK_D, VK_END, VK_F, VK_F3, VK_HOME, VK_LEFT, VK_MENU, VK_NUMPAD0,
     VK_OEM_4, VK_OEM_6, VK_OEM_MINUS, VK_OEM_PLUS, VK_R, VK_RETURN, VK_RIGHT, VK_SHIFT,
-    VK_SUBTRACT, VK_TAB, VK_W, VIRTUAL_KEY,
+    VK_SUBTRACT, VK_TAB, VK_W, VK_Z, VIRTUAL_KEY,
 };
 use windows::Win32::UI::Controls::{EM_SETCUEBANNER, WM_MOUSELEAVE};
 use windows::Win32::UI::Controls::Dialogs::{
@@ -220,6 +221,32 @@ const PAGE_BUTTON_W: f32 = 30.0;
 const PAGE_TRANSITION_MS: u128 = 200;
 const PAGE_TIMER: usize = 0x5143;
 const PAGE_TICK_MS: u32 = 16;
+/// How long a pointer has to rest on a citation before its note opens.
+///
+/// A quarter of a second is long enough that a cursor crossing a line of prose passes
+/// without opening every citation on it, and short enough that a reader who has stopped
+/// on one has not yet wondered whether it is a target at all. The wait is the point: the
+/// bubble is what a reader gets for stopping, and a thing that appears on the way past
+/// is a flicker rather than an answer.
+const NOTE_DELAY_MS: u32 = 250;
+const NOTE_TIMER: usize = 0x5144;
+/// The space between a citation and the bubble it opened, and the air inside the
+/// bubble's own edge.
+const BUBBLE_GAP: f32 = 8.0;
+const BUBBLE_PAD: f32 = 10.0;
+/// The panel's corner, the same radius a page card carries, so a note and the page it
+/// floats over are rounded alike.
+const BUBBLE_RADIUS: f32 = 8.0;
+/// The bubble's measure, in ems of the body size: wide enough for a note to read as
+/// prose rather than as a column of fragments, narrow enough that a window a reader
+/// has split on two screens still has room to put one beside the citation it came
+/// from rather than across the whole window.
+const BUBBLE_MEASURE_EM: f32 = 26.0;
+/// The most of a note a bubble shows, in lines of note leading, and the most of the
+/// window it will ever take. A note past either is cut with an ellipsis and a click
+/// that goes to the rest of it.
+const BUBBLE_MAX_LINES: f32 = 5.0;
+const BUBBLE_MAX_SCREEN: f32 = 0.5;
 
 fn page_stack_layout_for(client_w: f32, client_h: f32, content_dx: f32) -> PageStackLayout {
     let content_dx = content_dx.clamp(0.0, client_w.max(1.0));
@@ -703,6 +730,116 @@ pub struct Hot {
     pub w: f32,
     pub h: f32,
     pub kind: HotKind,
+}
+
+/// A pointer resting on a citation, and the tick it started resting at.
+///
+/// The note itself is not held here: the citation's rectangle is still in the
+/// hotspots, and what would be needed to find it again is the one thing that has to
+/// survive a relayout -- the index into them.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct NoteHover {
+    note: usize,
+    since: u32,
+}
+
+/// What a pointer's move does to the note waiting under it.
+///
+/// `over` is the citation the pointer is on, and `held` whether it is on the bubble
+/// that citation opened rather than on the citation. The two are not the same and
+/// conflating them is the flicker: a reader reaching from the mark down onto the note
+/// it opened leaves the citation for the bubble, and a step that read leaving the
+/// citation as leaving the note would close the bubble under their hand and reopen it
+/// the moment they came back.
+///
+/// Resting on the same citation is not a new arrival. The clock runs from the first
+/// touch, so a reader reading their way across a long note keeps the one bubble open
+/// rather than losing it to every small movement across the mark.
+fn hover_step(current: Option<NoteHover>, over: Option<usize>, held: bool, now: u32) -> Option<NoteHover> {
+    match over {
+        Some(note) => Some(current.filter(|h| h.note == note).unwrap_or(NoteHover { note, since: now })),
+        None if held => current,
+        None => None,
+    }
+}
+
+/// Whether a pointer has been still on its citation long enough to be reading it.
+///
+/// The subtraction wraps rather than saturating: `GetTickCount` wraps every forty-nine
+/// days, and a window left open over a weekend should find its bubble waiting on the
+/// reader's return rather than never opening one again.
+fn hover_due(hover: &NoteHover, now: u32) -> bool {
+    now.wrapping_sub(hover.since) >= NOTE_DELAY_MS
+}
+
+/// A note readied for the bubble, in the bubble's own coordinates and size.
+struct NoteBubble {
+    /// Which note this is, and the measure it was read at. The measure is kept beside
+    /// the ops rather than recovered from them, because it is what the bubble is sized
+    /// from, and a window dragged wider re-reads the note rather than stretching it.
+    note: usize,
+    measure: Pt,
+    /// The note as a display list of its own, in the bubble's origin. A list rather
+    /// than a run of text, because a note may carry a fence's panel, a table's rules
+    /// or a figure, and a bubble that showed only the words would show a code block
+    /// as what is presumably an error message.
+    ops: Vec<Op>,
+    /// How tall the note came out, which is the bubble's content height: a note that
+    /// was cut reports the height it was cut at, not the height it would have had.
+    height: Pt,
+}
+
+/// Where a note's bubble goes: under the citation that opened it, over it when the
+/// page runs out, and inside the band either way.
+///
+/// Staying in the window is what lets a bubble be a thing the page draws rather than a
+/// window of its own, which is the whole of what a topmost popup would cost for a
+/// panel the size of a paragraph.
+fn bubble_placement(
+    anchor: (f32, f32, f32, f32),
+    size: (Pt, Pt),
+    band: (f32, f32, f32, f32),
+) -> (f32, f32) {
+    let (ax, ay, aw, ah) = anchor;
+    let (w, h) = size;
+    let (left, top, right, bottom) = band;
+    let below = ay + ah + BUBBLE_GAP;
+    let above = ay - BUBBLE_GAP - h;
+    // Under the citation is where the reader's eye already is, and where the note can
+    // be read without the pointer standing between it and the mark that opened it.
+    // Over it is the answer when the citation sits near the foot of the window. A note
+    // taller than the band has neither side to be on, and is pinned to the top and cut
+    // short rather than dropped: a note too long to show is still a note that was
+    // asked for, and the ellipsis at the bottom is the same message either way.
+    let y = if below + h <= bottom {
+        below
+    } else if above >= top {
+        above
+    } else if h >= bottom - top {
+        top
+    } else {
+        below.min(bottom - h)
+    };
+    let x = (ax + aw * 0.5 - w * 0.5).clamp(left, (right - w).max(left));
+    (x, y.clamp(top, (bottom - h).max(top)))
+}
+
+/// How much of a note survives the bubble, and where the ellipsis saying there was
+/// more goes.
+///
+/// The cut is the first run that rises above the room left for it, so a line is never
+/// half drawn and the note ends where the page would have broken it. `ellipsis_room`
+/// is held back from the bottom for the mark itself, and is only held back when there
+/// is something to report -- a note that fits is the common case and must cost nothing
+/// for the rare one.
+fn bubble_cut(baselines: &[f32], max_h: f32, ellipsis_room: f32) -> (usize, Option<f32>) {
+    let room = (max_h - ellipsis_room).max(0.0);
+    let keep = baselines.iter().position(|b| *b > room).unwrap_or(baselines.len());
+    if keep == baselines.len() {
+        return (keep, None);
+    }
+    let last = keep.saturating_sub(1);
+    (keep, Some(baselines.get(last).copied().unwrap_or(room).min(room)))
 }
 
 /// How a line's text is set off from the line before it when a selection is read back.
@@ -1324,6 +1461,12 @@ pub struct View {
     wide_regions: Vec<WideRegion>,
     /// A full-size object preview opened from a wide hotspot.
     preview: Option<Preview>,
+    /// The citation a pointer is resting on, and the note readied for it. The two are
+    /// kept apart because they are not the same age: a reader sweeping past a mark
+    /// arms the first and never reaches the second, and a reader who has come back to
+    /// the note they are reading should not have it re-laid for the asking.
+    note_hover: Option<NoteHover>,
+    note_bubble: Option<NoteBubble>,
     /// The page's text, character by character, as the current layout drew it.
     sel_index: Vec<SelLine>,
     /// What the reader has dragged out, if anything. Cleared by a relayout, whose
@@ -1566,6 +1709,13 @@ fn scale_of(dpi: f32) -> f32 {
 #[inline]
 fn scroll_dip(scroll: Pt, dpi: f32) -> Pt {
     scroll * scale_of(dpi)
+}
+
+/// Milliseconds since the machine booted, which is the only clock a resting pointer
+/// needs: it costs nothing to read, it runs through sleep, and it wraps every
+/// forty-nine days rather than the century a `u64` would buy nothing for.
+fn now_ms() -> u32 {
+    unsafe { GetTickCount() }
 }
 
 /// The document y represented by a pointer y in the reader's client area.
@@ -1936,8 +2086,8 @@ fn menu_items(s: &MenuState) -> Vec<MenuRow> {
     // is standing next to, and the bracket keys step the measure rather than settling on
     // a rung, so a hint on either would promise a different thing from the one it keeps.
     let mut v = vec![
-        row(Command::GoBack, format!("{}\tAlt+\u{2190}", i18n::t(s.lang, Key::MenuBack)), s.can_back),
-        row(Command::GoForward, format!("{}\tAlt+\u{2192}", i18n::t(s.lang, Key::MenuForward)), s.can_forward),
+        row(Command::GoBack, format!("{}\tCtrl+Z\tAlt+\u{2190}", i18n::t(s.lang, Key::MenuBack)), s.can_back),
+        row(Command::GoForward, format!("{}\tCtrl+Shift+Z\tAlt+\u{2192}", i18n::t(s.lang, Key::MenuForward)), s.can_forward),
         MenuRow::Gap,
         row(Command::Copy, format!("{}\tCtrl+C", i18n::t(s.lang, Key::MenuCopy)), s.selected),
         row(Command::SelectAll, format!("{}\tCtrl+A", i18n::t(s.lang, Key::MenuSelectAll)), s.text),
@@ -2431,6 +2581,8 @@ pub fn run(path: Option<PathBuf>, extra: Vec<PathBuf>) -> Result<()> {
         hotspots: Vec::new(),
         wide_regions: Vec::new(),
         preview: None,
+        note_hover: None,
+        note_bubble: None,
         note_tops: Vec::new(),
         anchor_tops: Vec::new(),
         sel_index: Vec::new(),
@@ -3505,6 +3657,16 @@ impl View {
                         let dark = !self.palette.dark;
                         self.apply_command(Command::Palette(dark), hwnd);
                     }
+                    // The undo key, for a reader who has followed a citation to the
+                    // foot of a long document and wants the sentence back. Nothing in
+                    // this window edits, so the key is free, and it is the one every
+                    // other program answers a "take that back" with -- which is why it
+                    // is bound here beside the arrows it duplicates rather than
+                    // instead of them.
+                    k if ctrl && k == VK_Z.0 as u32 => {
+                        let cmd = if shift { Command::GoForward } else { Command::GoBack };
+                        self.apply_command(cmd, hwnd);
+                    }
                     // A copy with nothing selected leaves the clipboard alone. Clearing
                     // it would throw away what the reader put there from somewhere else,
                     // to no purpose: an empty selection is not an edit.
@@ -3616,6 +3778,10 @@ impl View {
                         }
                     }
                     PAGE_TIMER => self.tick_page_transition(hwnd),
+                    // Armed only while a pointer rests on a citation, so the common
+                    // reader -- who is reading, not hovering -- is not paying for a
+                    // beat they never asked for.
+                    NOTE_TIMER => self.tick_note_bubble(hwnd),
                     _ => {
                         // A poll, not a push: there is no message for this setting. The
                         // reader's own choice outranks it, and `set_dark` does nothing when
@@ -3800,20 +3966,24 @@ impl View {
                 let hot = self.tab_hot;
                 let btn_hot = self.cap_hot;
                 let page_hot = self.page_hot;
+                // Armed on the first move anywhere, not only on one over the strip:
+                // the page keeps hovers of its own -- the stack's arrows, and the note
+                // a citation opens -- and a pointer that leaves the window holding one
+                // of those is a hover with nothing under it to be right about.
+                if !self.tracking_leave {
+                    let mut tme = TRACKMOUSEEVENT {
+                        cbSize: std::mem::size_of::<TRACKMOUSEEVENT>() as u32,
+                        dwFlags: TME_LEAVE,
+                        hwndTrack: hwnd,
+                        dwHoverTime: 0,
+                    };
+                    if unsafe { TrackMouseEvent(&mut tme) }.is_ok() {
+                        self.tracking_leave = true;
+                    }
+                }
                 if y < TOPBAR_H {
                     self.cap_hot = self.caption_button_at(x, y);
                     self.tab_hot = if self.cap_hot.is_none() { self.tab_at(x, y) } else { None };
-                    if !self.tracking_leave {
-                        let mut tme = TRACKMOUSEEVENT {
-                            cbSize: std::mem::size_of::<TRACKMOUSEEVENT>() as u32,
-                            dwFlags: TME_LEAVE,
-                            hwndTrack: hwnd,
-                            dwHoverTime: 0,
-                        };
-                        if unsafe { TrackMouseEvent(&mut tme) }.is_ok() {
-                            self.tracking_leave = true;
-                        }
-                    }
                     self.page_hot = None;
                     self.page_pressed = None;
                 } else {
@@ -3824,6 +3994,11 @@ impl View {
                 if self.tab_hot != hot || self.cap_hot != btn_hot || self.page_hot != page_hot {
                     let _ = InvalidateRect(Some(hwnd), None, false);
                 }
+                // Asked after the strip's own hovers, and for the same reason: a
+                // pointer is either on the chrome or on the page, and one that has
+                // left the page owes the page no note either. This one is a question
+                // rather than an answer, so it repaints only when the note changes.
+                self.hover_note(x, y, hwnd);
                 if self.tree_dragging {
                     self.tree_width = x.clamp(TREE_MIN_W, TREE_MAX_W);
                     self.layout_epoch += 1;
@@ -3912,9 +4087,14 @@ impl View {
             WM_MOUSELEAVE => {
                 // The strip's hovers live only while the pointer is on the window.
                 self.tracking_leave = false;
-                let gone = self.tab_hot.take().is_some()
+                let mut gone = self.tab_hot.take().is_some()
                     | self.cap_hot.take().is_some()
                     | self.page_hot.take().is_some();
+                // A note goes with it, and the wait with the note: a pointer that has
+                // left the window is not resting on anything, so a bubble left up
+                // would be one with nothing behind it.
+                let _ = KillTimer(Some(hwnd), NOTE_TIMER);
+                gone |= self.close_note_bubble();
                 if gone {
                     let _ = InvalidateRect(Some(hwnd), None, false);
                 }
@@ -4061,6 +4241,65 @@ impl View {
         }
     }
 
+    /// The window position a point on the page is drawn at: [`View::page_point`]
+    /// backwards, for the one thing that has to name a rectangle on the page and then
+    /// put it somewhere in the window.
+    ///
+    /// A document point under the strip has no place in the window, which is the same
+    /// answer [`View::page_point`] gives for it in the other direction.
+    fn client_point(&self, x: f32, y: f32) -> Option<(f32, f32)> {
+        if self.reading_mode == ReadingMode::Stack {
+            if self.page_transition.is_some() { return None; }
+            let layout = self.page_stack_layout();
+            let page_w = (self.client_w - self.content_dx()).max(1.0);
+            let tx = layout.left - (page_w - layout.width) * 0.5;
+            let start = self.page_start(self.current_page_index()).unwrap_or(0.0);
+            let (cx, cy) = (x + tx, y - start * scale_of(self.dpi) + layout.top);
+            let inside = cx >= layout.left && cx <= layout.left + layout.width && cy >= layout.top;
+            inside.then_some((cx, cy))
+        } else {
+            let cy = y - scroll_dip(self.scroll, self.dpi);
+            (cy >= TOPBAR_H).then_some((x + self.content_dx(), cy))
+        }
+    }
+
+    /// The band a floating note may sit in: the viewport the strip leaves, and clear
+    /// of the docked tree, which is the reader's not the note's to cover.
+    fn bubble_band(&self) -> (f32, f32, f32, f32) {
+        (self.content_dx().max(0.0), TOPBAR_H, self.client_w, self.client_h)
+    }
+
+    /// Where the open note is drawn, in the window's own pixels.
+    ///
+    /// Derived from what is stored rather than remembered separately, so the test that
+    /// asks whether the pointer is still on the bubble and the paint that puts it there
+    /// are one piece of arithmetic and cannot answer differently.
+    fn note_bubble_rect(&self) -> Option<(f32, f32, f32, f32)> {
+        let bubble = self.note_bubble.as_ref()?;
+        let hot = self.hotspots.iter().find(|h| matches!(&h.kind, HotKind::Cite(i) if *i == bubble.note))?;
+        let k = scale_of(self.dpi);
+        let (ax, ay) = self.client_point(hot.x, hot.y)?;
+        // A citation the reader has scrolled out of the window has nowhere to put its
+        // note: the panel would clamp itself to an edge its mark no longer belongs to,
+        // and a note pinned to the foot of a screen the reader left is a note about
+        // nothing. Gone with the mark is the honest answer.
+        let (_, top, _, bottom) = self.bubble_band();
+        if ay < top || ay > bottom {
+            return None;
+        }
+        let size = (bubble.measure * k + BUBBLE_PAD * 2.0, bubble.height * k + BUBBLE_PAD * 2.0);
+        let (x, y) = bubble_placement((ax, ay, hot.w, hot.h), size, self.bubble_band());
+        Some((x, y, size.0, size.1))
+    }
+
+    /// Whether a pointer at this client position is on the open note, borders and all.
+    /// A bubble is read rather than clicked, so nothing inside it acts -- but the
+    /// pointer has to be able to travel onto it without the note closing under it.
+    fn on_note_bubble(&self, x: f32, y: f32) -> bool {
+        self.note_bubble_rect()
+            .is_some_and(|(bx, by, bw, bh)| x >= bx && x <= bx + bw && y >= by && y <= by + bh)
+    }
+
     /// The target under a pointer position, given in device independent pixels from the
     /// window's client origin. The rectangles are stored against the top of the
     /// document, so the only translation the test needs is the scroll.
@@ -4081,6 +4320,74 @@ impl View {
                 let hx = h.x + shift;
                 x >= hx && x <= hx + h.w && y >= h.y && y <= h.y + h.h
             })
+    }
+
+    /// The note a pointer is resting on, by way of the hotspot it is over. Links are
+    /// not asked about: a URL shows the address in the status sense of the word and
+    /// opens somewhere else, while a citation has the note on the same page and only
+    /// has to be read out of it.
+    fn cite_at(&self, x: f32, y: f32) -> Option<usize> {
+        let i = self.hot_at(x, y)?;
+        match self.hotspots.get(i)?.kind {
+            HotKind::Cite(note) => Some(note),
+            _ => None,
+        }
+    }
+
+    /// Keep the note under the pointer in step with where the pointer is.
+    ///
+    /// Two things are true at once here and neither can be left to the other: the
+    /// citation under the pointer is the note a reader is resting on, and the note
+    /// they have moved off is the one they are not. Getting the second wrong is how a
+    /// bubble ends up describing one footnote while the pointer sits on another, so a
+    /// note the reader has walked away from goes at once rather than at the end of a
+    /// wait -- the wait is for a note to arrive, not for the last one to leave.
+    fn hover_note(&mut self, x: f32, y: f32, hwnd: HWND) {
+        let over = self.cite_at(x, y);
+        let held = self.on_note_bubble(x, y);
+        let was = self.note_hover.map(|h| h.note);
+        let next = hover_step(self.note_hover, over, held, now_ms());
+        if self.note_bubble.as_ref().is_some_and(|b| Some(b.note) != next.map(|h| h.note)) {
+            self.note_bubble = None;
+            let _ = unsafe { InvalidateRect(Some(hwnd), None, false) };
+        }
+        // Re-armed only when the note under the pointer changes, which is what makes a
+        // reader reading their way across one mark keep the single wait rather than
+        // restarting it under every small movement.
+        if was != next.map(|h| h.note) {
+            let _ = unsafe { KillTimer(Some(hwnd), NOTE_TIMER) };
+            if next.is_some() {
+                let _ = unsafe { SetTimer(Some(hwnd), NOTE_TIMER, NOTE_DELAY_MS, None) };
+            }
+        }
+        self.note_hover = next;
+    }
+
+    /// Open the note a pointer has been resting on, now that it has.
+    ///
+    /// The pointer is asked about again rather than taken on trust, because a wait is
+    /// exactly as long as a reader's hand takes to change its mind, and a note that
+    /// opened for a mark its reader has left is a note about the wrong sentence.
+    fn tick_note_bubble(&mut self, hwnd: HWND) {
+        let _ = unsafe { KillTimer(Some(hwnd), NOTE_TIMER) };
+        let now = now_ms();
+        let Some(hover) = self.note_hover.filter(|h| hover_due(h, now)) else { return };
+        self.note_hover = None;
+        // A note already read is not read again: a reader who has come back to the
+        // mark they were on finds the note they were reading still there.
+        if self.note_bubble.as_ref().is_none_or(|b| b.note != hover.note) {
+            self.note_bubble = self.build_note_bubble(hover.note);
+        }
+        if self.note_bubble.is_some() {
+            let _ = unsafe { InvalidateRect(Some(hwnd), None, false) };
+        }
+    }
+
+    /// Put a note away, wherever the reader has gone next. Answers whether there was
+    /// one to put away, which is what a caller painting on demand needs to know.
+    fn close_note_bubble(&mut self) -> bool {
+        self.note_hover = None;
+        self.note_bubble.take().is_some()
     }
 
     fn shift_at(&self, x: f32, y: f32) -> f32 {
@@ -4254,7 +4561,15 @@ impl View {
         let Some(kind) = self.hotspots.get(i).map(|h| h.kind.clone()) else { return };
         match kind {
             HotKind::Url(url) => open_url(&url),
-            HotKind::Cite(note) => self.jump_to(self.note_tops.get(note).copied(), hwnd),
+            HotKind::Cite(note) => {
+                // A citation is still a jump -- a long note is not finished in a
+                // bubble, and the apparatus at the foot of the page is the rest of it
+                // -- but the note the reader was reading goes first, because the mark
+                // they clicked is about to scroll out from under the pointer that
+                // opened its note.
+                self.close_note_bubble();
+                self.jump_to(self.note_tops.get(note).copied(), hwnd)
+            }
             HotKind::Heading(at) => self.jump_to(self.anchor_tops.get(at).copied(), hwnd),
             HotKind::Wide(index) => {
                 let Some(region) = self.wide_regions.get(index).cloned() else { return };
@@ -5290,8 +5605,11 @@ impl View {
             self.hyphenator,
         );
         // A relayout moves the notes, so a jump still held down from before would now
-        // point at a paragraph rather than at a footnote.
+        // point at a paragraph rather than at a footnote. An open note goes with them:
+        // the page under it is a different page, and the same number on it is a
+        // different note.
         self.pressed = None;
+        self.close_note_bubble();
         self.content_h = page.height;
         self.page_starts = reader_page_starts(
             &page.sel,
@@ -6860,6 +7178,10 @@ impl View {
     fn take_page(&mut self, page: &mut TabPage) {
         page.epoch = self.layout_epoch;
         page.layout_dpi = self.dpi;
+        // A note belongs to the page it was read from, and the page under the pointer
+        // is about to be a different one: the same number in another document is a
+        // different note, and a bubble carried across would be describing neither.
+        self.close_note_bubble();
         std::mem::swap(&mut page.source, &mut self.source);
         std::mem::swap(&mut page.doc, &mut self.doc);
         std::mem::swap(&mut page.ops, &mut self.ops);
@@ -7310,6 +7632,10 @@ impl View {
     /// so a deleted page costs the reader that page and not their step.
     fn step(&mut self, hwnd: HWND, back: bool) {
         self.history.prune(back);
+        // A step lands the reader on a page, or a scroll position, that is not the one
+        // an open note is anchored to. `reopen` repaints either way, so putting the
+        // note away here costs nothing and saves a panel following them across a jump.
+        self.close_note_bubble();
         let here = self.here();
         let there = if back {
             self.history.back(here)
@@ -7402,6 +7728,7 @@ impl View {
                 target.SetTransform(&Matrix3x2::identity());
                 self.draw_page_stack(&target);
                 self.draw_preview(&target);
+                self.draw_note_bubble(&target);
                 target.PopAxisAlignedClip();
                 if self.find.is_some() {
                     target.SetTransform(&Matrix3x2::translation(self.content_dx(), 0.0));
@@ -7430,7 +7757,7 @@ impl View {
             // document y = `top` is the first line under the strip, at client y = TOPBAR_H.
             let top = up + TOPBAR_H;
             let bottom = top + (self.client_h - TOPBAR_H).max(1.0);
-            self.draw_document(&target, up, top, bottom);
+            self.draw_document(&target, &self.ops, up, top, bottom, true);
             self.draw_preview(&target);
             // Search marks, selection bands, and the caret all belong to the page that
             // is currently in front. Their line indexes stay global, so snapping to a
@@ -7445,6 +7772,11 @@ impl View {
                     target.FillRectangle(&r, &brush);
                 }
             }
+            // A note the reader is resting on, over the page and over the thumb, and
+            // before the bar for the same reason the bar is last: a reader who has
+            // opened both is looking at the bar, and a note under it would be a note
+            // half a window from the mark that opened it.
+            self.draw_note_bubble(&target);
             // The bar's panel last of all, and over the page: it is pinned to the glass, so
             // what lies under it is whatever the reader has scrolled into place there, and
             // must not be read as part of the answer. The box on the panel's left is USER32's
@@ -7560,7 +7892,7 @@ impl View {
         target.SetTransform(&Matrix3x2::identity());
         target.PushAxisAlignedClip(&content_rect, D2D1_ANTIALIAS_MODE_PER_PRIMITIVE);
         target.SetTransform(&Matrix3x2::translation(tx, 0.0));
-        self.draw_document(target, up, band_top, band_bottom);
+        self.draw_document(target, &self.ops, up, band_top, band_bottom, true);
         if with_overlays {
             self.draw_page_overlays(target, up, band_top, band_bottom);
         }
@@ -7691,22 +8023,271 @@ impl View {
         }
     }
 
-    /// Draw the display list into a clipped window. The same operation list serves the
+    /// Read one note for the bubble: the note's own blocks, set at the note's scale
+    /// into the bubble's measure, in the bubble's own origin.
+    ///
+    /// These are the two functions the apparatus at the foot of the page is set
+    /// through, so a note read here carries its headings, its lists, its code and its
+    /// formulas exactly as it would carry them there. What differs is only the width it
+    /// is broken to -- which is why it cannot be lifted off the page instead: those
+    /// lines are broken to the page's measure, and a note re-wrapped to nothing is
+    /// still the wrong shape for a reader who came to read it.
+    fn build_note_bubble(&mut self, index: usize) -> Option<NoteBubble> {
+        let k = scale_of(self.dpi);
+        // The page's own rule for how wide a measure may be, so that a bubble on a
+        // narrow window is as narrow as the page on it rather than a fixed panel with
+        // nowhere to go.
+        let margin = self.theme.base * MARGIN_EM;
+        let client_pt = (self.client_w - self.content_dx()) / k;
+        let avail = (client_pt - margin * 2.0).max(self.theme.base * 6.0);
+        let measure = (BUBBLE_MEASURE_EM * self.theme.base).min(avail);
+        let leading = self.theme.note_leading();
+        // A fixed handful of note lines, and never more than half of what the window
+        // shows: a note is a reader's way of reading on where they are, and a bubble
+        // that opened over the whole page would be the problem it was meant to avoid.
+        let max_h = (BUBBLE_MAX_LINES * leading.cjk.max(leading.latin) * self.theme.note_size())
+            .min((self.client_h - TOPBAR_H) * BUBBLE_MAX_SCREEN / k)
+            .max(self.theme.note_size());
+        let View { font, theme, doc, maths, images, path, profile, .. } = self;
+        let note = doc.footnotes.get(index)?;
+        // A style table of the bubble's own, because a `StyleId` is an index into
+        // whichever table made it and the page's ids would name the wrong faces.
+        let mut styles: Vec<AppStyle> = Vec::new();
+        let prepared: Vec<(&Block, Prepared)> = {
+            let mut objects = Objects::new(
+                images.as_ref(),
+                path.as_deref().and_then(|p| p.parent()),
+                maths.entry(profile.clone()).or_default(),
+            );
+            note.blocks
+                .iter()
+                .enumerate()
+                .map(|(i, b)| {
+                    // The number leads the note's first block, and the later blocks
+                    // are the same note continuing, which is the page's own rule.
+                    let set = Setting {
+                        marker: if i == 0 { format!("{}. ", note.number) } else { String::new() },
+                        size: Some(theme.note_body_size(b.kind)),
+                    };
+                    (b, prepare_block(font, theme, &mut styles, &mut objects, b, &set, measure))
+                })
+                .collect()
+        };
+
+        // Nothing in a bubble is clickable, so a citation or a link inside one finds
+        // no note and no heading and is set as the prose around it. The bridges are
+        // empty rather than borrowed because the alternative is carrying the page's
+        // into a panel the reader cannot act on.
+        let notes = HashMap::new();
+        let anchors = HashMap::new();
+        let store = maths.get(profile)?;
+        let ctx = Ctx {
+            theme,
+            styles: &styles,
+            math: store,
+            notes: &notes,
+            anchors: &anchors,
+            base: path.as_deref().and_then(|p| p.parent()),
+            k,
+            wide_limit: 0.0,
+        };
+        // Everything a note typesets is thrown away but its ink: a bubble has no
+        // targets to hit, nothing to select and no page of its own to divide.
+        let mut ops: Vec<Op> = Vec::new();
+        let (mut hots, mut sel, mut wide) = (Vec::new(), Vec::new(), Vec::new());
+        let (mut headers, mut spans) = (Vec::new(), Vec::new());
+        let (mut note_spans, mut math_texts) = (Vec::new(), Vec::new());
+        let mut breaks = HyphenCount::default();
+        // This note's own marker width, hung for all of its blocks: the page takes the
+        // widest marker across every note so their numbers stand in one column there,
+        // and a bubble showing one note has no other column to line up with.
+        let mut hang = 0.0;
+        let mut y = 0.0;
+        for (i, (b, p)) in prepared.iter().enumerate() {
+            if i == 0 {
+                hang = p.hang;
+            } else {
+                y += theme.note_space(false);
+            }
+            y = layout_block(
+                font,
+                &ctx,
+                &Blk {
+                    b,
+                    text: &p.text,
+                    spans: &p.spans,
+                    base: p.base,
+                    left: 0.0,
+                    column: measure,
+                    table: p.table.as_ref(),
+                    // A note in a panel this narrow is a pointer to the rest of
+                    // itself rather than the text itself, and a word split across two
+                    // lines of it reads worse than one over-long line.
+                    hyphenation: Hyphenation::NONE,
+                    size: theme.note_body_size(b.kind),
+                    leading: leading.clone(),
+                    hang,
+                    actions: &p.actions,
+                },
+                &mut Out {
+                    ops: &mut ops,
+                    hots: &mut hots,
+                    sel: &mut sel,
+                    hyphens: &mut breaks,
+                    wide: &mut wide,
+                    table_headers: &mut headers,
+                    table_spans: &mut spans,
+                    note_spans: &mut note_spans,
+                    math_texts: &mut math_texts,
+                },
+                y,
+            );
+        }
+
+        // The cut is taken in the display list's own units, which are points scaled by
+        // the window's, and every top it looks at is one line's or one shape's own --
+        // so a line is never half drawn and the note ends where the page would have
+        // broken it.
+        let room = max_h * k;
+        let mark = theme.note_size() * 0.9 * k;
+        // One top per op and never more or fewer, because the cut is an index into
+        // the ops themselves. A line with nothing in it takes the top of the line
+        // before it: the layout is free to push an empty run list, and one that read
+        // as infinitely low would end the note there and show a reader nothing.
+        let mut tops: Vec<f32> = Vec::with_capacity(ops.len());
+        let mut last = 0.0;
+        for op in &ops {
+            last = match op {
+                Op::Runs(runs) => runs.first().map_or(last, |r| r.baseline),
+                Op::Rect { y, .. } | Op::Image { y, .. } => *y,
+                Op::Line { y0, y1, .. } => y0.min(*y1),
+            };
+            tops.push(last);
+        }
+        let (keep, cut) = bubble_cut(&tops, room, mark);
+        ops.truncate(keep);
+        if let Some(baseline) = cut {
+            // The ellipsis hangs off the end of the last line kept, beside that line's
+            // own ink rather than in a line of its own: a bubble that spends its last
+            // line announcing that it ran out shows less of the note for admitting it.
+            let right = ops
+                .iter()
+                .rev()
+                .find_map(|op| match op {
+                    Op::Runs(runs) => runs
+                        .iter()
+                        .rev()
+                        .find(|r| (r.baseline - baseline).abs() < 0.5)
+                        .map(|r| r.x + r.advances.iter().sum::<f32>()),
+                    _ => None,
+                })
+                .unwrap_or(0.0);
+            let style = intern(
+                &mut styles,
+                &theme.fonts.fallback,
+                theme.resolve_at(BlockKind::Paragraph, InlineStyle::EMPTY, theme.note_size()),
+            );
+            let st = styles[style.0 as usize].clone();
+            let mut ink: Vec<PaintRun> = Vec::new();
+            for r in font.shape_runs("\u{2026}", 0..3, &st.face, st.size, st.tracking) {
+                if let Some(run) =
+                    paint_run(font, &r, right / k + st.size * 0.3, 0.0, k, ColorRole::Muted, None)
+                {
+                    ink.push(run);
+                }
+            }
+            seat(&mut ink, baseline / k, k);
+            if !ink.is_empty() {
+                ops.push(Op::Runs(ink));
+            }
+        }
+        Some(NoteBubble {
+            note: index,
+            measure,
+            ops,
+            height: if cut.is_some() { max_h } else { y },
+        })
+    }
+
+    /// Paint the open note over the page, on the window's own glass.
+    ///
+    /// Drawn after the page and its overlays because it is the one thing on screen the
+    /// reader was not looking at a moment ago, and it has to be over the ink it covers
+    /// rather than under it. It is anchored to the glass rather than translated into
+    /// page space, which is what lets the same panel sit beside its citation in the
+    /// continuous viewport and on a card in the stack without being placed twice.
+    unsafe fn draw_note_bubble(&mut self, target: &ID2D1RenderTarget) {
+        let Some(bubble) = self.note_bubble.as_ref() else { return };
+        let Some((x, y, w, h)) = self.note_bubble_rect() else { return };
+        let panel = D2D_RECT_F { left: x, top: y, right: x + w, bottom: y + h };
+        // A surface a shade off the paper and a soft offset under it, in the same
+        // relationship the page cards have: just enough shadow to say the note is above
+        // the page rather than printed on it.
+        let mut shadow_color = d2d(self.palette.page_shadow);
+        shadow_color.a = 0.18;
+        if let Ok(shadow) = target.CreateSolidColorBrush(&shadow_color, None) {
+            let drop = D2D1_ROUNDED_RECT {
+                rect: D2D_RECT_F {
+                    left: panel.left,
+                    top: panel.top + 4.0,
+                    right: panel.right,
+                    bottom: panel.bottom + 4.0,
+                },
+                radiusX: BUBBLE_RADIUS,
+                radiusY: BUBBLE_RADIUS,
+            };
+            target.FillRoundedRectangle(&drop, &shadow);
+        }
+        if let Some(surface) = self.brushes.get(&ColorRole::Surface) {
+            target.FillRoundedRectangle(
+                &D2D1_ROUNDED_RECT { rect: panel, radiusX: BUBBLE_RADIUS, radiusY: BUBBLE_RADIUS },
+                surface,
+            );
+        }
+        // The note is set in its own origin, so the list is drawn where it stands and
+        // the band it is cut against is the panel: a bubble this size has no scroll to
+        // lift its ink out of, and the clip is what stops a long note at the edge.
+        let inner = D2D_RECT_F {
+            left: x + BUBBLE_PAD,
+            top: y + BUBBLE_PAD,
+            right: x + w - BUBBLE_PAD,
+            bottom: y + h - BUBBLE_PAD,
+        };
+        target.PushAxisAlignedClip(&inner, D2D1_ANTIALIAS_MODE_PER_PRIMITIVE);
+        target.SetTransform(&Matrix3x2::translation(inner.left, inner.top));
+        self.draw_document(target, &bubble.ops, 0.0, -1.0, inner.bottom - inner.top, false);
+        target.PopAxisAlignedClip();
+        let restore = if self.reading_mode == ReadingMode::Stack {
+            Matrix3x2::identity()
+        } else {
+            Matrix3x2::translation(self.content_dx(), 0.0)
+        };
+        target.SetTransform(&restore);
+    }
+
+    /// Draw a display list into a clipped window. The same operation list serves the
     /// continuous viewport and each card in the stack; only `up` and the visible band
-    /// change between them.
+    /// change between them, and a note's bubble brings a list of its own.
+    ///
+    /// `shift_wide` says these are the page's ops, which is what the pan of a wide
+    /// table applies to. A bubble's ops are set in its own origin and know nothing of
+    /// the region the reader may have panned on the page underneath, so asking about
+    /// that region for them would move the note to match a gesture it is not part of.
     unsafe fn draw_document(
         &self,
         target: &ID2D1RenderTarget,
+        ops: &[Op],
         up: Pt,
         top: Pt,
         bottom: Pt,
+        shift_wide: bool,
     ) {
         // The display list is in reading order and an op never rises above the one
         // before it, so the visible band is a contiguous slice: find its ends by
         // binary search rather than testing a whole document's ops per frame. The
-        // first op is stepped back one in case its ink is tall enough to reach into
-        // the band from above it.
-        let ops = &self.ops[..];
+        // first op is stepped back one in case its ink is tall enough to reach into the
+        // band from above it.
+        let pan = |x: f32, y: f32| if shift_wide { self.shift_at(x, y) } else { 0.0 };
         let (first, past) = if self.ops_sorted {
             let first = ops.partition_point(|op| op_top(op) < top).saturating_sub(1);
             (first, ops.partition_point(|op| op_top(op) <= bottom).max(first))
@@ -7717,7 +8298,7 @@ impl View {
         for op in &ops[first..past] {
             match op {
                 Op::Rect { x, y, w, h, color } => {
-                    let dx = self.shift_at(*x, *y);
+                    let dx = pan(*x, *y);
                     if y + h < top || *y > bottom {
                         continue;
                     }
@@ -7733,7 +8314,7 @@ impl View {
                     }
                 }
                 Op::Line { x0, y0, x1, y1, thickness, color } => {
-                    let dx = self.shift_at(*x0, *y0);
+                    let dx = pan(*x0, *y0);
                     if (*y1).max(*y0) < top || (*y0).min(*y1) > bottom {
                         continue;
                     }
@@ -7749,7 +8330,7 @@ impl View {
                     }
                 }
                 Op::Image { path, x, y, w, h } => {
-                    let dx = self.shift_at(*x, *y);
+                    let dx = pan(*x, *y);
                     if y + h < top || *y > bottom {
                         continue;
                     }
@@ -7777,7 +8358,7 @@ impl View {
                             continue;
                         }
                         let mut run = run.clone();
-                        run.x += self.shift_at(run.x, run.baseline);
+                        run.x += pan(run.x, run.baseline);
                         shifted.push(run);
                     }
                     self.draw_runs(target, &shifted, up);
@@ -11160,8 +11741,8 @@ mod tests {
         };
         let got = rows(&state(true, None, None, true, true));
         for (cmd, key) in [
-            (&Command::GoBack, "Back\tAlt+\u{2190}"),
-            (&Command::GoForward, "Forward\tAlt+\u{2192}"),
+            (&Command::GoBack, "Back\tCtrl+Z\tAlt+\u{2190}"),
+            (&Command::GoForward, "Forward\tCtrl+Shift+Z\tAlt+\u{2192}"),
             (&Command::Copy, "Copy\tCtrl+C"),
             (&Command::SelectAll, "Select All\tCtrl+A"),
             (&Command::Find, "Find in Document\tCtrl+F"),
@@ -11677,5 +12258,93 @@ mod document_interaction_tests {
         assert_eq!(heading_index(&doc, "%E7%AC%AC%E4%BA%8C%E7%AB%A0"), Some(1));
         assert_eq!(heading_index(&doc, "a-bold-heading"), Some(2));
         assert!(heading_index(&doc, "missing").is_none());
+    }
+
+    #[test]
+    fn a_note_opens_only_after_the_pointer_has_settled_on_it() {
+        let resting = NoteHover { note: 3, since: 1_000 };
+        assert!(!hover_due(&resting, 1_000));
+        assert!(!hover_due(&resting, 1_000 + NOTE_DELAY_MS - 1));
+        assert!(hover_due(&resting, 1_000 + NOTE_DELAY_MS));
+        // The clock wraps every forty-nine days, and a window left open over a
+        // weekend has to find its note on the reader's return rather than never.
+        let wrapped = NoteHover { note: 3, since: u32::MAX - 100 };
+        assert!(hover_due(&wrapped, 200));
+    }
+
+    #[test]
+    fn reading_across_one_citation_does_not_restart_the_wait() {
+        let arrived = hover_step(None, Some(2), false, 5_000);
+        assert_eq!(arrived, Some(NoteHover { note: 2, since: 5_000 }));
+        // Ten seconds of reading across the same mark, and the note is still the one
+        // the reader put their hand on ten seconds ago.
+        let later = hover_step(arrived, Some(2), false, 15_000);
+        assert_eq!(later, Some(NoteHover { note: 2, since: 5_000 }));
+        // A different citation is a different question, asked from scratch.
+        let other = hover_step(later, Some(7), false, 15_100);
+        assert_eq!(other, Some(NoteHover { note: 7, since: 15_100 }));
+    }
+
+    #[test]
+    fn a_pointer_that_has_left_a_citation_owes_it_no_note() {
+        let resting = Some(NoteHover { note: 2, since: 5_000 });
+        assert_eq!(hover_step(resting, None, false, 6_000), None);
+        // Unless it has travelled onto the note that citation opened, which is the
+        // one move that must not be read as leaving: a bubble that closed under the
+        // reader's hand and reopened when they came back is a flicker, not an answer.
+        assert_eq!(hover_step(resting, None, true, 6_000), resting);
+    }
+
+    #[test]
+    fn a_bubble_sits_under_its_citation_and_flips_above_when_the_page_runs_out() {
+        // A window 800 by 600, its strip 40 tall, a mark near the middle of a line.
+        let band = (0.0, TOPBAR_H, 800.0, 600.0);
+        let anchor = (300.0, 200.0, 10.0, 14.0);
+        let size = (260.0, 120.0);
+        let (x, y) = bubble_placement(anchor, size, band);
+        // Under the mark, and centred on it.
+        assert_eq!(y, 200.0 + 14.0 + BUBBLE_GAP);
+        assert_eq!(x, 300.0 + 5.0 - 130.0);
+        // Too near the foot of the window to go under: over the mark instead, with
+        // the same gap between them.
+        let low = (300.0, 500.0, 10.0, 14.0);
+        assert_eq!(bubble_placement(low, size, band).1, 500.0 - BUBBLE_GAP - 120.0);
+    }
+
+    #[test]
+    fn a_bubble_stays_inside_the_window_even_when_it_cannot() {
+        let band = (0.0, TOPBAR_H, 800.0, 600.0);
+        // Against the left edge, where centring on the mark would put half the note
+        // off the glass.
+        let left = bubble_placement((2.0, 200.0, 10.0, 14.0), (260.0, 120.0), band);
+        assert_eq!(left.0, 0.0);
+        let right = bubble_placement((790.0, 200.0, 10.0, 14.0), (260.0, 120.0), band);
+        assert_eq!(right.0, 800.0 - 260.0);
+        // Taller than the window it has to be shown in: pinned to the top rather than
+        // dropped, because a note too long for the window is still a note asked for.
+        let tall = bubble_placement((300.0, 100.0, 10.0, 14.0), (260.0, 900.0), band);
+        assert_eq!(tall.1, TOPBAR_H);
+        // Wider than the window: the left edge rather than a negative one.
+        let wide = bubble_placement((300.0, 200.0, 10.0, 14.0), (1000.0, 120.0), band);
+        assert_eq!(wide.0, 0.0);
+    }
+
+    #[test]
+    fn a_note_that_fits_is_not_cut_and_one_that_does_not_is_never_half_drawn() {
+        // Five lines, all inside a bubble with room for six.
+        let fits = [10.0, 30.0, 50.0, 70.0, 90.0];
+        assert_eq!(bubble_cut(&fits, 120.0, 12.0), (5, None));
+        // Eight lines into the same bubble: the cut is the first baseline above the
+        // room left for the mark, so a line is kept whole or dropped whole.
+        let long = [10.0, 30.0, 50.0, 70.0, 90.0, 110.0, 130.0, 150.0];
+        let (keep, mark) = bubble_cut(&long, 120.0, 12.0);
+        assert_eq!(keep, 5);
+        // The mark hangs off the end of the last line kept, which is the line it
+        // belongs to rather than a line of its own.
+        assert_eq!(mark, Some(90.0));
+        // A note with no line in the room at all still reports the room, so the mark
+        // has a place to go.
+        assert_eq!(bubble_cut(&[200.0], 120.0, 12.0), (0, Some(108.0)));
+        assert_eq!(bubble_cut(&[], 120.0, 12.0), (0, None));
     }
 }
