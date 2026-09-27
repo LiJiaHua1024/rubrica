@@ -89,10 +89,11 @@ use windows::Win32::UI::WindowsAndMessaging::{
     IDC_ARROW, IDI_APPLICATION, KBDLLHOOKSTRUCT, LLKHF_INJECTED,
     MA_NOACTIVATE,
     MENU_ITEM_FLAGS, MF_CHECKED, MF_SEPARATOR, MF_STRING, MSG, SW_HIDE, SW_SHOWNOACTIVATE, SW_SHOWNORMAL,
-    SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, TPM_RETURNCMD, TPM_RIGHTBUTTON, WH_KEYBOARD_LL,
-    WINEVENT_OUTOFCONTEXT, WNDCLASSEXW, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_TOPMOST,
-    WS_POPUP, WM_APP, WM_DESTROY, WM_ERASEBKGND, WM_KEYDOWN, WM_MOUSEACTIVATE, WM_MOUSEWHEEL, WM_NCCREATE,
-    WM_PAINT, WM_RBUTTONUP, WM_SYSKEYDOWN, WM_TIMER,
+    SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, TPM_RETURNCMD, TPM_RIGHTBUTTON,
+    WINEVENT_OUTOFCONTEXT, WNDCLASSEXW, WH_KEYBOARD_LL, WH_MOUSE_LL, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_TOPMOST,
+    WS_POPUP, WM_APP, WM_DESTROY, WM_ERASEBKGND, WM_KEYDOWN, WM_LBUTTONDOWN, WM_MBUTTONDOWN,
+    WM_MOUSEACTIVATE, WM_MOUSEWHEEL, WM_NCCREATE,
+    WM_PAINT, WM_RBUTTONDOWN, WM_RBUTTONUP, WM_SYSKEYDOWN, WM_TIMER,
 };
 use windows_numerics::{Matrix3x2, Vector2};
 use crate::theme::{ColorRole, Theme};
@@ -212,6 +213,19 @@ pub fn daemon() -> crate::Result<()> {
         )
         .map_err(|e| -> crate::Error { format!("keyboard hook: {e}").into() })?
     };
+    // The mouse watches for a leaving the foreground cannot hear: a preview of a
+    // desktop icon sits on the desktop, which is already the foreground of its own
+    // click -- a click on it moves the foreground nowhere. The click itself is
+    // the leaving instead.
+    let mouse = unsafe {
+        SetWindowsHookExW(
+            WH_MOUSE_LL,
+            Some(mouse_proc),
+            Some(GetModuleHandleW(None)?.into()),
+            0,
+        )
+        .map_err(|e| -> crate::Error { format!("mouse hook: {e}").into() })?
+    };
     // A foreground change ends the invalid-key cooldown: the window the typing
     // happened in is gone, and the next space is a fresh request.
     let event_hook = unsafe {
@@ -254,6 +268,7 @@ pub fn daemon() -> crate::Result<()> {
             let _ = UnhookWinEvent(event_hook);
         }
         let _ = UnhookWindowsHookEx(hook);
+        let _ = UnhookWindowsHookEx(mouse);
         let _ = Shell_NotifyIconW(NIM_DELETE, &tray_icon(hwnd));
     }
     Ok(())
@@ -564,6 +579,35 @@ fn close_preview_service() {
 }
 
 // ---------------------------------------------------------------- the hook
+
+/// The service window to tell about a click when a preview stands that lives only
+/// as long as its source has the focus, and none at any other time.
+fn focus_bound_window() -> Option<HWND> {
+    let service = SERVICE.with(|slot| slot.get())?;
+    let service = unsafe { &*service };
+    (service.shown && focus_close()).then_some(service.window)
+}
+
+/// The mouse half of the watching. A preview that lives only while its source has
+/// the focus hears the foreground move, but the foreground does not always move:
+/// the desktop, which is the source of a preview shown from its own icons, is
+/// already the foreground of the click a user lands on it. The click is the
+/// leaving itself, whatever the foreground says -- but the wheel is not, since it
+/// rolls a long document under the pointer: only a button down departs.
+unsafe extern "system" fn mouse_proc(code: i32, wp: WPARAM, _lp: LPARAM) -> LRESULT {
+    unsafe {
+        if code < 0 {
+            return CallNextHookEx(None, code, wp, _lp);
+        }
+        let msg = wp.0 as u32;
+        if msg == WM_LBUTTONDOWN || msg == WM_MBUTTONDOWN || msg == WM_RBUTTONDOWN {
+            if let Some(window) = focus_bound_window() {
+                let _ = PostMessageW(Some(window), WM_APP_ESCAPE, WPARAM(0), LPARAM(0));
+            }
+        }
+        CallNextHookEx(None, code, wp, _lp)
+    }
+}
 
 /// The vocabulary a preview answers to: the keys that ask for one, the keys the
 /// preview itself handles, and the modifiers, whose presses are part of every
