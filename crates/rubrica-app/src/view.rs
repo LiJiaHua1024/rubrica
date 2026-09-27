@@ -5652,30 +5652,36 @@ impl View {
     /// abandoned; their batches are dropped on the floor.
     fn layout_messages(&mut self) {
         loop {
-            let Some(message) = self.layout_job.as_ref().map(|job| job.receiver.try_recv()) else {
+            let Some(result) = self.layout_job.as_ref().map(|job| job.receiver.try_recv()) else {
                 break;
             };
-            let Ok(message) = message else {
-                // A worker that went without finishing -- no font face it can open, a
-                // panic part way through -- closes the channel and takes the rest of the
-                // page with it. Nothing will ever arrive for the run this window still
-                // has on its books, so the window would go on answering as though a
-                // layout were in flight: the stack never gains a page, the scroll is
-                // never bounded, and every wheel notch and page key lands on a
-                // `page_count` of one. Laying the page out again here is the tidy answer
-                // and the wrong one -- the work that killed the worker would kill this
-                // thread too, and this thread has a window to keep answering. So the run
-                // is closed and the page is paginated from the part that did arrive.
-                self.layout_job = None;
-                self.page_starts = reader_page_starts(
-                    &self.sel_index,
-                    &self.anchor_tops,
-                    self.content_h,
-                    self.stack_page_height(),
-                    scale_of(self.dpi),
-                );
-                self.take_pending_anchor();
-                break;
+            // An empty channel is a worker still laying out the next batch -- it wakes
+            // the window again when the batch lands, so an idle run stays on the books.
+            // A closed channel is different: a worker that went without finishing -- no
+            // font face it can open, a panic part way through -- takes the rest of the
+            // page with it. Nothing will ever arrive for the run this window still
+            // has on its books, so the window would go on answering as though a
+            // layout were in flight: the stack never gains a page, the scroll is
+            // never bounded, and every wheel notch and page key lands on a
+            // `page_count` of one. Laying the page out again here is the tidy answer
+            // and the wrong one -- the work that killed the worker would kill this
+            // thread too, and this thread has a window to keep answering. So the run
+            // is closed and the page is paginated from the part that did arrive.
+            let message = match result {
+                Ok(message) => message,
+                Err(std::sync::mpsc::TryRecvError::Empty) => break,
+                Err(_) => {
+                    self.layout_job = None;
+                    self.page_starts = reader_page_starts(
+                        &self.sel_index,
+                        &self.anchor_tops,
+                        self.content_h,
+                        self.stack_page_height(),
+                        scale_of(self.dpi),
+                    );
+                    self.take_pending_anchor();
+                    break;
+                }
             };
             let Some(job) = self.layout_job.as_mut() else { break };
             match message {
