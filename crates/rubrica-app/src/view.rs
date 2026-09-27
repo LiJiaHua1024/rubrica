@@ -1838,6 +1838,8 @@ enum Command {
     PeekSpace(crate::peek::SpaceMode),
     /// Flip whether a preview closes when the folder loses the focus.
     PeekFocusClose,
+    /// Flip whether a click on the preview itself closes it as well.
+    PeekClickClose,
     /// Set the GUI language, or follow system.
     Language(Option<Language>),
 }
@@ -1892,6 +1894,7 @@ struct MenuState {
     /// The space bar's meaning and the focus rule, from the same place.
     peek_space: crate::peek::SpaceMode,
     peek_focus_close: bool,
+    peek_click_close: bool,
     /// Whether a step back or forward has a page to land on. A reader who has opened one
     /// document and never followed a link out of it has no road behind them, and a `Back`
     /// that does nothing when pressed teaches them the menu is not to be believed.
@@ -2045,6 +2048,7 @@ fn menu_items(s: &MenuState) -> Vec<MenuRow> {
         check(Command::PeekSpace(crate::peek::SpaceMode::Mixed), i18n::t(s.lang, Key::MenuPeekMixed), s.peek_space == crate::peek::SpaceMode::Mixed),
         MenuRow::Gap,
         check(Command::PeekFocusClose, i18n::t(s.lang, Key::MenuPeekFocusClose), s.peek_focus_close),
+        check(Command::PeekClickClose, i18n::t(s.lang, Key::MenuPeekClickClose), s.peek_click_close),
     ] });
     v.insert(v.len() - 3, MenuRow::Sub { label: i18n::t(s.lang, Key::MenuTextReading), items: vec![
         check(Command::PlainText(None), i18n::t(s.lang, Key::MenuFormatExt), s.plain_override.is_none()),
@@ -4382,6 +4386,7 @@ impl View {
             peek: crate::settings::peek_enabled(),
             peek_space: crate::peek::space_mode(),
             peek_focus_close: crate::peek::focus_close(),
+            peek_click_close: crate::peek::click_close(),
             can_back: self.history.leads(true),
             can_forward: self.history.leads(false),
             link: self.pointer_link(pt.x as f32, pt.y as f32),
@@ -4621,6 +4626,9 @@ impl View {
             Command::PeekSpace(mode) => crate::peek::record_space_mode(mode),
             Command::PeekFocusClose => {
                 crate::peek::record_focus_close(!crate::peek::focus_close());
+            }
+            Command::PeekClickClose => {
+                crate::peek::record_click_close(!crate::peek::click_close());
             }
             Command::Language(choice) => {
                 crate::settings::record_language(choice);
@@ -5182,7 +5190,10 @@ impl View {
                         job.avg_block = (chunk.y - job.y) / blocks;
                         job.y = chunk.y;
                     }
-                    let rest = (job.blocks_total - job.blocks_done) as Pt * job.avg_block;
+                    // Saturated, because a count that outruns its total is a wrong
+                    // total rather than a reason to take the window down: the error
+                    // shows in the thumb's position, nowhere else.
+                    let rest = job.blocks_total.saturating_sub(job.blocks_done) as Pt * job.avg_block;
                     self.content_h = job.y + rest;
                     // The page's answer to "is the list ordered by y" is kept current as
                     // the batches land rather than walked once at the end, and rather than
@@ -9750,7 +9761,11 @@ pub fn build_in_chunks(
     macro_rules! emit {
         ($blocks:expr) => {{
             let blocks = $blocks;
-            if blocks == 0 {
+            // A batch is only worth a message for what it carries: the blocks count
+            // says how far the layout has run, and the notes' own flush below runs
+            // out of blocks yet still has the notes to hand over. An empty batch is
+            // a message with nothing in it, which is the only one not worth sending.
+            if blocks == 0 && ops.is_empty() {
                 return;
             }
             let mut sel = std::mem::take(&mut sel);
@@ -9963,7 +9978,9 @@ pub fn build_in_chunks(
     }
 
     // Whatever is left after the apparatus: the notes are part of the last batch.
-    emit!(doc.blocks.len() - laid + 1);
+    // They are not blocks, so they add nothing to the count the window tracks the
+    // layout's progress by.
+    emit!(0);
     sink.finish(LayoutFinals {
         height: y + theme.base * 2.0,
         column,

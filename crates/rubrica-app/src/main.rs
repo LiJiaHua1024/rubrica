@@ -35,6 +35,18 @@ pub(crate) type Error = Box<dyn std::error::Error + Send + Sync>;
 pub(crate) type Result<T> = std::result::Result<T, Error>;
 
 fn main() -> Result<()> {
+    // DIAGNOSTIC (temporary): a start-up that dies with no window and no message
+    // is a panic a GUI process cannot print anywhere. Put it on disk instead.
+    std::panic::set_hook(Box::new(|info| {
+        if let Ok(mut file) = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(std::env::temp_dir().join("rubrica-panic.log"))
+        {
+            use std::io::Write as _;
+            let _ = writeln!(file, "{info}");
+        }
+    }));
     // First thing, before an argument is looked at: the start-up clock starts here, so
     // every later mark is a distance from the process rather than from the window.
     view::trace("main-entry");

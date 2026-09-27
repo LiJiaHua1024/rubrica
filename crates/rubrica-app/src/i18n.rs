@@ -193,6 +193,7 @@ pub enum Key {
     MenuPeekHold,
     MenuPeekMixed,
     MenuPeekFocusClose,
+    MenuPeekClickClose,
 
     MenuTextReading,
     MenuFormatExt,
@@ -326,6 +327,7 @@ fn translate_en(key: Key) -> &'static str {
         Key::MenuPeekHold => "Space bar: Hold to preview",
         Key::MenuPeekMixed => "Space bar: Tap or hold",
         Key::MenuPeekFocusClose => "Close when focus moves away",
+        Key::MenuPeekClickClose => "Also close when the preview is clicked",
 
         Key::MenuTextReading => "Text reading",
         Key::MenuFormatExt => "Format: From file extension",
@@ -444,6 +446,7 @@ fn translate_zh_cn(key: Key) -> &'static str {
         Key::MenuPeekHold => "空格键：长按预览",
         Key::MenuPeekMixed => "空格键：点击或长按",
         Key::MenuPeekFocusClose => "失去焦点时关闭",
+        Key::MenuPeekClickClose => "点击预览窗口时也关闭",
 
         Key::MenuTextReading => "纯文本阅读",
         Key::MenuFormatExt => "格式：根据文件扩展名",
@@ -562,6 +565,7 @@ fn translate_zh_tw(key: Key) -> &'static str {
         Key::MenuPeekHold => "空格鍵：長按預覽",
         Key::MenuPeekMixed => "空格鍵：按一下或長按",
         Key::MenuPeekFocusClose => "失去焦點時關閉",
+        Key::MenuPeekClickClose => "點擊預覽視窗時也關閉",
 
         Key::MenuTextReading => "純文字閱讀",
         Key::MenuFormatExt => "格式：依副檔名判斷",
@@ -680,6 +684,7 @@ fn translate_ja(key: Key) -> &'static str {
         Key::MenuPeekHold => "スペースキー: 長押しでプレビュー",
         Key::MenuPeekMixed => "スペースキー: タップまたは長押し",
         Key::MenuPeekFocusClose => "フォーカスが外れたら閉じる",
+        Key::MenuPeekClickClose => "プレビューをクリックしても閉じる",
 
         Key::MenuTextReading => "テキスト閲覧",
         Key::MenuFormatExt => "形式: 拡張子から判定",
@@ -798,6 +803,7 @@ fn translate_ko(key: Key) -> &'static str {
         Key::MenuPeekHold => "스페이스바: 길게 눌러 미리보기",
         Key::MenuPeekMixed => "스페이스바: 탭 또는 길게 누르기",
         Key::MenuPeekFocusClose => "포커스를 잃으면 닫기",
+        Key::MenuPeekClickClose => "미리보기를 클릭할 때도 닫기",
 
         Key::MenuTextReading => "텍스트 읽기",
         Key::MenuFormatExt => "형식: 파일 확장자 기준",
@@ -916,6 +922,7 @@ fn translate_fr(key: Key) -> &'static str {
         Key::MenuPeekHold => "Barre d'espace : Maintenir pour l'aperçu",
         Key::MenuPeekMixed => "Barre d'espace : Appuyer ou maintenir",
         Key::MenuPeekFocusClose => "Fermer lorsque le focus change",
+        Key::MenuPeekClickClose => "Fermer aussi en cliquant sur l'aperçu",
 
         Key::MenuTextReading => "Lecture de texte",
         Key::MenuFormatExt => "Format : Selon l'extension",
@@ -1034,6 +1041,7 @@ fn translate_de(key: Key) -> &'static str {
         Key::MenuPeekHold => "Leertaste: Halten für Vorschau",
         Key::MenuPeekMixed => "Leertaste: Antippen oder Halten",
         Key::MenuPeekFocusClose => "Schließen bei Fokusverlust",
+        Key::MenuPeekClickClose => "Auch beim Klick auf die Vorschau schließen",
 
         Key::MenuTextReading => "Textlesen",
         Key::MenuFormatExt => "Format: Nach Dateierweiterung",
@@ -1152,6 +1160,7 @@ fn translate_es(key: Key) -> &'static str {
         Key::MenuPeekHold => "Barra espaciadora: Mantener para vista previa",
         Key::MenuPeekMixed => "Barra espaciadora: Pulsar o mantener",
         Key::MenuPeekFocusClose => "Cerrar al perder el foco",
+        Key::MenuPeekClickClose => "Cerrar también al hacer clic en la vista previa",
 
         Key::MenuTextReading => "Lectura de texto",
         Key::MenuFormatExt => "Formato: Según la extensión",
@@ -1270,6 +1279,7 @@ fn translate_ru(key: Key) -> &'static str {
         Key::MenuPeekHold => "Пробел: Удержание для просмотра",
         Key::MenuPeekMixed => "Пробел: Нажатие или удержание",
         Key::MenuPeekFocusClose => "Закрывать при потере фокуса",
+        Key::MenuPeekClickClose => "Закрывать и при клике по окну предпросмотра",
 
         Key::MenuTextReading => "Чтение текста",
         Key::MenuFormatExt => "Формат: По расширению файла",
@@ -1388,6 +1398,7 @@ fn translate_it(key: Key) -> &'static str {
         Key::MenuPeekHold => "Barra spaziatrice: Tieni premuto per anteprima",
         Key::MenuPeekMixed => "Barra spaziatrice: Tocca o tieni premuto",
         Key::MenuPeekFocusClose => "Chiudi quando perde il focus",
+        Key::MenuPeekClickClose => "Chiudi anche al clic sull'anteprima",
 
         Key::MenuTextReading => "Lettura del testo",
         Key::MenuFormatExt => "Formato: Dall'estensione",
@@ -1506,6 +1517,7 @@ fn translate_pt(key: Key) -> &'static str {
         Key::MenuPeekHold => "Barra de espaço: Segure para prévia",
         Key::MenuPeekMixed => "Barra de espaço: Toque ou segure",
         Key::MenuPeekFocusClose => "Fechar ao perder o foco",
+        Key::MenuPeekClickClose => "Fechar também ao clicar na pré-visualização",
 
         Key::MenuTextReading => "Leitura de texto",
         Key::MenuFormatExt => "Formato: Pela extensão do arquivo",

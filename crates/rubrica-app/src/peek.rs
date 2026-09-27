@@ -85,10 +85,11 @@ use windows::Win32::UI::WindowsAndMessaging::{
     FindWindowW, KillTimer, LoadCursorW, LoadIconW, PostMessageW, PostQuitMessage, RegisterClassExW,
     RegisterWindowMessageW, SetForegroundWindow, SetTimer, SetWindowLongPtrW, SetWindowsHookExW,
     SetWindowPos, ShowWindow, TrackPopupMenu, TranslateMessage, UnhookWindowsHookEx,
+    WindowFromPoint,
     EVENT_SYSTEM_FOREGROUND, GWLP_USERDATA, GUITHREADINFO, GUITHREADINFO_FLAGS, HWND_TOPMOST,
     IDC_ARROW, IDI_APPLICATION, KBDLLHOOKSTRUCT, LLKHF_INJECTED,
     MA_NOACTIVATE,
-    MENU_ITEM_FLAGS, MF_CHECKED, MF_SEPARATOR, MF_STRING, MSG, SW_HIDE, SW_SHOWNOACTIVATE, SW_SHOWNORMAL,
+    MENU_ITEM_FLAGS, MF_CHECKED, MF_SEPARATOR, MF_STRING, MSG, MSLLHOOKSTRUCT, SW_HIDE, SW_SHOWNOACTIVATE, SW_SHOWNORMAL,
     SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, TPM_RETURNCMD, TPM_RIGHTBUTTON,
     WINEVENT_OUTOFCONTEXT, WNDCLASSEXW, WH_KEYBOARD_LL, WH_MOUSE_LL, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_TOPMOST,
     WS_POPUP, WM_APP, WM_DESTROY, WM_ERASEBKGND, WM_KEYDOWN, WM_LBUTTONDOWN, WM_MBUTTONDOWN,
@@ -162,6 +163,17 @@ pub fn focus_close() -> bool {
 
 pub fn record_focus_close(on: bool) {
     settings::record_plain_word("PeekFocusClose", u32::from(on));
+}
+
+/// Whether a click on the preview window itself closes it as well. Off by
+/// default: a preview is what a user clicks away to, and a document being read
+/// is not dismissed by the click that chose to read it.
+pub fn click_close() -> bool {
+    settings::plain_word("PeekClickClose") == Some(1)
+}
+
+pub fn record_click_close(on: bool) {
+    settings::record_plain_word("PeekClickClose", u32::from(on));
 }
 
 /// A key outside the preview vocabulary starts a cooldown that silences space for a
@@ -443,10 +455,10 @@ unsafe extern "system" fn service_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPA
                 if let Some(path) = peek.path().map(Path::to_owned) {
                     if wp.0 == 1 {
                         // Ctrl+Enter: the reader the user already has open, if it is
-                        // running, gets the file as if it had been double-clicked.
-                        if !instance::forward(std::slice::from_ref(&path)) {
-                            open_with_default(&path);
-                        }
+                        // running, gets the file as if it had been double-clicked;
+                        // otherwise this same program opens it itself, whatever the
+                        // file type's default program is.
+                        open_in_reader(&path);
                     } else {
                         open_with_default(&path);
                     }
@@ -580,12 +592,25 @@ fn close_preview_service() {
 
 // ---------------------------------------------------------------- the hook
 
-/// The service window to tell about a click when a preview stands that lives only
-/// as long as its source has the focus, and none at any other time.
-fn focus_bound_window() -> Option<HWND> {
+/// The service window to tell about a click that leaves, and none when nothing
+/// leaves: no preview stands, the switch is off, or the click landed on the
+/// preview itself while the option that allows that is off. A click on the
+/// preview belongs to it -- a document being read is not dismissed by the click
+/// that chose to read it -- but the option exists for those who want it gone.
+fn leaving_window(pt: POINT) -> Option<HWND> {
     let service = SERVICE.with(|slot| slot.get())?;
     let service = unsafe { &*service };
-    (service.shown && focus_close()).then_some(service.window)
+    if !service.shown || !focus_close() {
+        return None;
+    }
+    let on_preview = service
+        .peek
+        .as_ref()
+        .is_some_and(|p| unsafe { WindowFromPoint(pt) } == p.hwnd);
+    if on_preview && !click_close() {
+        return None;
+    }
+    Some(service.window)
 }
 
 /// The mouse half of the watching. A preview that lives only while its source has
@@ -594,18 +619,19 @@ fn focus_bound_window() -> Option<HWND> {
 /// already the foreground of the click a user lands on it. The click is the
 /// leaving itself, whatever the foreground says -- but the wheel is not, since it
 /// rolls a long document under the pointer: only a button down departs.
-unsafe extern "system" fn mouse_proc(code: i32, wp: WPARAM, _lp: LPARAM) -> LRESULT {
+unsafe extern "system" fn mouse_proc(code: i32, wp: WPARAM, lp: LPARAM) -> LRESULT {
     unsafe {
         if code < 0 {
-            return CallNextHookEx(None, code, wp, _lp);
+            return CallNextHookEx(None, code, wp, lp);
         }
         let msg = wp.0 as u32;
         if msg == WM_LBUTTONDOWN || msg == WM_MBUTTONDOWN || msg == WM_RBUTTONDOWN {
-            if let Some(window) = focus_bound_window() {
+            let click = &*(lp.0 as *const MSLLHOOKSTRUCT);
+            if let Some(window) = leaving_window(click.pt) {
                 let _ = PostMessageW(Some(window), WM_APP_ESCAPE, WPARAM(0), LPARAM(0));
             }
         }
-        CallNextHookEx(None, code, wp, _lp)
+        CallNextHookEx(None, code, wp, lp)
     }
 }
 
@@ -917,6 +943,41 @@ fn open_with_default(path: &Path) {
     let wide = utf16(&path.as_os_str().to_string_lossy());
     unsafe {
         ShellExecuteW(None, PCWSTR::null(), PCWSTR(wide.as_ptr()), PCWSTR::null(), PCWSTR::null(), SW_SHOWNORMAL);
+    }
+}
+
+/// Open the file in the reader: the reader already running first, this very program
+/// started without `--peek` otherwise. Ctrl+Enter means "read it in the reader",
+/// whatever the file type's default program happens to be.
+fn open_in_reader(path: &Path) {
+    let path = path.to_owned();
+    // This thread owns the global hooks, so waiting is expensive: the reader-window
+    // wait that `forward` performs -- two seconds of polling a reader that may never
+    // come -- would stall every key and click in the system. So ask once, without
+    // waiting, and hand off only to a reader that is actually there.
+    let class = utf16("Rubrica.Main");
+    let there =
+        unsafe { FindWindowW(PCWSTR(class.as_ptr()), PCWSTR::null()) }.is_ok();
+    if there && instance::forward(std::slice::from_ref(&path)) {
+        return;
+    }
+    // Start this very program the way a double-click starts it: the shell is what
+    // a launch of a GUI program goes through, and it is what the window appears
+    // without -- a process started by hand can be handed no console, no desktop,
+    // and no standard handles, and a reader that dies at birth dies of those.
+    let mut exe = [0u16; 1024];
+    let len = unsafe { GetModuleFileNameW(None, &mut exe) } as usize;
+    let exe = utf16(&String::from_utf16_lossy(&exe[..len]));
+    let args = utf16(&format!("\"{}\"", path.as_os_str().to_string_lossy()));
+    unsafe {
+        ShellExecuteW(
+            None,
+            PCWSTR::null(),
+            PCWSTR(exe.as_ptr()),
+            PCWSTR(args.as_ptr()),
+            PCWSTR::null(),
+            SW_SHOWNORMAL,
+        );
     }
 }
 
@@ -1530,13 +1591,9 @@ unsafe extern "system" fn preview_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPA
             LRESULT(0)
         },
         // A click on the window never moves the focus anywhere: the window is a
-        // topmost WS_EX_NOACTIVATE popup, so the press is swallowed here and
-        // neither the folder nor the desktop ever gains the foreground. A
-        // preview that lives no longer than the focus hears the press as the
-        // user's leaving anyway -- the click they aimed away may well have
-        // landed on the preview itself, a window three quarters of a screen
-        // tall sitting where a click meant for the desk would fall.
-        WM_MOUSEACTIVATE if focus_close() => {
+        // topmost, non-activating popup whose press the desktop would otherwise
+        // have received. Closing on it is a choice of its own, off by default.
+        WM_MOUSEACTIVATE if click_close() => {
             close_preview_service();
             LRESULT(MA_NOACTIVATE as isize)
         }
