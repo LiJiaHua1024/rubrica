@@ -464,6 +464,30 @@ pub fn op_top(op: &Op) -> f32 {
     }
 }
 
+/// Fold a batch of display-list ops into the page's, and keep the page's answer to
+/// "is this ordered by y" true as it goes.
+///
+/// A batch is ordered within itself unless a table laid its cells out column by column,
+/// and it is ordered against the batch before it only if that one's last op sits above
+/// this one's first. Answering it per batch costs one pass over the batch being added
+/// and none over the page, which is the same arithmetic the answer would cost at the end
+/// and the difference between paying it while the ops are in hand and walking the whole
+/// list again afterwards.
+///
+/// Once the answer is no, it stays no: a later batch cannot repair an earlier one, and
+/// the ops themselves are still appended, since an unordered page is drawn in full.
+fn ops_in_order(into: &mut Vec<Op>, was_ordered: &mut bool, batch: Vec<Op>) {
+    if !*was_ordered {
+        into.extend(batch);
+        return;
+    }
+    *was_ordered = match (into.last(), batch.first()) {
+        (Some(last), Some(first)) => op_top(last) <= op_top(first),
+        _ => true,
+    } && batch.windows(2).all(|w| op_top(&w[0]) <= op_top(&w[1]));
+    into.extend(batch);
+}
+
 /// DirectWrite's faces are free-threaded, so a run built on the layout thread can
 /// be drawn on the window thread; the rest of the run is plain data.
 unsafe impl Send for PaintRun {}
@@ -553,7 +577,10 @@ impl LayoutSink for RemoteSink {
 /// Everything a worker layout is handed.
 struct LayoutRequest {
     epoch: u64,
-    doc: Document,
+    /// Shared, not copied. A document is never edited in place -- a new page replaces
+    /// the old one wholesale -- so handing one to a layout is a reference count and
+    /// not a walk of every block's text, spans and tables.
+    doc: Arc<Document>,
     theme: Theme,
     page_w: f32,
     dpi: f32,
@@ -1205,7 +1232,9 @@ pub struct View {
     /// layout has lines to point it at. A worker layout answers in batches, so the
     /// place cannot be stood in until the layout that owns it is finished.
     pending_anchor: Option<usize>,
-    doc: Document,
+    /// The page, shared with any layout worker currently building it. Replaced whole
+    /// rather than edited, which is what makes sharing it safe.
+    doc: Arc<Document>,
     source: String,
     source_view: bool,
     text_options: TextOptions,
@@ -1436,7 +1465,7 @@ struct TabPage {
     epoch: u64,
     layout_dpi: f32,
     source: String,
-    doc: Document,
+    doc: Arc<Document>,
     ops: Vec<Op>,
     reading_mode: ReadingMode,
     page_starts: Vec<Pt>,
@@ -1472,7 +1501,7 @@ impl TabPage {
             epoch: 0,
             layout_dpi: 96.0,
             source: String::new(),
-            doc: Document { blocks: Vec::new(), footnotes: Vec::new() },
+            doc: Arc::new(Document { blocks: Vec::new(), footnotes: Vec::new() }),
             ops: Vec::new(),
             reading_mode: ReadingMode::Scroll,
             page_starts: Vec::new(),
@@ -2300,10 +2329,8 @@ fn held(vk: VIRTUAL_KEY) -> bool {
 /// The window comes first and the page second, and not by preference: a double-click
 /// is answered with a frame milliseconds after the process starts, while the
 /// document's settings, read, parse and layout all run afterwards against a window
-/// that is already there. DirectWrite's system font collection -- the most expensive
-/// single thing a start used to pay for before there was anything to show -- is
-/// enumerated by the first face the page resolves, which is also the first thing
-/// that needs it.
+/// that is already there.
+
 pub fn run(path: Option<PathBuf>, extra: Vec<PathBuf>) -> Result<()> {
     // Must happen before the first window exists, or the process is already
     // bitmap-scaled and text on a secondary high-density monitor is soft.
@@ -2356,7 +2383,7 @@ pub fn run(path: Option<PathBuf>, extra: Vec<PathBuf>) -> Result<()> {
         profile: "Default".to_string(),
         started: false,
         pending_anchor: None,
-        doc: Document::source(""),
+        doc: Arc::new(Document::source("")),
         source: String::new(),
         source_view: false,
         text_options: TextOptions::default(),
@@ -2564,14 +2591,17 @@ pub fn run(path: Option<PathBuf>, extra: Vec<PathBuf>) -> Result<()> {
     Ok(())
 }
 
-/// The path as it is shown, not as it is named. `canonicalize` answers in the Windows
-/// verbatim form, and a title is copied and read by people, who want the drive letter
 /// A mark on the start-up path, printed to stderr when the run is asked for one with
 /// `RUBRICA_STARTUP_TRACE` in the environment. A cold start's cost is otherwise
-/// something to guess at; with this it is four lines to read.
+/// something to guess at; with this it is a column of numbers to read.
+///
+/// The clock starts at its first caller, which is `main` before it has looked at an
+/// argument, so a mark is a distance from the process rather than from the window. The
+/// warm thread marks too, so the two threads' lines interleave in the order they
+/// happened, which is the only thing worth knowing about them.
 static PROCESS_START: LazyLock<Instant> = LazyLock::new(Instant::now);
 
-fn trace(label: &str) {
+pub(crate) fn trace(label: &str) {
     if std::env::var_os("RUBRICA_STARTUP_TRACE").is_some() {
         eprintln!("startup {}: +{:?}", label, PROCESS_START.elapsed());
     }
@@ -2904,8 +2934,9 @@ impl View {
     /// that takes a while never stops the window replying.
     fn finish_startup(&mut self, saved: crate::settings::Settings) -> Result<()> {
         // The one check start-up cannot do without a font face for, now asked of a
-        // window that could show the answer. This is also where the system font
-        // collection is enumerated, which the frame no longer waits on.
+        // window that could show the answer. The collection it resolves against was
+        // begun before the window was created, so this is usually a cache hit; a start
+        // that arrives here first still waits for the same work, only further along.
         if !self.font.probe() {
             return Err("could not open any installed font face".into());
         }
@@ -2942,20 +2973,31 @@ impl View {
         let can_window = plain && !preferences.source && path.as_deref().is_some_and(|p| {
             preferences.text.chapters && reading::can_window_text(p, preferences.encoding)
         });
+        trace("prefs-read");
 
         // A file named on the command line is what the reader asked for, and one that cannot
         // be read is worth stopping on -- visibly, though: now there is a window to show the
         // reason beside. Nothing named is not a request for the sample, either: the reader was
         // here before, and the page they left is the one to come back to.
-        let (mut source, mut decoded) = match path.as_deref() {
-            None => (crate::sample::DOCUMENT.to_string(), None),
-        Some(p) => {
-            let mut d = reading::read(p, preferences.encoding)
-                .map_err(|e| document_open_error_in(p, &e, self.lang))?;
-            let text = std::mem::take(&mut d.text);
-            (text, Some(d))
-        }
+        //
+        // A large chaptered text is the one file not read whole. The chapter pass below reads
+        // the slice the reader is actually standing on, so decoding the whole book here would
+        // be a start that pays for every byte of it and then draws none: both the text and
+        // the encoding that came back from it are replaced a few lines down.
+        let (mut source, mut decoded) = if can_window {
+            (String::new(), None)
+        } else {
+            match path.as_deref() {
+                None => (crate::sample::DOCUMENT.to_string(), None),
+                Some(p) => {
+                    let mut d = reading::read(p, preferences.encoding)
+                        .map_err(|e| document_open_error_in(p, &e, self.lang))?;
+                    let text = std::mem::take(&mut d.text);
+                    (text, Some(d))
+                }
+            }
         };
+        trace("file-read");
 
         let mut lazy_text = false;
         let mut initial_chapter = path
@@ -2976,22 +3018,46 @@ impl View {
                                 lazy_decoded = Some(d);
                             }
                             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                                // The shell may have removed a file between its first read
-                                // and this chapter pass. Keep the text already in hand.
+                                // The shell may have removed the file between the probe that
+                                // promised it and this chapter pass. There is no whole-file
+                                // read to fall back on any more, so read it now or say why,
+                                // which is the answer the unwindowed path gives for a file
+                                // that is not there.
                                 initial_chapter = 0;
+                                let mut d = reading::read(path, preferences.encoding)
+                                    .map_err(|e| document_open_error_in(path, &e, self.lang))?;
+                                source = std::mem::take(&mut d.text);
+                                decoded = Some(d);
                             }
                             Err(_) => {
+                                // The chapter slice would not decode, so the whole file is
+                                // read instead. It carries the encoding it was read as, and
+                                // that is the same answer the unwindowed path gives.
                                 initial_chapter = 0;
-                                source = reading::read(path, preferences.encoding)?.text;
+                                let mut d = reading::read(path, preferences.encoding)
+                                    .map_err(|e| document_open_error_in(path, &e, self.lang))?;
+                                source = std::mem::take(&mut d.text);
+                                decoded = Some(d);
                             }
                         }
                         if lazy_text { Some(index) } else { Some(ChapterIndex::new(&source, true)) }
                     }
                     Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                        // Gone between the probe and the scan: the same whole-file answer,
+                        // for the same reason -- nothing was decoded on the way here.
+                        let mut d = reading::read(path, preferences.encoding)
+                            .map_err(|e| document_open_error_in(path, &e, self.lang))?;
+                        source = std::mem::take(&mut d.text);
+                        decoded = Some(d);
                         Some(ChapterIndex::new(&source, true))
                     }
                     Err(_) => {
-                        source = reading::read(path, preferences.encoding)?.text;
+                        // The line-by-line scan could not decode the file, so the whole of
+                        // it is read the other way, for the same two reasons.
+                        let mut d = reading::read(path, preferences.encoding)
+                            .map_err(|e| document_open_error_in(path, &e, self.lang))?;
+                        source = std::mem::take(&mut d.text);
+                        decoded = Some(d);
                         Some(ChapterIndex::new(&source, true))
                     }
                 }
@@ -3012,11 +3078,15 @@ impl View {
         }) };
         trace("page-ready");
 
+        // The tab strip the last session left, plus this document's own tab. Restored
+        // here rather than on the window's deferred pass: a second launch hands its
+        // documents over as a sent message, which jumps ahead of a posted one, and a tab
+        // opened in the gap between the two would be replaced by this wholesale.
         let mut workspace = crate::settings::restored_workspace();
         if let Some(path) = path.as_ref() {
             workspace.open_file(View::workspace_file(path), TabKind::Pinned);
         }
-        self.doc = doc;
+        self.doc = Arc::new(doc);
         self.source = source;
         self.source_view = preferences.source;
         self.text_options = crate::reading::text_options_for(path.as_deref(), preferences.text);
@@ -4656,10 +4726,10 @@ impl View {
             self.cache_window(next, source.clone());
             self.chapter = next;
             self.source = source;
-            self.doc = index.window_text(&self.source, next, self.text_options);
+            self.doc = Arc::new(index.window_text(&self.source, next, self.text_options));
         } else {
             self.chapter = next;
-            self.doc = self.parse_source();
+            self.doc = Arc::new(self.parse_source());
         }
         self.scroll = 0.0;
         self.relayout();
@@ -4745,7 +4815,7 @@ impl View {
                 }
             }
         }
-        self.doc = self.parse_source();
+        self.doc = Arc::new(self.parse_source());
         self.relayout_in_place(hwnd);
         if let Some(byte) = source { self.restore_source(byte); }
         self.update_title(hwnd);
@@ -5055,7 +5125,10 @@ impl View {
             window,
             LayoutRequest {
                 epoch,
-                doc: self.doc.clone(),
+                // A reference count, where this used to be the whole document walked and
+                // copied block by block on the thread that was about to answer the
+                // reader's next click.
+                doc: Arc::clone(&self.doc),
                 theme: self.theme.clone(),
                 page_w,
                 dpi: self.dpi,
@@ -5065,6 +5138,10 @@ impl View {
         // The page on screen is the beginning of the document as it is being laid
         // out: whatever was there belonged to a wrapping that no longer exists.
         self.ops.clear();
+        // Which is also the end of whatever the last layout's list looked like. An
+        // answer that outlived the list it was about is how a page ends up walking
+        // every op it has, on every frame, to draw the band in front of the reader.
+        self.ops_sorted = true;
         self.sel_index.clear();
         self.sel_version += 1;
         self.hotspots.clear();
@@ -5091,6 +5168,11 @@ impl View {
             let Some(job) = self.layout_job.as_mut() else { break };
             match message {
                 LayoutMessage::Batch { epoch, chunk } if epoch == job.epoch => {
+                    // The first batch is the one the reader has been waiting for: the
+                    // window has been open and empty since before the document was read.
+                    if job.blocks_done == 0 {
+                        trace("first-content");
+                    }
                     job.blocks_done += chunk.blocks;
                     // The height the content reaches is known only when the layout
                     // ends; until then it is what has been laid out plus what the
@@ -5103,13 +5185,21 @@ impl View {
                     }
                     let rest = (job.blocks_total - job.blocks_done) as Pt * job.avg_block;
                     self.content_h = job.y + rest;
-                    self.ops.extend(chunk.ops);
+                    // The page's answer to "is the list ordered by y" is kept current as
+                    // the batches land rather than walked once at the end, and rather than
+                    // inherited from whatever layout ran before this one. A page that
+                    // believes it is ordered when a wide table laid its cells out column
+                    // by column paints only the band a binary search can find.
+                    let mut ordered = self.ops_sorted;
+                    ops_in_order(&mut self.ops, &mut ordered, chunk.ops);
+                    self.ops_sorted = ordered;
                     self.sel_version += 1;
                     self.sel_index.extend(chunk.sel);
                     self.hotspots.extend(chunk.hots);
                     self.wide_regions.extend(chunk.wide);
                 }
                 LayoutMessage::Finished { epoch, finals } if epoch == job.epoch => {
+                    trace("content-complete");
                     self.content_h = finals.height;
                     self.page_starts = reader_page_starts(
                         &self.sel_index,
@@ -7180,7 +7270,7 @@ impl View {
             .as_ref()
             .map(|index| chapter.min(index.chapters().len().saturating_sub(1)))
             .unwrap_or(0);
-        self.doc = self.parse_source();
+        self.doc = Arc::new(self.parse_source());
         // Filed at the same moment as the text that came out of it, so that the next tick
         // of the poll compares the page on screen against the file it was read from rather
         // than against whatever the last page's file was.
@@ -9327,11 +9417,17 @@ fn write_pdf(
     Ok(())
 }
 
-/// Blocks between two batches of the display list.
+/// Blocks in the first batch of a layout, and in every batch after it.
 ///
-/// A batch is the unit the reader sees arrive: small enough that the window keeps
-/// painting between two of them, large enough that the per-batch overhead -- a
-/// message, an append, an invalidate -- disappears against the layout of the blocks.
+/// The first is the smaller because it is the one the reader has been waiting for: the
+/// window has been open and empty since before the document was even read, and a
+/// screenful's worth of blocks answers that faster than a longer one costs to lay out.
+/// After it the page is filling in, and the steady size is the cheaper one, where the
+/// per-batch overhead -- a message, an append, an invalidate -- has a window's worth of
+/// layout to disappear against.
+const LAYOUT_FIRST_CHUNK_BLOCKS: usize = 12;
+
+/// Blocks between two batches of the display list, after the first.
 const LAYOUT_CHUNK_BLOCKS: usize = 48;
 
 /// One batch of a layout in progress: what the layout laid out since the last one.
@@ -9457,6 +9553,72 @@ pub fn build_ops(
     }
 }
 
+/// The widest marker at each list depth, over the whole document.
+///
+/// One hanging indent per list level rather than one per item: an ordered list that
+/// runs from `9.` to `10.` still sets every body at the same x, the way a table's
+/// second column would. Which makes this the one value in a layout that a block cannot
+/// answer for itself -- an item set against a marker three hundred blocks later is set
+/// at the wrong x if the widest marker has not been seen yet -- and the reason the page
+/// below cannot simply be prepared a window at a time without asking for this first.
+///
+/// A level's entry is the widest marker at that level anywhere in the document, and it
+/// stays that way: a level is reached once and is never forgotten, whatever shallower
+/// items come after it.
+///
+/// It is asked of the markers, which is the whole of what a prepared block's hanging
+/// indent is: the marker's own width, set in the paragraph style, since a marker's ink
+/// is prose's however the item's own body is set. A document has few distinct markers --
+/// a bullet, a checkbox, a run of numbers -- and each is shaped once and remembered, so
+/// this walks the document's list items and shapes a handful of strings, where asking
+/// the prepared blocks would have had to copy every block's text and intern every one
+/// of its spans before a single one of them could be measured.
+fn level_hangs(
+    font: &FontEngine,
+    theme: &Theme,
+    styles: &mut Vec<AppStyle>,
+    doc: &Document,
+) -> Vec<Pt> {
+    let mut hangs: Vec<Pt> = Vec::new();
+    let mut measured: HashMap<String, Pt> = HashMap::new();
+    for b in &doc.blocks {
+        let Some(list) = b.list else { continue };
+        let depth = list.depth as usize;
+        // Grown, never shortened. `resize` truncates when it is handed a shorter
+        // length, so asking for it unconditionally dropped the hang of a level the
+        // moment a shallower item came along: an item nested one level deep, followed
+        // by its own list's second item, left the nested level set against nothing.
+        if hangs.len() <= depth {
+            hangs.resize(depth + 1, 0.0);
+        }
+        let marker = marker_for(b);
+        if marker.is_empty() {
+            continue;
+        }
+        let known = measured.get(marker.as_str()).copied();
+        let width = match known {
+            Some(w) => w,
+            None => {
+                let id = intern(
+                    styles,
+                    &theme.fonts.fallback,
+                    theme.resolve(BlockKind::Paragraph, InlineStyle::EMPTY),
+                );
+                let st = &styles[id.0 as usize];
+                let w: Pt = font
+                    .shape_runs(&marker, 0..marker.len(), &st.face, st.size, st.tracking)
+                    .iter()
+                    .map(|run| run.width())
+                    .sum();
+                measured.insert(marker.clone(), w);
+                w
+            }
+        };
+        hangs[depth] = hangs[depth].max(width);
+    }
+    hangs
+}
+
 /// Lay a document out, handing each batch of the display list to `sink` as it is
 /// finished. The whole page, in one call, is [`build_ops`].
 #[allow(clippy::too_many_arguments)]
@@ -9516,14 +9678,13 @@ pub fn build_in_chunks(
     let mut y = theme.base * 2.0;
     let mut first = true;
 
-    // Interning has to finish before measuring, because the engine resolves a
-    // StyleId through the installed table. That includes the notes' table, which is
-    // why they are readied here and drawn at the very end.
-    let mut prepared: Vec<Prepared> = Vec::with_capacity(doc.blocks.len());
-    for b in &doc.blocks {
-        let set = Setting { marker: marker_for(b), size: None };
-        prepared.push(prepare_block(font, theme, &mut styles, objects, b, &set, column));
-    }
+    // The one value a block cannot answer for itself, asked before any block is
+    // prepared. Everything else a block needs it can intern for itself, which is what
+    // lets the page be prepared a window at a time below.
+    let level_hang = level_hangs(font, theme, &mut styles, doc);
+    // The notes are the exception and are readied whole: they are set at the very end
+    // rather than in document order, their markers are the note size rather than the
+    // body size, and there are few enough of them that a window of them buys nothing.
     let note_units: Vec<Vec<Prepared>> = doc
         .footnotes
         .iter()
@@ -9543,45 +9704,44 @@ pub fn build_in_chunks(
                 .collect()
         })
         .collect();
-
-    // One hanging indent per list level rather than one per item: an ordered list that
-    // runs from `9.` to `10.` still sets every body at the same x, the way a table's
-    // second column would. The same for the apparatus, where the numbers `9` and `10`
-    // sit in one column of notes. Digits are tabular in the faces in use, so the widest
-    // marker of a level is also the measure every narrower one is set against.
-    let mut level_hang: Vec<Pt> = Vec::new();
-    for (b, p) in doc.blocks.iter().zip(&prepared) {
-        if let Some(l) = b.list {
-            let d = l.depth as usize;
-            level_hang.resize(d + 1, 0.0);
-            level_hang[d] = level_hang[d].max(p.hang);
-        }
-    }
+    // One hanging indent for the apparatus as well, where the numbers `9` and `10` sit
+    // in one column of notes.
     let note_hang = note_units
         .iter()
         .map(|u| u.first().map_or(0.0, |p| p.hang))
         .fold(0.0f32, Pt::max);
 
+    // A reader can walk through many documents without the window ever going away, and
+    // the itemization cache is the one thing in the engine that grows with the reading.
+    // Policed once per layout here rather than by the table installation below, which a
+    // windowed layout does once per window.
+    font.trim_caches();
+
+    // Window geometry rather than document geometry, so it is the same for every window
+    // and is asked once.
+    let wide_limit = {
+        let available = (client_pt - margin * 0.5).max(column);
+        column + (available - column) * theme.wide_table_factor.clamp(0.0, 1.0)
+    };
+
+    // A table is installed before anything is typeset against one, and a document whose
+    // blocks are all in a window that has not come round yet -- a file that is nothing
+    // but a footnote definition has none at all -- would otherwise be set against
+    // whatever the last layout left behind, or against nothing. Each window installs
+    // the whole table again as it grows; this one is here so that a table always
+    // exists, not so that the first window has one.
+    // A table is installed before anything is typeset against one, and a document whose
+    // blocks are all in a window that has not come round yet -- a file that is nothing
+    // but a footnote definition has none at all -- would otherwise be set against
+    // whatever the last layout left behind, or against nothing. Each window installs
+    // the whole table again as it grows; this one is here so that a table always
+    // exists, not so that the first window has one.
     font.begin_layout(
         styles
             .iter()
             .map(|s| RunStyle { face: s.face.clone(), size: s.size, tracking: s.tracking, object: s.object })
             .collect(),
     );
-
-    let ctx = Ctx {
-        theme,
-        styles: &styles,
-        math: &*objects.math,
-        notes: &notes,
-        anchors: &anchors,
-        base: objects.base_dir,
-        k,
-        wide_limit: {
-            let available = (client_pt - margin * 0.5).max(column);
-            column + (available - column) * theme.wide_table_factor.clamp(0.0, 1.0)
-        },
-    };
 
     // The layout's own buffers, drained into a batch every LAYOUT_CHUNK_BLOCKS blocks.
     // The display list a batch carries is sorted by y before it leaves, because a
@@ -9616,86 +9776,122 @@ pub fn build_in_chunks(
             }
         }};
     }
+    // A window at a time: prepared, installed, laid out, handed over. The first window
+    // is the short one, because its batch is the one the reader has been waiting for
+    // since before the document was read; the rest are the steady size, where a message
+    // and an append have a window's worth of layout to disappear against.
     let mut laid = 0usize;
-    for (index, (b, p)) in doc.blocks.iter().zip(prepared).enumerate() {
-        if index > 0 && index % LAYOUT_CHUNK_BLOCKS == 0 {
-            let blocks = index - laid;
-            laid = index;
-            emit!(blocks);
+    let mut window_blocks = LAYOUT_FIRST_CHUNK_BLOCKS;
+    while laid < doc.blocks.len() {
+        let start = laid;
+        let end = (laid + window_blocks).min(doc.blocks.len());
+        let window = &doc.blocks[start..end];
+        // Interning has to finish before measuring, because the engine resolves a
+        // StyleId through the installed table. Only this window's blocks are measured
+        // against this table, and the ids of the blocks before it keep the meanings they
+        // had under the shorter tables those were measured against, since a table is
+        // only ever appended to.
+        let mut prepared: Vec<Prepared> = Vec::with_capacity(window.len());
+        for b in window {
+            let set = Setting { marker: marker_for(b), size: None };
+            prepared.push(prepare_block(font, theme, &mut styles, objects, b, &set, column));
         }
-        let base_left = left;
-        // Offsets are computed against the block's own text, which already carries
-        // the list marker, so they need no shifting.
-        let (hyphens, hyphen_width) =
-            hyphenation_for(&p.text, &styles, p.base, hyphenator, font, b.kind == BlockKind::Code);
-        let size = theme.body_size(b.kind);
-        y += theme.space_before(b.kind, first);
-        first = false;
-        // Where a fragment link naming this heading has to land. Pushed here, at the top
-        // of the block rather than after it, because the line a reader asks to be taken
-        // to is the one their eye goes to first.
-        if matches!(b.kind, BlockKind::Heading(_)) {
-            anchor_tops.push(y);
-        }
-        // A list's geometry belongs to the list, not to whichever block happens to be
-        // standing at its level: an item's code fence set at its own, smaller size would
-        // start its text a little left of the prose above it.
-        let depth = b.item_depth.unwrap_or(0) as Pt;
-        let level = level_hang.get(depth as usize).copied().unwrap_or(0.0);
-        let mut left = base_left
-            + b.quote_depth as Pt * theme.quote_indent_em * theme.base
-            + depth * theme.list_indent_em * theme.base
-            // A block that only continues an item has no marker of its own to hang, so
-            // it starts where the item's text does rather than where its marker does.
-            // Ordinary prose is neither: it has no item to continue, and must not pay
-            // for one.
-            + if b.list.is_some() || b.item_depth.is_none() { 0.0 } else { level }
-            // A definition stands under its term, which is the one thing the syntax
-            // said and the page has to keep saying: run at the margin it is the term
-            // again, and the reader has nothing left to tell the two apart.
-            + if b.kind == BlockKind::Definition { theme.base * theme.definition_indent_em } else { 0.0 };
-        // Every point a block is run in from the margin is a point it has to give back
-        // at the right: a nested list or a quotation that kept the page's whole measure
-        // would end its lines out past the text standing beside it.
-        let inner = (column - (left - base_left)).max(size * 4.0);
-        // A displayed equation is the only thing on its line, and an equation on its
-        // own is centred rather than run in to the margin: the prose around it is
-        // justified, so a short line starting at the left edge reads as a line that
-        // broke early, not as a display. It only centres when it fits.
-        if b.spans.len() == 1
-            && matches!(b.objects.first().map(|o| &o.kind), Some(rubrica_doc::ObjectKind::Math { display: true, .. }))
-        {
-            if let Some(s) = p.spans.last() {
-                if let Some(o) = styles[s.style.0 as usize].object {
-                    left += ((inner - o.advance) * 0.5).max(0.0);
+        font.begin_layout(
+            styles
+                .iter()
+                .map(|s| RunStyle { face: s.face.clone(), size: s.size, tracking: s.tracking, object: s.object })
+                .collect(),
+        );
+        // Built per window rather than once for the page, because it borrows the style
+        // table and the formula store that the window above has just grown.
+        let ctx = Ctx {
+            theme,
+            styles: &styles,
+            math: &*objects.math,
+            notes: &notes,
+            anchors: &anchors,
+            base: objects.base_dir,
+            k,
+            wide_limit,
+        };
+        for (b, p) in window.iter().zip(&prepared) {
+            let base_left = left;
+            // Offsets are computed against the block's own text, which already carries
+            // the list marker, so they need no shifting.
+            let (hyphens, hyphen_width) =
+                hyphenation_for(&p.text, &styles, p.base, hyphenator, font, b.kind == BlockKind::Code);
+            let size = theme.body_size(b.kind);
+            y += theme.space_before(b.kind, first);
+            first = false;
+            // Where a fragment link naming this heading has to land. Pushed here, at the top
+            // of the block rather than after it, because the line a reader asks to be taken
+            // to is the one their eye goes to first.
+            if matches!(b.kind, BlockKind::Heading(_)) {
+                anchor_tops.push(y);
+            }
+            // A list's geometry belongs to the list, not to whichever block happens to be
+            // standing at its level: an item's code fence set at its own, smaller size would
+            // start its text a little left of the prose above it.
+            let depth = b.item_depth.unwrap_or(0) as Pt;
+            let level = level_hang.get(depth as usize).copied().unwrap_or(0.0);
+            let mut left = base_left
+                + b.quote_depth as Pt * theme.quote_indent_em * theme.base
+                + depth * theme.list_indent_em * theme.base
+                // A block that only continues an item has no marker of its own to hang, so
+                // it starts where the item's text does rather than where its marker does.
+                // Ordinary prose is neither: it has no item to continue, and must not pay
+                // for one.
+                + if b.list.is_some() || b.item_depth.is_none() { 0.0 } else { level }
+                // A definition stands under its term, which is the one thing the syntax
+                // said and the page has to keep saying: run at the margin it is the term
+                // again, and the reader has nothing left to tell the two apart.
+                + if b.kind == BlockKind::Definition { theme.base * theme.definition_indent_em } else { 0.0 };
+            // Every point a block is run in from the margin is a point it has to give back
+            // at the right: a nested list or a quotation that kept the page's whole measure
+            // would end its lines out past the text standing beside it.
+            let inner = (column - (left - base_left)).max(size * 4.0);
+            // A displayed equation is the only thing on its line, and an equation on its
+            // own is centred rather than run in to the margin: the prose around it is
+            // justified, so a short line starting at the left edge reads as a line that
+            // broke early, not as a display. It only centres when it fits.
+            if b.spans.len() == 1
+                && matches!(b.objects.first().map(|o| &o.kind), Some(rubrica_doc::ObjectKind::Math { display: true, .. }))
+            {
+                if let Some(s) = p.spans.last() {
+                    if let Some(o) = styles[s.style.0 as usize].object {
+                        left += ((inner - o.advance) * 0.5).max(0.0);
+                    }
                 }
             }
+            // The block starts at its own left and the marker hangs out of it: no extra
+            // indent is added here for a list, because the lines under the marker give that
+            // width back themselves, at the width the marker actually has.
+            y = layout_block(
+                font,
+                &ctx,
+                &Blk {
+                    b,
+                    text: &p.text,
+                    spans: &p.spans,
+                    base: p.base,
+                    left,
+                    column: inner,
+                    table: p.table.as_ref(),
+                    hyphenation: Hyphenation { points: &hyphens, width: hyphen_width },
+                    size,
+                    leading: theme.line_spacing(b.kind),
+                    // The level's marker width, shared by every item at that level so their
+                    // bodies line up. A continuation block has already paid it at `left`.
+                    hang: if b.list.is_some() { level } else { 0.0 },
+                    actions: &p.actions,
+                },
+                &mut Out { ops: &mut ops, hots: &mut hots, sel: &mut sel, hyphens: &mut breaks, wide: &mut wide, table_headers: &mut table_headers, table_spans: &mut table_spans, note_spans: &mut note_spans, math_texts: &mut math_texts },
+                y,
+            );
         }
-        // The block starts at its own left and the marker hangs out of it: no extra
-        // indent is added here for a list, because the lines under the marker give that
-        // width back themselves, at the width the marker actually has.
-        y = layout_block(
-            font,
-            &ctx,
-            &Blk {
-                b,
-                text: &p.text,
-                spans: &p.spans,
-                base: p.base,
-                left,
-                column: inner,
-                table: p.table.as_ref(),
-                hyphenation: Hyphenation { points: &hyphens, width: hyphen_width },
-                size,
-                leading: theme.line_spacing(b.kind),
-                // The level's marker width, shared by every item at that level so their
-                // bodies line up. A continuation block has already paid it at `left`.
-                hang: if b.list.is_some() { level } else { 0.0 },
-                actions: &p.actions,
-            },
-            &mut Out { ops: &mut ops, hots: &mut hots, sel: &mut sel, hyphens: &mut breaks, wide: &mut wide, table_headers: &mut table_headers, table_spans: &mut table_spans, note_spans: &mut note_spans, math_texts: &mut math_texts },
-            y,
-        );
+        laid = end;
+        window_blocks = LAYOUT_CHUNK_BLOCKS;
+        emit!(end - start);
     }
 
     // The apparatus, after the last block: a rule across the measure, then each note
@@ -9703,6 +9899,19 @@ pub fn build_in_chunks(
     // prose uses, so a note with two paragraphs wraps and justifies exactly as they
     // would on the page -- the only things it changes are the size and the leading the
     // caller hands in.
+    //
+    // Its own `ctx`, because the one above is scoped to the window it was built for and
+    // this borrows the style table and the formula store as they now stand, whole.
+    let ctx = Ctx {
+        theme,
+        styles: &styles,
+        math: &*objects.math,
+        notes: &notes,
+        anchors: &anchors,
+        base: objects.base_dir,
+        k,
+        wide_limit,
+    };
     let mut apparatus = doc.footnotes.iter().zip(note_units).peekable();
     if apparatus.peek().is_some() {
         y += theme.note_space(true);

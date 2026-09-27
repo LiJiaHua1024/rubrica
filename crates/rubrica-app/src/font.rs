@@ -291,19 +291,34 @@ impl FontEngine {
     }
 
     /// Install the style table the layout pass will index with its `StyleId`s.
+    ///
+    /// The whole table every time, never just the entries a window added: the ids in
+    /// flight for the blocks already laid out resolve through this same table, and an
+    /// id past its end is not an error here but a silent substitution of a default body
+    /// style, which would set a page in the wrong face at the wrong size with no sign
+    /// of having done so. Installing a longer table never disturbs a shorter one's
+    /// indices, since the table is only ever appended to.
     pub fn begin_layout(&self, styles: Vec<Style>) {
         *self.styles.borrow_mut() = styles;
-        // The itemization cache is content-addressed -- script, level and language come
-        // out of the text alone -- so it stays valid across layouts and documents, and
-        // dropping it per layout would re-analyse every paragraph of every switch. Only
-        // its size is policed here, since the reader can walk through many documents
-        // without the window ever going away.
+    }
+
+    /// Police the itemization cache, once per layout rather than once per style table.
+    ///
+    /// The cache is content-addressed -- script, level and language come out of the
+    /// text alone -- so it stays valid across layouts and documents, and dropping it
+    /// per layout would re-analyse every paragraph of every switch. Only its size is
+    /// policed, since the reader can walk through many documents without the window
+    /// ever going away.
+    ///
+    /// It is not policed by [`FontEngine::begin_layout`] because a windowed layout
+    /// installs one table per window: bound there, a long document would have its
+    /// cache emptied between every window of itself and re-analyse the whole of the
+    /// text behind it each time.
+    pub fn trim_caches(&self) {
         const ANALYZED_CACHE_CAP: usize = 8192;
         if self.analyzed.borrow().len() > ANALYZED_CACHE_CAP {
             self.analyzed.borrow_mut().clear();
         }
-        // Content-addressed run cache stays valid across documents; face handles
-        // depend only on (family, weight, slant) so they do too.
     }
 
     fn find_family(&self, name: &str) -> Option<u32> {

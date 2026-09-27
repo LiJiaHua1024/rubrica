@@ -35,6 +35,9 @@ pub(crate) type Error = Box<dyn std::error::Error + Send + Sync>;
 pub(crate) type Result<T> = std::result::Result<T, Error>;
 
 fn main() -> Result<()> {
+    // First thing, before an argument is looked at: the start-up clock starts here, so
+    // every later mark is a distance from the process rather than from the window.
+    view::trace("main-entry");
     let argv: Vec<String> = std::env::args().collect();
     if argv.iter().any(|a| a == "--peek") {
         // The spacebar peek service: a background watcher that previews what the
