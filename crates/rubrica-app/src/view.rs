@@ -5684,7 +5684,8 @@ pub struct PreparedTable {
 
 /// Horizontal padding inside a table cell, in ems of the body size.
 const CELL_PAD_EM: Pt = 0.6;
-/// The narrowest a column may be squeezed to before it is left to overflow.
+/// The narrowest a column may be squeezed to before it is left to overflow -- a
+/// floor for a column whose own widest unbreakable word is shorter than this.
 const CELL_MIN_EM: Pt = 3.0;
 
 /// A shaped run turned into something the painter can position: scaled to device
@@ -7885,7 +7886,10 @@ impl View {
 /// Columns size to their widest cell, which is what makes a short table look
 /// deliberate rather than striped; the grid only gets squeezed when it genuinely
 /// will not fit the measure, and then it is squeezed in proportion to how far each
-/// column is above a floor that can still hold a short word. Cell heights are
+/// column is above a floor of its own -- never less than the one a short word
+/// needs, and never less than the widest run of content no break cuts in any of
+/// its cells, because a column narrower than its own word leaves the solver no
+/// break to take and paints the cell's ink on the neighbour. Cell heights are
 /// measured from the wrapped result, never assumed, so a cell that wraps to four
 /// lines grows its row instead of overwriting the row below it.
 fn layout_table(
@@ -7939,7 +7943,10 @@ fn layout_table(
 
     // Pass 1: natural width of each column, measured with no break opportunities.
     let mut widths = vec![0.0f32; cols];
-    let mut measure = |widths: &mut Vec<f32>, cells: &[PreparedCell]| {
+    // And the narrowest each column may be squeezed: the widest run of content no
+    // break splits in any of its cells, padding included.
+    let mut fragments = vec![0.0f32; cols];
+    let mut measure = |widths: &mut Vec<f32>, fragments: &mut Vec<f32>, cells: &[PreparedCell]| {
         for (i, c) in cells.iter().enumerate().take(cols) {
             let (para, _) = typeset(
                 &c.text,
@@ -7968,12 +7975,16 @@ fn layout_table(
                     }
                 }
             }
+            // Squeezed below this the column holds a word no break can cut, which
+            // leaves the solver no break to take at all.
+            let fragment = para.widest_fragment();
             widths[i] = widths[i].max(widest.max(run) + pad * 2.0);
+            fragments[i] = fragments[i].max(fragment + pad * 2.0);
         }
     };
-    measure(&mut widths, &t.head);
+    measure(&mut widths, &mut fragments, &t.head);
     for r in &t.rows {
-        measure(&mut widths, r);
+        measure(&mut widths, &mut fragments, r);
     }
 
     let natural_total: Pt = widths.iter().sum();
@@ -7985,16 +7996,14 @@ fn layout_table(
             // column stays the same; the extra width is a pannable region below.
             left -= (total - column) * 0.5;
         } else {
-            let floor = size * CELL_MIN_EM + pad * 2.0;
-            let excess: Pt = widths.iter().map(|w| (w - floor).max(0.0)).sum();
-            if excess > 0.0 {
-                let take = (total - column).min(excess);
-                for w in widths.iter_mut() {
-                    let e = (*w - floor).max(0.0);
-                    *w -= take * (e / excess);
-                }
-                total = widths.iter().sum();
-            }
+            // A column's floor is its own content's, never less than the one a short
+            // word needs: a squeezed grid is still a grid of whole words.
+            let floors: Vec<Pt> = fragments
+                .iter()
+                .map(|f| (size * CELL_MIN_EM + pad * 2.0).max(*f))
+                .collect();
+            squeeze_grid(&mut widths, &floors, column);
+            total = widths.iter().sum();
         }
     }
 
@@ -8367,6 +8376,28 @@ fn layout_table(
     }
     table_spans.push(TableSpan { y: grid_top, height: y - grid_top, header: header_index });
     y
+}
+
+/// Squeeze a grid's columns into the measure, each giving back its own share of how
+/// far the whole grid is over, in proportion to how far it sits above its floor.
+///
+/// A floor is the narrowest its column may be -- never less than the one a short
+/// word needs, and never less than the widest run of content no break splits in
+/// any of its cells. A column squeezed past that holds a word the solver cannot
+/// cut, and its only remaining answer is a line wider than the column: ink on the
+/// neighbour to the right. The grid answers with whatever width it has left.
+fn squeeze_grid(widths: &mut [Pt], floors: &[Pt], column: Pt) -> Pt {
+    let total: Pt = widths.iter().sum();
+    let excess: Pt = widths.iter().zip(floors).map(|(w, f)| (w - f).max(0.0)).sum();
+    if excess <= 0.0 {
+        return total;
+    }
+    let take = (total - column).min(excess);
+    for (w, f) in widths.iter_mut().zip(floors) {
+        let e = (*w - f).max(0.0);
+        *w -= take * (e / excess);
+    }
+    widths.iter().sum()
 }
 
 /// Intern an inline object's style: the box the line has to make room for, and what
@@ -9765,28 +9796,32 @@ pub fn build_in_chunks(
             // says how far the layout has run, and the notes' own flush below runs
             // out of blocks yet still has the notes to hand over. An empty batch is
             // a message with nothing in it, which is the only one not worth sending.
-            if blocks == 0 && ops.is_empty() {
-                return;
-            }
-            let mut sel = std::mem::take(&mut sel);
-            sel.sort_by(|a, b| {
-                a.y.total_cmp(&b.y).then_with(|| {
-                    a.xs.first().copied().unwrap_or(0.0).total_cmp(&b.xs.first().copied().unwrap_or(0.0))
-                })
-            });
-            if !sink.accept(LayoutChunk {
-                ops: std::mem::take(&mut ops),
-                hots: std::mem::take(&mut hots),
-                sel,
-                wide: std::mem::take(&mut wide),
-                table_headers: std::mem::take(&mut table_headers),
-                table_spans: std::mem::take(&mut table_spans),
-                note_spans: std::mem::take(&mut note_spans),
-                math_texts: std::mem::take(&mut math_texts),
-                y,
-                blocks,
-            }) {
-                return;
+            //
+            // The message is what may be skipped, never the layout's own finish
+            // below it: a reader whose window is still laying out never learns the
+            // height the content reaches, and a document with no notes -- whose last
+            // batch is always empty -- would scroll to nothing and stay unfinished.
+            if blocks != 0 || !ops.is_empty() {
+                let mut sel = std::mem::take(&mut sel);
+                sel.sort_by(|a, b| {
+                    a.y.total_cmp(&b.y).then_with(|| {
+                        a.xs.first().copied().unwrap_or(0.0).total_cmp(&b.xs.first().copied().unwrap_or(0.0))
+                    })
+                });
+                if !sink.accept(LayoutChunk {
+                    ops: std::mem::take(&mut ops),
+                    hots: std::mem::take(&mut hots),
+                    sel,
+                    wide: std::mem::take(&mut wide),
+                    table_headers: std::mem::take(&mut table_headers),
+                    table_spans: std::mem::take(&mut table_spans),
+                    note_spans: std::mem::take(&mut note_spans),
+                    math_texts: std::mem::take(&mut math_texts),
+                    y,
+                    blocks,
+                }) {
+                    return;
+                }
             }
         }};
     }
@@ -11288,6 +11323,105 @@ mod tests {
         // Verify window title localization
         assert!(window_title(None, Language::ZhCn).contains("示例"));
         assert!(window_title(None, Language::EnUs).contains("sample"));
+    }
+
+    /// The one place a grid's columns get narrower than their content is the
+    /// squeeze, so a column's floor is the widest run of content no break cuts in
+    /// it -- the word the column has to hold. Cut past it and the solver has no
+    /// break to take, and the cell's ink lands on the neighbour to the right.
+    #[test]
+    fn a_squeezed_column_is_never_cut_below_the_word_it_holds() {
+        // 300pt of grid into a 240pt measure: 60pt has to come out of somewhere.
+        let mut widths = [120.0, 180.0];
+        // The second column holds a 150pt token in its 166pt of padding, so it can
+        // only give back 14pt; the first column carries the rest.
+        squeeze_grid(&mut widths, &[40.0, 166.0], 240.0);
+        assert!(widths[1] >= 166.0 - 1e-3, "the column lost the word it holds: {}", widths[1]);
+        assert!(widths[0] >= 40.0, "the other column went below its floor");
+        assert!((widths[0] + widths[1] - 240.0).abs() < 1e-3, "the measure was missed");
+
+        // And when the floors alone are wider than the measure, the grid keeps them
+        // and answers with the width it has left: the caller turns that into a
+        // pannable region rather than a grid of half words.
+        let mut widths = [120.0, 180.0];
+        let total = squeeze_grid(&mut widths, &[100.0, 170.0], 60.0);
+        assert_eq!(widths, [100.0, 170.0], "a floor is a floor");
+        assert!((total - 270.0).abs() < 1e-3, "the grid answered with the wrong width: {total}");
+    }
+
+    /// A grid squeezed into a narrow window: every cell's ink has to stay inside its
+    /// own column. The squeeze is where a column would otherwise be cut below the
+    /// word it holds, which leaves the solver no break to take and paints the cell's
+    /// line at its natural width -- across the rule and onto the neighbour.
+    #[test]
+    fn a_squeezed_table_keeps_its_ink_inside_its_own_columns() {
+        let Ok(mut font) = FontEngine::new() else { return };
+        if !font.probe() {
+            return;
+        }
+        // Wider than the measure at 700dip, and with tokens in two columns no break
+        // can cut -- the shape the squeeze exists for.
+        let doc = Document::parse(
+            "# 宽表\n\n| 工具 | 密钥库 | 配置目录 | 格式 | 计量 | 费用 |\n|:--|:--|:--|:--|:--|:--|\n| CodeBuddy IDE (CN) | `secret://tenant.credentials.key.db` | `%APPDATA%/CodeBuddy/CN/State/` | SQLite | `codebuddy-sessions.vscdb` | credits |\n",
+        );
+        let mut math = crate::math::MathStore::new();
+        let mut objects = Objects::new(None, None, &mut math);
+        let page = build_ops(&mut font, &Theme::default(), &doc, 700.0, DPI, &mut objects, None);
+
+        // The grid's own rules: a vertical one is a column boundary, and together
+        // they span the band the cells are painted in.
+        let mut xs: Vec<f32> = Vec::new();
+        let mut top = f32::INFINITY;
+        let mut bottom = f32::NEG_INFINITY;
+        for op in &page.ops {
+            if let Op::Line { x0, y0, x1, y1, .. } = op {
+                if (x0 - x1).abs() > 0.01 || *y1 <= *y0 {
+                    continue;
+                }
+                xs.push(*x0);
+                top = top.min(*y0);
+                bottom = bottom.max(*y1);
+            }
+        }
+        assert!(xs.len() >= 3, "the grid drew no columns: {xs:?}");
+        assert!(page.ops.iter().any(|op| matches!(op, Op::Runs(_))), "nothing was painted");
+
+        for op in &page.ops {
+            let Op::Runs(runs) = op else { continue };
+            let ink = runs.iter().fold(None, |band: Option<(f32, f32)>, r| {
+                let w: f32 = r.advances.iter().sum();
+                let Some((lo, hi)) = band else { return Some((r.x, r.x + w)) };
+                Some((lo.min(r.x), hi.max(r.x + w)))
+            });
+            let Some((lo, hi)) = ink else { continue };
+            if runs[0].baseline < top || runs[0].baseline > bottom {
+                continue;
+            }
+            for x in &xs {
+                assert!(
+                    lo + 1.0 >= *x || hi - 1.0 <= *x,
+                    "a cell's ink crosses the rule at {x}: {lo}..{hi}"
+                );
+            }
+        }
+    }
+
+    /// A layout hands its finish to the window whatever its last batch carried.
+    /// The height the content reaches is what the reader scrolls against and what
+    /// the page breaks are read from, and a document with no notes always ends on
+    /// an empty batch -- so the batch may be dropped, never the finish.
+    #[test]
+    fn a_layout_hands_over_its_finish_even_on_an_empty_last_batch() {
+        let Ok(mut font) = FontEngine::new() else { return };
+        if !font.probe() {
+            return;
+        }
+        let doc = Document::parse("# 一\n\n正文。\n");
+        let mut math = crate::math::MathStore::new();
+        let mut objects = Objects::new(None, None, &mut math);
+        let page = build_ops(&mut font, &Theme::default(), &doc, 700.0, DPI, &mut objects, None);
+        assert!(page.height > 0.0, "the page never said how tall its content is");
+        assert!(page.column > 0.0, "the page never said how wide its measure is");
     }
 }
 #[cfg(test)]

@@ -1025,3 +1025,44 @@ fn split_han_text_also_keeps_every_character() {
     assert_eq!(joined, src, "a split Han paragraph lost or repeated content");
     assert!(plan.lines.len() > 20);
 }
+
+/// The widest unbreakable run of `text`, set at a measure wide enough that
+/// nothing is obliged to break.
+fn fragment(text: &str) -> Pt {
+    fragment_spans(text, &[])
+}
+
+fn fragment_spans(text: &str, spans: &[StyleSpan]) -> Pt {
+    let mut measure = MonospaceMeasure { size: SIZE, factor: 0.5 };
+    let (para, _) =
+        typeset(text, &Spacing::for_size(SIZE), StyleId(0), spans, &BreakOptions::new(4000.0), &mut measure);
+    para.widest_fragment()
+}
+
+#[test]
+fn a_fragment_ends_where_a_break_may_be_taken() {
+    // Eight points a character: "longer" is six of them, "words" five, "a" one.
+    assert_eq!(fragment("a longer word"), 48.0, "the widest word, not the widest line");
+}
+
+#[test]
+fn a_forced_break_ends_a_fragment_too() {
+    // A `<br>` is the author asking for two lines, so the wider piece answers.
+    assert_eq!(fragment("short\nlonger words"), 48.0);
+}
+
+#[test]
+fn a_style_change_inside_a_word_leaves_the_word_whole() {
+    // The bold half of the word is joined to the plain half rather than broken
+    // there: a column as wide as "super" would leave "cali" nowhere to go.
+    let bold = [StyleSpan { range: 5..9, style: StyleId(1) }];
+    assert_eq!(fragment_spans("supercali", &bold), 72.0);
+    assert_eq!(fragment("supercali"), 72.0);
+}
+
+#[test]
+fn a_token_with_no_break_in_it_is_one_fragment() {
+    // What a squeezed table column meets: the whole token is the floor, because
+    // the solver has no cut to take inside it.
+    assert_eq!(fragment("unbreakabletoken"), 128.0);
+}

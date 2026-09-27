@@ -195,6 +195,43 @@ impl Paragraph {
     pub fn node(&self, i: u32) -> &Node {
         &self.nodes[i as usize]
     }
+
+    /// The widest run of content no legal break splits.
+    ///
+    /// A fragment ends where the solver could end a line: at breakable glue, at a
+    /// forced break, and at the paragraph's own end. What a conservative answer
+    /// means here is a *wide* one, so a discretion kept out of the break set --
+    /// a hyphen the solver may use but was never promised -- holds its halves
+    /// together, and a style change mid-word stays one word through the join that
+    /// already says so.
+    ///
+    /// This is the width a column has to hold before its cells can be broken at
+    /// all, which is why it is asked of a table's cells: squeeze a column below
+    /// its own widest fragment and the solver is left with no break to take.
+    pub fn widest_fragment(&self) -> Pt {
+        let mut widest: Pt = 0.0;
+        let mut run: Pt = 0.0;
+        for it in &self.items {
+            match *it {
+                Item::Box { node } => run += self.node(node).advance,
+                // A join holds two nodes of one word together, so its zero width
+                // belongs to the fragment on either side of it.
+                Item::Glue { base, breakable: false, .. } => run += base,
+                // A break the solver may take ends the fragment here.
+                Item::Glue { .. } => {
+                    widest = widest.max(run);
+                    run = 0.0;
+                }
+                // A penalty's own width is ink it draws when the break is taken,
+                // so it belongs to the fragment the break would end.
+                Item::Penalty { width, .. } => {
+                    widest = widest.max(run + width);
+                    run = 0.0;
+                }
+            }
+        }
+        widest.max(run)
+    }
 }
 
 /// Supplies natural advance widths. The production implementation shapes with
