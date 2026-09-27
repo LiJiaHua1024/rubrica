@@ -86,7 +86,7 @@ use windows::Win32::UI::WindowsAndMessaging::{
     CreateWindowExW, DefWindowProcW, DestroyMenu, DispatchMessageW,
     GWLP_USERDATA, GetCaretBlinkTime, GetClientRect, GetCursorPos, GetSystemMetrics, GetWindowLongPtrW, GetMessageW, GetWindowPlacement,
     HCURSOR, HMENU, HWND_TOP, HTCLIENT, HTCAPTION, HTBOTTOM, HTBOTTOMLEFT, HTBOTTOMRIGHT, HTLEFT, HTRIGHT,
-    HTTOP, HTTOPLEFT, HTTOPRIGHT, IDC_ARROW, IDC_HAND, IsIconic, IsZoomed, KillTimer, LoadCursorW, MF_CHECKED,
+    HTTOP, HTTOPLEFT, HTTOPRIGHT, IDC_ARROW, IDC_HAND, IsZoomed, KillTimer, LoadCursorW, MF_CHECKED,
     MF_GRAYED, MF_POPUP, MF_SEPARATOR, MF_STRING, MSG, PostMessageW, PostQuitMessage,
     RegisterClassExW, SetCursor, SetForegroundWindow, SetWindowTextW, SM_CXPADDEDBORDER, SM_CXSIZEFRAME,
     SW_MAXIMIZE, SW_MINIMIZE, SW_SHOWNORMAL, SetTimer,
@@ -1129,6 +1129,27 @@ fn motion_of(key: u32, ctrl: bool) -> Option<Motion> {
     })
 }
 
+/// What a bare `Ctrl` and a digit key mean, or `None` when the press is not one.
+///
+/// Two things this window is not. A chord the reader is holding down is one command:
+/// the repeat the system sends while a key has not come back up is the keyboard saying
+/// it again, not a second request to undo the first, so a held `Ctrl`+`4` would
+/// otherwise flip the page stack on and off under one finger. And `AltGr` on a layout
+/// where it composes a character arrives as `Ctrl` plus `Alt` and nothing else, so a
+/// reader typing `$` on a German keyboard would be turning the page stack on and off
+/// as they type; the `Alt` combinations that really are commands are answered from
+/// `WM_SYSKEYDOWN`, which is where Windows sends them.
+fn plain_chord(ctrl: bool, alt: bool, repeated: bool, key: usize) -> Option<Command> {
+    if !ctrl || alt || repeated {
+        return None;
+    }
+    match key {
+        0x33 => Some(Command::SourceView),
+        0x34 => Some(Command::TogglePageMode),
+        _ => None,
+    }
+}
+
 /// A place in the index that cannot fall off the page.
 fn clamp_caret(sel: &[SelLine], c: Caret) -> Caret {
     if sel.is_empty() {
@@ -1504,6 +1525,15 @@ pub struct View {
     /// tabs after the window is answering for the reader, which is the only order in
     /// which a multi-select open shows its first page instead of a frozen frame.
     extra: Vec<PathBuf>,
+    /// Documents another process handed over, waiting for the same deferred pass. A
+    /// hand-off is a sent message, so the window it arrives at may still be a window
+    /// that has read nothing: opening such a document there would lay out a page over
+    /// a `View` whose layout is not running, and leave the reader with a document
+    /// nothing has drawn.
+    pending_open: Vec<PathBuf>,
+    /// Whether the start-up pass has run. The peek service is asked for once, on that
+    /// pass, and a later hand-off is not a second start-up.
+    watcher_started: bool,
     /// Open documents and their stable tab identities. The window keeps one materialized
     /// document at a time; this is the authority for what can be switched to next.
     workspace: Workspace,
@@ -2601,6 +2631,8 @@ pub fn run(path: Option<PathBuf>, extra: Vec<PathBuf>) -> Result<()> {
         dpi: 96.0,
         path,
         extra,
+        pending_open: Vec::new(),
+        watcher_started: false,
         workspace: Workspace::default(),
         tree: Vec::new(),
         tree_root: None,
@@ -3052,6 +3084,17 @@ unsafe extern "system" fn edit_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM
     if msg == WM_KEYDOWN {
         if let Some(answer) = edit_find_key(hwnd, wp.0 as u32) {
             return answer;
+        }
+    }
+    // A wheel is about the window the pointer is over, but Windows sends it to the
+    // window the *keyboard* is in -- and while a search is open the keyboard is in
+    // here, because the box asked for it. A single-line box has nothing to scroll, so
+    // the page under it would stand still for as long as the search lasts: not the
+    // wheel, not `PageUp`, not a click on the text. Handing the message up is what
+    // "the page still reads while the search is open" is made of.
+    if msg == WM_MOUSEWHEEL {
+        if let Ok(parent) = GetParent(hwnd) {
+            return SendMessageW(parent, WM_MOUSEWHEEL, Some(wp), Some(lp));
         }
     }
     // `TranslateMessage` has already turned the key down above into this character by the
@@ -3561,12 +3604,8 @@ impl View {
                 let step = self.theme.base * self.theme.body_leading.latin;
                 let ctrl = held(VK_CONTROL);
                 let shift = held(VK_SHIFT);
-                if ctrl && wp.0 == 0x33 {
-                    self.apply_command(Command::SourceView, hwnd);
-                    return LRESULT(0);
-                }
-                if ctrl && wp.0 == 0x34 {
-                    self.apply_command(Command::TogglePageMode, hwnd);
+                if let Some(cmd) = plain_chord(ctrl, held(VK_MENU), lp.0 & (1 << 15) != 0, wp.0) {
+                    self.apply_command(cmd, hwnd);
                     return LRESULT(0);
                 }
                 if ctrl && wp.0 == VK_TAB.0 as usize {
@@ -3801,6 +3840,15 @@ impl View {
                 LRESULT(0)
             }
             WM_APP_DEFERRED => {
+                // A window that has read nothing yet has no page to put a document in,
+                // and a layout asked for this early would be a layout of nothing: the
+                // relayout stands down until the start-up document is in. The window is
+                // findable the instant it is created, which is before that, so a
+                // hand-off can land in the gap -- and the start-up pass collects it on
+                // the sender's behalf rather than dropping it.
+                if !self.started {
+                    return LRESULT(0);
+                }
                 // Documents named alongside the first, each opened as its own tab in the
                 // order named -- the walk a reader taking them by hand would take. They
                 // waited for the window to be answering, so the first of them is read
@@ -3809,11 +3857,23 @@ impl View {
                 for path in &extra {
                     self.load_document(path, hwnd);
                 }
+                // And the documents another process handed over, which waited for the same
+                // reason and by the same road: the message that carried them is a *sent*
+                // one, so opening a document inside that handler reads, parses and lays
+                // out with the sender parked outside this window the whole time.
+                let handed = std::mem::take(&mut self.pending_open);
+                for path in &handed {
+                    self.load_document(path, hwnd);
+                }
                 // A peek preference left on is honoured here, at the one moment a reader is
                 // alive to check: the service outlives the reader's windows, and a watcher
-                // the last session started has no reason still to be watching.
-                if crate::settings::peek_enabled() {
-                    crate::peek::ensure_running();
+                // the last session started has no reason still to be watching. A later
+                // hand-off is not a second start-up, so it asks for nothing.
+                if !self.watcher_started {
+                    self.watcher_started = true;
+                    if crate::settings::peek_enabled() {
+                        crate::peek::ensure_running();
+                    }
                 }
                 LRESULT(0)
             }
@@ -3824,15 +3884,22 @@ impl View {
                 // payload is the sender's memory for this call alone, so the paths are
                 // copied out before anything can yield.
                 if let Some(paths) = crate::instance::take_forward(lp) {
-                    for path in &paths {
-                        self.load_document(path, hwnd);
-                    }
+                    // The document is not opened here. `WM_COPYDATA` is a *sent* message:
+                    // the sending thread stays parked outside this window procedure until
+                    // one line below it returns, so reading, parsing and laying out a
+                    // document here parks the sender for as long as the reader is busy --
+                    // and when the sender is a background watcher holding a low-level
+                    // keyboard hook, that silence is long enough for the system to take
+                    // the hook away, and the preview service with it.
+                    self.pending_open.extend(paths);
+                    let _ = unsafe { PostMessageW(Some(hwnd), WM_APP_DEFERRED, WPARAM(0), LPARAM(0)) };
                     // A hand-off is also a summons: the window the reader already had
-                    // comes forward, restored first if it was minimised.
-                    if IsIconic(hwnd).as_bool() {
-                        let _ = ShowWindow(hwnd, SW_RESTORE);
-                    }
-                    let _ = SetForegroundWindow(hwnd);
+                    // comes forward, restored first if it was minimised. Asking for the
+                    // foreground from inside this window is the one place it can be
+                    // asked for honestly -- the reader is the process whose window the
+                    // keyboard is meant to reach, and the request is what a launch from
+                    // a detached service has no right to make on its behalf.
+                    crate::instance::focus(hwnd);
                     LRESULT(1)
                 } else {
                     LRESULT(0)
@@ -5419,6 +5486,18 @@ impl View {
         true
     }
 
+    /// The decoder the figures on this page are drawn through, made once.
+    ///
+    /// The worker that measures a layout builds a decoder of its own, so the two never
+    /// share one, and the ops it posts name figures that only this window can open.
+    /// A start-up goes straight to the worker and never through `relayout`, so this
+    /// cannot be left to the relayout alone.
+    fn ensure_images(&mut self) {
+        if self.images.is_none() {
+            self.images = ImageStore::new().ok();
+        }
+    }
+
     /// Start laying this page out on a worker thread. The batches arrive on the
     /// window thread through [`Self::layout_messages`]; the document as it stands
     /// is replaced by its own first batch, so the window keeps answering the whole
@@ -5429,6 +5508,17 @@ impl View {
         if let Some(job) = self.layout_job.take() {
             job.cancel.store(true, Ordering::Relaxed);
         }
+        // And so does the place that layout was standing the reader at. A pending
+        // anchor names a character in a document that is about to be replaced, and the
+        // layout that would have applied it is the one just cancelled -- so it goes
+        // with it, rather than standing a new document at an offset measured in the old
+        // one's prose. Whoever wants a place in the new page sets it again.
+        self.pending_anchor = None;
+        // The figures on the page are drawn through this window's own decoder, and the
+        // worker builds a separate one for measuring, so the window needs its own
+        // before the first page arrives -- a start-up that never calls `relayout`
+        // would otherwise skip every image in its first document at paint time.
+        self.ensure_images();
         let epoch = LAYOUT_RUN.fetch_add(1, Ordering::Relaxed);
         let (sender, receiver) = std::sync::mpsc::channel();
         let job = LayoutJob {
@@ -5486,7 +5576,28 @@ impl View {
             let Some(message) = self.layout_job.as_ref().map(|job| job.receiver.try_recv()) else {
                 break;
             };
-            let Ok(message) = message else { break };
+            let Ok(message) = message else {
+                // A worker that went without finishing -- no font face it can open, a
+                // panic part way through -- closes the channel and takes the rest of the
+                // page with it. Nothing will ever arrive for the run this window still
+                // has on its books, so the window would go on answering as though a
+                // layout were in flight: the stack never gains a page, the scroll is
+                // never bounded, and every wheel notch and page key lands on a
+                // `page_count` of one. Laying the page out again here is the tidy answer
+                // and the wrong one -- the work that killed the worker would kill this
+                // thread too, and this thread has a window to keep answering. So the run
+                // is closed and the page is paginated from the part that did arrive.
+                self.layout_job = None;
+                self.page_starts = reader_page_starts(
+                    &self.sel_index,
+                    &self.anchor_tops,
+                    self.content_h,
+                    self.stack_page_height(),
+                    scale_of(self.dpi),
+                );
+                self.take_pending_anchor();
+                break;
+            };
             let Some(job) = self.layout_job.as_mut() else { break };
             match message {
                 LayoutMessage::Batch { epoch, chunk } if epoch == job.epoch => {
@@ -5568,9 +5679,7 @@ impl View {
         // The image decoder rides along with the first layout rather than the window's
         // creation: by the time a page is laid out the frame is already up, and a
         // document that never shows a figure still pays only the factory.
-        if self.images.is_none() {
-            self.images = ImageStore::new().ok();
-        }
+        self.ensure_images();
         // A worker takes the layout when there is a lot of it -- many blocks, or a
         // few blocks so large they cost as much as many: a log folded into one
         // paragraph by Markdown is one block and hundreds of kilobytes of work.
@@ -7572,6 +7681,17 @@ impl View {
         self.remember_reading();
         self.reset_chapter_cache();
         self.remember_document();
+        // A place a layout was going to stand the reader at belongs to the document
+        // that layout was reading, and the document below is not it. A hand-off landing
+        // while the start-up layout is still running would otherwise carry that
+        // document's remembered offset over to this one, which lands the reader in
+        // whatever character happens to sit at the same index in different prose.
+        self.pending_anchor = None;
+        // A global choice, read afresh rather than inherited from whatever window
+        // started: this is the one route to a document that a start-up never takes, and
+        // a line-break rule changed in the Settings app since the last launch belongs
+        // to this document as much as to the one after it.
+        self.keep_line_breaks = crate::settings::keep_line_breaks();
         let preferences = path.as_deref().map(crate::settings::document).unwrap_or_default();
         self.line_break_override = preferences.line_breaks;
         self.plain_override = preferences.plain;
@@ -11107,6 +11227,59 @@ mod tests {
         assert!(rows.iter().any(|(cmd, _, checked)| *cmd == Command::PageMode(true) && *checked));
         assert!(rows.iter().any(|(cmd, enabled, _)| *cmd == Command::PreviousPage && !enabled));
         assert!(rows.iter().any(|(cmd, enabled, _)| *cmd == Command::NextPage && *enabled));
+    }
+
+    /// The two `Ctrl` chords, and the three ways a press is not one of them.
+    #[test]
+    fn a_bare_ctrl_and_a_digit_is_the_command_that_digit_names() {
+        assert_eq!(plain_chord(true, false, false, 0x33), Some(Command::SourceView));
+        assert_eq!(plain_chord(true, false, false, 0x34), Some(Command::TogglePageMode));
+        // A digit with no `Ctrl` is a digit, and a key outside the two is nobody's.
+        assert_eq!(plain_chord(false, false, false, 0x34), None);
+        assert_eq!(plain_chord(true, false, false, 0x35), None);
+        // `AltGr` composes a character on a German or Nordic layout and arrives as
+        // `Ctrl` plus `Alt` and nothing else, so `AltGr`+`4` is a reader typing, not a
+        // reader asking for the page stack.
+        assert_eq!(plain_chord(true, true, false, 0x34), None);
+        // A key held down is one command: the system repeating it is the keyboard
+        // saying it again, not a second request to undo the first.
+        assert_eq!(plain_chord(true, false, true, 0x34), None);
+    }
+
+    /// A page stack with no pages in it is a page stack that cannot turn. The reader
+    /// would see a document that looks like it scrolls and does not, with every wheel
+    /// notch and page key landing on a `page_count` of one -- so every way of building
+    /// the list has to leave at least the first page in it, including the way that
+    /// runs on a page whose layout was cut short.
+    #[test]
+    fn a_page_list_always_has_the_first_page_in_it() {
+        let line = |y, h| SelLine {
+            source: None,
+            y,
+            h,
+            join: Join::None,
+            chars: Vec::new(),
+            copies: Vec::new(),
+            xs: Vec::new(),
+            ends: Vec::new(),
+        };
+        let lines: Vec<SelLine> = (0..40).map(|i| line(i as f32 * 20.0, 20.0)).collect();
+        let cases: [(&[SelLine], f32); 4] = [
+            (&[], 0.0),
+            (&[], 900.0),
+            (&lines, 900.0),
+            (&lines, 20.0),
+        ];
+        for (sel, height) in cases {
+            for (page_height, scale) in [(0.0, 1.0), (400.0, 1.0), (f32::NAN, 1.0), (400.0, 0.0)] {
+                let starts = reader_page_starts(sel, &[], height, page_height, scale);
+                assert!(!starts.is_empty(), "{height} at {page_height}/{scale}");
+                assert_eq!(starts[0], 0.0, "{height} at {page_height}/{scale}");
+            }
+        }
+        // And the index it feeds answers for a list with nothing in it, so a reader who
+        // is somehow on one of these is on its first page rather than off the end.
+        assert_eq!(page_index_at(&[], 900.0), 0);
     }
 
     #[test]

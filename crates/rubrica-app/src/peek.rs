@@ -192,6 +192,12 @@ const BAR_PAD: f32 = 14.0;
 
 const TRAY_ID: u32 = 1;
 const POLL_TIMER: usize = 1;
+/// The service's own beat, on the message-only window rather than the preview's, and
+/// armed for as long as the service runs. A hook the system takes away is never
+/// announced, and the state it was maintaining is the only casualty the service can
+/// actually notice, so something has to keep asking.
+const SERVICE_TIMER: usize = 2;
+const SERVICE_TICK_MS: u32 = 1000;
 const MENU_AUTOSTART: usize = 100;
 const MENU_EXIT: usize = 101;
 
@@ -263,6 +269,7 @@ pub fn daemon() -> crate::Result<()> {
     });
     SERVICE.with(|slot| slot.set(Some(&mut *service as *mut Service)));
     unsafe { SetWindowLongPtrW(hwnd, GWLP_USERDATA, &mut *service as *mut Service as isize) };
+    unsafe { let _ = SetTimer(Some(hwnd), SERVICE_TIMER, SERVICE_TICK_MS, None); }
 
     unsafe {
         let mut msg = MSG::default();
@@ -273,7 +280,10 @@ pub fn daemon() -> crate::Result<()> {
     }
 
     SERVICE.with(|slot| slot.set(None));
-    unsafe { SetWindowLongPtrW(hwnd, GWLP_USERDATA, 0) };
+    unsafe {
+        let _ = KillTimer(Some(hwnd), SERVICE_TIMER);
+        SetWindowLongPtrW(hwnd, GWLP_USERDATA, 0);
+    }
     drop(service);
     unsafe {
         if !event_hook.is_invalid() {
@@ -451,6 +461,7 @@ unsafe extern "system" fn service_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPA
             LRESULT(0)
         }
         WM_APP_OPEN => {
+            let mut opened = false;
             if let Some(peek) = service.peek.as_ref() {
                 if let Some(path) = peek.path().map(Path::to_owned) {
                     if wp.0 == 1 {
@@ -458,13 +469,18 @@ unsafe extern "system" fn service_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPA
                         // running, gets the file as if it had been double-clicked;
                         // otherwise this same program opens it itself, whatever the
                         // file type's default program is.
-                        open_in_reader(&path);
+                        opened = open_in_reader(&path);
                     } else {
-                        open_with_default(&path);
+                        opened = open_with_default(&path);
                     }
                 }
             }
-            service.close_preview();
+            // The preview goes when something takes the document off it. When nothing
+            // did, it stays: it is the page the reader was still reading, and losing it
+            // to a failed hand-off is not something anybody asked for.
+            if opened {
+                service.close_preview();
+            }
             LRESULT(0)
         }
         WM_APP_RELOAD => {
@@ -492,6 +508,22 @@ unsafe extern "system" fn service_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPA
                 .is_some_and(|src| unsafe { GetForegroundWindow() } != src);
             if service.shown && moved && focus_close() {
                 service.close_preview();
+            }
+            LRESULT(0)
+        }
+        WM_TIMER if wp.0 == SERVICE_TIMER => {
+            // The one place the service asks the keyboard what it still thinks it is
+            // holding. A release the hook never saw leaves a space believed down, and
+            // from then on every press reads as a repeat from a key nobody is holding --
+            // so the preview answers to nothing at all, for good. The hardware is the
+            // truth here, and it costs one call to ask.
+            //
+            // This is also the only thing that heals a hook the system took away: a
+            // low-level hook stops being called the moment its thread stops answering,
+            // and nothing says so. The flag it was maintaining simply stays put.
+            if service.space_down && !pressed(VK_SPACE) {
+                service.space_down = false;
+                service.hold_started = None;
             }
             LRESULT(0)
         }
@@ -664,6 +696,40 @@ fn pressed(vk: VIRTUAL_KEY) -> bool {
     (unsafe { GetAsyncKeyState(vk.0 as i32) } as u16) & 0x8000 != 0
 }
 
+/// What a preview standing open does with a key.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Answer {
+    /// Not the preview's: the shell keeps the key whole, down and up.
+    Pass,
+    /// The preview's, and the press opens it -- the message, and whether `Ctrl` was
+    /// down with the key that asked.
+    Open { message: u32, ctrl: bool },
+    /// The preview's, and nothing to say: the release of a key it has already taken.
+    Release,
+}
+
+/// The keys a standing preview answers, in the form the hook can act on.
+///
+/// A key the preview takes goes down and comes back up as a pair, the way the space
+/// bar's does. Swallowing only the press leaves whatever was in front holding a
+/// release it never saw a press for, and a release is a keystroke of its own: the
+/// `Enter` of an `Enter` in a rename box is a second `Enter`, and the reader's folder
+/// gets two of them for the one that was meant.
+fn preview_answer(key: VIRTUAL_KEY, down: bool, shift: bool, ctrl: bool) -> Answer {
+    let message = match key {
+        k if k == VK_ESCAPE => WM_APP_ESCAPE,
+        // `Shift`+`Enter` is the folder's own gesture and the preview does not take it.
+        k if k == VK_RETURN && !shift => WM_APP_OPEN,
+        k if k == VK_F5 => WM_APP_RELOAD,
+        _ => return Answer::Pass,
+    };
+    if down {
+        Answer::Open { message, ctrl }
+    } else {
+        Answer::Release
+    }
+}
+
 unsafe extern "system" fn hook_proc(code: i32, wp: WPARAM, lp: LPARAM) -> LRESULT {
     if code < 0 {
         return unsafe { CallNextHookEx(None, code, wp, lp) };
@@ -718,25 +784,20 @@ unsafe extern "system" fn hook_proc(code: i32, wp: WPARAM, lp: LPARAM) -> LRESUL
         return unsafe { CallNextHookEx(None, code, wp, lp) };
     }
 
-    if down && service.shown {
+    if service.shown {
         let key = VIRTUAL_KEY(vk as u16);
-        if key == VK_ESCAPE {
-            let _ = unsafe { PostMessageW(Some(service.window), WM_APP_ESCAPE, WPARAM(0), LPARAM(0)) };
-            return LRESULT(1);
+        match preview_answer(key, down, pressed(VK_SHIFT), pressed(VK_CONTROL)) {
+            Answer::Open { message, ctrl } => {
+                let _ = unsafe {
+                    PostMessageW(Some(service.window), message, WPARAM(ctrl as usize), LPARAM(0))
+                };
+                return LRESULT(1);
+            }
+            Answer::Release => return LRESULT(1),
+            // Arrows and page keys belong to the folder: Explorer moves the selection,
+            // and the preview's timer notices.
+            Answer::Pass => {}
         }
-        if key == VK_RETURN && !pressed(VK_SHIFT) {
-            let ctrl = pressed(VK_CONTROL) as usize;
-            let _ = unsafe {
-                PostMessageW(Some(service.window), WM_APP_OPEN, WPARAM(ctrl), LPARAM(0))
-            };
-            return LRESULT(1);
-        }
-        if key == VK_F5 {
-            let _ = unsafe { PostMessageW(Some(service.window), WM_APP_RELOAD, WPARAM(0), LPARAM(0)) };
-            return LRESULT(1);
-        }
-        // Arrows and page keys belong to the folder: Explorer moves the selection,
-        // and the preview's timer notices.
     }
     if down && !preview_vocabulary(vk) {
         service.invalid_at = Some(Instant::now());
@@ -939,27 +1000,34 @@ fn peekable(path: &Path) -> bool {
     )
 }
 
-fn open_with_default(path: &Path) {
+fn open_with_default(path: &Path) -> bool {
     let wide = utf16(&path.as_os_str().to_string_lossy());
-    unsafe {
-        ShellExecuteW(None, PCWSTR::null(), PCWSTR(wide.as_ptr()), PCWSTR::null(), PCWSTR::null(), SW_SHOWNORMAL);
-    }
+    let started = unsafe {
+        ShellExecuteW(None, PCWSTR::null(), PCWSTR(wide.as_ptr()), PCWSTR::null(), PCWSTR::null(), SW_SHOWNORMAL)
+    };
+    // The shell answers a failed hand-off with a handle it invents rather than the one
+    // it was given, and every value up to the icon it hands back for a real one means
+    // it did not happen at all.
+    started.0 as isize > 32
 }
 
 /// Open the file in the reader: the reader already running first, this very program
 /// started without `--peek` otherwise. Ctrl+Enter means "read it in the reader",
-/// whatever the file type's default program happens to be.
-fn open_in_reader(path: &Path) {
+/// whatever the file type's default program happens to be. `false` says nothing opened,
+/// which is the preview's cue to stay where it is and let the reader ask again.
+fn open_in_reader(path: &Path) -> bool {
     let path = path.to_owned();
-    // This thread owns the global hooks, so waiting is expensive: the reader-window
-    // wait that `forward` performs -- two seconds of polling a reader that may never
-    // come -- would stall every key and click in the system. So ask once, without
-    // waiting, and hand off only to a reader that is actually there.
-    let class = utf16("Rubrica.Main");
-    let there =
-        unsafe { FindWindowW(PCWSTR(class.as_ptr()), PCWSTR::null()) }.is_ok();
-    if there && instance::forward(std::slice::from_ref(&path)) {
-        return;
+    // A reader that is already up takes the file as a tab, and answers in the time it
+    // takes to copy a path out: the window opens the document on its own next pass.
+    // So neither the wait for a window to appear nor the wait for the reader to finish
+    // reading is this thread's -- which matters, because this thread owns the global
+    // hooks, and every millisecond it spends waiting is a millisecond in which a key or
+    // a click anywhere in the system has nobody to answer it.
+    if instance::find_reader_window().is_some() {
+        if let Some(hwnd) = instance::forward(std::slice::from_ref(&path)) {
+            instance::focus(hwnd);
+            return true;
+        }
     }
     // Start this very program the way a double-click starts it: the shell is what
     // a launch of a GUI program goes through, and it is what the window appears
@@ -969,7 +1037,7 @@ fn open_in_reader(path: &Path) {
     let len = unsafe { GetModuleFileNameW(None, &mut exe) } as usize;
     let exe = utf16(&String::from_utf16_lossy(&exe[..len]));
     let args = utf16(&format!("\"{}\"", path.as_os_str().to_string_lossy()));
-    unsafe {
+    let started = unsafe {
         ShellExecuteW(
             None,
             PCWSTR::null(),
@@ -977,8 +1045,32 @@ fn open_in_reader(path: &Path) {
             PCWSTR(args.as_ptr()),
             PCWSTR::null(),
             SW_SHOWNORMAL,
-        );
+        )
+    };
+    if started.0 as isize <= 32 {
+        return false;
     }
+    focus_the_reader();
+    true
+}
+
+/// Name the window the shell is starting, and give it the keyboard, on a thread of its
+/// own.
+///
+/// Windows will not hand the foreground to the process this one started. This service
+/// is detached, it is not the window in front, and the key that asked for the reader
+/// was swallowed by this thread's own hook a moment ago -- so the last input the system
+/// remembers belongs to whatever was in front before, and a launch inherits nothing. The
+/// window therefore comes up behind whatever is there, holding a page no key can reach,
+/// and a reader who presses `Ctrl`+`4` on it is pressing it somewhere else. Naming the
+/// window from a thread of its own costs the hooks nothing: this one has already gone
+/// back to its message loop.
+fn focus_the_reader() {
+    std::thread::spawn(|| {
+        if let Some(hwnd) = instance::reader_window() {
+            instance::focus(hwnd);
+        }
+    });
 }
 
 // ---------------------------------------------------------------- autostart
@@ -1611,5 +1703,55 @@ unsafe extern "system" fn preview_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPA
             LRESULT(0)
         }
         _ => unsafe { DefWindowProcW(hwnd, msg, wp, lp) },
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The three keys a standing preview takes, each of them a whole keystroke rather
+    /// than half of one: a press the preview answers, and a release the shell must not
+    /// see on its own.
+    #[test]
+    fn a_key_a_preview_answers_is_swallowed_down_and_up() {
+        let down = Answer::Open { message: WM_APP_ESCAPE, ctrl: false };
+        assert_eq!(preview_answer(VK_ESCAPE, true, false, false), down);
+        assert_eq!(preview_answer(VK_ESCAPE, false, false, false), Answer::Release);
+        assert_eq!(
+            preview_answer(VK_F5, true, false, false),
+            Answer::Open { message: WM_APP_RELOAD, ctrl: false }
+        );
+        assert_eq!(preview_answer(VK_F5, false, false, false), Answer::Release);
+    }
+
+    /// `Enter` is the one that carries a choice with it, and the one whose half a
+    /// keystroke hurts most: a plain `Enter` reads the document in the reader, the same
+    /// key with `Ctrl`, and `Shift`+`Enter` belongs to the folder.
+    #[test]
+    fn enter_asks_for_the_reader_and_says_which_reader() {
+        assert_eq!(
+            preview_answer(VK_RETURN, true, false, false),
+            Answer::Open { message: WM_APP_OPEN, ctrl: false }
+        );
+        assert_eq!(
+            preview_answer(VK_RETURN, true, false, true),
+            Answer::Open { message: WM_APP_OPEN, ctrl: true }
+        );
+        assert_eq!(preview_answer(VK_RETURN, false, false, true), Answer::Release);
+        // `Shift`+`Enter` is the folder's, so the preview never takes either half of it.
+        assert_eq!(preview_answer(VK_RETURN, true, true, false), Answer::Pass);
+        assert_eq!(preview_answer(VK_RETURN, false, true, false), Answer::Pass);
+    }
+
+    /// Everything the preview does not answer belongs to the window that opened it --
+    /// the arrows that move a selection most of all, since the preview follows the
+    /// selection rather than making it.
+    #[test]
+    fn every_other_key_is_the_folders() {
+        for vk in [VK_LEFT, VK_UP, VK_RIGHT, VK_DOWN, VK_HOME, VK_END, VK_PRIOR, VK_NEXT, VK_TAB] {
+            assert_eq!(preview_answer(vk, true, false, false), Answer::Pass, "{vk:?}");
+            assert_eq!(preview_answer(vk, false, false, false), Answer::Pass, "{vk:?}");
+        }
     }
 }

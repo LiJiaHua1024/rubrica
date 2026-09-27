@@ -195,7 +195,7 @@ fn main() -> Result<()> {
         // Another reader owns this session. Its window gets what was asked for, and this
         // launch becomes nothing; a bare launch is still a summons, an empty list that
         // only brings the window forward.
-        if instance::forward(&paths) {
+        if instance::forward(&paths).is_some() {
             return Ok(());
         }
         // The other reader never opened a window to receive anything, so the launch
