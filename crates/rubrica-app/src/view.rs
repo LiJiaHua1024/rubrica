@@ -7550,7 +7550,7 @@ impl View {
         target.SetTransform(&Matrix3x2::translation(tx, 0.0));
         let up = start * scale_of(self.dpi) - top;
         let content_height = self.page_content_height(index);
-        let bottom = up + content_height;
+        let (band_top, band_bottom) = card_band(top, content_height, up);
         let content_rect = D2D_RECT_F {
             left: layout.left,
             top,
@@ -7560,9 +7560,9 @@ impl View {
         target.SetTransform(&Matrix3x2::identity());
         target.PushAxisAlignedClip(&content_rect, D2D1_ANTIALIAS_MODE_PER_PRIMITIVE);
         target.SetTransform(&Matrix3x2::translation(tx, 0.0));
-        self.draw_document(target, up, up, bottom);
+        self.draw_document(target, up, band_top, band_bottom);
         if with_overlays {
-            self.draw_page_overlays(target, up, up, bottom);
+            self.draw_page_overlays(target, up, band_top, band_bottom);
         }
         target.PopAxisAlignedClip();
         target.SetTransform(&Matrix3x2::identity());
@@ -9090,6 +9090,19 @@ fn page_content_height_for(starts: &[Pt], index: usize, scale: Pt, nominal: Pt) 
         .unwrap_or(nominal)
 }
 
+/// The band of the document a card shows, in the display list's own coordinates.
+///
+/// A card lifts the document by `up` alone -- its transform moves nothing
+/// vertically -- so a client y lands at `y - up`. The window the card clips to runs
+/// from `window_top` to `window_top + window_height` in client space, and those two
+/// numbers are the band's ends in document space. A band that starts at `up` instead
+/// ends a card's height short of the window's floor, and the painter culls at the
+/// band's edge with no grace: every page loses the lines it stands on, and no
+/// neighbouring page draws them either.
+fn card_band(window_top: f32, window_height: f32, up: Pt) -> (Pt, Pt) {
+    (up + window_top, up + window_top + window_height)
+}
+
 #[cfg(feature = "pdf")]
 fn pdf_page_starts(page: &Page, page_height: Pt) -> Vec<Pt> {
     reader_page_starts(&page.sel, &page.anchor_tops, page.height, page_height, 1.0)
@@ -10268,6 +10281,42 @@ mod tests {
         let starts = [0.0, 350.0, 800.0];
         assert_eq!(page_content_height_for(&starts, 0, 1.0, 400.0), 350.0);
         assert_eq!(page_content_height_for(&starts, 1, 1.0, 400.0), 400.0);
+    }
+
+    #[test]
+    fn a_line_a_page_owns_is_inside_the_band_that_page_draws() {
+        // Twenty lines of thirty pixels on a four-hundred pixel page: a page takes
+        // every line that fits and the next one starts where the first line that will
+        // not fit stands, so the last line a page owns ends on the page's own floor.
+        let line = |y: f32| SelLine {
+            source: None,
+            y,
+            h: 30.0,
+            join: Join::None,
+            chars: Vec::new(),
+            copies: Vec::new(),
+            xs: Vec::new(),
+            ends: Vec::new(),
+        };
+        let sel: Vec<SelLine> = (0..20).map(|i| line(i as f32 * 30.0)).collect();
+        let starts = reader_page_starts(&sel, &[], 600.0, 400.0, 1.0);
+        assert_eq!(starts, vec![0.0, 390.0]);
+        let layout = page_stack_layout_for(1200.0, 900.0, 0.0);
+        for (index, start) in starts.iter().copied().enumerate() {
+            let window = page_content_height_for(&starts, index, 1.0, layout.content_height);
+            let (top, bottom) = card_band(layout.top, window, start - layout.top);
+            assert_eq!(top, start, "page {index} does not open on its own first line");
+            for l in sel.iter().filter(|l| page_index_at(&starts, l.y) == index) {
+                // A line's ops are keyed on a baseline inside it, and the painter culls
+                // at the band's edge with nothing to spare.
+                assert!(
+                    l.y + l.h <= bottom,
+                    "page {index} culls a line it owns: the band ends at {bottom}, \
+                     the line at {}",
+                    l.y + l.h
+                );
+            }
+        }
     }
 
     #[test]
