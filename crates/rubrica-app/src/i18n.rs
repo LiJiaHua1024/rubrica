@@ -172,6 +172,8 @@ pub enum Key {
     MenuOpenTabs,
     MenuPinTab,
     MenuCloseTab,
+    MenuCloseOtherTabs,
+    MenuCloseAllTabs,
     MenuRecentDocuments,
 
     MenuSingleNewlines,
@@ -306,6 +308,8 @@ fn translate_en(key: Key) -> &'static str {
         Key::MenuOpenTabs => "Open tabs",
         Key::MenuPinTab => "Pin",
         Key::MenuCloseTab => "Close",
+        Key::MenuCloseOtherTabs => "Close Others",
+        Key::MenuCloseAllTabs => "Close All",
         Key::MenuRecentDocuments => "Recent documents",
 
         Key::MenuSingleNewlines => "Single newlines",
@@ -425,6 +429,8 @@ fn translate_zh_cn(key: Key) -> &'static str {
         Key::MenuOpenTabs => "打开的标签页",
         Key::MenuPinTab => "固定",
         Key::MenuCloseTab => "关闭",
+        Key::MenuCloseOtherTabs => "关闭其他标签页",
+        Key::MenuCloseAllTabs => "关闭全部标签页",
         Key::MenuRecentDocuments => "最近打开的文档",
 
         Key::MenuSingleNewlines => "单换行处理",
@@ -544,6 +550,8 @@ fn translate_zh_tw(key: Key) -> &'static str {
         Key::MenuOpenTabs => "已開啟的標籤頁",
         Key::MenuPinTab => "釘選",
         Key::MenuCloseTab => "關閉",
+        Key::MenuCloseOtherTabs => "關閉其他標籤頁",
+        Key::MenuCloseAllTabs => "關閉全部標籤頁",
         Key::MenuRecentDocuments => "最近開啟的文件",
 
         Key::MenuSingleNewlines => "單換行處理",
@@ -663,6 +671,8 @@ fn translate_ja(key: Key) -> &'static str {
         Key::MenuOpenTabs => "開いているタブ",
         Key::MenuPinTab => "固定",
         Key::MenuCloseTab => "閉じる",
+        Key::MenuCloseOtherTabs => "他のタブを閉じる",
+        Key::MenuCloseAllTabs => "すべてのタブを閉じる",
         Key::MenuRecentDocuments => "最近開いたドキュメント",
 
         Key::MenuSingleNewlines => "単一の改行",
@@ -782,6 +792,8 @@ fn translate_ko(key: Key) -> &'static str {
         Key::MenuOpenTabs => "열린 탭",
         Key::MenuPinTab => "고정",
         Key::MenuCloseTab => "닫기",
+        Key::MenuCloseOtherTabs => "다른 탭 닫기",
+        Key::MenuCloseAllTabs => "모든 탭 닫기",
         Key::MenuRecentDocuments => "최근 문서",
 
         Key::MenuSingleNewlines => "단일 줄 바꿈",
@@ -901,6 +913,8 @@ fn translate_fr(key: Key) -> &'static str {
         Key::MenuOpenTabs => "Onglets ouverts",
         Key::MenuPinTab => "Épingler",
         Key::MenuCloseTab => "Fermer",
+        Key::MenuCloseOtherTabs => "Fermer les autres",
+        Key::MenuCloseAllTabs => "Fermer tout",
         Key::MenuRecentDocuments => "Documents récents",
 
         Key::MenuSingleNewlines => "Retours à la ligne simples",
@@ -1020,6 +1034,8 @@ fn translate_de(key: Key) -> &'static str {
         Key::MenuOpenTabs => "Offene Tabs",
         Key::MenuPinTab => "Anheften",
         Key::MenuCloseTab => "Schließen",
+        Key::MenuCloseOtherTabs => "Andere schließen",
+        Key::MenuCloseAllTabs => "Alle schließen",
         Key::MenuRecentDocuments => "Zuletzt geöffnete Dokumente",
 
         Key::MenuSingleNewlines => "Einfache Zeilenumbrüche",
@@ -1139,6 +1155,8 @@ fn translate_es(key: Key) -> &'static str {
         Key::MenuOpenTabs => "Pestañas abiertas",
         Key::MenuPinTab => "Fijar",
         Key::MenuCloseTab => "Cerrar",
+        Key::MenuCloseOtherTabs => "Cerrar las demás",
+        Key::MenuCloseAllTabs => "Cerrar todo",
         Key::MenuRecentDocuments => "Documentos recientes",
 
         Key::MenuSingleNewlines => "Saltos de línea individuales",
@@ -1258,6 +1276,8 @@ fn translate_ru(key: Key) -> &'static str {
         Key::MenuOpenTabs => "Открытые вкладки",
         Key::MenuPinTab => "Закрепить",
         Key::MenuCloseTab => "Закрыть",
+        Key::MenuCloseOtherTabs => "Закрыть остальные",
+        Key::MenuCloseAllTabs => "Закрыть все",
         Key::MenuRecentDocuments => "Недавние документы",
 
         Key::MenuSingleNewlines => "Одиночные переносы строк",
@@ -1377,6 +1397,8 @@ fn translate_it(key: Key) -> &'static str {
         Key::MenuOpenTabs => "Schede aperte",
         Key::MenuPinTab => "Blocca",
         Key::MenuCloseTab => "Chiudi",
+        Key::MenuCloseOtherTabs => "Chiudi le altre",
+        Key::MenuCloseAllTabs => "Chiudi tutto",
         Key::MenuRecentDocuments => "Documenti recenti",
 
         Key::MenuSingleNewlines => "Interruzioni di riga singole",
@@ -1496,6 +1518,8 @@ fn translate_pt(key: Key) -> &'static str {
         Key::MenuOpenTabs => "Guias abertas",
         Key::MenuPinTab => "Fixar",
         Key::MenuCloseTab => "Fechar",
+        Key::MenuCloseOtherTabs => "Fechar as outras",
+        Key::MenuCloseAllTabs => "Fechar tudo",
         Key::MenuRecentDocuments => "Documentos recentes",
 
         Key::MenuSingleNewlines => "Quebras de linha simples",

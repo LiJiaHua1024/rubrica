@@ -52,7 +52,7 @@ use windows::Win32::Graphics::DirectWrite::{
 use windows::Win32::Graphics::Dwm::{DwmSetWindowAttribute, DWMWA_BORDER_COLOR, DWMWA_USE_IMMERSIVE_DARK_MODE};
 use windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_B8G8R8A8_UNORM;
 use windows::Win32::Graphics::Gdi::{
-    CLIP_DEFAULT_PRECIS, CreateFontW, CreateSolidBrush, DEFAULT_CHARSET, DEFAULT_QUALITY,
+    CLIP_DEFAULT_PRECIS, ClientToScreen, CreateFontW, CreateSolidBrush, DEFAULT_CHARSET, DEFAULT_QUALITY,
     DeleteObject, EnumDisplayMonitors, FillRect, GetMonitorInfoW, HBRUSH, HDC, HFONT, HGDIOBJ, HMONITOR,
     InvalidateRect, MONITORINFO, OUT_DEFAULT_PRECIS, ScreenToClient, SetBkColor, SetTextColor,
     UpdateWindow, ValidateRect,
@@ -124,12 +124,21 @@ const MARGIN_EM: Pt = 2.6;
 /// Height of the fused title bar and document-tab strip, in device-independent pixels.
 ///
 /// The window has no caption of its own (`WM_NCCALCSIZE` gives the frame's room to the
-/// client), so this one strip answers for both: tabs at the left, the window title in
-/// the space between, and the window controls at the right.
+/// client), so this one strip answers for both: tabs at the left, a control for the tabs
+/// that did not fit when there are more of them than room, the window title in the space
+/// between, and the window controls at the right.
 const TOPBAR_H: Pt = 40.0;
 /// The width of one window control -- minimise, maximise, close -- in the strip's
 /// right-hand end. Each is the strip's own height tall, the way the system's are.
 const CAPTION_BTN_W: Pt = 46.0;
+/// The room the three window controls own at the strip's right-hand end. The tabs stop
+/// before it, and that is a promise rather than a courtesy: the controls are asked for
+/// before the pills, so a pill that shared a pixel with one of them would be a pill whose
+/// press the control answered for -- a reader reaching for a file would be quitting.
+const CAPTION_ZONE_W: Pt = 3.0 * CAPTION_BTN_W;
+/// The breath between the last pill and the window controls, so the two read as
+/// neighbours rather than as one run of boxes.
+const TAB_EDGE_GAP: Pt = 8.0;
 /// Tab pill metrics, in device-independent pixels. The pill is centred in the strip,
 /// sized to its label, and spaced a step apart so two adjacent pills read as two.
 const TAB_PILL_H: Pt = 22.0;
@@ -140,6 +149,9 @@ const TAB_MIN_W: Pt = 72.0;
 const TAB_MAX_W: Pt = 220.0;
 /// The right-hand strip of a pill that closes it, once the pointer is on the pill.
 const TAB_CLOSE_W: Pt = 16.0;
+/// The room the overflow button takes from the tabs' band once there are more tabs than
+/// the band can hold: a chevron and a count, and no more.
+const TAB_OVERFLOW_W: Pt = 34.0;
 const TREE_ROW_H: Pt = 24.0;
 const TREE_MIN_W: f32 = 160.0;
 const TREE_MAX_W: f32 = 360.0;
@@ -1476,9 +1488,23 @@ pub struct View {
     /// Measured tab labels, keyed on the tab list that produced them: hit-testing and
     /// painting answer from one geometry, and a repaint never re-shapes a file name.
     tab_labels: Option<TabLabelCache>,
+    /// Labels shaped for the pills the strip had to narrow, kept apart from the labels
+    /// above because what a pill is given changes with the window while what it asks for
+    /// does not: only the names that no longer fit are shaped again, and a window being
+    /// resized never measures a name it is not going to draw.
+    tab_fitted: Option<TabFittedCache>,
     /// The pill the pointer is over. Cleared when USER32 says the pointer has left
     /// the window.
     tab_hot: Option<TabId>,
+    /// Whether the pointer is over the overflow control, which lights like a pill does.
+    /// It is the one place on the strip whose answer is a list of documents rather than
+    /// a document.
+    overflow_hot: bool,
+    /// Whether a press went down on the overflow control and is still being watched. Its
+    /// list is opened on the release: a menu put up mid-press reads the button coming up
+    /// as a selection, and would open onto whichever tab happened to be under the
+    /// pointer.
+    overflow_pressed: bool,
     /// The window control the pointer is over, and the one a button went down on.
     /// A control lights under the pointer and acts on the release, and only where
     /// the release finds the press again: sliding off before letting go is the
@@ -1635,6 +1661,11 @@ pub struct View {
 /// the labels must be measured again.
 type TabLabelCache = (Vec<(TabId, String)>, Vec<TabLabel>);
 
+/// Measured tab labels narrowed to the rooms the strip actually gave them, keyed on those
+/// rooms: the pills whose names have to be shaped again, and only while the strip is too
+/// full to show them as they would like to be shown.
+type TabFittedCache = (Vec<(TabId, u32)>, Vec<TabLabel>);
+
 /// One tab's measured label: the laid-out text, the pill width it asked for, and the
 /// height of its layout box for centring.
 #[derive(Clone)]
@@ -1644,6 +1675,120 @@ struct TabLabel {
     layout: Option<IDWriteTextLayout>,
     width: f32,
     box_h: f32,
+}
+
+/// What the strip shows now that the room it has has been taken into account.
+///
+/// One answer for the painter and the pointer both, and a pure function of the widths
+/// the labels asked for, so what a strip does with a full house can be read in a test
+/// without a window. `band` is the room the tabs may occupy with the window controls
+/// already taken out of it, and nothing here returns a pill that reaches past its right
+/// edge: the controls are asked for before the pills are, so a pill under one of them
+/// would answer to minimise, maximise or close rather than to the file it names.
+///
+/// Where the pills sit and how wide they are is the same whether or not the pointer is
+/// on the strip. Only the room a label is given changes, by the close control the pill
+/// under the pointer makes room for.
+#[derive(Clone, Debug, PartialEq)]
+struct TabLayout {
+    /// Every pill on the strip, in tab order: the tab, its left edge, its width, and the
+    /// room left inside it for its label -- the width less the padding, and less the close
+    /// control while the pointer holds the pill.
+    pills: Vec<(TabId, f32, f32, f32)>,
+    /// Tabs the strip could not show, before its first pill and after its last one.
+    hidden_left: usize,
+    hidden_right: usize,
+    /// Where the overflow control sits and how wide it is, when tabs are hidden and the
+    /// band has the room for it.
+    overflow: Option<(f32, f32)>,
+}
+
+impl TabLayout {
+    /// How many tabs the strip is not showing. One control answers for all of them,
+    /// whichever side of the strip they fell off.
+    fn hidden(&self) -> usize { self.hidden_left + self.hidden_right }
+}
+
+/// Lay the tabs out in `band`, as wide as they ask to be and no wider than the band.
+///
+/// Three answers, in the order a reader would want them: the pills as their labels ask;
+/// failing that, the same pills narrowed together, down to a floor no pill goes below;
+/// and failing that, a run around the tab being read -- the one tab that cannot be spared
+/// -- with the rest behind the overflow control. The run is centred on the active tab and
+/// clamped at both ends of the list, so the strip shows the same pills for a given tab
+/// until the window or the tab list changes.
+///
+/// `hover` is the pill the pointer is on, and it moves nothing: the pill keeps the width
+/// it was given and its neighbours keep their places. All it changes is that one label's
+/// room, which gives up the close control's width -- so a name that fills its pill is cut
+/// where the mark will stand, rather than the mark being drawn over the name.
+fn tab_layout(natural: &[(TabId, f32)], band: (f32, f32), active: usize, hover: Option<TabId>) -> TabLayout {
+    let count = natural.len();
+    let x0 = band.0;
+    let room = (band.1 - band.0).max(0.0);
+    if count == 0 {
+        return TabLayout { pills: Vec::new(), hidden_left: 0, hidden_right: 0, overflow: None };
+    }
+    let gaps = |shown: usize| shown.saturating_sub(1) as f32 * TAB_GAP;
+    let asked: Vec<f32> = natural.iter().map(|(_, width)| *width).collect();
+    // Narrow a run of pills together until it fits the room it is given. What a pill can
+    // give up is what it has above the floor, so a long file name gives more than a short
+    // one rather than both being shaved by the same factor -- which is the difference
+    // between the long name becoming a stub and it staying a name. A run that cannot fit
+    // even at the floor comes back at the floor, and the caller has to show fewer pills.
+    let narrow = |run: &[f32], room: f32| -> Vec<f32> {
+        let budget = room - gaps(run.len());
+        let sum: f32 = run.iter().sum();
+        if sum <= budget { return run.to_vec(); }
+        let floor = run.len() as f32 * TAB_MIN_W;
+        let give: f32 = run.iter().map(|width| (width - TAB_MIN_W).max(0.0)).sum();
+        if give <= 0.0 || budget <= floor { return vec![TAB_MIN_W; run.len()]; }
+        let factor = ((budget - floor) / give).clamp(0.0, 1.0);
+        run.iter().map(|width| TAB_MIN_W + (width - TAB_MIN_W).max(0.0) * factor).collect()
+    };
+    let fits = |widths: &[f32], room: f32| widths.iter().sum::<f32>() + gaps(widths.len()) <= room;
+    let (first, widths, overflow) = if fits(&asked, room) {
+        (0, asked, None)
+    } else {
+        let all = narrow(&asked, room);
+        if fits(&all, room) {
+            (0, all, None)
+        } else {
+            // Room for the pills comes after the overflow control's, since the control is
+            // what the tabs that do not fit are reached through.
+            let button = (room >= TAB_OVERFLOW_W).then_some((x0 + room - TAB_OVERFLOW_W, TAB_OVERFLOW_W));
+            let pill_room = (room - TAB_OVERFLOW_W - TAB_GAP).max(0.0);
+            let here = active.min(count - 1);
+            let widest = (((pill_room + TAB_GAP) / (TAB_MIN_W + TAB_GAP)).floor().max(0.0) as usize).min(count);
+            let mut chosen = (0, vec![TAB_MIN_W; 0]);
+            for capacity in (1..=widest).rev() {
+                let start = here.saturating_sub((capacity - 1) / 2).min(count - capacity);
+                let run = narrow(&asked[start..start + capacity], pill_room);
+                if fits(&run, pill_room) {
+                    chosen = (start, run);
+                    break;
+                }
+            }
+            (chosen.0, chosen.1, button)
+        }
+    };
+    // A pill is the size the layout gave it, and stays that size while the pointer is on
+    // it. The close control lives inside the pill that carries it -- its room comes out of
+    // the label's own, so a name that fills its pill is cut a little sooner rather than
+    // having a mark drawn over it -- and a pill never grows to make room for it. So nothing
+    // on the strip moves under a pointer crossing it, and the strip stays worth aiming at
+    // however full it is.
+    let mut left = x0;
+    let mut pills = Vec::with_capacity(widths.len());
+    for (i, width) in widths.iter().enumerate() {
+        let id = natural[first + i].0;
+        let held = hover == Some(id);
+        let inner = (width - 2.0 * TAB_PAD_X).max(0.0);
+        let label_room = if held { (inner - TAB_CLOSE_W).max(0.0) } else { inner };
+        pills.push((id, left, *width, label_room));
+        left += width + TAB_GAP;
+    }
+    TabLayout { pills, hidden_left: first, hidden_right: count - first - widths.len(), overflow }
 }
 
 /// The window controls at the strip's right-hand end, named for what they do. The
@@ -2045,6 +2190,10 @@ enum Command {
     TreeDirectory(usize),
     ActivateTab(TabId),
     CloseTab(TabId),
+    /// Close every tab but this one.
+    CloseOtherTabs(TabId),
+    /// Close every tab there is, leaving the sample document.
+    CloseAll,
     PinTab(TabId),
     NextTab,
     PreviousTab,
@@ -2650,7 +2799,10 @@ pub fn run(path: Option<PathBuf>, extra: Vec<PathBuf>) -> Result<()> {
         brushes: HashMap::new(),
         tab_format: None,
         tab_labels: None,
+        tab_fitted: None,
         tab_hot: None,
+        overflow_hot: false,
+        overflow_pressed: false,
         cap_hot: None,
         cap_pressed: None,
         zoomed: false,
@@ -3564,8 +3716,15 @@ impl View {
                 let (x, y) = (pt.x as f32, pt.y as f32);
                 if y < TOPBAR_H {
                     // The strip's own controls answer as client ink; the room around
-                    // them is the caption they sit in.
-                    if self.caption_button_at(x, y).is_some() || self.tab_at(x, y).is_some() {
+                    // them is the caption they sit in. A pill is never laid out under
+                    // the window controls, so asking them first costs a tab nothing --
+                    // and the overflow control is a control of the strip's own, so it
+                    // answers as ink too rather than moving the window under a press
+                    // meant for a list.
+                    if self.caption_button_at(x, y).is_some()
+                        || self.tab_overflow_at(x, y)
+                        || self.tab_at(x, y).is_some()
+                    {
                         return LRESULT(HTCLIENT as isize);
                     }
                     return LRESULT(HTCAPTION as isize);
@@ -3865,7 +4024,24 @@ impl View {
                 } else {
                     (((lp.0 & 0xFFFF) as u16) as i16 as i32, (((lp.0 >> 16) as i32) << 16 >> 16))
                 };
-                let _ = SetForegroundWindow(hwnd);
+                // A press on a pill opens what can be done to that tab rather than the
+                // application's own menu: the tabs are what the reader is pointing at,
+                // and closing the one under the pointer is the thing a strip cannot
+                // otherwise be asked for at all. The menu key answers here too, over
+                // whatever pill the pointer is resting on.
+                let mut pt = POINT { x, y };
+                let _ = ScreenToClient(hwnd, &mut pt);
+                if let Some(id) = self.tab_at(pt.x as f32, pt.y as f32) {
+                    self.open_tab_menu(hwnd, id, x, y);
+                    return LRESULT(0);
+                }
+                // The same list the overflow control opens with a left click: it is the
+                // only way to the tabs it stands for, and a right press on it means the
+                // same thing a left one does.
+                if self.tab_overflow_at(pt.x as f32, pt.y as f32) {
+                    self.open_tab_overflow(hwnd, pt.x as f32, pt.y as f32);
+                    return LRESULT(0);
+                }
                 self.popup_menu(x, y, hwnd);
                 LRESULT(0)
             }
@@ -3992,6 +4168,16 @@ impl View {
                         let _ = InvalidateRect(Some(hwnd), None, false);
                         return LRESULT(0);
                     }
+                    // The overflow control waits for its release, like a window control
+                    // and for a reason of its own: the list it opens would otherwise be
+                    // standing when the button came up, and a menu opened mid-press
+                    // reads that as a selection.
+                    if self.tab_overflow_at(x, y) {
+                        self.overflow_pressed = true;
+                        let _ = SetCapture(hwnd);
+                        let _ = InvalidateRect(Some(hwnd), None, false);
+                        return LRESULT(0);
+                    }
                     if let Some(id) = self.tab_close_at(x, y) {
                         self.apply_command(Command::CloseTab(id), hwnd);
                     } else if let Some(id) = self.tab_at(x, y) {
@@ -4075,10 +4261,12 @@ impl View {
                     let _ = GetCursorPos(&mut pt);
                     let _ = ScreenToClient(hwnd, &mut pt);
                     let (px, py) = (pt.x as f32, pt.y as f32);
-                    // The strip's pills are as much a hand as a link is; the window
-                    // controls keep the arrow, the way the system's own do.
+                    // The strip's pills and its overflow control are as much a hand as a
+                    // link is; the window controls keep the arrow, the way the system's
+                    // own do.
                     let over = if py < TOPBAR_H {
-                        self.caption_button_at(px, py).is_none() && self.tab_at(px, py).is_some()
+                        self.caption_button_at(px, py).is_none()
+                            && (self.tab_at(px, py).is_some() || self.tab_overflow_at(px, py))
                     } else {
                         self.page_button_at(px, py).is_some() || self.hot_at(px, py).is_some()
                     };
@@ -4097,6 +4285,7 @@ impl View {
                 // nothing.
                 let hot = self.tab_hot;
                 let btn_hot = self.cap_hot;
+                let over_hot = self.overflow_hot;
                 let page_hot = self.page_hot;
                 // Armed on the first move anywhere, not only on one over the strip:
                 // the page keeps hovers of its own -- the stack's arrows, and the note
@@ -4116,14 +4305,22 @@ impl View {
                 if y < TOPBAR_H {
                     self.cap_hot = self.caption_button_at(x, y);
                     self.tab_hot = if self.cap_hot.is_none() { self.tab_at(x, y) } else { None };
+                    self.overflow_hot = self.cap_hot.is_none()
+                        && self.tab_hot.is_none()
+                        && self.tab_overflow_at(x, y);
                     self.page_hot = None;
                     self.page_pressed = None;
                 } else {
                     self.tab_hot = None;
                     self.cap_hot = None;
+                    self.overflow_hot = false;
                     self.page_hot = self.page_button_at(x, y);
                 }
-                if self.tab_hot != hot || self.cap_hot != btn_hot || self.page_hot != page_hot {
+                if self.tab_hot != hot
+                    || self.cap_hot != btn_hot
+                    || self.overflow_hot != over_hot
+                    || self.page_hot != page_hot
+                {
                     let _ = InvalidateRect(Some(hwnd), None, false);
                 }
                 // Asked after the strip's own hovers, and for the same reason: a
@@ -4163,6 +4360,7 @@ impl View {
                 // and now, and a press read out after that announcement is a press
                 // already taken away. The control answers first, then the capture goes.
                 let button = self.cap_pressed.take();
+                let overflow = std::mem::take(&mut self.overflow_pressed);
                 // Captured on every press, so released on every release: a window that
                 // keeps the capture after a plain click takes the mouse away from the
                 // rest of the desktop, thumb drags being the only case it is meant for.
@@ -4186,6 +4384,17 @@ impl View {
                     // over the control the button went down on.
                     if self.caption_button_at(x, y) == Some(btn) {
                         self.caption_action(btn, hwnd);
+                    }
+                    let _ = InvalidateRect(Some(hwnd), None, false);
+                    return LRESULT(0);
+                }
+                if overflow {
+                    // The list, on the same terms: let go anywhere else and no list was
+                    // asked for at all.
+                    let x = ((lp.0 & 0xFFFF) as i16) as f32;
+                    let y = ((lp.0 >> 16) as i16) as f32;
+                    if self.tab_overflow_at(x, y) {
+                        self.open_tab_overflow(hwnd, x, y);
                     }
                     let _ = InvalidateRect(Some(hwnd), None, false);
                     return LRESULT(0);
@@ -4234,6 +4443,7 @@ impl View {
                 self.tracking_leave = false;
                 let mut gone = self.tab_hot.take().is_some()
                     | self.cap_hot.take().is_some()
+                    | std::mem::take(&mut self.overflow_hot)
                     | self.page_hot.take().is_some();
                 // A note goes with it, and the wait with the note: a pointer that has
                 // left the window is not resting on anything, so a bubble left up
@@ -4249,7 +4459,10 @@ impl View {
                 // The capture a window control pressed was holding can be taken away
                 // -- a menu opening under the button, another window claiming the
                 // mouse -- and a press nobody watched to its end is no act at all.
-                if self.cap_pressed.take().is_some() || self.page_pressed.take().is_some() {
+                if self.cap_pressed.take().is_some()
+                    || std::mem::take(&mut self.overflow_pressed)
+                    || self.page_pressed.take().is_some()
+                {
                     let _ = InvalidateRect(Some(hwnd), None, false);
                 }
                 LRESULT(0)
@@ -4862,28 +5075,75 @@ impl View {
             headings: outline(&self.doc, self.anchor_tops.len()),
             offered: TextFace::ALL.iter().map(|f| face_drawable(&self.font, f)).collect(),
         };
+        self.run_menu(hwnd, &menu_items(&state), x, y);
+    }
+
+    /// Put a small menu of the strip's own up at a screen point, and do what the row it
+    /// came back with says.
+    ///
+    /// The window comes forward first, for the reason the application menu does: a menu
+    /// opened over a window that is not the frontmost one takes the click that was meant
+    /// to dismiss it. The rows are the same rows the application menu is built from, so a
+    /// tab command means one thing wherever it is asked for.
+    fn run_menu(&mut self, hwnd: HWND, rows: &[MenuRow], x: i32, y: i32) {
         let menu = match unsafe { CreatePopupMenu() } {
             Ok(m) => m,
             Err(_) => return,
         };
-        // A row's id is the number it was appended with, taken from one counter shared by
-        // the whole tree of menus, so the number the menu answers with reads back into its
-        // command without a second table to keep in step. Shared rather than per-menu
-        // because a submenu's rows are appended to a different menu, and their positions
-        // would otherwise repeat numbers already in use above them.
-        let mut rows: HashMap<usize, Command> = HashMap::new();
+        let mut table: HashMap<usize, Command> = HashMap::new();
         let mut next = 1usize;
-        append_rows(&menu, &menu_items(&state), &mut next, &mut rows);
-        // The flags argument is a plain `u32` here rather than the flag newtype the other
-        // menu calls take, which is what makes the `.0` necessary.
+        append_rows(&menu, rows, &mut next, &mut table);
+        let _ = unsafe { SetForegroundWindow(hwnd) };
         let picked = unsafe {
             TrackPopupMenuEx(menu, (TPM_RETURNCMD | TPM_RIGHTBUTTON).0, x, y, hwnd, None)
         };
         let _ = unsafe { DestroyMenu(menu) };
-        if let Some(cmd) = rows.remove(&(picked.0.max(0) as usize)) {
+        if let Some(cmd) = table.remove(&(picked.0.max(0) as usize)) {
             self.apply_command(cmd, hwnd);
         }
         let _ = unsafe { PostMessageW(Some(hwnd), WM_NULL, WPARAM(0), LPARAM(0)) };
+    }
+
+    /// What the overflow control lists: every tab the strip could not show, named the way
+    /// a pill names it and marked the way the application menu marks the one being read.
+    /// One row per tab to go to, and under them the two ways to be rid of a houseful at
+    /// once -- the tabs that did not fit are still tabs, and having to visit each in turn
+    /// to close it is the whole cost of a full strip.
+    fn open_tab_overflow(&mut self, hwnd: HWND, x: f32, y: f32) {
+        let layout = self.tab_metrics();
+        if layout.hidden() == 0 { return; }
+        let shown: Vec<TabId> = layout.pills.iter().map(|(id, _, _, _)| *id).collect();
+        let active = self.workspace.tabs.active().id;
+        let mut rows = Vec::new();
+        for tab in self.workspace.tabs.items().iter().filter(|tab| !shown.contains(&tab.id)) {
+            rows.push(row(
+                Command::ActivateTab(tab.id),
+                format!("{} {}", if tab.id == active { "\u{25CF}" } else { "\u{25CB}" }, Self::tab_title(tab)),
+                true,
+            ));
+        }
+        rows.push(MenuRow::Gap);
+        rows.push(row(Command::CloseOtherTabs(active), i18n::t(self.lang, Key::MenuCloseOtherTabs), true));
+        rows.push(row(Command::CloseAll, i18n::t(self.lang, Key::MenuCloseAllTabs), true));
+        let mut pt = POINT { x: x.round() as i32, y: y.round() as i32 };
+        let _ = unsafe { ClientToScreen(hwnd, &mut pt) };
+        self.run_menu(hwnd, &rows, pt.x, pt.y);
+    }
+
+    /// What a right press on a pill opens: this tab, or every tab.
+    ///
+    /// A tab is closed by a control that only appears while the pointer is on the pill,
+    /// which a reader with more tabs than strip has no way to find; this is the same act
+    /// on a pill they can see, and the same act widened to the ones they cannot.
+    fn open_tab_menu(&mut self, hwnd: HWND, id: TabId, x: i32, y: i32) {
+        let count = self.workspace.tabs.items().len();
+        let rows = vec![
+            row(Command::CloseTab(id), format!("{}\tCtrl+W", i18n::t(self.lang, Key::MenuCloseTab)), true),
+            row(Command::CloseOtherTabs(id), i18n::t(self.lang, Key::MenuCloseOtherTabs), count > 1),
+            MenuRow::Gap,
+            row(Command::CloseAll, i18n::t(self.lang, Key::MenuCloseAllTabs), true),
+        ];
+        self.run_menu(hwnd, &rows, x, y);
     }
 
     /// Do one of the things the menu offers, most of which are also keys.
@@ -4979,6 +5239,8 @@ impl View {
                     let _ = unsafe { InvalidateRect(Some(hwnd), None, false) };
                 }
             }
+            Command::CloseOtherTabs(id) => self.close_tabs(Some(id), hwnd),
+            Command::CloseAll => self.close_tabs(None, hwnd),
             Command::PinTab(id) => {
                 if self.workspace.pin(id) {
                     let _ = unsafe { InvalidateRect(Some(hwnd), None, false) };
@@ -7026,15 +7288,17 @@ impl View {
         self.workspace.tabs.items().iter().map(|tab| (tab.id, Self::tab_title(tab))).collect()
     }
 
-    /// The pills' geometry, from one measurement that the painter and the pointer both
-    /// answer to: left-aligned from the strip's left edge, each pill as wide as its
-    /// label asks and no wider than the cap, a step apart.
-    ///
-    /// The pill under the pointer is one close-button wider than its label, which is
-    /// where its `×` then lives: room the label never occupies, instead of an ink drawn
-    /// over the title's last letters. The measurement is a laid-out label kept until the
-    /// tab list changes, so a wheel tick or a hover never shapes a file name twice.
-    fn tab_metrics(&mut self) -> Vec<(TabId, f32, f32)> {
+    /// The room the tabs may occupy, with the window controls and the breath before them
+    /// already taken out. Nothing the strip lays out reaches past the right edge of it:
+    /// a pill that did would be one the controls' own hit test answered for.
+    fn tab_band(&self) -> (f32, f32) {
+        (TAB_FIRST_LEFT, (self.client_w - CAPTION_ZONE_W - TAB_EDGE_GAP).max(TAB_FIRST_LEFT))
+    }
+
+    /// The widths the labels ask to be, from a measurement kept until the tab list
+    /// changes: a wheel tick or a hover never shapes a file name twice. What a name asks
+    /// for is a fact about the name, so a resize leaves this alone entirely.
+    fn tab_widths(&mut self) -> Vec<(TabId, f32)> {
         let titles = self.tab_titles();
         if self.tab_labels.as_ref().is_none_or(|(key, _)| *key != titles) {
             let room = TAB_MAX_W - 2.0 * TAB_PAD_X;
@@ -7049,40 +7313,113 @@ impl View {
                 labels.push(TabLabel { id: *id, title: title.clone(), layout, width, box_h });
             }
             self.tab_labels = Some((titles, labels));
+            // The narrowed labels were shaped for tabs that are gone: a name that comes
+            // back later asks to be shaped again rather than drawn from a stale cut.
+            self.tab_fitted = None;
         }
-        let hot = self.tab_hot;
-        let labels = self.tab_labels.as_ref().map(|(_, l)| l).expect("just built");
-        let mut left = TAB_FIRST_LEFT;
-        labels
+        self.tab_labels.as_ref().expect("just built").1.iter().map(|label| (label.id, label.width)).collect()
+    }
+
+    /// The pills' geometry: one answer from the widths the labels ask for, the room the
+    /// strip has, and the tab being read, which the painter and the pointer both use.
+    fn tab_metrics(&mut self) -> TabLayout {
+        let asked = self.tab_widths();
+        let layout = tab_layout(&asked, self.tab_band(), self.workspace.tabs.active_index(), self.tab_hot);
+        self.fit_labels(&layout);
+        layout
+    }
+
+    /// Shape the labels of the pills the strip had to narrow, and only those: a name being
+    /// shown whole is drawn from the measurement it already has.
+    fn fit_labels(&mut self, layout: &TabLayout) {
+        let Some((_, labels)) = self.tab_labels.as_ref() else { return };
+        let needed: Vec<(TabId, u32)> = layout
+            .pills
             .iter()
-            .map(|label| {
-                let here = left;
-                let width = if hot == Some(label.id) { label.width + TAB_CLOSE_W } else { label.width };
-                left += width + TAB_GAP;
-                (label.id, here, width)
+            .filter_map(|(id, _, _, room)| {
+                let asked = labels.iter().find(|label| label.id == *id)?.width;
+                // A half pixel of slack, so a pill laid out at exactly the room its label
+                // was measured in is not shaped a second time for nothing.
+                (room + 0.5 < asked - 2.0 * TAB_PAD_X).then_some((*id, room.round().max(0.0) as u32))
             })
-            .collect()
+            .collect();
+        if self.tab_fitted.as_ref().is_some_and(|(key, _)| *key == needed) {
+            return;
+        }
+        let mut shaped = Vec::with_capacity(needed.len());
+        for (id, room) in &needed {
+            let title = labels
+                .iter()
+                .find(|label| label.id == *id)
+                .map(|label| label.title.clone())
+                .unwrap_or_default();
+            let (fitted, _, box_h) = self
+                .font
+                .ui_label(&title, "Segoe UI", 12.0, *room as f32)
+                .map(|(layout, width, height)| (Some(layout), width, height))
+                .unwrap_or((None, 0.0, 0.0));
+            shaped.push(TabLabel { id: *id, title, layout: fitted, width: *room as f32, box_h });
+        }
+        self.tab_fitted = Some((needed, shaped));
+    }
+
+    /// The measured label to draw in a pill given `room` inside it: the narrowed one when
+    /// the name did not fit, and the one it asked for when it did. The room is part of the
+    /// question as well as the tab, so a label shaped for a room the pill no longer has is
+    /// never the answer.
+    fn tab_label(&self, id: TabId, room: f32) -> Option<TabLabel> {
+        if let Some((key, labels)) = self.tab_fitted.as_ref() {
+            let fitted = key
+                .iter()
+                .position(|(fitted, was_room)| *fitted == id && (*was_room as f32 - room).abs() < 0.5);
+            if let Some(index) = fitted {
+                return labels.get(index).cloned();
+            }
+        }
+        self.tab_labels
+            .as_ref()
+            .and_then(|(_, labels)| labels.iter().find(|label| label.id == id))
+            .cloned()
     }
 
     fn tab_at(&mut self, x: f32, y: f32) -> Option<TabId> {
         if y >= TOPBAR_H { return None; }
         self.tab_metrics()
+            .pills
             .into_iter()
-            .find(|(_, left, width)| x >= *left && x < *left + *width)
-            .map(|(id, _, _)| id)
+            .find(|(_, left, width, _)| x >= *left && x < *left + *width)
+            .map(|(id, _, _, _)| id)
     }
 
-    /// The close zone of the hovered pill, which is the room its `×` is drawn in: the
-    /// strip the pill grew for the purpose, and nowhere else.
+    /// The close zone of the hovered pill, which is the room its `×` is drawn in: the end
+    /// of the pill, which is the room its label gave up for the mark, and nowhere else.
     fn tab_close_at(&mut self, x: f32, y: f32) -> Option<TabId> {
         if y >= TOPBAR_H { return None; }
         let hot = self.tab_hot?;
         let pill_top = (TOPBAR_H - TAB_PILL_H) * 0.5;
         let pill_band = pill_top..pill_top + TAB_PILL_H;
         self.tab_metrics()
+            .pills
             .into_iter()
-            .find(|(id, left, width)| *id == hot && x >= left + width - TAB_CLOSE_W && x < left + width && pill_band.contains(&y))
-            .map(|(id, _, _)| id)
+            .find(|(id, left, width, _)| *id == hot && x >= left + width - TAB_CLOSE_W && x < left + width && pill_band.contains(&y))
+            .map(|(id, _, _, _)| id)
+    }
+
+    /// The overflow control under the point: the pill that stands for the tabs the strip
+    /// could not show. Only ever where the layout put it, which is inside the band and so
+    /// clear of the window controls.
+    fn tab_overflow_at(&mut self, x: f32, y: f32) -> bool {
+        if !(0.0..TOPBAR_H).contains(&y) { return false; }
+        self.tab_metrics()
+            .overflow
+            .is_some_and(|(left, width)| x >= left && x < left + width)
+    }
+
+    /// The right edge the tabs reach, and whether the overflow control stands at the end
+    /// of them. The two facts the window title's room is measured against.
+    fn tabs_right(&self, layout: &TabLayout) -> (f32, bool) {
+        let right = layout.pills.last().map_or(TAB_FIRST_LEFT, |(_, left, width, _)| left + width);
+        (right, layout.overflow.is_some())
     }
 
     /// The window control under the point, if the point is on one. The three live in
@@ -7170,32 +7507,42 @@ impl View {
             self.tab_format = self.font.text_format("Segoe UI", 12.0).ok();
         }
         let format = self.tab_format.clone();
-        // A strip with no tabs in it still has a title and controls to draw, so the
-        // pills are measured only when there are any to measure.
+        // A strip with no tabs in it still has a title and controls to draw, so the pills
+        // are measured only when there are any to measure.
         let empty = self.workspace.tabs.items().is_empty();
-        let (rects, labels) = if empty {
-            (Vec::new(), Vec::new())
+        let layout = if empty {
+            TabLayout { pills: Vec::new(), hidden_left: 0, hidden_right: 0, overflow: None }
         } else {
-            let rects = self.tab_metrics();
-            let labels = self.tab_labels.as_ref().map(|(_, l)| l).expect("tab_metrics built the labels").clone();
-            (rects, labels)
+            self.tab_metrics()
         };
         let active = (!empty).then(|| self.workspace.tabs.active().id);
-        for ((id, left, width), label) in rects.into_iter().zip(labels.iter()) {
-            let hot = self.tab_hot == Some(id);
-            let pill_top = (TOPBAR_H - TAB_PILL_H) * 0.5;
+        // The labels are taken out of the caches before anything is drawn, so the loop
+        // below borrows nothing from the view that a brush lookup has to share.
+        let shown: Vec<(f32, f32, bool, bool, Option<TabLabel>)> = layout
+            .pills
+            .iter()
+            .map(|(id, left, width, room)| {
+                (*left, *width, self.tab_hot == Some(*id), active == Some(*id), self.tab_label(*id, *room))
+            })
+            .collect();
+        let overflow = layout.overflow.map(|(left, width)| (left, width, layout.hidden()));
+        let pill_top = (TOPBAR_H - TAB_PILL_H) * 0.5;
+        for (left, width, hot, on, label) in shown {
             let pill = D2D1_ROUNDED_RECT {
                 rect: D2D_RECT_F { left, top: pill_top, right: left + width, bottom: pill_top + TAB_PILL_H },
                 radiusX: TAB_PILL_H * 0.5,
                 radiusY: TAB_PILL_H * 0.5,
             };
-            let fill = if active == Some(id) { accent.as_ref() } else if hot { hover.as_ref() } else { pills.as_ref() };
+            let fill = if on { accent.as_ref() } else if hot { hover.as_ref() } else { pills.as_ref() };
             if let Some(brush) = fill {
                 target.FillRoundedRectangle(&pill, brush);
             }
-            let ink = if active == Some(id) { on_accent.clone() } else { muted.clone() };
+            let ink = if on { on_accent.clone() } else { muted.clone() };
+            let Some(label) = label else { continue };
             // The label from the layout the measurement already shaped, so a repaint
-            // neither re-shapes nor re-measures a file name.
+            // neither re-shapes nor re-measures a file name. A pill the strip had to
+            // narrow brings the label shaped for the room it was given instead: a name
+            // that does not fit is cut with an ellipsis, never run under its neighbour.
             if let (Some(layout), Some(brush)) = (label.layout.as_ref(), ink.as_ref()) {
                 target.DrawTextLayout(
                     Vector2::new(left + TAB_PAD_X, pill_top + (TAB_PILL_H - label.box_h) * 0.5),
@@ -7208,7 +7555,7 @@ impl View {
                 let text_rect = D2D_RECT_F {
                     left: left + TAB_PAD_X,
                     top: pill_top,
-                    right: left + width - TAB_PAD_X,
+                    right: left + TAB_PAD_X + label.width,
                     bottom: pill_top + TAB_PILL_H,
                 };
                 target.DrawText(&text, format, &text_rect, brush, D2D1_DRAW_TEXT_OPTIONS_CLIP, DWRITE_MEASURING_MODE_NATURAL);
@@ -7227,20 +7574,73 @@ impl View {
                 }
             }
         }
-        self.draw_title(target, &labels);
+        if let Some((left, width, hidden)) = overflow {
+            self.draw_tab_overflow(target, left, width, hidden, &format);
+        }
+        self.draw_title(target, &layout);
         self.draw_caption_buttons(target);
+    }
+
+    /// The overflow control: how many tabs the strip could not show, and a chevron saying
+    /// that pressing it will list them. The chevron is geometry rather than a font's
+    /// glyph, so it is the same shape at every DPI, the way the window controls beside it
+    /// are. It answers for the tabs hidden on either side at once -- the strip shows a run
+    /// around the tab being read, so what fell off the left is as lost as what fell off
+    /// the right, and both are in the list.
+    unsafe fn draw_tab_overflow(
+        &mut self,
+        target: &ID2D1RenderTarget,
+        left: f32,
+        width: f32,
+        hidden: usize,
+        format: &Option<IDWriteTextFormat>,
+    ) {
+        let hover = self.brushes.get(&ColorRole::TabHover).cloned();
+        let resting = self.brushes.get(&ColorRole::TabInactive).cloned();
+        let muted = self.brushes.get(&ColorRole::Muted).cloned();
+        let pill_top = (TOPBAR_H - TAB_PILL_H) * 0.5;
+        let pill = D2D1_ROUNDED_RECT {
+            rect: D2D_RECT_F { left, top: pill_top, right: left + width, bottom: pill_top + TAB_PILL_H },
+            radiusX: TAB_PILL_H * 0.5,
+            radiusY: TAB_PILL_H * 0.5,
+        };
+        let fill = if self.overflow_hot { hover.as_ref() } else { resting.as_ref() };
+        if let Some(brush) = fill {
+            target.FillRoundedRectangle(&pill, brush);
+        }
+        let Some(ink) = muted else { return };
+        let (cx, cy) = (left + 10.0, TOPBAR_H * 0.5);
+        target.DrawLine(Vector2::new(cx - 4.5, cy - 2.0), Vector2::new(cx, cy + 2.5), &ink, 1.0, None);
+        target.DrawLine(Vector2::new(cx, cy + 2.5), Vector2::new(cx + 4.5, cy - 2.0), &ink, 1.0, None);
+        if let Some(format) = format.as_ref() {
+            // Two digits is what the control has the room for. Past that the number is
+            // not something it can carry, and the list itself is the answer: it names
+            // every tab the strip could not.
+            let text = utf16(&hidden.min(99).to_string());
+            let count = D2D_RECT_F {
+                left: cx + 6.0,
+                top: pill_top,
+                right: left + width - 2.0,
+                bottom: pill_top + TAB_PILL_H,
+            };
+            target.DrawText(&text, format, &count, &ink, D2D1_DRAW_TEXT_OPTIONS_CLIP, DWRITE_MEASURING_MODE_NATURAL);
+        }
     }
 
     /// The window title, centred in the room the tabs leave and the controls spare.
     ///
-    /// The room is measured against the tabs' resting extent -- a pill grown for its
-    /// close button does not shove the title sideways -- and a room too narrow to
-    /// read in stays empty: a title trimmed to three letters is less information
-    /// than none.
-    unsafe fn draw_title(&mut self, target: &ID2D1RenderTarget, labels: &[TabLabel]) {
-        let tabs_right = Self::tabs_resting_right(labels);
+    /// The room is measured against the extent the pills reach -- the pointer moving along
+    /// them cannot change that, since a pill is the width it is whether or not it is being
+    /// pointed at -- and a room too narrow to read in stays empty: a title trimmed to three
+    /// letters is less information than none.
+    unsafe fn draw_title(&mut self, target: &ID2D1RenderTarget, layout: &TabLayout) {
+        let (tabs_right, overflow) = self.tabs_right(layout);
         let band_left = tabs_right + 12.0;
-        let band_right = self.client_w - 3.0 * CAPTION_BTN_W - 12.0;
+        // The controls' own room, less the breath before them, and less the overflow
+        // control when one stands there: the title is a guest in what is left.
+        let band_right = self.tab_band().1
+            - if overflow { TAB_OVERFLOW_W } else { 0.0 }
+            - 12.0;
         if band_right - band_left < 120.0 {
             return;
         }
@@ -7353,17 +7753,6 @@ impl View {
                 }
             }
         }
-    }
-
-    /// The right edge the tabs reach when nothing is hovered: the extent the title's
-    /// room is measured against, so a pill grown for its close button does not move
-    /// the title while the pointer is on it.
-    fn tabs_resting_right(labels: &[TabLabel]) -> f32 {
-        let mut right = TAB_FIRST_LEFT;
-        for label in labels {
-            right += label.width + TAB_GAP;
-        }
-        right - TAB_GAP
     }
 
     fn thumb_hit(&self, x: f32, y: f32) -> bool {
@@ -7574,6 +7963,10 @@ impl View {
             self.workspace.activate(previous);
             self.undo_enter(previous, hwnd);
         }
+        // Which tab is being read is part of where the strip puts the pills -- the run it
+        // shows is the one the active tab is in -- so the strip is redrawn for the same
+        // reason the page was: the tab the reader asked for has to be the one on it.
+        let _ = unsafe { InvalidateRect(Some(hwnd), None, false) };
         loaded
     }
 
@@ -7586,6 +7979,59 @@ impl View {
         let next = (current + delta).rem_euclid(count as isize) as usize;
         let id = self.workspace.tabs.items()[next].id;
         self.switch_to_tab(id, hwnd);
+    }
+
+    /// Close every tab but `keep`, or every tab at all when there is nothing to keep.
+    ///
+    /// A strip can hold more tabs than it can show, and the ones behind the overflow
+    /// control are reached one at a time; this is the same act widened, so a reader with
+    /// thirty files open is not made to close twenty-nine of them singly. The tab that
+    /// survives is entered before the rest go, so the page brought up belongs to a tab
+    /// that is still there when the list changes under it -- and when nothing survives,
+    /// the sample takes the page's place the way it does at the last tab.
+    fn close_tabs(&mut self, keep: Option<TabId>, hwnd: HWND) {
+        let active = self.workspace.tabs.active().id;
+        let doomed: Vec<TabId> = self
+            .workspace
+            .tabs
+            .items()
+            .iter()
+            .map(|tab| tab.id)
+            .filter(|id| Some(*id) != keep)
+            .collect();
+        if doomed.is_empty() {
+            return;
+        }
+        if doomed.contains(&active) {
+            self.remember_reading();
+            match keep {
+                Some(id) => {
+                    if !self.switch_to_tab(id, hwnd) {
+                        return;
+                    }
+                }
+                None => {
+                    let mut discard = TabPage::empty();
+                    self.take_page(&mut discard);
+                    self.set_page(crate::sample::DOCUMENT.to_string(), None, hwnd);
+                    self.after_switch(hwnd);
+                }
+            }
+        }
+        // The pages go with the tabs they were written for: a tab that is closed is not
+        // one to come back to, and a materialized page is the whole of a tab's reading
+        // position.
+        for id in &doomed {
+            self.pages.remove(id);
+        }
+        match keep {
+            Some(id) => {
+                self.workspace.close_others(id);
+            }
+            None => self.workspace.close_all(),
+        }
+        self.update_title(hwnd);
+        let _ = unsafe { InvalidateRect(Some(hwnd), None, false) };
     }
 
     fn close_active_tab(&mut self, hwnd: HWND) {
@@ -12401,6 +12847,143 @@ mod tests {
         let page = build_ops(&mut font, &Theme::default(), &doc, 700.0, DPI, &mut objects, None);
         assert!(page.height > 0.0, "the page never said how tall its content is");
         assert!(page.column > 0.0, "the page never said how wide its measure is");
+    }
+
+    /// A strip of `count` pills, each asking for one of a few widths, so a name long
+    /// enough to be capped and one short enough to be at the floor are both in the mix.
+    fn asked_widths(count: usize) -> Vec<(TabId, f32)> {
+        const ASKED: [f32; 4] = [72.0, 118.0, 196.0, 220.0];
+        (0..count).map(|i| (TabId(i as u64), ASKED[i % ASKED.len()])).collect()
+    }
+
+    /// The window width whose tab band comes to `room`.
+    fn client_w_with_room(room: f32) -> f32 {
+        room + TAB_FIRST_LEFT + CAPTION_ZONE_W + TAB_EDGE_GAP
+    }
+
+    /// The room the tabs may take in a window `client_w` wide.
+    fn band_of(client_w: f32) -> (f32, f32) {
+        (TAB_FIRST_LEFT, client_w - CAPTION_ZONE_W - TAB_EDGE_GAP)
+    }
+
+    #[test]
+    fn no_pill_ever_reaches_the_window_controls() {
+        for client_w in [1600.0, 1000.0, 700.0, 480.0, 300.0, 200.0] {
+            for count in [1, 2, 5, 12, 40] {
+                let asked = asked_widths(count);
+                for hover in [None, Some(asked[0].0), Some(asked[count - 1].0)] {
+                    let layout = tab_layout(&asked, band_of(client_w), count / 2, hover);
+                    let controls = client_w - CAPTION_ZONE_W;
+                    for (id, left, width, _) in &layout.pills {
+                        assert!(
+                            left + width <= controls,
+                            "tab {id:?} runs {} into the window controls at width {client_w} with {count} tabs",
+                            left + width - controls,
+                        );
+                    }
+                    if let Some((left, width)) = layout.overflow {
+                        assert!(left >= TAB_FIRST_LEFT, "the overflow control starts off the strip");
+                        assert!(
+                            left + width <= controls,
+                            "the overflow control runs into the window controls at width {client_w}",
+                        );
+                    }
+                    // Every tab is either on the strip or counted by the control that
+                    // stands for the ones that are not: none is silently lost, and none
+                    // is counted twice.
+                    assert_eq!(layout.pills.len() + layout.hidden(), count);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn the_tab_being_read_is_never_the_one_that_falls_off() {
+        for client_w in [1400.0, 900.0, 600.0, 420.0, 320.0] {
+            for count in [3, 8, 20, 40] {
+                let asked = asked_widths(count);
+                for active in [0, 1, count / 2, count - 2, count - 1] {
+                    let layout = tab_layout(&asked, band_of(client_w), active, None);
+                    // A window too narrow for even one pill shows none, and says so by
+                    // counting every tab as hidden; that is the one case the tab being
+                    // read is not on the strip.
+                    if layout.pills.is_empty() {
+                        assert_eq!(layout.hidden(), count);
+                        continue;
+                    }
+                    let on_strip: Vec<TabId> = layout.pills.iter().map(|(id, _, _, _)| *id).collect();
+                    assert!(
+                        on_strip.contains(&asked[active].0),
+                        "the tab being read fell off the strip at width {client_w} with {count} tabs",
+                    );
+                    // And what is shown is one run around it: the tabs left out are the
+                    // ones before the run and the ones after it, never one in its middle.
+                    assert_eq!(on_strip, asked[layout.hidden_left..][..on_strip.len()].iter().map(|(id, _)| *id).collect::<Vec<_>>());
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn tabs_are_narrowed_before_any_of_them_is_given_up() {
+        // Six names asking for 816 points of strip into 600: not as they asked, but as
+        // they can be narrowed, which is the answer that keeps all six readable.
+        let asked = asked_widths(6);
+        let band = band_of(client_w_with_room(600.0));
+        let layout = tab_layout(&asked, band, 0, None);
+        assert_eq!(layout.hidden(), 0, "a strip with room once narrowed gave tabs up instead");
+        assert_eq!(layout.pills.len(), 6);
+        for (_, _, width, room) in &layout.pills {
+            assert!(*width >= TAB_MIN_W, "a pill was narrowed below the floor");
+            assert!(*room <= width - 2.0 * TAB_PAD_X + 0.5, "a label was given more room than its pill");
+        }
+        assert!(layout.overflow.is_none(), "a control was put up for tabs that all fit");
+        // One point less than the narrowed run needs, and the strip has to lose a tab
+        // rather than shave them below the floor.
+        let tight = tab_layout(&asked, band_of(client_w_with_room(451.0)), 0, None);
+        assert!(tight.hidden() > 0, "the tabs were shaved below the floor rather than counted");
+        for (_, _, width, _) in &tight.pills {
+            assert!(*width >= TAB_MIN_W);
+        }
+    }
+
+    #[test]
+    fn the_close_control_never_moves_a_pill() {
+        // A strip with room to spare and one with none: in both, the pill under the
+        // pointer keeps the width it had, and its neighbours keep their places, because
+        // the control lives inside the pill that carries it rather than beside it.
+        for room in [1000.0, 5.0 * TAB_MIN_W + 4.0 * TAB_GAP] {
+            let asked = asked_widths(5);
+            let band = band_of(client_w_with_room(room));
+            let resting = tab_layout(&asked, band, 0, None);
+            let held = tab_layout(&asked, band, 0, Some(asked[3].0));
+            for (i, (_, left, width, _)) in held.pills.iter().enumerate() {
+                assert_eq!(*left, resting.pills[i].1, "a pill moved when the pointer arrived");
+                assert_eq!(*width, resting.pills[i].2, "a pill changed size when the pointer arrived");
+            }
+            // The pill under the pointer gives up exactly the close control's room, and
+            // no other label gives up anything -- so only a name that fills its pill is
+            // cut to make room for the mark.
+            assert_eq!(resting.pills[3].3 - held.pills[3].3, TAB_CLOSE_W);
+            for i in [0, 1, 2, 4] {
+                assert_eq!(held.pills[i].3, resting.pills[i].3, "a label that is not under the pointer was cut");
+            }
+        }
+    }
+
+    #[test]
+    fn the_overflow_control_stands_a_step_clear_of_the_last_pill() {
+        let client_w = client_w_with_room(700.0);
+        let asked = asked_widths(24);
+        let layout = tab_layout(&asked, band_of(client_w), 12, None);
+        assert!(layout.hidden() > 0);
+        let (left, width) = layout.overflow.expect("tabs were hidden without a control to reach them");
+        let last = layout.pills.last().expect("a strip with hidden tabs shows the run they fell off from");
+        assert!(
+            last.1 + last.2 + TAB_GAP <= left,
+            "the overflow control is not a step clear of the last pill",
+        );
+        assert_eq!(left + width, band_of(client_w).1, "the overflow control is not at the end of the band");
     }
 }
 #[cfg(test)]

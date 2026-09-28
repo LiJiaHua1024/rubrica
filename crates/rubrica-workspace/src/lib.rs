@@ -126,6 +126,24 @@ impl TabSet {
         true
     }
 
+    /// Close every tab but this one. It is the tab the reader named that survives, not
+    /// whichever one happened to be showing: "the others" is said about a tab.
+    pub fn close_others(&mut self, id: TabId) -> bool {
+        if self.find(id).is_none() { return false; }
+        self.items.retain(|tab| tab.id == id);
+        self.active = 0;
+        true
+    }
+
+    /// Close every tab, and leave the sample document where the last of them stood --
+    /// the same end a reader reaches by closing them one at a time.
+    pub fn close_all(&mut self) {
+        self.items.clear();
+        self.items.push(Tab { id: TabId(self.next_id), document: DocumentRef::Sample, kind: TabKind::Pinned });
+        self.next_id += 1;
+        self.active = 0;
+    }
+
     pub fn move_tab(&mut self, id: TabId, to: usize) -> bool {
         let Some(from) = self.find(id) else { return false };
         let to = to.min(self.items.len() - 1);
@@ -181,6 +199,8 @@ impl Workspace {
         self.tabs.replace_document(id, document)
     }
     pub fn close(&mut self, id: TabId) -> bool { self.tabs.close(id) }
+    pub fn close_others(&mut self, id: TabId) -> bool { self.tabs.close_others(id) }
+    pub fn close_all(&mut self) { self.tabs.close_all() }
     pub fn pin(&mut self, id: TabId) -> bool { self.tabs.pin(id) }
     pub fn move_tab(&mut self, id: TabId, to: usize) -> bool { self.tabs.move_tab(id, to) }
     pub fn clear_recent(&mut self) { self.recent.clear(); }
@@ -406,5 +426,38 @@ mod tests {
         assert!(workspace.move_tab(a, 0));
         assert_eq!(workspace.tabs.active().id, a);
         assert!(workspace.tabs.find(b).is_some());
+    }
+
+    #[test]
+    fn closing_the_others_keeps_the_tab_that_was_named() {
+        let mut workspace = Workspace::default();
+        let (a, _) = workspace.open_file(file("a"), TabKind::Pinned);
+        let (b, _) = workspace.open_file(file("b"), TabKind::Pinned);
+        let (c, _) = workspace.open_file(file("c"), TabKind::Pinned);
+        workspace.activate(a);
+        assert!(workspace.close_others(b));
+        assert_eq!(workspace.tabs.items().len(), 1);
+        assert_eq!(workspace.tabs.active().id, b);
+        assert!(workspace.tabs.find(c).is_none());
+    }
+
+    #[test]
+    fn closing_the_others_of_a_tab_that_is_gone_does_nothing() {
+        let mut workspace = Workspace::default();
+        let (a, _) = workspace.open_file(file("a"), TabKind::Pinned);
+        workspace.close(a);
+        assert!(!workspace.close_others(a));
+        assert_eq!(workspace.tabs.items().len(), 1);
+    }
+
+    #[test]
+    fn closing_every_tab_leaves_the_sample_the_way_the_last_close_does() {
+        let mut workspace = Workspace::default();
+        workspace.open_file(file("a"), TabKind::Pinned);
+        workspace.open_file(file("b"), TabKind::Pinned);
+        workspace.close_all();
+        assert_eq!(workspace.tabs.items().len(), 1);
+        assert_eq!(workspace.tabs.active().document, DocumentRef::Sample);
+        assert_eq!(workspace.tabs.active_index(), 0);
     }
 }
