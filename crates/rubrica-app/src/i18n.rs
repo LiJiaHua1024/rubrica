@@ -2155,7 +2155,10 @@ pub fn filter_documents(lang: Language) -> String {
         Language::ItIt => ("Documenti", "Tutti i file"),
         Language::PtBr => ("Documentos", "Todos os arquivos"),
     };
-    format!("{docs}\0*.md;*.markdown;*.txt\0{all}\0*.*\0\0")
+    // `.log` belongs here because `reading::is_plain` opens it as a first-class
+    // document: the tree lists it and neighbour navigation walks it, so a filter
+    // that hides it only makes the reader pretend not to read what it reads.
+    format!("{docs}\0*.md;*.markdown;*.txt;*.log\0{all}\0*.*\0\0")
 }
 
 pub fn filter_applications(lang: Language) -> String {

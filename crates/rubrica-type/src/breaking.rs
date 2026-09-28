@@ -329,12 +329,17 @@ fn score(
     if bad >= 10000 {
         adj = 100_000;
     }
-    if prev_fit < 1 && fit >= 1 {
-        adj += opts.lousy_demerits;
-    } else if prev_fit < 2 && fit >= 2 {
-        adj += opts.awful_demerits;
-    } else if prev_fit >= 2 && fit >= 2 {
-        adj += opts.nasty_demerits;
+    // Fitness classes may not jump the ladder two rungs at a time: TeX charges
+    // `\adjdemerits` for it, graded here by the size of the fall. Two rungs pay
+    // `lousy`; the whole ladder at once pays `awful` and `nasty` together. Holding
+    // a class costs nothing -- two loose lines in a row are not themselves a fault
+    // -- and a one-rung step is free, as in TeX.
+    let jump = fit.abs_diff(prev_fit);
+    if jump > 1 {
+        adj += match jump {
+            2 => opts.lousy_demerits,
+            _ => opts.awful_demerits.saturating_add(opts.nasty_demerits),
+        };
     }
     Some((bad, fit, (f64::from(adj.max(0)) / 100.0).powi(2)))
 }
@@ -371,6 +376,12 @@ fn split_piece(items: &[Item], from: usize, end: usize, limit: usize) -> Vec<(us
                 out.push((start, cut));
                 start = cut + 1;
                 last_cut = None;
+                // With no soft item to cut at, the cut is the hard item itself
+                // and `start` has just passed it: step `i` along too, or the
+                // next round re-reads the same byte and `i - start` wraps.
+                if cut == i {
+                    i += 1;
+                }
                 continue;
             }
             last_cut = Some(i);
@@ -503,7 +514,9 @@ fn solve(
     extra_stretch: Pt,
 ) -> Option<(Vec<Line>, f64)> {
     let first_line = from == 0;
-    let mut edges: Vec<Edge> = vec![Edge { prev: usize::MAX, item: from, start: from, cost: 0.0, fitness: 0, ..Default::default() }];
+    // TeX seeds the "preceding line" as decent, so the first line pays nothing for
+    // merely landing one class off -- it has no neighbour to jump away from.
+    let mut edges: Vec<Edge> = vec![Edge { prev: usize::MAX, item: from, start: from, cost: 0.0, fitness: 1, ..Default::default() }];
     let mut active: Vec<usize> = vec![0];
     let mut at_start = vec![true];
 
@@ -545,7 +558,12 @@ fn solve(
                 Item::Penalty { width, .. } => width,
                 _ => 0.0,
             };
-            let line_target = opts.target(at_start[e]);
+            // The piece's own first line is the paragraph's first line only when the
+            // piece itself is the paragraph's first: a piece that starts at a hard
+            // break or a solver cut continues the paragraph, and continues at the
+            // hanging measure. Scoring it against the first-line measure would pick
+            // breaks for a width the line is neither placed nor checked at.
+            let line_target = opts.target(first_line && at_start[e]);
             let (range, natural, stretch, shrink) = trim(items, sums, ed.start, k, pw);
             if range.is_empty() {
                 next_active.push(e);
@@ -601,7 +619,7 @@ fn solve(
             Item::Penalty { width, .. } => width,
             _ => 0.0,
         };
-        let line_target = opts.target(at_start[prev]);
+        let line_target = opts.target(first_line && at_start[prev]);
         let (range, natural, stretch, shrink) = trim(items, sums, ed.start, k, pw);
         let hang = if natural > line_target {
             hanging_width(para, items, range.clone(), opts.hanging_punctuation)
@@ -667,6 +685,18 @@ fn solve(
             },
             hang: ed.hang,
         });
+    }
+    // The paragraph's last line has to carry ink. A paragraph ending in a hard
+    // break ends in the `\parfillskip` glue alone -- no box follows the break --
+    // and set as-is that glue is a content-free line, a blank at the bottom the
+    // author never asked for. A hard break mid-paragraph keeps its empty line (two
+    // breaks in a row say "leave a gap"); only the final one goes.
+    if end == items.len() - 1 {
+        while lines.last().is_some_and(|l| {
+            !items[l.items.start..l.items.end].iter().any(|i| matches!(i, Item::Box { .. }))
+        }) {
+            lines.pop();
+        }
     }
     Some((lines, total))
 }

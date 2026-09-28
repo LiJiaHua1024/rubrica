@@ -354,7 +354,11 @@ fn tag_attrs(text: &str, from: usize, out: &mut Vec<(Range<usize>, ColorRole)>) 
             if text[end..].trim_start().starts_with('=') {
                 push(out, i..end, ColorRole::Keyword);
             }
-            i = end;
+            // A lead byte starts a word for `is_word_start`, but a non-letter
+            // (a fullwidth mark, an arrow) leaves `word_end` where it began:
+            // step past the character whatever the word said, or this loop
+            // never leaves the byte.
+            i = end.max(i + text[i..].chars().next().map_or(1, |c| c.len_utf8()));
             continue;
         }
         i += text[i..].chars().next().map_or(1, |c| c.len_utf8());
@@ -1030,5 +1034,16 @@ mod tests {
             assert!(super::knows(name), "{name} is not a language this build reads");
         }
         assert_eq!(role_of("pwsh", "'a string'"), Some(ColorRole::String));
+    }
+
+    #[test]
+    fn a_tag_with_a_multibyte_mark_terminates() {
+        // `is_word_start` takes any lead byte, but a fullwidth mark is not a letter,
+        // so `word_end` stood still and the attribute scan spun on the one byte
+        // forever. The scanner now steps past the character whatever the word said;
+        // this call simply returning is the regression it guards.
+        let out = tokens("html", "<a （>中文</a>");
+        let text: String = out.iter().map(|(r, _)| &"<a （>中文</a>"[r.start..r.end]).collect();
+        assert!(text.contains("<a"), "the tag was still read: {text}");
     }
 }

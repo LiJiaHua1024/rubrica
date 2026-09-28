@@ -242,7 +242,12 @@ pub fn names() -> Vec<String> {
 fn read_names() -> Vec<String> {
     let mut names = vec!["Default".into(), "Book".into()];
     for name in settings::text(ROOT, "Names").unwrap_or_default().lines().take(100) {
-        if !name.is_empty() && !names.iter().any(|n: &String| n.eq_ignore_ascii_case(name)) {
+        // Exact matches only. The registry keys beneath `Names` are hex-encoded
+        // bytes, so two presets that differ in case are two real keys with real
+        // data, and `write_profile` and `read_selected` both compare exactly:
+        // folding case here alone is what made one of them vanish from the list
+        // -- and its selection with it -- the next time the reader started.
+        if !name.is_empty() && !names.iter().any(|n| n == name) {
             names.push(name.into());
         }
     }

@@ -96,7 +96,7 @@ use windows::Win32::UI::WindowsAndMessaging::{
     WINEVENT_OUTOFCONTEXT, WNDCLASSEXW, WH_KEYBOARD_LL, WH_MOUSE_LL, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_TOPMOST,
     WS_POPUP, WM_APP, WM_DESTROY, WM_ERASEBKGND, WM_KEYDOWN, WM_LBUTTONDOWN, WM_MBUTTONDOWN,
     WM_MOUSEACTIVATE, WM_MOUSEWHEEL, WM_NCCREATE,
-    WM_PAINT, WM_RBUTTONDOWN, WM_RBUTTONUP, WM_SYSKEYDOWN, WM_TIMER,
+    WM_PAINT, WM_RBUTTONDOWN, WM_RBUTTONUP, WM_SYSKEYDOWN, WM_TIMER, WHEEL_DELTA,
 };
 use windows_numerics::{Matrix3x2, Vector2};
 use crate::theme::{ColorRole, Theme};
@@ -267,6 +267,7 @@ pub fn daemon() -> crate::Result<()> {
         hold_started: None,
         invalid_at: None,
         shown: false,
+        vocabulary_down: None,
         peek: None,
     });
     SERVICE.with(|slot| slot.set(Some(&mut *service as *mut Service)));
@@ -382,6 +383,11 @@ struct Service {
     invalid_at: Option<Instant>,
     /// Mirrored from the preview window so the hook can ask "is it up" in O(1).
     shown: bool,
+    /// The virtual key whose press the hook swallowed for the preview and whose
+    /// release has not come back yet. The release is swallowed wherever the focus
+    /// has moved since: a release the foreground never saw a press for is a
+    /// keystroke of its own.
+    vocabulary_down: Option<u32>,
     peek: Option<Box<Peek>>,
 }
 
@@ -819,8 +825,11 @@ unsafe extern "system" fn hook_proc(code: i32, wp: WPARAM, lp: LPARAM) -> LRESUL
                 return unsafe { CallNextHookEx(None, code, wp, lp) };
             }
             // A press that is not asking for a preview is not this watcher's: the
-            // shell keeps it whole, down and up, and no trace is kept here.
-            if service.shown || unsafe { foreground_reader().is_some() } {
+            // shell keeps it whole, down and up, and no trace is kept here. A
+            // folder is asking for one -- with a preview standing, the press is
+            // its toggle. Anywhere else the space is that application's, and
+            // taking it would drop a character the user meant to type.
+            if unsafe { foreground_reader().is_some() } {
                 service.space_down = true;
                 service.hold_started = Some(Instant::now());
                 let _ = unsafe { PostMessageW(Some(service.window), WM_APP_SPACE, WPARAM(0), LPARAM(0)) };
@@ -842,10 +851,23 @@ unsafe extern "system" fn hook_proc(code: i32, wp: WPARAM, lp: LPARAM) -> LRESUL
         return unsafe { CallNextHookEx(None, code, wp, lp) };
     }
 
-    if service.shown {
+    // The release of a vocabulary key whose press this service swallowed goes
+    // with it, wherever the focus has moved since the press -- the pairing is
+    // what keeps a half keystroke from landing in whatever is in front now.
+    if !down && service.vocabulary_down == Some(vk) {
+        service.vocabulary_down = None;
+        return LRESULT(1);
+    }
+    // The preview's own keys answer only while the foreground is still a place
+    // files are chosen -- the folder the preview came from, or another one.
+    // Anywhere else Enter, F5 and Escape belong to whatever the user is doing:
+    // a preview that outlived its folder's focus must not swallow the Enter of
+    // a form or the F5 of a browser.
+    if service.shown && unsafe { foreground_reader().is_some() } {
         let key = VIRTUAL_KEY(vk as u16);
         match preview_answer(key, down, pressed(VK_SHIFT), pressed(VK_CONTROL)) {
             Answer::Open { message, ctrl } => {
+                service.vocabulary_down = Some(vk);
                 let _ = unsafe {
                     PostMessageW(Some(service.window), message, WPARAM(ctrl as usize), LPARAM(0))
                 };
@@ -1217,6 +1239,10 @@ struct Peek {
     /// foreground is still that window.
     source: Option<HWND>,
     scroll: f32,
+    /// Wheel remainder a high-resolution mouse left behind: deltas that are not a
+    /// whole notch add up here instead of vanishing, which is what made most
+    /// messages of a smooth wheel scroll nothing at all.
+    wheel_carry: i32,
 }
 
 impl Peek {
@@ -1256,6 +1282,7 @@ impl Peek {
                 path: None,
                 source: None,
                 scroll: 0.0,
+                wheel_carry: 0,
             });
             peek.hwnd = CreateWindowExW(
                 WS_EX_TOOLWINDOW | WS_EX_TOPMOST | WS_EX_NOACTIVATE,
@@ -1577,10 +1604,18 @@ impl Peek {
     }
 
     fn paint(&mut self) {
+        // BeginPaint first, whatever there is to draw with: it is what validates the
+        // update region, and a paint that returns without it leaves the region
+        // pending -- Windows re-queues WM_PAINT at once, and a window whose render
+        // target failed to create spins the service thread at full speed, taking
+        // the global keyboard and mouse hooks down with it.
+        let mut ps = PAINTSTRUCT::default();
+        let _ps = unsafe { BeginPaint(self.hwnd, &mut ps) };
+        let Some(target) = self.target.clone() else {
+            let _ = unsafe { EndPaint(self.hwnd, &ps) };
+            return;
+        };
         unsafe {
-            let Some(target) = self.target.clone() else { return };
-            let mut ps = PAINTSTRUCT::default();
-            let _ps = BeginPaint(self.hwnd, &mut ps);
             target.BeginDraw();
             let mut rect = RECT::default();
             let _ = GetClientRect(self.hwnd, &mut rect);
@@ -1669,8 +1704,8 @@ impl Peek {
             target.PopAxisAlignedClip();
             target.SetTransform(&Matrix3x2::identity());
             let _ = target.EndDraw(None, None);
-            let _ = EndPaint(self.hwnd, &ps);
         }
+        let _ = unsafe { EndPaint(self.hwnd, &ps) };
     }
 }
 
@@ -1753,9 +1788,14 @@ unsafe extern "system" fn preview_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPA
         WM_MOUSEWHEEL => {
             // The window never holds the focus, so this arrives only through the
             // system's "scroll under the pointer" courtesy; honour it by scrolling.
+            // The remainder a smooth wheel's sub-notch deltas leave behind is kept
+            // for the next message rather than thrown away.
             let delta = (wp.0 as u32 >> 16) as u16 as i16;
-            let lines = (delta / 120) * 3;
-            peek.scroll -= lines as f32 * peek.theme.base * 1.7;
+            let notch = WHEEL_DELTA as i32;
+            peek.wheel_carry = (peek.wheel_carry + delta as i32).clamp(-notch * 8, notch * 8);
+            let notches = peek.wheel_carry / notch;
+            peek.wheel_carry -= notches * notch;
+            peek.scroll -= (notches * 3) as f32 * peek.theme.base * 1.7;
             unsafe { let _ = InvalidateRect(Some(hwnd), None, false); }
             LRESULT(0)
         }

@@ -271,6 +271,16 @@ pub struct Parser<'a> {
     /// The boundaries an environment's rows were read with, claimed by the builder that
     /// read them. See [`Parser::env_rows`].
     row_rules: Vec<bool>,
+    /// How deep the braces and commands have stacked. A formula is reader-supplied
+    /// text, and `{{{{{...` or `\frac\frac\frac...` built to do exactly one thing
+    /// would otherwise recurse once per brace until the stack is gone; past the cap
+    /// the parser reads groups whole, linearly, instead of descending.
+    depth: usize,
+    /// Consecutive script attachments -- `x^a^b^c...` wraps one Box around
+    /// another per token, and unwinding that chain recurses as deep as it is
+    /// long, in the drop as well as the layout. The counter resets wherever
+    /// something other than a script lands, so only the chain itself is counted.
+    script_chain: usize,
 }
 
 /// The two commands that sit *between* their operands instead of in front of them.
@@ -322,6 +332,12 @@ pub fn parse(src: &str) -> Node {
 }
 
 impl<'a> Parser<'a> {
+    /// Brace and command nesting the parser will actually represent. A formula has
+    /// no business being a hundred levels deep -- TeX's own macros bottom out long
+    /// before -- and past this point the reader loses the arrangement, not the
+    /// mathematics, rather than the process losing the stack.
+    const MAX_DEPTH: usize = 100;
+
     pub fn new(s: &'a str) -> Parser<'a> {
         Parser {
             src: s.as_bytes(),
@@ -332,6 +348,8 @@ impl<'a> Parser<'a> {
             hline: false,
             style: None,
             row_rules: Vec::new(),
+            depth: 0,
+            script_chain: 0,
         }
     }
 
@@ -419,7 +437,17 @@ impl<'a> Parser<'a> {
                 }
                 Some(b'{') => {
                     self.bump();
-                    let inner = Node::Row(self.list(Ctx::Group));
+                    let inner = if self.depth >= Self::MAX_DEPTH {
+                        // Too deep to represent: the group is skipped whole --
+                        // linearly, no recursion -- and its raw text shown, which
+                        // keeps the braces balanced and the parse terminating.
+                        Node::Atom(self.skip_group())
+                    } else {
+                        self.depth += 1;
+                        let inner = Node::Row(self.list(Ctx::Group));
+                        self.depth -= 1;
+                        inner
+                    };
                     self.push(&mut out, inner);
                 }
                 Some(b'\\') => {
@@ -459,6 +487,7 @@ impl<'a> Parser<'a> {
                     // A digit or an operator breaks the run: `x1y` is two identifiers,
                     // because the spacing of the three is not the same.
                     self.welding = ch.is_alphabetic();
+                    self.script_chain = 0;
                     out.push(Node::Atom(text));
                 }
             }
@@ -480,6 +509,7 @@ impl<'a> Parser<'a> {
                 Some(Infix::Brack) => fence('[', ']', stack),
                 _ => stack,
             });
+            self.script_chain = 0;
 
             fn fence(left: char, right: char, body: Node) -> Node {
                 Node::Fence { left, right, body: Box::new(body) }
@@ -491,6 +521,7 @@ impl<'a> Parser<'a> {
             // `\(\displaystyle ... \)` never reaches out of its parentheses.
             let body = std::mem::take(&mut out);
             out.push(Node::Styled { body: Box::new(Node::Row(body)), style: mode });
+            self.script_chain = 0;
         }
         out
     }
@@ -500,6 +531,8 @@ impl<'a> Parser<'a> {
     /// identifier before it, which is what keeps `\pi x` two atoms with an italic `x`
     /// rather than one upright word.
     fn push(&mut self, out: &mut Vec<Node>, n: Node) {
+        // Whatever lands here breaks any run of consecutive script attachments.
+        self.script_chain = 0;
         if matches!(n, Node::Atom(ref s) if s.is_empty()) {
             return;
         }
@@ -511,6 +544,7 @@ impl<'a> Parser<'a> {
     /// whole point: `x^2` is one atom with a script, not a row followed by a script.
     fn attach_script(&mut self, out: &mut Vec<Node>, is_sup: bool, arg: Node) {
         self.welding = false;
+        self.script_chain += 1;
         let prev = out.pop().unwrap_or(Node::Atom(String::new()));
         match (is_sup, prev) {
             (true, Node::BigOp { op, limits, sub, sup: None }) => {
@@ -535,7 +569,24 @@ impl<'a> Parser<'a> {
                 (false, Node::Sup { base, sup }) => {
                     out.push(Node::SubSup { base, sub: Box::new(arg), sup })
                 }
-                (is_sup, base) => out.push(Self::script(is_sup, base, arg)),
+                // A script on the same slot of a script is the double-superscript
+                // TeX refuses to set. Stacking them would grow one Box per `^`
+                // token -- a formula of nothing but `^a^a^a...` would overflow the
+                // stack unwinding the tree it made -- so both scripts stay visible
+                // side by side instead of nesting.
+                (is_sup, base) => {
+                    // TeX nests a second script on a script, and that reading is
+                    // pinned by the tests. But a formula that is nothing but `^`
+                    // tokens would grow one Box per token until unwinding the
+                    // tree it made overflowed the stack -- so past the same cap
+                    // the groups take, the scripts sit side by side instead.
+                    if self.script_chain > Self::MAX_DEPTH {
+                        out.push(base);
+                        out.push(Self::script(is_sup, Node::Atom(String::new()), arg));
+                    } else {
+                        out.push(Self::script(is_sup, base, arg));
+                    }
+                }
             },
         }
     }
@@ -550,7 +601,34 @@ impl<'a> Parser<'a> {
 
     /// One group, or the single character or command that follows.
     fn argument(&mut self) -> Node {
-        match self.peek() {
+        if self.depth >= Self::MAX_DEPTH {
+            // The cap is reached mid-command-chain (`\frac\frac\frac...` recurses
+            // through here without ever entering a group). One argument-shaped
+            // piece of input is consumed so the parse always moves forward, and
+            // the argument itself answers with nothing.
+            match self.peek() {
+                Some(b'{') => {
+                    self.skip_group();
+                }
+                Some(b'\\') => {
+                    self.bump();
+                    while self.peek().is_some_and(|c| c.is_ascii_alphabetic()) {
+                        self.bump();
+                    }
+                }
+                Some(_) => {
+                    let before = self.at;
+                    let _ = self.take_char();
+                    if self.at == before {
+                        self.bump();
+                    }
+                }
+                None => {}
+            }
+            return Node::Atom(String::new());
+        }
+        self.depth += 1;
+        let node = match self.peek() {
             Some(b'{') => {
                 self.bump();
                 Node::Row(self.list(Ctx::Group))
@@ -564,7 +642,38 @@ impl<'a> Parser<'a> {
                 }
             },
             None => Node::Atom(String::new()),
+        };
+        self.depth -= 1;
+        node
+    }
+
+    /// Consume one balanced brace group, without recursing, and return the text
+    /// between its braces. The exit a too-deep group takes instead of the stack:
+    /// scanning braces is linear, and `{`, `}` and `\` are ASCII, so the byte
+    /// range between them is always whole characters.
+    fn skip_group(&mut self) -> String {
+        let start = self.at;
+        let mut open = 1usize; // the `{` the caller already consumed
+        let mut end = self.src.len();
+        while open > 0 {
+            match self.bump() {
+                Some(b'{') => open += 1,
+                Some(b'}') => {
+                    open -= 1;
+                    if open == 0 {
+                        end = self.at - 1;
+                        break;
+                    }
+                }
+                // An escaped brace is the character, not a boundary.
+                Some(b'\\') => {
+                    self.bump();
+                }
+                Some(_) => {}
+                None => break,
+            }
         }
+        String::from_utf8_lossy(&self.src[start..end]).into_owned()
     }
 
     /// The atom a character written in the source becomes.
@@ -738,7 +847,14 @@ impl<'a> Parser<'a> {
             }
             "right" => {
                 let r = self.delim();
-                Node::Atom(r.to_string())
+                // A `.` -- or nothing at all, when the `\right` ends the input --
+                // means "no delimiter here": an empty atom, which `push` drops,
+                // rather than a NUL the shaper would carry to the page as tofu.
+                if r == '\0' {
+                    Node::Atom(String::new())
+                } else {
+                    Node::Atom(r.to_string())
+                }
             }
             // Upright words: read as written, spaces and all, because a formula's
             // `\text{as } x` loses a word when the space is treated as a separator.
@@ -972,6 +1088,10 @@ impl<'a> Parser<'a> {
     /// else -- by setting the cells that were read inline beside the literal marker
     /// text. A reader loses the arrangement, not the mathematics.
     fn environment(&mut self) -> Node {
+        // A `\hline` written *before* a `\begin` belongs to no environment -- TeX
+        // calls it misplaced -- and leaving it pending would let the next one claim
+        // it and draw a rule its author never wrote.
+        self.hline = false;
         let Some(name) = self.braced_text() else {
             // `\begin` with nothing after it: the word itself, and no more eaten.
             return Node::Atom("\\begin".into());
@@ -1189,29 +1309,56 @@ impl<'a> Parser<'a> {
                 self.bump();
                 self.command_delim()
             }
-            Some(_) => self.bump().unwrap() as char,
+            // A whole character, not one byte: `\left（` would otherwise land the
+            // cursor inside the three-byte glyph and drop the rest of the formula
+            // when the next read fails to decode from mid-character.
+            Some(_) => match self.take_char() {
+                Some(c) => c,
+                None => {
+                    self.bump();
+                    '\0'
+                }
+            },
             None => '\0',
         }
     }
 
     fn command_delim(&mut self) -> char {
-        let start = self.at;
-        while self.peek().is_some_and(|c| c.is_ascii_alphabetic()) {
-            self.bump();
-        }
-        match &self.src[start..self.at] {
-            b"langle" => '\u{27e8}',
-            b"rangle" => '\u{27e9}',
-            b"lbrace" => '{',
-            b"rbrace" => '}',
-            b"lbrack" => '[',
-            b"rbrack" => ']',
-            b"vert" | b"lvert" | b"rvert" | b"mid" => '|',
-            b"Vert" | b"lVert" | b"rVert" => '\u{2016}',
-            // `\|` is the shorthand for `\Vert`, and the escaped bar is how a norm
-            // reaches the page -- a delimiter nothing else would draw.
-            b"|" => '\u{2016}',
-            _ => '\0',
+        // `\{`, `\}` and `\|` are the shorthand spellings of `lbrace`, `rbrace` and
+        // `Vert`. They are single escaped characters, not words -- the word scanner
+        // below collects only letters, so without these arms the escaped byte is
+        // left unconsumed: `\\left\\{x\\right\\}` would lose both delimiters and read
+        // the `{` as the start of a group the `\right` never closes.
+        match self.peek() {
+            Some(b'{') => {
+                self.bump();
+                '{'
+            }
+            Some(b'}') => {
+                self.bump();
+                '}'
+            }
+            Some(b'|') => {
+                self.bump();
+                '\u{2016}'
+            }
+            _ => {
+                let start = self.at;
+                while self.peek().is_some_and(|c| c.is_ascii_alphabetic()) {
+                    self.bump();
+                }
+                match &self.src[start..self.at] {
+                    b"langle" => '\u{27e8}',
+                    b"rangle" => '\u{27e9}',
+                    b"lbrace" => '{',
+                    b"rbrace" => '}',
+                    b"lbrack" => '[',
+                    b"rbrack" => ']',
+                    b"vert" | b"lvert" | b"rvert" | b"mid" => '|',
+                    b"Vert" | b"lVert" | b"rVert" => '\u{2016}',
+                    _ => '\0',
+                }
+            }
         }
     }
 }
@@ -2236,5 +2383,61 @@ mod tests {
         assert_eq!(of("\u{3C0}+1"), "(\u{3C0} + 1)");
         assert_eq!(of("\u{3C0}\u{3C1}"), "\u{3C0}\u{3C1}", "letters still run together");
         assert_eq!(of("\\text{\u{4E2D}\u{6587}}"), "\u{4E2D}\u{6587}");
+    }
+
+    #[test]
+    fn the_shorthand_delimiters_reach_the_fence() {
+        // `\\{` and `\\}` are single escaped characters, not words, and the word
+        // scanner only ever collected letters: both spellings came back as no
+        // delimiter at all, and the `{` the reader wrote opened a group instead.
+        assert_eq!(of("\\left\\{x\\right\\}"), "(fence {} x)");
+        // And the spelled-out names still read the same, as they always did.
+        assert_eq!(of("\\left\\lbrace x\\right\\rbrace"), "(fence {} x)");
+        // `\\big\\|` keeps its doubled bar instead of eating it as an empty name.
+        match parse("\\big\\|x\\big\\|") {
+            Node::Row(v) => assert!(
+                v.iter().any(|n| matches!(n, Node::Big { delim: '\u{2016}', .. })),
+                "{v:?}",
+            ),
+            other => panic!("not a row: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_multibyte_delimiter_is_one_character_and_drops_nothing() {
+        // One byte of the three-byte fullwidth paren left the cursor inside the
+        // glyph, where the next read failed to decode and the rest of the formula
+        // was silently dropped.
+        assert_eq!(of("\\left\u{FF08}x+1\\right\u{FF09}"), "(fence \u{FF08}\u{FF09} (x + 1))");
+    }
+
+    #[test]
+    fn a_delimiterless_right_is_nothing_rather_than_a_nul() {
+        // `\\right.` means "no delimiter here"; read as a character it was the
+        // one-character string U+0000, measured, shaped and drawn.
+        assert_eq!(of("x\\right."), "x");
+        match parse("\\left x\\right.") {
+            Node::Row(v) => match &v[..] {
+                [Node::Fence { left: 'x', right: '\0', .. }] => {}
+                other => panic!("the dot is no delimiter, and the left one is kept: {other:?}"),
+            },
+            other => panic!("not a row: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn an_hline_before_an_environment_belongs_to_no_environment() {
+        // TeX calls it misplaced; leaving it pending let the next environment
+        // claim it and draw a rule its author never wrote.
+        let node = parse("\\hline x \\begin{matrix}a\\end{matrix}");
+        let Node::Row(v) = &node else { panic!("not a row: {node:?}") };
+        let rules = v
+            .iter()
+            .find_map(|n| match n {
+                Node::Array { rules, .. } => Some(rules.clone()),
+                _ => None,
+            })
+            .expect("the environment is still a grid");
+        assert_eq!(rules, vec![false, false], "no rule was claimed from before the begin");
     }
 }

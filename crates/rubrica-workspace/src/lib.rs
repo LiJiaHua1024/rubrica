@@ -113,8 +113,14 @@ impl TabSet {
             self.items.push(Tab { id: TabId(self.next_id), document: DocumentRef::Sample, kind: TabKind::Pinned });
             self.next_id += 1;
             self.active = 0;
-        } else if self.active >= index {
-            self.active = (index).min(self.items.len() - 1);
+        } else if self.active == index {
+            // The active tab itself closed: its right neighbour takes over, and at
+            // the right edge the selection falls back to the last tab left.
+            self.active = index.min(self.items.len() - 1);
+        } else if self.active > index {
+            // A tab left of the active one closed: the active tab itself slid one
+            // place down, and keeps the selection rather than handing it away.
+            self.active -= 1;
         }
         true
     }
@@ -459,5 +465,26 @@ mod tests {
         assert_eq!(workspace.tabs.items().len(), 1);
         assert_eq!(workspace.tabs.active().document, DocumentRef::Sample);
         assert_eq!(workspace.tabs.active_index(), 0);
+    }
+
+    #[test]
+    fn closing_a_tab_left_of_the_active_one_keeps_the_active_tab() {
+        // The tab that closed slid the active one down an index; the selection
+        // belongs to the tab the reader was reading, not to whatever now sits
+        // where the closed one was.
+        let mut workspace = Workspace::default();
+        let (a, _) = workspace.open_file(file("a"), TabKind::Pinned);
+        let (_b, _) = workspace.open_file(file("b"), TabKind::Pinned);
+        let (c, _) = workspace.open_file(file("c"), TabKind::Pinned);
+        workspace.activate(c);
+        workspace.close(a);
+        assert_eq!(workspace.tabs.active().id, c);
+        workspace.close(_b);
+        assert_eq!(workspace.tabs.active().id, c);
+        // The active-tab case still prefers the right neighbour, then falls back.
+        let (d, _) = workspace.open_file(file("d"), TabKind::Pinned);
+        workspace.activate(d);
+        workspace.close(d);
+        assert_eq!(workspace.tabs.active().id, c);
     }
 }

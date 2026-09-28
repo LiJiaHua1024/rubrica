@@ -314,6 +314,14 @@ impl MathMeasure for Adapter<'_> {
 
     fn percent(&mut self, index: usize, fallback: Pt) -> Pt {
         match self.table() {
+            // MathLeading is one of the table's *length* records -- design units
+            // over the em -- not a percentage. Reading it through the percent
+            // channel would divide it by 100 and set every stacked row's gap at
+            // tens of em on any face that ships a nonzero value. The script sizes
+            // really are percentages, and keep the division.
+            Some(t) if index == rubrica_math::table::constant::MATH_LEADING => {
+                t.constant(index) as f32 / t.units_per_em.max(1) as f32
+            }
             Some(t) => t.constant(index) as f32 / 100.0,
             None => fallback,
         }

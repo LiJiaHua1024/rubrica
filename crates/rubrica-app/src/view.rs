@@ -3953,7 +3953,10 @@ impl View {
                 let step = self.theme.base * self.theme.body_leading.latin;
                 let ctrl = held(VK_CONTROL);
                 let shift = held(VK_SHIFT);
-                if let Some(cmd) = plain_chord(ctrl, held(VK_MENU), lp.0 & (1 << 15) != 0, wp.0) {
+                // Bit 30 is the previous-key-state flag, the one that says a held key
+                // is auto-repeating. Bit 15 is the top of the repeat count, set only
+                // past 32768 repeats, so reading it never once saw a repeat.
+                if let Some(cmd) = plain_chord(ctrl, held(VK_MENU), lp.0 & (1 << 30) != 0, wp.0) {
                     self.apply_command(cmd, hwnd);
                     return LRESULT(0);
                 }
@@ -4365,6 +4368,14 @@ impl View {
                     self.selection = if msg == WM_LBUTTONDBLCLK {
                         let w = word_at(&self.sel_index, c);
                         (w.from != w.to).then_some(w)
+                    } else if held(VK_SHIFT) {
+                        // Shift+click extends the selection from the end the caret is
+                        // not on, the way the arrow chords do; a plain click collapses
+                        // to the point clicked.
+                        Some(self.selection.map_or(Selection { from: c, to: c }, |s| {
+                            let anchor = if self.caret.is_some_and(|at| at == s.to) { s.from } else { s.to };
+                            Selection { from: anchor, to: c }
+                        }))
                     } else {
                         None
                     };
@@ -4788,8 +4799,28 @@ impl View {
     /// A bubble is read rather than clicked, so nothing inside it acts -- but the
     /// pointer has to be able to travel onto it without the note closing under it.
     fn on_note_bubble(&self, x: f32, y: f32) -> bool {
-        self.note_bubble_rect()
-            .is_some_and(|(bx, by, bw, bh)| x >= bx && x <= bx + bw && y >= by && y <= by + bh)
+        let Some((bx, by, bw, bh)) = self.note_bubble_rect() else { return false };
+        if x >= bx && x <= bx + bw && y >= by && y <= by + bh {
+            return true;
+        }
+        // The strip between the citation and its bubble is neither one, and a
+        // pointer crossing it is on its way from the mark to the note it opened.
+        // Counted as held, or every trip onto the note dies in the eight-pixel
+        // gap between the two.
+        let Some((ax, ay, aw, ah)) = self.note_bubble_anchor() else { return false };
+        let x0 = bx.min(ax);
+        let x1 = (bx + bw).max(ax + aw);
+        let (y0, y1) = if ay <= by { (ay + ah, by) } else { (by + bh, ay) };
+        x >= x0 && x <= x1 && y >= y0 && y <= y1
+    }
+
+    /// Where the citation that opened the standing note sits, in window pixels --
+    /// the same rectangle [`Self::note_bubble_rect`] places its bubble against.
+    fn note_bubble_anchor(&self) -> Option<(f32, f32, f32, f32)> {
+        let bubble = self.note_bubble.as_ref()?;
+        let hot = self.hotspots.iter().find(|h| matches!(&h.kind, HotKind::Cite(i) if *i == bubble.note))?;
+        let (ax, ay) = self.client_point(hot.x, hot.y)?;
+        Some((ax, ay, hot.w, hot.h))
     }
 
     /// The target under a pointer position, given in device independent pixels from the
@@ -4864,7 +4895,10 @@ impl View {
         let _ = unsafe { KillTimer(Some(hwnd), NOTE_TIMER) };
         let now = now_ms();
         let Some(hover) = self.note_hover.filter(|h| hover_due(h, now)) else { return };
-        self.note_hover = None;
+        // The hover is kept rather than cleared: it is what lets the pointer step
+        // off the citation onto the bubble -- `hover_step` holds a place the hand
+        // has not left. Clearing it here made the very move the bubble invites,
+        // the one from mark onto note, close what it opened.
         // A note already read is not read again: a reader who has come back to the
         // mark they were on finds the note they were reading still there.
         if self.note_bubble.as_ref().is_none_or(|b| b.note != hover.note) {
@@ -5844,6 +5878,19 @@ impl View {
     /// at rather than as a distance, and found again where the new layout put it.
     fn relayout_from_anchor(&mut self, anchor: Option<usize>) {
         self.relayout();
+        // A heavy page's layout went to the worker: the lines this anchor needs do
+        // not exist yet, and `begin_layout_job` cleared the index it was measured
+        // against. Hand the place to the job the way a start-up does, so the
+        // Finished batch stands the reader back where they were -- without it the
+        // `scroll_for_anchor` below asks an empty index and the page opens at the
+        // top. An anchor-less call leaves any pending place alone rather than
+        // cancelling it: a resize mid-drag measures against a half-built index.
+        if self.layout_job.is_some() {
+            if anchor.is_some() {
+                self.pending_anchor = anchor;
+            }
+            return;
+        }
         let k = scale_of(self.dpi);
         if let Some(a) = anchor {
             if let Some(scroll) = scroll_for_anchor(&self.sel_index, a, k) {
@@ -5948,7 +5995,13 @@ impl View {
         self.remember();
         self.layout_epoch += 1;
         self.relayout();
-        if let Some(a) = anchor {
+        // On a heavy page the layout went to the worker and the index is gone: the
+        // anchor waits for the lines it needs, and the Finished batch restores it.
+        if self.layout_job.is_some() {
+            if anchor.is_some() {
+                self.pending_anchor = anchor;
+            }
+        } else if let Some(a) = anchor {
             if let Some(scroll) = scroll_for_anchor(&self.sel_index, a, k) {
                 self.scroll = scroll;
             }
@@ -11109,6 +11162,11 @@ pub struct LayoutChunk {
 
 /// Everything about a page that is only known once every block is laid out: the
 /// notes' positions, the headings' anchors, and the height the content ends at.
+///
+/// The table headers, table spans, note spans and math texts a [`Page`] carries are
+/// *not* finals: the layout's own buffers are drained into a batch as it goes, so
+/// by the time the layout finishes those lists are empty. A sink that assembles the
+/// page reads them from the batches it has accepted.
 pub struct LayoutFinals {
     pub height: Pt,
     pub column: Pt,
@@ -11116,10 +11174,6 @@ pub struct LayoutFinals {
     pub note_tops: Vec<Pt>,
     pub anchor_tops: Vec<Pt>,
     pub hyphens: HyphenCount,
-    pub table_headers: Vec<TableHeaderFragment>,
-    pub table_spans: Vec<TableSpan>,
-    pub note_spans: Vec<NoteSpan>,
-    pub math_texts: Vec<MathTextFragment>,
 }
 
 /// Where a layout hands its batches.
@@ -11191,11 +11245,10 @@ pub fn build_ops(
         note_tops: Vec::new(),
         anchor_tops: Vec::new(),
         hyphens: HyphenCount::default(),
-        table_headers: Vec::new(),
-        table_spans: Vec::new(),
-        note_spans: Vec::new(),
-        math_texts: Vec::new(),
     });
+    // The table apparatus and the math text layer arrived batch by batch, so they
+    // are read from the sink -- the finals' own copies were emptied the moment each
+    // batch left, and reading them here handed the page four empty lists.
     Page {
         ops: sink.ops,
         height: finals.height,
@@ -11207,10 +11260,10 @@ pub fn build_ops(
         anchor_tops: finals.anchor_tops,
         sel: sink.sel,
         hyphens: finals.hyphens,
-        table_headers: finals.table_headers,
-        table_spans: finals.table_spans,
-        note_spans: finals.note_spans,
-        math_texts: finals.math_texts,
+        table_headers: sink.table_headers,
+        table_spans: sink.table_spans,
+        note_spans: sink.note_spans,
+        math_texts: sink.math_texts,
     }
 }
 
@@ -11308,6 +11361,11 @@ pub fn build_in_chunks(
     let mut hots = Vec::new();
     let mut sel: Vec<SelLine> = Vec::new();
     let mut wide: Vec<WideRegion> = Vec::new();
+    // Wide regions the batches have already carried away. A hot names its region
+    // by index into the sink's list, so the region this window has not yet
+    // handed over sits at `wide_emitted + wide` -- an index that restarted with
+    // every batch would reach into some earlier region's slot.
+    let mut wide_emitted: usize = 0;
     let mut table_headers: Vec<TableHeaderFragment> = Vec::new();
     let mut table_spans: Vec<TableSpan> = Vec::new();
     let mut note_spans: Vec<NoteSpan> = Vec::new();
@@ -11422,6 +11480,15 @@ pub fn build_in_chunks(
             // height the content reaches, and a document with no notes -- whose last
             // batch is always empty -- would scroll to nothing and stay unfinished.
             if blocks != 0 || !ops.is_empty() {
+                // The batch's own hots name their wide regions in the sink's list,
+                // not in this window's buffer, so each one is rebased before it
+                // leaves: after the take the indices would restart at nothing.
+                for hot in &mut hots {
+                    if let HotKind::Wide(i) = &mut hot.kind {
+                        *i += wide_emitted;
+                    }
+                }
+                wide_emitted += wide.len();
                 let mut sel = std::mem::take(&mut sel);
                 sel.sort_by(|a, b| {
                     a.y.total_cmp(&b.y).then_with(|| {
@@ -11636,6 +11703,12 @@ pub fn build_in_chunks(
     // They are not blocks, so they add nothing to the count the window tracks the
     // layout's progress by.
     emit!(0);
+    // The counter has served its one purpose -- rebasing hot indices batch by
+    // batch -- and nothing reads it again.
+    let _ = wide_emitted;
+    // The four fragment lists rode out with the batches, where the sink that
+    // assembles a page reads them; carrying copies here would mean taking from
+    // buffers the batches already drained.
     sink.finish(LayoutFinals {
         height: y + theme.base * 2.0,
         column,
@@ -11643,10 +11716,6 @@ pub fn build_in_chunks(
         note_tops,
         anchor_tops,
         hyphens: breaks,
-        table_headers: std::mem::take(&mut table_headers),
-        table_spans: std::mem::take(&mut table_spans),
-        note_spans: std::mem::take(&mut note_spans),
-        math_texts: std::mem::take(&mut math_texts),
     });
 }
 

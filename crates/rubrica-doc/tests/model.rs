@@ -973,3 +973,33 @@ fn a_soft_wrapped_term_stays_one_term() {
     assert_eq!(doc.blocks[1].kind, BlockKind::Definition);
     assert_eq!(doc.blocks[1].text, "its definition");
 }
+
+#[test]
+fn a_closing_fence_may_trail_whitespace_and_quoted_fences_still_shield_tex() {
+    // Trailing spaces on a closing fence are CommonMark-legal; a fence that stays
+    // open over them kept every later line verbatim, and the prose after it was
+    // never read as prose at all.
+    let src = "```tex\n\\(x^2\\)\n```   \n\nprose \\(y^3\\) after.\n";
+    let doc = Document::parse(src);
+    let code = doc
+        .blocks
+        .iter()
+        .find(|b| matches!(b.kind, BlockKind::Code))
+        .expect("the fence is code");
+    assert!(code.text.contains("\\(x^2\\)"), "{}", code.text);
+    let prose = doc.blocks.iter().find(|b| b.text.contains("after")).unwrap();
+    assert!(prose.text.contains('\u{fffc}'), "the TeX became a formula object: {}", prose.text);
+    // A fence inside a blockquote shields its LaTeX the same way: the `>` markers
+    // sit above the fence, and not seeing them made the rewrite read quoted code
+    // as quoted prose.
+    let quoted = "> ```tex\n> \\(z^4\\)\n> ```\n\nquoted \\(w^5\\) prose.\n";
+    let doc = Document::parse(quoted);
+    let code = doc
+        .blocks
+        .iter()
+        .find(|b| matches!(b.kind, BlockKind::Code))
+        .expect("the quoted fence is code");
+    assert!(code.text.contains("\\(z^4\\)"), "{}", code.text);
+    let prose = doc.blocks.iter().find(|b| b.text.contains("quoted")).unwrap();
+    assert!(prose.text.contains('\u{fffc}'), "the TeX became a formula object: {}", prose.text);
+}

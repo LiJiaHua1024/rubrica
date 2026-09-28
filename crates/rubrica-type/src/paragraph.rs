@@ -389,11 +389,21 @@ pub fn build(
     });
     // A dictionary point splits a word that UAX #14 would keep whole. It joins the
     // cut list but must not later be handed glue, which is what distinguishes it.
+    // The offsets are byte offsets into `text`, so a point that is not on a
+    // character boundary is a slicing panic waiting to happen, and a point right
+    // after an explicit hyphen lands where the author's own `-` already breaks --
+    // taking it as a discretionary would draw a second hyphen over the first.
     let hyphen_set: Vec<usize> = opts
         .hyphens
         .iter()
         .copied()
-        .filter(|&at| at > 0 && at < text.len() && !text[..at].ends_with(char::is_whitespace))
+        .filter(|&at| {
+            at > 0
+                && at < text.len()
+                && text.is_char_boundary(at)
+                && !text[..at].ends_with(char::is_whitespace)
+                && !text[..at].ends_with('-')
+        })
         .collect();
     for at in &hyphen_set {
         cuts.push((*at, false));
@@ -539,7 +549,9 @@ pub fn build(
 /// Emit the item for a run of literal whitespace, and record that the following
 /// box needs no script-recipe glue because this space already separates them.
 fn emit_space(p: &mut Paragraph, prev: &mut Option<(Role, char)>, ws: &str, opts: &BuildOptions) {
-    if ws.contains('\n') {
+    // Every mandatory separator UAX #14 can name, not only `\n`: a CR, FF or NEL
+    // that reaches this far is a line the author ended, just spelled differently.
+    if ws.contains(['\n', '\r', '\u{c}', '\u{85}']) {
         // `\hfil\break`, which is what a forced break is in TeX: the line ends where
         // the author said so and is then left flush at its natural width. Without the
         // filler the line is justified like any other, and because a Chinese line's
@@ -560,7 +572,10 @@ fn emit_space(p: &mut Paragraph, prev: &mut Option<(Role, char)>, ws: &str, opts
         p.items.push(Item::Glue {
             base: r.base * n,
             stretch: r.stretch * n,
-            shrink: r.shrink * n,
+            // Same cap `Item::glue` applies: a gap can close, it cannot eat ink.
+            // A theme that retunes the recipe past the cap would otherwise hand
+            // the solver room that is really its neighbour's glyphs sliding over.
+            shrink: (r.shrink * n).min(r.base * n),
             breakable: true,
         });
     }

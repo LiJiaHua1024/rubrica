@@ -457,11 +457,24 @@ fn tex_delimiters(src: &str) -> Option<String> {
         let body = line.trim_end_matches(['\n', '\r']);
         let text = body.trim_start();
         let indent = body.len() - text.len();
-        let first = text.chars().next();
-        let run = text.chars().take_while(|c| Some(*c) == first).count();
+        // A blockquote's markers sit above whatever the line carries: a quoted
+        // fence is still a fence, and its `>` comes off before the character
+        // test, or LaTeX inside quoted code is rewritten to `$` and shown as
+        // written instead of as the author left it.
+        let mut quoted = text;
+        while let Some(rest) = quoted.strip_prefix('>') {
+            quoted = rest.strip_prefix([' ', '\t']).unwrap_or(rest);
+        }
+        let first = quoted.chars().next();
+        let run = quoted.chars().take_while(|c| Some(*c) == first).count();
         let marker = indent < 4 && matches!(first, Some('`') | Some('~')) && run >= 3;
+        // A closing fence may trail whitespace, as CommonMark allows; anything
+        // else after the run -- another fence, words -- leaves it open.
         let ends_fence = fence.is_some_and(|(c, n)| {
-            marker && first == Some(c) && run >= n && text.chars().all(|x| x == c)
+            marker
+                && first == Some(c)
+                && run >= n
+                && quoted.trim_end_matches([' ', '\t']).chars().all(|x| x == c)
         });
         if ends_fence || marker && fence.is_none() {
             // The fence's own lines are copied as written: opening or closing it.
@@ -533,8 +546,19 @@ fn tex_inline(line: &str) -> String {
 fn rewrite_origins(original: &str, rewritten: &str, base: usize) -> Vec<(usize, usize)> {
     let mut points = vec![(0, base)];
     let (mut from, mut to) = (0, 0);
+    // Offsets are walked byte-wise where the two agree, but always advanced
+    // whole characters, so every slice below starts on a boundary however the
+    // two texts come to differ.
+    let step = |s: &str, at: usize| s[at..].chars().next().map_or(1, |c| c.len_utf8());
     while to < rewritten.len() && from < original.len() {
-        if original.as_bytes()[from] == rewritten.as_bytes()[to] { from += 1; to += 1; continue; }
+        if original.as_bytes()[from] == rewritten.as_bytes()[to] {
+            let f = step(original, from);
+            let t = step(rewritten, to);
+            // Equal lead bytes and both texts valid UTF-8: one character each.
+            from += f.max(t);
+            to += f.max(t);
+            continue;
+        }
         let tail = &original[from..];
         if rewritten.as_bytes()[to] == b'$' && (tail.starts_with("\\(") || tail.starts_with("\\)")) {
             from += 2; to += 1;
@@ -546,9 +570,12 @@ fn rewrite_origins(original: &str, rewritten: &str, base: usize) -> Vec<(usize, 
                 points.push((to, base + from));
                 from += 2; to += 2;
             } else {
-                // No other edit is part of the rewrite contract.
+                // No other edit is part of the rewrite contract. Unreachable
+                // while it holds; walked whole characters regardless, so a
+                // contract break cannot turn into a slicing abort.
                 debug_assert!(false, "unmapped Markdown source rewrite");
-                from += 1; to += 1;
+                from += step(original, from);
+                to += step(rewritten, to);
             }
         }
         points.push((to, base + from));

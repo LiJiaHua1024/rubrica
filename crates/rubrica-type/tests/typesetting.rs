@@ -1066,3 +1066,125 @@ fn a_token_with_no_break_in_it_is_one_fragment() {
     // the solver has no cut to take inside it.
     assert_eq!(fragment("unbreakabletoken"), 128.0);
 }
+
+#[test]
+fn a_paragraph_that_ends_in_a_hard_break_grows_no_blank_line() {
+    // The trailing break is the line's end, not a line of its own: the piece after
+    // it holds the `\parfillskip` glue and nothing else, and set as-is it was a
+    // content-free line at the bottom of every paragraph closed by a `<br>`.
+    let (para, plan) = set("abc\n", 6.0 * SIZE);
+    let texts: Vec<_> = plan.lines.iter().map(|l| text_of(&para, "abc\n", l)).collect();
+    assert_eq!(texts, ["abc"]);
+    // A hard break mid-paragraph still separates the two halves it was written
+    // between; only the final content-free line goes.
+    let (para, plan) = set("a\nb", 6.0 * SIZE);
+    let texts: Vec<_> = plan.lines.iter().map(|l| text_of(&para, "a\nb", l)).collect();
+    assert_eq!(texts, ["a", "b"]);
+}
+
+#[test]
+fn a_hard_break_in_a_hanging_block_continues_at_the_hanging_measure() {
+    // A list item's first line runs beside the marker and the rest give the width
+    // up. The line a hard break starts is one of the rest -- scored, dropped and
+    // placed at the hanging measure, not at the wider first-line one the piece's
+    // own first line would have. The run after the break is long enough that its
+    // first line cannot pass as the piece's exempt parfill line: scored wide, it
+    // would overrun the measure outright.
+    let column = 12.0 * SIZE;
+    let hang = 4.0 * SIZE;
+    let src = "aa bb\nAA BB CC DD EE FF GG HH II JJ KK LL MM";
+    let spacing = Spacing::for_size(SIZE);
+    let mut measure = MonospaceMeasure { size: SIZE, factor: 0.5 };
+    let mut opts = BreakOptions::new(column);
+    opts.hang_indent = hang;
+    opts.ragged = true;
+    let (para, plan) = typeset(src, &spacing, StyleId(0), &[], &opts, &mut measure);
+    let line = &plan.lines[1];
+    assert_eq!(text_of(&para, src, line), "AABBCCDDEEFF");
+    assert!(!line.first, "the line after a hard break is not a first line");
+    assert_eq!(line.target, column - hang);
+    assert!(
+        line.natural <= line.target,
+        "the line after a hard break overran the hanging measure: {} > {}",
+        line.natural,
+        line.target
+    );
+}
+
+#[test]
+fn every_mandatory_separator_forces_a_line() {
+    // UAX #14 names CR, FF and NEL mandatory separators alongside LF; the builder
+    // heard only the one it spells with, and "a\rb" set as "a b".
+    let (para, plan) = set("a\rb", 6.0 * SIZE);
+    let texts: Vec<_> = plan.lines.iter().map(|l| text_of(&para, "a\rb", l)).collect();
+    assert_eq!(texts, ["a", "b"], "CR is a line the author ended, not a space");
+}
+
+#[test]
+fn a_dictionary_point_after_an_explicit_hyphen_draws_one_hyphen() {
+    // "foo-bar" already carries the hyphen that shows at its break; the
+    // dictionary point sitting right behind it must not add a discretionary of
+    // its own, or the line ends "foo--".
+    let src = "foo-bar";
+    let spacing = Spacing::for_size(SIZE);
+    let mut measure = MonospaceMeasure { size: SIZE, factor: 0.5 };
+    let mut opts = BreakOptions::new(3.0 * SIZE);
+    opts.ragged = true;
+    let hyphenation = Hyphenation { points: &[4], width: 0.0 };
+    let (para, plan) = typeset_hyphenated(src, &spacing, StyleId(0), &[], &hyphenation, &opts, &mut measure);
+    let texts: Vec<_> = plan.lines.iter().map(|l| text_of(&para, src, l)).collect();
+    assert_eq!(texts, ["foo-", "bar"], "{texts:?}");
+    assert!(plan.lines[0].hyphen.is_none(), "the author's hyphen is the one shown");
+}
+
+#[test]
+fn word_space_never_hands_the_solver_room_it_cannot_give_back() {
+    // `Item::glue` caps a recipe's shrink at its base because a gap can close but
+    // cannot eat ink; the literal-space path built its glue raw and skipped the
+    // cap, so a theme retuning `shrink` past `base` set overlapping lines.
+    let mut spacing = Spacing::for_size(SIZE);
+    spacing.latin_space = GlueRecipe { base: 4.0, stretch: 8.0, shrink: 12.0 };
+    let mut measure = MonospaceMeasure { size: SIZE, factor: 0.5 };
+    let opts = BreakOptions::new(10.0 * SIZE);
+    let (para, _plan) = typeset("a b", &spacing, StyleId(0), &[], &opts, &mut measure);
+    let word_space = para
+        .items
+        .iter()
+        .find_map(|i| match i {
+            Item::Glue { base, shrink, .. } if *base > 0.0 => Some((*base, *shrink)),
+            _ => None,
+        })
+        .expect("the word space is a glue with width");
+    assert!(
+        word_space.1 <= word_space.0,
+        "shrink {} outran base {}",
+        word_space.1,
+        word_space.0
+    );
+}
+
+#[test]
+fn a_piece_with_no_soft_items_still_splits_and_terminates() {
+    // A run longer than the solver's piece limit with nothing soft in it -- a
+    // dictionary-hyphenated token, say -- used to spin `split_piece` forever:
+    // with no soft item to cut at, the scan re-read the same item and its
+    // distance to the piece start wrapped around.
+    let src = "a".repeat(200);
+    let spacing = Spacing::for_size(SIZE);
+    let mut measure = MonospaceMeasure { size: SIZE, factor: 0.5 };
+    let mut opts = BreakOptions::new(20.0 * SIZE);
+    opts.ragged = true;
+    opts.piece_limit = 64;
+    let points: Vec<usize> = (2..src.len()).step_by(2).collect();
+    let hyphenation = Hyphenation { points: &points, width: 0.0 };
+    let (para, plan) =
+        typeset_hyphenated(&src, &spacing, StyleId(0), &[], &hyphenation, &opts, &mut measure);
+    assert!(!plan.lines.is_empty());
+    // Nothing was lost: every letter the source had is still on the page.
+    let total: usize = plan
+        .lines
+        .iter()
+        .map(|l| text_of(&para, &src, l).len())
+        .sum();
+    assert_eq!(total, src.len(), "the run survived the split whole");
+}
