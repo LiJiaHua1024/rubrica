@@ -51,14 +51,15 @@ use windows::Win32::System::Com::{
     COINIT_APARTMENTTHREADED, COINIT_DISABLE_OLE1DDE, DVASPECT_CONTENT, FORMATETC,
     TYMED_HGLOBAL,
 };
+use windows::Win32::System::Diagnostics::Debug::OutputDebugStringW;
 use windows::Win32::System::LibraryLoader::{GetModuleFileNameW, GetModuleHandleW};
 use windows::Win32::System::Ole::{CF_HDROP, ReleaseStgMedium};
 use windows::Win32::System::Registry::{
     RegDeleteKeyValueW, RegGetValueW, RegSetKeyValueW, HKEY_CURRENT_USER, REG_SZ, RRF_RT_REG_SZ,
 };
 use windows::Win32::System::Threading::{
-    AttachThreadInput, CreateMutexW, CreateProcessW, GetCurrentThreadId, PROCESS_INFORMATION,
-    STARTUPINFOW, CREATE_NEW_PROCESS_GROUP, DETACHED_PROCESS,
+    CreateMutexW, CreateProcessW, PROCESS_INFORMATION, STARTUPINFOW,
+    CREATE_NEW_PROCESS_GROUP, DETACHED_PROCESS,
 };
 use windows::Win32::System::Variant::{VARIANT, VARIANT_0, VARIANT_0_0, VARIANT_0_0_0, VT_I4};
 use windows::Win32::UI::Accessibility::{SetWinEventHook, UnhookWinEvent, HWINEVENTHOOK};
@@ -67,7 +68,7 @@ use windows::Win32::UI::HiDpi::{
     GetDpiForWindow, SetProcessDpiAwarenessContext, DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2,
 };
 use windows::Win32::UI::Input::KeyboardAndMouse::{
-    GetAsyncKeyState, GetFocus, VIRTUAL_KEY, VK_CONTROL, VK_DOWN, VK_END, VK_ESCAPE,
+    GetAsyncKeyState, VIRTUAL_KEY, VK_CONTROL, VK_DOWN, VK_END, VK_ESCAPE,
     VK_F5, VK_HOME, VK_LEFT, VK_LWIN, VK_MENU, VK_NEXT, VK_PRIOR, VK_RETURN, VK_RIGHT, VK_RWIN,
     VK_SHIFT, VK_SPACE, VK_TAB, VK_UP,
 };
@@ -82,6 +83,7 @@ use windows::Win32::UI::WindowsAndMessaging::{
     CREATESTRUCTW, DefWindowProcW, DestroyMenu, DestroyWindow, DispatchMessageW,
     FindWindowExW, GetClassNameW, GetClientRect, GetCursorPos, GetForegroundWindow,
     GetMessageW, GetGUIThreadInfo, GetShellWindow, GetWindowLongPtrW, GetWindowThreadProcessId,
+    IsWindowVisible,
     FindWindowW, KillTimer, LoadCursorW, LoadIconW, PostMessageW, PostQuitMessage, RegisterClassExW,
     RegisterWindowMessageW, SetForegroundWindow, SetTimer, SetWindowLongPtrW, SetWindowsHookExW,
     SetWindowPos, ShowWindow, TrackPopupMenu, TranslateMessage, UnhookWindowsHookEx,
@@ -427,16 +429,29 @@ unsafe extern "system" fn service_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPA
     let service = unsafe { &mut *(raw as *mut Service) };
     match msg {
         WM_APP_SPACE => {
-            if service.shown {
+            let visible = service
+                .peek
+                .as_ref()
+                .is_some_and(|p| unsafe { IsWindowVisible(p.hwnd) }.as_bool());
+            match space_asks(service.shown, visible) {
                 // The modes differ exactly here. A tap and the mix both treat a
                 // second press as the toggle's other half; hold-to-preview keeps
-                // the window up for as long as the key is down, and lets its own
-                // release be the thing that takes it away.
-                if space_mode() != SpaceMode::Hold {
-                    service.close_preview();
+                // the window up for as long as the key is down, and its press on
+                // a standing preview is nothing at all -- the release closes it.
+                Ask::Close if space_mode() != SpaceMode::Hold => service.close_preview(),
+                Ask::Close => {}
+                Ask::Open => {
+                    if let Some(path) = unsafe { request_preview() } {
+                        service.show_preview(path);
+                    }
                 }
-            } else if let Some(path) = unsafe { request_preview() } {
-                service.show_preview(path);
+                Ask::Reopen => {
+                    trace("peek: a preview was believed up but no window was there; settling it");
+                    service.close_preview();
+                    if let Some(path) = unsafe { request_preview() } {
+                        service.show_preview(path);
+                    }
+                }
             }
             LRESULT(0)
         }
@@ -522,6 +537,7 @@ unsafe extern "system" fn service_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPA
             // low-level hook stops being called the moment its thread stops answering,
             // and nothing says so. The flag it was maintaining simply stays put.
             if service.space_down && !pressed(VK_SPACE) {
+                trace("peek: a space the hook never saw released is down no longer");
                 service.space_down = false;
                 service.hold_started = None;
             }
@@ -551,13 +567,17 @@ impl Service {
                 // afterwards: the service keeps running and simply never answers.
                 Err(error) => {
                     eprintln!("peek window: {error}");
+                    trace("peek: the preview window could not be built");
                     return;
                 }
             }
         }
+        // The flag follows the reveal itself. A file that could not be read leaves
+        // no window standing, and a flag that says one does turns the next press
+        // into the close of a preview nobody can see -- the service then needs two
+        // presses to answer one question.
         if let Some(peek) = self.peek.as_mut() {
-            peek.show(&path);
-            self.shown = true;
+            self.shown = peek.show(&path);
         }
     }
 
@@ -696,6 +716,14 @@ fn pressed(vk: VIRTUAL_KEY) -> bool {
     (unsafe { GetAsyncKeyState(vk.0 as i32) } as u16) & 0x8000 != 0
 }
 
+/// One line of diagnosis, sent to whoever is listening and nowhere else: a debug
+/// string costs nothing when nobody reads it, and on the day a preview refuses to
+/// appear it says which guard said no. Nothing the user sees carries it.
+fn trace(note: &str) {
+    let line: Vec<u16> = note.encode_utf16().chain(std::iter::once(0)).collect();
+    unsafe { OutputDebugStringW(PCWSTR(line.as_ptr())) };
+}
+
 /// What a preview standing open does with a key.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Answer {
@@ -730,6 +758,32 @@ fn preview_answer(key: VIRTUAL_KEY, down: bool, shift: bool, ctrl: bool) -> Answ
     }
 }
 
+/// What a press of the space bar asks of the service. The service's belief and
+/// the preview window are two witnesses to the same preview, and they can
+/// disagree -- a close the belief never heard about, a reveal that failed after
+/// it was counted. The press believes whichever saw less, and settles the
+/// difference rather than acting on it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Ask {
+    /// Nothing stands, or stands somewhere the service knows nothing about: ask
+    /// for a preview.
+    Open,
+    /// A preview stands and is on the screen: this press is the toggle's other
+    /// half.
+    Close,
+    /// The service believes a preview is up, but no window is there to see. The
+    /// belief is wrong; put it right and open, instead of closing nothing.
+    Reopen,
+}
+
+fn space_asks(shown: bool, visible: bool) -> Ask {
+    match (shown, visible) {
+        (false, _) => Ask::Open,
+        (true, true) => Ask::Close,
+        (true, false) => Ask::Reopen,
+    }
+}
+
 unsafe extern "system" fn hook_proc(code: i32, wp: WPARAM, lp: LPARAM) -> LRESULT {
     if code < 0 {
         return unsafe { CallNextHookEx(None, code, wp, lp) };
@@ -757,7 +811,11 @@ unsafe extern "system" fn hook_proc(code: i32, wp: WPARAM, lp: LPARAM) -> LRESUL
                 return LRESULT(1);
             }
             let modified = pressed(VK_CONTROL) || pressed(VK_MENU) || pressed(VK_SHIFT);
-            if modified || in_cooldown(service) {
+            if in_cooldown(service) {
+                trace("peek: space lands inside the cooldown typing leaves behind");
+                return unsafe { CallNextHookEx(None, code, wp, lp) };
+            }
+            if modified {
                 return unsafe { CallNextHookEx(None, code, wp, lp) };
             }
             // A press that is not asking for a preview is not this watcher's: the
@@ -836,9 +894,11 @@ unsafe extern "system" fn foreground_changed(
 // ---------------------------------------------------------------- judging the foreground
 
 /// The window a preview would come from, if the foreground is a place files are
-/// chosen. Three guards stand before the class name, each answering a way a user is
-/// not "browsing": a menu they have open, a rename box they are typing in, and the
-/// search box whose UWP control has no caret for the thread info to report.
+/// chosen. Two guards stand before the class name, each answering a way a user is
+/// not "browsing": a menu they have open, and a rename box they are typing in.
+/// A typing UWP control -- the search box, the Explorer caption -- owns no Win32
+/// caret and so hides from both; it is the cooldown the typing itself starts
+/// that keeps space out of it, for exactly as long as the typing lasts.
 unsafe fn foreground_reader() -> Option<HWND> {
     unsafe {
         let fg = GetForegroundWindow();
@@ -853,15 +913,18 @@ unsafe fn foreground_reader() -> Option<HWND> {
         if GetGUIThreadInfo(tid, &mut info).is_ok() {
             // A nonzero flag is a menu in progress, a drag, a move: states in which
             // space means something else. A caret means a text field is live.
-            if info.flags != GUITHREADINFO_FLAGS(0) || !info.hwndCaret.is_invalid() {
+            if info.flags != GUITHREADINFO_FLAGS(0) {
+                trace("peek: the foreground thread is busy (a menu, a drag, a move)");
+                return None;
+            }
+            if !info.hwndCaret.is_invalid() {
+                trace("peek: a caret is live -- a rename box, a field being typed in");
                 return None;
             }
         }
         let class = class_name(fg);
         match class.as_str() {
-            "ExploreWClass" | "CabinetWClass" => {
-                if xaml_box_focused(tid) { None } else { Some(fg) }
-            }
+            "ExploreWClass" | "CabinetWClass" => Some(fg),
             // The desktop is a Progman or WorkerW window that carries the icon view,
             // and only the one carrying the view is worth asking.
             "Progman" | "WorkerW" => {
@@ -869,26 +932,12 @@ unsafe fn foreground_reader() -> Option<HWND> {
                     .ok()
                     .map(|_| fg)
             }
-            _ => None,
-        }
-    }
-}
-
-/// Whether the thread's focus sits in a UWP text box, which owns no Win32 caret and
-/// so hides from the thread info above. Windows 10 1909 replaced the Explorer search
-/// box with exactly such a control, and its focus window is a CoreWindow.
-unsafe fn xaml_box_focused(tid: u32) -> bool {
-    unsafe {
-        let here = GetCurrentThreadId();
-        if AttachThreadInput(here, tid, true).as_bool() {
-            let focus = GetFocus();
-            let _ = AttachThreadInput(here, tid, false);
-            if !focus.is_invalid() {
-                return class_name(focus) == "Windows.UI.Core.CoreWindow";
+            _ => {
+                trace(&format!("peek: the foreground is a {class}, not a place files are chosen"));
+                None
             }
         }
     }
-    false
 }
 
 unsafe fn class_name(hwnd: HWND) -> String {
@@ -904,7 +953,10 @@ unsafe fn class_name(hwnd: HWND) -> String {
 /// already been swallowed, and a silent nothing is better than a dialog about it.
 unsafe fn request_preview() -> Option<PathBuf> {
     let fg = unsafe { foreground_reader() }?;
-    unsafe { foreground_selection(fg) }
+    unsafe { foreground_selection(fg) }.or_else(|| {
+        trace("peek: nothing peekable is selected under the foreground window");
+        None
+    })
 }
 
 /// The shell's collection of open windows and the desktop, `{9BA05972-F6A8-11CF-A442-
@@ -1239,12 +1291,14 @@ impl Peek {
         self.path.as_deref()
     }
 
-    /// Read, typeset, place, and show -- the whole reveal. A file that cannot be read
-    /// leaves the previous state alone rather than showing an empty page over it.
-    fn show(&mut self, path: &Path) {
+    /// Read, typeset, place, and show -- the whole reveal, and whether it
+    /// happened. A file that cannot be read leaves the previous state alone
+    /// rather than showing an empty page over it, which also means nothing came
+    /// up, and that is what the answer says.
+    fn show(&mut self, path: &Path) -> bool {
         unsafe { self.place() };
         if !self.load(path) {
-            return;
+            return false;
         }
         unsafe {
             let _ = ShowWindow(self.hwnd, SW_SHOWNOACTIVATE);
@@ -1264,6 +1318,7 @@ impl Peek {
         }
         let fg = unsafe { GetForegroundWindow() };
         self.source = if fg.is_invalid() { None } else { Some(fg) };
+        true
     }
 
     fn close(&mut self) {
@@ -1272,6 +1327,12 @@ impl Peek {
             let _ = KillTimer(Some(self.hwnd), POLL_TIMER);
         }
         self.source = None;
+        // Nothing stands, so nothing is the target: a page left behind outlives
+        // its file only as a lie a later follow would believe of it.
+        self.path = None;
+        self.page = None;
+        self.images = None;
+        self.scroll = 0.0;
     }
 
     /// Re-lay the file the preview is already on, for a change on disk.
@@ -1709,6 +1770,18 @@ unsafe extern "system" fn preview_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPA
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The service's belief and the preview's own window are two witnesses to one
+    /// preview, and a press that finds them disagreeing settles the difference
+    /// rather than acting on it: closing a window nobody can see is not a close,
+    /// and a second press is a price nobody should pay for the first one's error.
+    #[test]
+    fn a_space_press_asks_what_the_window_is_showing() {
+        assert_eq!(space_asks(false, false), Ask::Open);
+        assert_eq!(space_asks(false, true), Ask::Open);
+        assert_eq!(space_asks(true, true), Ask::Close);
+        assert_eq!(space_asks(true, false), Ask::Reopen);
+    }
 
     /// The three keys a standing preview takes, each of them a whole keystroke rather
     /// than half of one: a press the preview answers, and a release the shell must not
