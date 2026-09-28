@@ -217,6 +217,22 @@ pub enum Key {
 
     MenuLanguage,
 
+    MenuStatusLabel,
+    StatusCharacters,
+    StatusWords,
+    StatusReadingTime,
+    StatusProgress,
+    StatusPage,
+    StatusChapter,
+    StatusParagraphs,
+    StatusEncoding,
+    StatusFormat,
+    StatusSize,
+    StatusModified,
+    StatusFormatPlain,
+    /// The reading-time value, with `{n}` standing for the number of minutes.
+    StatusReadingTimeValue,
+
     TypoTitle,
     TypoPresetName,
     TypoCustom,
@@ -375,6 +391,21 @@ fn translate_en(key: Key) -> &'static str {
         Key::ErrorCannotReadTxtChapter => "Cannot read the TXT chapter",
         Key::ErrorChooseAnotherName => "Choose a name other than Default or Book (up to 80 bytes).",
         Key::ErrorTooManyPresets => "There are already 100 saved typography presets.",
+
+        Key::MenuStatusLabel => "Status bar",
+        Key::StatusCharacters => "Characters",
+        Key::StatusWords => "Words",
+        Key::StatusReadingTime => "Reading time",
+        Key::StatusProgress => "Progress",
+        Key::StatusPage => "Page",
+        Key::StatusChapter => "Chapter",
+        Key::StatusParagraphs => "Paragraphs",
+        Key::StatusEncoding => "Encoding",
+        Key::StatusFormat => "Format",
+        Key::StatusSize => "Size",
+        Key::StatusModified => "Modified",
+        Key::StatusFormatPlain => "Plain text",
+        Key::StatusReadingTimeValue => "~{n} min",
     }
 }
 
@@ -496,6 +527,21 @@ fn translate_zh_cn(key: Key) -> &'static str {
         Key::ErrorCannotReadTxtChapter => "无法读取 TXT 章节",
         Key::ErrorChooseAnotherName => "请选择 Default 或 Book 以外的名称（最多 80 字节）。",
         Key::ErrorTooManyPresets => "排版预设已达 100 个上限。",
+
+        Key::MenuStatusLabel => "状态栏",
+        Key::StatusCharacters => "字数",
+        Key::StatusWords => "词数",
+        Key::StatusReadingTime => "阅读时间",
+        Key::StatusProgress => "进度",
+        Key::StatusPage => "页码",
+        Key::StatusChapter => "章节",
+        Key::StatusParagraphs => "段落",
+        Key::StatusEncoding => "编码",
+        Key::StatusFormat => "格式",
+        Key::StatusSize => "大小",
+        Key::StatusModified => "修改时间",
+        Key::StatusFormatPlain => "纯文本",
+        Key::StatusReadingTimeValue => "约 {n} 分钟",
     }
 }
 
@@ -617,6 +663,21 @@ fn translate_zh_tw(key: Key) -> &'static str {
         Key::ErrorCannotReadTxtChapter => "無法讀取 TXT 章節",
         Key::ErrorChooseAnotherName => "請選擇 Default 或 Book 以外的名稱（最多 80 位元組）。",
         Key::ErrorTooManyPresets => "排版預設已達 100 個上限。",
+
+        Key::MenuStatusLabel => "狀態列",
+        Key::StatusCharacters => "字數",
+        Key::StatusWords => "詞數",
+        Key::StatusReadingTime => "閱讀時間",
+        Key::StatusProgress => "進度",
+        Key::StatusPage => "頁碼",
+        Key::StatusChapter => "章節",
+        Key::StatusParagraphs => "段落",
+        Key::StatusEncoding => "編碼",
+        Key::StatusFormat => "格式",
+        Key::StatusSize => "大小",
+        Key::StatusModified => "修改時間",
+        Key::StatusFormatPlain => "純文字",
+        Key::StatusReadingTimeValue => "約 {n} 分鐘",
     }
 }
 
@@ -738,6 +799,21 @@ fn translate_ja(key: Key) -> &'static str {
         Key::ErrorCannotReadTxtChapter => "TXT の章を読み取れません",
         Key::ErrorChooseAnotherName => "Default や Book 以外の名前を指定してください（最大 80 バイト）。",
         Key::ErrorTooManyPresets => "保存されたタイポグラフィプリセットが既に 100 個あります。",
+
+        Key::MenuStatusLabel => "ステータスバー",
+        Key::StatusCharacters => "文字数",
+        Key::StatusWords => "単語数",
+        Key::StatusReadingTime => "読了時間",
+        Key::StatusProgress => "進捗",
+        Key::StatusPage => "ページ",
+        Key::StatusChapter => "章",
+        Key::StatusParagraphs => "段落",
+        Key::StatusEncoding => "文字コード",
+        Key::StatusFormat => "形式",
+        Key::StatusSize => "サイズ",
+        Key::StatusModified => "更新日時",
+        Key::StatusFormatPlain => "プレーンテキスト",
+        Key::StatusReadingTimeValue => "約 {n} 分",
     }
 }
 
@@ -859,6 +935,21 @@ fn translate_ko(key: Key) -> &'static str {
         Key::ErrorCannotReadTxtChapter => "TXT 장을 읽을 수 없습니다",
         Key::ErrorChooseAnotherName => "Default 또는 Book 이외의 이름을 선택하세요(최대 80바이트).",
         Key::ErrorTooManyPresets => "저장된 타이포그래피 프리셋이 이미 100개 있습니다.",
+
+        Key::MenuStatusLabel => "상태 표시줄",
+        Key::StatusCharacters => "글자 수",
+        Key::StatusWords => "단어 수",
+        Key::StatusReadingTime => "읽기 시간",
+        Key::StatusProgress => "진행률",
+        Key::StatusPage => "쪽",
+        Key::StatusChapter => "장",
+        Key::StatusParagraphs => "문단",
+        Key::StatusEncoding => "인코딩",
+        Key::StatusFormat => "형식",
+        Key::StatusSize => "크기",
+        Key::StatusModified => "수정한 날짜",
+        Key::StatusFormatPlain => "일반 텍스트",
+        Key::StatusReadingTimeValue => "약 {n}분",
     }
 }
 
@@ -980,6 +1071,21 @@ fn translate_fr(key: Key) -> &'static str {
         Key::ErrorCannotReadTxtChapter => "Impossible de lire le chapitre TXT",
         Key::ErrorChooseAnotherName => "Choisissez un nom autre que Default ou Book (jusqu'à 80 octets).",
         Key::ErrorTooManyPresets => "Il y a déjà 100 préréglages typographiques enregistrés.",
+
+        Key::MenuStatusLabel => "Barre d'état",
+        Key::StatusCharacters => "Caractères",
+        Key::StatusWords => "Mots",
+        Key::StatusReadingTime => "Temps de lecture",
+        Key::StatusProgress => "Progression",
+        Key::StatusPage => "Page",
+        Key::StatusChapter => "Chapitre",
+        Key::StatusParagraphs => "Paragraphes",
+        Key::StatusEncoding => "Encodage",
+        Key::StatusFormat => "Format",
+        Key::StatusSize => "Taille",
+        Key::StatusModified => "Modifié",
+        Key::StatusFormatPlain => "Texte brut",
+        Key::StatusReadingTimeValue => "~{n} min",
     }
 }
 
@@ -1101,6 +1207,21 @@ fn translate_de(key: Key) -> &'static str {
         Key::ErrorCannotReadTxtChapter => "TXT-Kapitel kann nicht gelesen werden",
         Key::ErrorChooseAnotherName => "Wählen Sie einen anderen Namen als Default oder Book (bis zu 80 Bytes).",
         Key::ErrorTooManyPresets => "Es gibt bereits 100 gespeicherte Typografie-Voreinstellungen.",
+
+        Key::MenuStatusLabel => "Statusleiste",
+        Key::StatusCharacters => "Zeichen",
+        Key::StatusWords => "Wörter",
+        Key::StatusReadingTime => "Lesezeit",
+        Key::StatusProgress => "Fortschritt",
+        Key::StatusPage => "Seite",
+        Key::StatusChapter => "Kapitel",
+        Key::StatusParagraphs => "Absätze",
+        Key::StatusEncoding => "Kodierung",
+        Key::StatusFormat => "Format",
+        Key::StatusSize => "Größe",
+        Key::StatusModified => "Geändert",
+        Key::StatusFormatPlain => "Nur Text",
+        Key::StatusReadingTimeValue => "~{n} Min.",
     }
 }
 
@@ -1222,6 +1343,21 @@ fn translate_es(key: Key) -> &'static str {
         Key::ErrorCannotReadTxtChapter => "No se puede leer el capítulo TXT",
         Key::ErrorChooseAnotherName => "Elija un nombre distinto de Default o Book (hasta 80 bytes).",
         Key::ErrorTooManyPresets => "Ya hay 100 ajustes tipográficos guardados.",
+
+        Key::MenuStatusLabel => "Barra de estado",
+        Key::StatusCharacters => "Caracteres",
+        Key::StatusWords => "Palabras",
+        Key::StatusReadingTime => "Tiempo de lectura",
+        Key::StatusProgress => "Progreso",
+        Key::StatusPage => "Página",
+        Key::StatusChapter => "Capítulo",
+        Key::StatusParagraphs => "Párrafos",
+        Key::StatusEncoding => "Codificación",
+        Key::StatusFormat => "Formato",
+        Key::StatusSize => "Tamaño",
+        Key::StatusModified => "Modificado",
+        Key::StatusFormatPlain => "Texto sin formato",
+        Key::StatusReadingTimeValue => "~{n} min",
     }
 }
 
@@ -1343,6 +1479,21 @@ fn translate_ru(key: Key) -> &'static str {
         Key::ErrorCannotReadTxtChapter => "Не удалось прочитать главу TXT",
         Key::ErrorChooseAnotherName => "Выберите имя, отличное от Default или Book (до 80 байт).",
         Key::ErrorTooManyPresets => "Уже сохранено максимально допустимое число наборов (100).",
+
+        Key::MenuStatusLabel => "Строка состояния",
+        Key::StatusCharacters => "Символы",
+        Key::StatusWords => "Слова",
+        Key::StatusReadingTime => "Время чтения",
+        Key::StatusProgress => "Прогресс",
+        Key::StatusPage => "Страница",
+        Key::StatusChapter => "Глава",
+        Key::StatusParagraphs => "Абзацы",
+        Key::StatusEncoding => "Кодировка",
+        Key::StatusFormat => "Формат",
+        Key::StatusSize => "Размер",
+        Key::StatusModified => "Изменён",
+        Key::StatusFormatPlain => "Обычный текст",
+        Key::StatusReadingTimeValue => "~{n} мин",
     }
 }
 
@@ -1464,6 +1615,21 @@ fn translate_it(key: Key) -> &'static str {
         Key::ErrorCannotReadTxtChapter => "Impossibile leggere il capitolo TXT",
         Key::ErrorChooseAnotherName => "Scegli un nome diverso da Default o Book (fino a 80 byte).",
         Key::ErrorTooManyPresets => "Ci sono già 100 predefiniti tipografici salvati.",
+
+        Key::MenuStatusLabel => "Barra di stato",
+        Key::StatusCharacters => "Caratteri",
+        Key::StatusWords => "Parole",
+        Key::StatusReadingTime => "Tempo di lettura",
+        Key::StatusProgress => "Avanzamento",
+        Key::StatusPage => "Pagina",
+        Key::StatusChapter => "Capitolo",
+        Key::StatusParagraphs => "Paragrafi",
+        Key::StatusEncoding => "Codifica",
+        Key::StatusFormat => "Formato",
+        Key::StatusSize => "Dimensione",
+        Key::StatusModified => "Modificato",
+        Key::StatusFormatPlain => "Testo semplice",
+        Key::StatusReadingTimeValue => "~{n} min",
     }
 }
 
@@ -1585,6 +1751,21 @@ fn translate_pt(key: Key) -> &'static str {
         Key::ErrorCannotReadTxtChapter => "Não é possível ler o capítulo TXT",
         Key::ErrorChooseAnotherName => "Escolha um nome diferente de Default ou Book (até 80 bytes).",
         Key::ErrorTooManyPresets => "Já existem 100 predefinições tipográficas salvas.",
+
+        Key::MenuStatusLabel => "Barra de status",
+        Key::StatusCharacters => "Caracteres",
+        Key::StatusWords => "Palavras",
+        Key::StatusReadingTime => "Tempo de leitura",
+        Key::StatusProgress => "Progresso",
+        Key::StatusPage => "Página",
+        Key::StatusChapter => "Capítulo",
+        Key::StatusParagraphs => "Parágrafos",
+        Key::StatusEncoding => "Codificação",
+        Key::StatusFormat => "Formato",
+        Key::StatusSize => "Tamanho",
+        Key::StatusModified => "Modificado",
+        Key::StatusFormatPlain => "Texto simples",
+        Key::StatusReadingTimeValue => "~{n} min",
     }
 }
 
@@ -1856,6 +2037,30 @@ pub fn find_count(lang: Language, focus: usize, hits: usize) -> String {
     }
 }
 
+/// The menu label for one status-bar item, by its bit. The bits come from
+/// [`crate::settings::STATUS_ITEMS`], which is also the order the menu lists them.
+pub fn status_item_key(item: u32) -> Key {
+    match item {
+        crate::settings::STATUS_WORDS => Key::StatusWords,
+        crate::settings::STATUS_READING_TIME => Key::StatusReadingTime,
+        crate::settings::STATUS_PROGRESS => Key::StatusProgress,
+        crate::settings::STATUS_PAGE => Key::StatusPage,
+        crate::settings::STATUS_CHAPTER => Key::StatusChapter,
+        crate::settings::STATUS_PARAGRAPHS => Key::StatusParagraphs,
+        crate::settings::STATUS_ENCODING => Key::StatusEncoding,
+        crate::settings::STATUS_FORMAT => Key::StatusFormat,
+        crate::settings::STATUS_SIZE => Key::StatusSize,
+        crate::settings::STATUS_MODIFIED => Key::StatusModified,
+        _ => Key::StatusCharacters,
+    }
+}
+
+/// The reading-time estimate, with its unit and its "about" built into the template,
+/// so every language spaces the number the way it should.
+pub fn status_reading_time(lang: Language, minutes: usize) -> String {
+    t(lang, Key::StatusReadingTimeValue).replace("{n}", &minutes.to_string())
+}
+
 pub fn error_font_required(lang: Language, role_label: &str) -> String {
     match lang {
         Language::EnUs => format!("Enter a font family for {role_label}."),
@@ -2017,6 +2222,13 @@ mod tests {
             assert!(!find_count(lang, 0, 0).is_empty());
             assert!(!find_count(lang, 0, 1).is_empty());
             assert!(!find_count(lang, 2, 5).is_empty());
+
+            assert!(!t(lang, Key::MenuStatusLabel).is_empty());
+            assert!(!t(lang, Key::StatusFormatPlain).is_empty());
+            for item in crate::settings::STATUS_ITEMS {
+                assert!(!t(lang, status_item_key(item)).is_empty());
+            }
+            assert!(status_reading_time(lang, 12).contains("12"));
         }
     }
 }

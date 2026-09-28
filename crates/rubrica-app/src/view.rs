@@ -28,7 +28,7 @@ use printpdf::{
 };
 use windows::core::{w, BOOL, Interface, PCWSTR};
 use windows::Win32::Foundation::GENERIC_WRITE;
-use windows::Win32::Foundation::{COLORREF, HWND, LPARAM, LRESULT, POINT, RECT, WPARAM};
+use windows::Win32::Foundation::{COLORREF, FILETIME, HWND, LPARAM, LRESULT, POINT, RECT, SYSTEMTIME, WPARAM};
 use windows::Win32::Graphics::Direct2D::Common::{
     D2D1_ALPHA_MODE_PREMULTIPLIED, D2D1_COLOR_F, D2D1_PIXEL_FORMAT, D2D_RECT_F, D2D_SIZE_U,
 };
@@ -70,6 +70,7 @@ use windows::Win32::UI::Input::KeyboardAndMouse::{
     TrackMouseEvent, TME_LEAVE, TRACKMOUSEEVENT,
 };
 use windows::Win32::System::SystemInformation::GetTickCount;
+use windows::Win32::System::Time::{FileTimeToSystemTime, SystemTimeToTzSpecificLocalTime};
 use windows::Win32::UI::Input::KeyboardAndMouse::{VK_DOWN, VK_ESCAPE, VK_NEXT, VK_PRIOR};
 use windows::Win32::UI::Input::KeyboardAndMouse::{
     VK_0, VK_A, VK_ADD, VK_C, VK_D, VK_END, VK_F, VK_F3, VK_HOME, VK_LEFT, VK_MENU, VK_NUMPAD0,
@@ -128,6 +129,18 @@ const MARGIN_EM: Pt = 2.6;
 /// that did not fit when there are more of them than room, the window title in the space
 /// between, and the window controls at the right.
 const TOPBAR_H: Pt = 40.0;
+/// Height of the status bar, in device-independent pixels.
+///
+/// A slimmer band than the strip above, at the foot of the window, showing whatever
+/// metadata the reader has asked for. It is pinned to the glass the way the strip is,
+/// and it is shown only while it has something to say: an empty bar would be chrome
+/// the reader never asked for, and the page gets the height back when it goes.
+const STATUS_H: Pt = 24.0;
+/// The air between the bar's text and the window's edge.
+const STATUS_PAD: f32 = 12.0;
+/// What stands between two items on the bar. A middle dot reads as a separator in
+/// every language this reader speaks.
+const STATUS_SEPARATOR: &str = "  \u{00B7}  ";
 /// The width of one window control -- minimise, maximise, close -- in the strip's
 /// right-hand end. Each is the strip's own height tall, the way the system's are.
 const CAPTION_BTN_W: Pt = 46.0;
@@ -1523,6 +1536,17 @@ pub struct View {
     /// The title's measured label, keyed on the text and the room it was measured
     /// for: a repaint neither re-shapes nor re-measures what it can look up.
     title_label: Option<TitleLabelCache>,
+    /// Which metadata the status bar shows, as the bits of
+    /// [`crate::settings::STATUS_ITEMS`]. An empty mask is a bar with nothing to say,
+    /// which is drawn as no bar at all.
+    status: u32,
+    /// The format the bar's text is drawn with, kept like the strip's own.
+    status_format: Option<IDWriteTextFormat>,
+    /// The bar's composed label, keyed on the text and the room it was measured for.
+    status_label: Option<StatusLabelCache>,
+    /// The current document's text statistics, counted once where the document is
+    /// built rather than on every keystroke of a wheel.
+    counts: rubrica_doc::stats::TextCounts,
     tracking_leave: bool,
     /// Other tabs' materialized pages; see [`TabPage`].
     pages: HashMap<TabId, TabPage>,
@@ -1805,6 +1829,11 @@ enum CapBtn {
 /// either changing asks for the shaping again.
 type TitleLabelCache = ((String, f32), Option<IDWriteTextLayout>, f32, f32, Vec<u16>);
 
+/// The status bar's measured label, cached the same way and for the same reason: the
+/// bar is repainted on every wheel tick, and re-shaping a sentence of numbers to find
+/// that it still fits is work a moving window cannot afford.
+type StatusLabelCache = ((String, f32), Option<IDWriteTextLayout>, f32, f32, Vec<u16>);
+
 /// One tab's materialized page: everything [`View`] keeps for the document it is
 /// showing, set aside when the reader moves to another tab.
 ///
@@ -1820,6 +1849,9 @@ struct TabPage {
     layout_dpi: f32,
     source: String,
     doc: Arc<Document>,
+    /// The document's counts, which travel with it: a tab switch swaps this along with
+    /// the text the numbers were taken from.
+    counts: rubrica_doc::stats::TextCounts,
     ops: Vec<Op>,
     reading_mode: ReadingMode,
     page_starts: Vec<Pt>,
@@ -1856,6 +1888,7 @@ impl TabPage {
             layout_dpi: 96.0,
             source: String::new(),
             doc: Arc::new(Document { blocks: Vec::new(), footnotes: Vec::new() }),
+            counts: rubrica_doc::stats::TextCounts::default(),
             ops: Vec::new(),
             reading_mode: ReadingMode::Scroll,
             page_starts: Vec::new(),
@@ -2224,6 +2257,9 @@ enum Command {
     PeekClickClose,
     /// Set the GUI language, or follow system.
     Language(Option<Language>),
+    /// Add or remove one item from the status bar, by its bit in
+    /// [`crate::settings::STATUS_ITEMS`].
+    StatusItem(u32),
 }
 
 /// One row of that menu.
@@ -2300,6 +2336,9 @@ struct MenuState {
     reading_mode: ReadingMode,
     page: usize,
     page_count: usize,
+    /// Which items the status bar is showing, as the bits of
+    /// [`crate::settings::STATUS_ITEMS`].
+    status: u32,
     /// The page's own outline, which is a fact about the document rather than about the
     /// reader's choices, and is empty on a page with no headings in it.
     headings: Vec<Outline>,
@@ -2352,6 +2391,20 @@ fn menu_items(s: &MenuState) -> Vec<MenuRow> {
         row(Command::PreviousPage, format!("{}\tPgUp", i18n::t(s.lang, Key::MenuPreviousPage)), s.reading_mode == ReadingMode::Scroll || s.page > 0),
         row(Command::NextPage, format!("{}\tPgDn", i18n::t(s.lang, Key::MenuNextPage)), s.reading_mode == ReadingMode::Scroll || s.page + 1 < s.page_count),
     ] });
+    // What the status bar is showing, one checkbox an item. A bar with nothing checked
+    // is not drawn at all: leaving the chrome off is the reader's answer to a page they
+    // want to themselves, and it is the same answer as leaving every item off.
+    let status_items: Vec<MenuRow> = crate::settings::STATUS_ITEMS
+        .into_iter()
+        .map(|item| {
+            check(
+                Command::StatusItem(item),
+                i18n::t(s.lang, i18n::status_item_key(item)),
+                s.status & item != 0,
+            )
+        })
+        .collect();
+    v.push(MenuRow::Sub { label: i18n::t(s.lang, Key::MenuStatusLabel), items: status_items });
     let mut typography = vec![row(Command::Typography, i18n::t(s.lang, Key::MenuEditSavePreset), true), MenuRow::Gap];
     typography.extend(s.profiles.iter().map(|name| check(Command::Profile(name.clone()), i18n::preset_display_name(s.lang, name), *name == s.profile)));
     v.push(MenuRow::Sub { label: i18n::t(s.lang, Key::MenuTypography), items: typography });
@@ -2810,6 +2863,10 @@ pub fn run(path: Option<PathBuf>, extra: Vec<PathBuf>) -> Result<()> {
         lang,
         lang_choice,
         title_label: None,
+        status: crate::settings::status_items(),
+        status_format: None,
+        status_label: None,
+        counts: rubrica_doc::stats::TextCounts::default(),
         tracking_leave: false,
         pages: HashMap::new(),
         layout_epoch: 0,
@@ -3200,6 +3257,77 @@ fn is_written(seen: Option<Stamp>, now: Option<Stamp>) -> bool {
     now.is_some() && now != seen
 }
 
+/// A count with thousands separators, the way a total is read at a glance rather than
+/// counted digit by digit.
+fn group_digits(n: usize) -> String {
+    let digits = n.to_string();
+    let mut out = String::with_capacity(digits.len() + digits.len() / 3);
+    for (i, ch) in digits.chars().enumerate() {
+        if i > 0 && (digits.len() - i).is_multiple_of(3) {
+            out.push(',');
+        }
+        out.push(ch);
+    }
+    out
+}
+
+/// A file's length in the unit a reader thinks in. Binary units, because that is what
+/// the file system counts in and a size that disagrees with Explorer is a size the
+/// reader will not believe.
+fn human_size(bytes: u64) -> String {
+    const KB: f64 = 1024.0;
+    let b = bytes as f64;
+    if b < KB {
+        format!("{bytes} B")
+    } else if b < KB * KB {
+        format!("{:.1} KB", b / KB)
+    } else if b < KB * KB * KB {
+        format!("{:.1} MB", b / (KB * KB))
+    } else {
+        format!("{:.2} GB", b / (KB * KB * KB))
+    }
+}
+
+/// A file's last write, as the local clock reads it: `YYYY-MM-DD HH:MM`.
+///
+/// The system's own conversion is used rather than arithmetic on the epoch, so a file
+/// written across a daylight-saving change still shows the hour the reader remembers
+/// writing it. `None` when the drive will not say when it was written -- some network
+/// shares will not -- which the bar shows by leaving the item out.
+fn local_time_label(written: Option<std::time::SystemTime>) -> Option<String> {
+    let since_epoch = written?.duration_since(std::time::UNIX_EPOCH).ok()?;
+    // A FILETIME counts 100-nanosecond ticks from 1601; Unix time counts seconds from
+    // 1970, and the two epochs are this far apart.
+    const SECONDS_FROM_1601_TO_1970: u64 = 11_644_473_600;
+    let ticks = since_epoch.as_secs().checked_add(SECONDS_FROM_1601_TO_1970)?.checked_mul(10_000_000)?;
+    let utc = FILETIME { dwLowDateTime: ticks as u32, dwHighDateTime: (ticks >> 32) as u32 };
+    let mut universal = SYSTEMTIME::default();
+    let mut parts = SYSTEMTIME::default();
+    unsafe {
+        // UTC first, then this machine's own zone, so a file written across a
+        // daylight-saving change still shows the hour the reader remembers writing it.
+        FileTimeToSystemTime(&utc, &mut universal).ok()?;
+        SystemTimeToTzSpecificLocalTime(None, &universal, &mut parts).ok()?;
+    }
+    Some(format!(
+        "{:04}-{:02}-{:02} {:02}:{:02}",
+        parts.wYear, parts.wMonth, parts.wDay, parts.wHour, parts.wMinute
+    ))
+}
+
+/// How long the document would take to read, in whole minutes.
+///
+/// The two scripts are paced separately -- a Chinese page is counted in characters and
+/// an English one in words, and one rate for both would be wrong for both -- and the
+/// result is rounded up, so a short note is never "0 minutes".
+fn reading_minutes(counts: &rubrica_doc::stats::TextCounts) -> usize {
+    if counts.characters == 0 {
+        return 0;
+    }
+    let minutes = counts.cjk_characters as f64 / 350.0 + counts.latin_words as f64 / 220.0;
+    (minutes.ceil() as usize).max(1)
+}
+
 unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRESULT {
     // The pointer is installed by WM_NCCREATE, before WM_SIZE can arrive.
     let raw = GetWindowLongPtrW(hwnd, GWLP_USERDATA);
@@ -3490,7 +3618,7 @@ impl View {
         if let Some(path) = path.as_ref() {
             workspace.open_file(View::workspace_file(path), TabKind::Pinned);
         }
-        self.doc = Arc::new(doc);
+        self.set_doc(doc);
         self.source = source;
         self.source_view = preferences.source;
         self.text_options = crate::reading::text_options_for(path.as_deref(), preferences.text);
@@ -4219,7 +4347,7 @@ impl View {
                     let _ = InvalidateRect(Some(hwnd), None, false);
                     return LRESULT(0);
                 }
-                if self.reading_mode == ReadingMode::Stack && self.page_point(x, y).is_none() {
+                if y >= self.content_bottom() || (self.reading_mode == ReadingMode::Stack && self.page_point(x, y).is_none()) {
                     return LRESULT(0);
                 }
                 self.pressed = None;
@@ -4268,7 +4396,8 @@ impl View {
                         self.caption_button_at(px, py).is_none()
                             && (self.tab_at(px, py).is_some() || self.tab_overflow_at(px, py))
                     } else {
-                        self.page_button_at(px, py).is_some() || self.hot_at(px, py).is_some()
+                        py < self.content_bottom()
+                            && (self.page_button_at(px, py).is_some() || self.hot_at(px, py).is_some())
                     };
                     SetCursor(Some(if over { self.hand } else { self.arrow }));
                     LRESULT(1)
@@ -4589,12 +4718,17 @@ impl View {
             if y < layout.top || y > layout.top + self.page_content_height(index) || x < layout.left || x > layout.left + layout.width {
                 return None;
             }
+            if y >= self.content_bottom() {
+                // The status bar is pinned over the foot of the card's own band; a
+                // pointer on the chrome is not a pointer on the page.
+                return None;
+            }
             let page_w = (self.client_w - self.content_dx()).max(1.0);
             let tx = layout.left - (page_w - layout.width) * 0.5;
             let start = self.page_start(index).unwrap_or(0.0);
             Some((x - tx, y + start * scale_of(self.dpi) - layout.top))
         } else {
-            if y < TOPBAR_H || x < self.content_dx() { return None; }
+            if y < TOPBAR_H || y >= self.content_bottom() || x < self.content_dx() { return None; }
             Some((x - self.content_dx(), document_y(y, self.scroll, self.dpi)))
         }
     }
@@ -4624,7 +4758,7 @@ impl View {
     /// The band a floating note may sit in: the viewport the strip leaves, and clear
     /// of the docked tree, which is the reader's not the note's to cover.
     fn bubble_band(&self) -> (f32, f32, f32, f32) {
-        (self.content_dx().max(0.0), TOPBAR_H, self.client_w, self.client_h)
+        (self.content_dx().max(0.0), TOPBAR_H, self.client_w, self.content_bottom())
     }
 
     /// Where the open note is drawn, in the window's own pixels.
@@ -5072,6 +5206,7 @@ impl View {
             reading_mode: self.reading_mode,
             page: self.current_page_index(),
             page_count: self.page_count(),
+            status: self.status,
             headings: outline(&self.doc, self.anchor_tops.len()),
             offered: TextFace::ALL.iter().map(|f| face_drawable(&self.font, f)).collect(),
         };
@@ -5360,6 +5495,17 @@ impl View {
                 unsafe { self.update_find_cue(); }
                 self.shape_find_label();
             }
+            // One item on the status bar, added or taken away. The choice is written
+            // down at once, the way the palette and the reading size are, because the
+            // window's own close button ends the process without asking anything of it.
+            Command::StatusItem(item) => {
+                self.status ^= item;
+                crate::settings::record_status_items(self.status);
+                // A bar that has just appeared or gone has changed the page's height,
+                // so the wrapping -- not the text -- has to be built again.
+                self.layout_epoch += 1;
+                self.relayout();
+            }
             Command::Typography => {
                 let plain = self.plain_override.unwrap_or_else(|| reading::is_plain(self.path.as_deref()));
                 if let Err(error) = crate::typography::show(hwnd, &self.theme, plain, self.lang) { show_error(hwnd, &error.to_string()); }
@@ -5411,6 +5557,15 @@ impl View {
         })
     }
 
+    /// Replace the page's document and count its text.
+    ///
+    /// Every path that builds a document goes through here, so the status bar can never
+    /// be reading numbers taken from a version of the text that is no longer on screen.
+    fn set_doc(&mut self, doc: Document) {
+        self.doc = Arc::new(doc);
+        self.counts = self.doc.counts();
+    }
+
     fn refresh_chapter_index(&mut self) {
         let plain = self.plain_override.unwrap_or_else(|| reading::is_plain(self.path.as_deref()));
         self.chapter_index = if plain && self.text_options.chapters {
@@ -5455,10 +5610,12 @@ impl View {
             self.cache_window(next, source.clone());
             self.chapter = next;
             self.source = source;
-            self.doc = Arc::new(index.window_text(&self.source, next, self.text_options));
+            let doc = index.window_text(&self.source, next, self.text_options);
+            self.set_doc(doc);
         } else {
             self.chapter = next;
-            self.doc = Arc::new(self.parse_source());
+            let doc = self.parse_source();
+            self.set_doc(doc);
         }
         self.scroll = 0.0;
         self.relayout();
@@ -5544,7 +5701,8 @@ impl View {
                 }
             }
         }
-        self.doc = Arc::new(self.parse_source());
+        let doc = self.parse_source();
+        self.set_doc(doc);
         self.relayout_in_place(hwnd);
         if let Some(byte) = source { self.restore_source(byte); }
         self.update_title(hwnd);
@@ -5767,7 +5925,7 @@ impl View {
             }
             return;
         }
-        let view_h = (self.client_h - TOPBAR_H).max(1.0) / scale_of(self.dpi);
+        let view_h = (self.content_bottom() - TOPBAR_H).max(1.0) / scale_of(self.dpi);
         let max = (self.content_h + self.theme.base - view_h).max(0.0);
         self.scroll = self.scroll.clamp(0.0, max);
     }
@@ -7209,14 +7367,113 @@ fn layout_block(
 }
 
 impl View {
+    /// The height of the status bar in the window as it is, which is zero when the
+    /// reader has cleared it: a bar with nothing to show is not a bar.
+    fn status_h(&self) -> f32 {
+        if self.status == 0 { 0.0 } else { STATUS_H }
+    }
+
+    /// The bottom of the page area: the window's foot, less the status bar. Every
+    /// viewport measurement ends here rather than at `client_h`, so the page can never
+    /// be laid out under the bar or scrolled past it.
+    fn content_bottom(&self) -> f32 {
+        (self.client_h - self.status_h()).max(TOPBAR_H + 1.0)
+    }
+
     /// Client-space height of one text page, in points: most of a window, so a reader
     /// keeps a little of the previous screen as a place to come back to.
     fn page_height(&self) -> Pt {
-        (self.client_h - TOPBAR_H).max(1.0) / scale_of(self.dpi) * 0.85
+        (self.content_bottom() - TOPBAR_H).max(1.0) / scale_of(self.dpi) * 0.85
     }
 
     fn page_stack_layout(&self) -> PageStackLayout {
-        page_stack_layout_for(self.client_w, self.client_h, self.content_dx())
+        page_stack_layout_for(self.client_w, self.content_bottom(), self.content_dx())
+    }
+
+    /// How far through the document the reader is, in whole percent.
+    ///
+    /// Measured from the scroll rather than the page index, so the two reading modes
+    /// agree: a page stack and a continuous scroll of the same document say the same
+    /// number. A document that fits the window entire is 100% -- all of it is in front
+    /// of the reader -- and one still being laid out measures against what it has so far.
+    fn progress_percent(&self) -> u32 {
+        let view = (self.content_bottom() - TOPBAR_H).max(1.0) / scale_of(self.dpi);
+        let max = (self.content_h + self.theme.base - view).max(0.0);
+        if max <= 0.0 {
+            return 100;
+        }
+        ((self.scroll / max).clamp(0.0, 1.0) * 100.0).round() as u32
+    }
+
+    /// The chapter the reader is in, by title when the document named one.
+    ///
+    /// A document with a single chapter has no chapter worth naming, and a chapter the
+    /// detector numbered rather than titled falls back to its place in the book.
+    fn chapter_label(&self) -> Option<String> {
+        let chapters = self.chapter_index.as_ref()?.chapters();
+        if chapters.len() < 2 {
+            return None;
+        }
+        let title = chapters.get(self.chapter)?.title.trim();
+        if title.is_empty() {
+            Some(format!("{} / {}", self.chapter + 1, chapters.len()))
+        } else {
+            Some(title.to_string())
+        }
+    }
+
+    /// Whether the page is Markdown or plain text, asked the same way the parser asks.
+    fn format_label(&self) -> String {
+        let plain = self.plain_override.unwrap_or_else(|| reading::is_plain(self.path.as_deref()));
+        if plain {
+            i18n::t(self.lang, Key::StatusFormatPlain).to_string()
+        } else {
+            "Markdown".to_string()
+        }
+    }
+
+    /// The bar's text: the enabled items that have something to say, in the menu's
+    /// order, joined by the separator.
+    ///
+    /// An item with no value for this document -- a chapter in a document with no
+    /// chapters, a size for a document that is not a file -- is left out rather than
+    /// printed as a dash, because a dash is one more mark to read and says nothing.
+    fn status_text(&self) -> String {
+        if self.status == 0 {
+            return String::new();
+        }
+        let lang = self.lang;
+        let counts = &self.counts;
+        let mut parts: Vec<String> = Vec::new();
+        for item in crate::settings::STATUS_ITEMS {
+            if self.status & item == 0 {
+                continue;
+            }
+            let value = match item {
+                crate::settings::STATUS_CHARACTERS => Some(group_digits(counts.characters)),
+                crate::settings::STATUS_WORDS => Some(group_digits(counts.words)),
+                crate::settings::STATUS_READING_TIME => {
+                    let minutes = reading_minutes(counts);
+                    (minutes > 0).then(|| i18n::status_reading_time(lang, minutes))
+                }
+                crate::settings::STATUS_PROGRESS => Some(format!("{}%", self.progress_percent())),
+                crate::settings::STATUS_PAGE => {
+                    Some(format!("{} / {}", self.current_page_index() + 1, self.page_count()))
+                }
+                crate::settings::STATUS_CHAPTER => self.chapter_label(),
+                crate::settings::STATUS_PARAGRAPHS => Some(group_digits(counts.paragraphs)),
+                crate::settings::STATUS_ENCODING => Some(self.encoding.label().to_string()),
+                crate::settings::STATUS_FORMAT => Some(self.format_label()),
+                crate::settings::STATUS_SIZE => self.stamp.map(|stamp| human_size(stamp.len)),
+                crate::settings::STATUS_MODIFIED => local_time_label(self.stamp.and_then(|s| s.written)),
+                _ => None,
+            };
+            if let Some(value) = value {
+                let label = i18n::t(lang, i18n::status_item_key(item));
+                parts.push(format!("{label} {value}"));
+            }
+        }
+        parts.join(STATUS_SEPARATOR)
     }
 
     fn stack_page_height(&self) -> Pt {
@@ -7272,7 +7529,7 @@ impl View {
             })
     }
     fn thumb_rect(&self) -> Option<(f32, f32, f32, f32)> {
-        thumb_rect(self.content_h, self.client_w, (self.client_h - TOPBAR_H).max(1.0), self.scroll, self.dpi)
+        thumb_rect(self.content_h, self.client_w, (self.content_bottom() - TOPBAR_H).max(1.0), self.scroll, self.dpi)
     }
 
     fn tab_title(tab: &Tab) -> String {
@@ -7674,6 +7931,77 @@ impl View {
         }
     }
 
+    /// The metadata bar at the foot of the window, right-aligned in the strip's own
+    /// quiet ink.
+    ///
+    /// It is pinned to the glass, so it is drawn after the page's clip has ended: what
+    /// lies under it is whatever the reader has scrolled into place there. The label is
+    /// shaped once per (text, room) and looked up after that, because the bar is
+    /// repainted on every wheel tick and re-measuring a sentence of numbers is work a
+    /// moving window cannot afford.
+    unsafe fn draw_status_bar(&mut self, target: &ID2D1RenderTarget) {
+        let status_h = self.status_h();
+        if status_h <= 0.0 {
+            return;
+        }
+        let top = self.client_h - status_h;
+        let strip = self.brushes.get(&ColorRole::TabStrip).cloned();
+        let hairline = self.brushes.get(&ColorRole::TabInactive).cloned();
+        let muted = self.brushes.get(&ColorRole::Muted).cloned();
+        if let Some(brush) = strip.as_ref() {
+            let rect = D2D_RECT_F { left: 0.0, top, right: self.client_w, bottom: self.client_h };
+            target.FillRectangle(&rect, brush);
+        }
+        // The hairline above the bar, the mirror of the one below the strip: with it the
+        // bar is chrome resting under the page, and without it the two run together.
+        if let Some(brush) = hairline.as_ref() {
+            let rect = D2D_RECT_F { left: 0.0, top, right: self.client_w, bottom: top + 1.0 };
+            target.FillRectangle(&rect, brush);
+        }
+        let Some(ink) = muted else { return };
+        let text = self.status_text();
+        if text.is_empty() {
+            return;
+        }
+        if self.status_format.is_none() {
+            self.status_format = self.font.text_format("Segoe UI", 12.0).ok();
+        }
+        // Right-aligned, because the tree panel docks at the left and the bar must not
+        // run under it. The room is what the two edges leave.
+        let band_left = self.content_dx().max(0.0) + STATUS_PAD;
+        let band_right = self.client_w - STATUS_PAD;
+        if band_right - band_left < 40.0 {
+            return;
+        }
+        let room = band_right - band_left;
+        let measured = match self.status_label.as_ref() {
+            Some(((was, was_room), _, _, _, _)) => *was == text && (was_room - room).abs() <= 1.0,
+            None => false,
+        };
+        if !measured {
+            let (layout, width, box_h) = self
+                .font
+                .ui_label(&text, "Segoe UI", 12.0, room)
+                .map(|(layout, w, h)| (Some(layout), w, h))
+                .unwrap_or((None, 0.0, 0.0));
+            self.status_label =
+                Some(((text.clone(), room), layout, width, box_h, utf16(&text)));
+        }
+        let (_, layout, width, box_h, wide) =
+            self.status_label.as_ref().expect("the label was just made").clone();
+        if let Some(layout) = layout.as_ref() {
+            target.DrawTextLayout(
+                Vector2::new(band_right - width, top + (status_h - box_h) * 0.5),
+                layout,
+                &ink,
+                D2D1_DRAW_TEXT_OPTIONS(0),
+            );
+        } else if let Some(format) = self.status_format.as_ref() {
+            let rect = D2D_RECT_F { left: band_left, top, right: band_right, bottom: self.client_h };
+            target.DrawText(&wide, format, &rect, &ink, D2D1_DRAW_TEXT_OPTIONS_CLIP, DWRITE_MEASURING_MODE_NATURAL);
+        }
+    }
+
     /// The three window controls, at the strip's right-hand end and the strip's own
     /// height tall, close at the corner the way the system's own are. Their glyphs
     /// are geometry rather than a font's, so they are the same shapes at every DPI.
@@ -7769,7 +8097,7 @@ impl View {
 
     fn scroll_to_thumb(&mut self, pointer_y: f32) {
         let Some((_, _, _, th)) = self.thumb_rect() else { return };
-        let view = (self.client_h - TOPBAR_H).max(1.0);
+        let view = (self.content_bottom() - TOPBAR_H).max(1.0);
         let max_scroll = (self.content_h - view / scale_of(self.dpi)).max(0.0);
         let room = (view - th).max(1.0);
         let centre = (pointer_y - TOPBAR_H - th * 0.5).clamp(0.0, room);
@@ -7817,6 +8145,7 @@ impl View {
         self.close_note_bubble();
         std::mem::swap(&mut page.source, &mut self.source);
         std::mem::swap(&mut page.doc, &mut self.doc);
+        std::mem::swap(&mut page.counts, &mut self.counts);
         std::mem::swap(&mut page.ops, &mut self.ops);
         self.ops_sorted = self.ops.windows(2).all(|w| op_top(&w[0]) <= op_top(&w[1]));
         std::mem::swap(&mut page.reading_mode, &mut self.reading_mode);
@@ -8304,7 +8633,8 @@ impl View {
             .as_ref()
             .map(|index| chapter.min(index.chapters().len().saturating_sub(1)))
             .unwrap_or(0);
-        self.doc = Arc::new(self.parse_source());
+        let doc = self.parse_source();
+        self.set_doc(doc);
         // Filed at the same moment as the text that came out of it, so that the next tick
         // of the poll compares the page on screen against the file it was read from rather
         // than against whatever the last page's file was.
@@ -8414,11 +8744,12 @@ impl View {
             let bg = d2d(self.palette.bg);
             target.Clear(Some(&bg));
             self.draw_top_bar(&target);
-            // The page lives below the strip, and nothing it draws may rise into the
-            // strip's band, whatever a transform or a tall image does. The tree panel is
-            // under the same law, so both are clipped to the viewport the strip leaves.
+            // The page lives below the strip and above the status bar, and nothing it
+            // draws may rise into the strip's band or fall into the bar's, whatever a
+            // transform or a tall image does. The tree panel is under the same law, so
+            // all of them are clipped to the viewport the two bands leave.
             target.PushAxisAlignedClip(
-                &D2D_RECT_F { left: 0.0, top: TOPBAR_H, right: self.client_w, bottom: self.client_h },
+                &D2D_RECT_F { left: 0.0, top: TOPBAR_H, right: self.client_w, bottom: self.content_bottom() },
                 D2D1_ANTIALIAS_MODE_PER_PRIMITIVE,
             );
             self.draw_tree_panel(&target);
@@ -8436,6 +8767,7 @@ impl View {
                     self.draw_find(&target);
                 }
                 target.SetTransform(&Matrix3x2::identity());
+                self.draw_status_bar(&target);
                 let _ = target.EndDraw(None, None);
                 return;
             }
@@ -8452,7 +8784,7 @@ impl View {
             // belongs to the band the viewport shows, though not to where ink lands:
             // document y = `top` is the first line under the strip, at client y = TOPBAR_H.
             let top = up + TOPBAR_H;
-            let bottom = top + (self.client_h - TOPBAR_H).max(1.0);
+            let bottom = top + (self.content_bottom() - TOPBAR_H).max(1.0);
             self.draw_document(&target, &self.ops, up, top, bottom, true);
             self.draw_preview(&target);
             // Search marks, selection bands, and the caret all belong to the page that
@@ -8484,6 +8816,7 @@ impl View {
                 self.draw_find(&target);
             }
             target.SetTransform(&Matrix3x2::identity());
+            self.draw_status_bar(&target);
             let _ = target.EndDraw(None, None);
         }
     }
@@ -8739,7 +9072,7 @@ impl View {
         // shows: a note is a reader's way of reading on where they are, and a bubble
         // that opened over the whole page would be the problem it was meant to avoid.
         let max_h = (BUBBLE_MAX_LINES * leading.cjk.max(leading.latin) * self.theme.note_size())
-            .min((self.client_h - TOPBAR_H) * BUBBLE_MAX_SCREEN / k)
+            .min((self.content_bottom() - TOPBAR_H) * BUBBLE_MAX_SCREEN / k)
             .max(self.theme.note_size());
         let View { font, theme, doc, maths, images, path, profile, .. } = self;
         let note = doc.footnotes.get(index)?;
@@ -11402,6 +11735,35 @@ mod tests {
         if let Ok(h) = std::fs::OpenOptions::new().write(true).open(path) {
             let _ = h.set_times(times);
         }
+    }
+
+    #[test]
+    fn a_count_is_grouped_for_reading_rather_than_counted() {
+        assert_eq!(group_digits(0), "0");
+        assert_eq!(group_digits(999), "999");
+        assert_eq!(group_digits(1_000), "1,000");
+        assert_eq!(group_digits(12_345_678), "12,345,678");
+    }
+
+    #[test]
+    fn a_size_is_given_in_the_unit_a_reader_thinks_in() {
+        assert_eq!(human_size(512), "512 B");
+        assert_eq!(human_size(2048), "2.0 KB");
+        assert_eq!(human_size(1024 * 1024 * 3 / 2), "1.5 MB");
+    }
+
+    #[test]
+    fn reading_time_is_paced_per_script_and_never_zero_for_text() {
+        let han = rubrica_doc::stats::TextCounts {
+            characters: 100, words: 100, paragraphs: 1, cjk_characters: 100, latin_words: 0,
+        };
+        assert_eq!(reading_minutes(&han), 1);
+        let long = rubrica_doc::stats::TextCounts {
+            characters: 3500, words: 3500, paragraphs: 1, cjk_characters: 3500, latin_words: 0,
+        };
+        assert_eq!(reading_minutes(&long), 10);
+        // Nothing to read is not zero minutes of reading; it is no estimate at all.
+        assert_eq!(reading_minutes(&rubrica_doc::stats::TextCounts::default()), 0);
     }
 
     #[test]

@@ -22,6 +22,7 @@ use pulldown_cmark::{
 
 mod emphasis;
 pub mod plain;
+pub mod stats;
 
 /// Byte range into [`Block::text`], plus the style it carries.
 #[derive(Clone, Debug, PartialEq, Eq)]

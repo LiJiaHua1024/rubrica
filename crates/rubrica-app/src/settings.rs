@@ -295,6 +295,54 @@ pub(crate) fn record_plain_word(name: &str, value: u32) {
     write_word(SUBKEY, name, value);
 }
 
+/// The bits of the status bar, one per item it can show. A bit set is an item on.
+pub const STATUS_CHARACTERS: u32 = 1 << 0;
+pub const STATUS_WORDS: u32 = 1 << 1;
+pub const STATUS_READING_TIME: u32 = 1 << 2;
+pub const STATUS_PROGRESS: u32 = 1 << 3;
+pub const STATUS_PAGE: u32 = 1 << 4;
+pub const STATUS_CHAPTER: u32 = 1 << 5;
+pub const STATUS_PARAGRAPHS: u32 = 1 << 6;
+pub const STATUS_ENCODING: u32 = 1 << 7;
+pub const STATUS_FORMAT: u32 = 1 << 8;
+pub const STATUS_SIZE: u32 = 1 << 9;
+pub const STATUS_MODIFIED: u32 = 1 << 10;
+
+/// Every bit a stored mask is allowed to carry, in the order the menu offers them --
+/// which is also the order the bar prints them.
+pub const STATUS_ITEMS: [u32; 11] = [
+    STATUS_CHARACTERS, STATUS_WORDS, STATUS_READING_TIME, STATUS_PROGRESS, STATUS_PAGE,
+    STATUS_CHAPTER, STATUS_PARAGRAPHS, STATUS_ENCODING, STATUS_FORMAT, STATUS_SIZE,
+    STATUS_MODIFIED,
+];
+
+const EVERY_STATUS_ITEM: u32 = STATUS_CHARACTERS | STATUS_WORDS | STATUS_READING_TIME
+    | STATUS_PROGRESS | STATUS_PAGE | STATUS_CHAPTER | STATUS_PARAGRAPHS | STATUS_ENCODING
+    | STATUS_FORMAT | STATUS_SIZE | STATUS_MODIFIED;
+
+/// What a bar shows when the reader has never said: characters, and nothing else.
+///
+/// The reading experience is the reason the default is one item rather than the whole
+/// row -- a bar crowded with numbers is a bar the eye keeps going back to. Every other
+/// item is opt-in, and clearing the last of them is a real choice that has to come back
+/// as an empty bar rather than as the default again.
+const DEFAULT_STATUS_ITEMS: u32 = STATUS_CHARACTERS;
+
+/// Which items the status bar shows, from a stored word. Absence means no choice yet.
+fn status_of(value: Option<u32>) -> u32 {
+    // Bits this build does not know -- a row an older one wrote, or a hand-edited key --
+    // are dropped rather than shown as an item with nothing behind it.
+    value.unwrap_or(DEFAULT_STATUS_ITEMS) & EVERY_STATUS_ITEM
+}
+
+pub fn status_items() -> u32 {
+    status_of(word(SUBKEY, "Status"))
+}
+
+pub fn record_status_items(items: u32) {
+    write_word(SUBKEY, "Status", items & EVERY_STATUS_ITEM);
+}
+
 pub fn editor() -> String {
     text(SUBKEY, "Editor").filter(|s| !s.is_empty()).unwrap_or_else(|| "notepad.exe".into())
 }
@@ -982,11 +1030,23 @@ mod tests {    use super::*;
         assert_eq!(read(Some(w[0]), Some(w[1]), Some(w[2]), Some(w[3])).dark, None);
     }
 
+    #[test]
+    fn an_unchosen_status_bar_shows_characters_and_a_cleared_one_stays_clear() {
+        // Never chosen: the one default item, so a first run has a bar worth reading.
+        assert_eq!(status_of(None), STATUS_CHARACTERS);
+        // Chosen and then cleared: an empty bar is what the reader asked for, not the
+        // default again.
+        assert_eq!(status_of(Some(0)), 0);
+        // A row of bits round-trips whole, and a bit this build does not know is dropped.
+        let chosen = STATUS_WORDS | STATUS_PROGRESS | (1 << 30);
+        assert_eq!(status_of(Some(chosen)), STATUS_WORDS | STATUS_PROGRESS);
+        assert_eq!(status_of(Some(EVERY_STATUS_ITEM)), EVERY_STATUS_ITEM);
+    }
+
     /// The whole road a setting travels: out to the registry and back. What the tests
     /// above check is the encoding, and an encoding nothing can read is no use to anyone.
     #[test]
-    fn a_choice_written_down_is_a_choice_read_back() {
-        let sub = "Software\\Rubrica Test";
+    fn a_choice_written_down_is_a_choice_read_back() {        let sub = "Software\\Rubrica Test";
         write_words(sub, &words(Zoom::DESIGN.up().up(), Some(true), 2, 0));
         assert_eq!(
             read_words(sub),
