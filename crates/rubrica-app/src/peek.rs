@@ -13,15 +13,15 @@
 //! -- happens on the service's window thread after a `PostMessage`, where a few
 //! hundred milliseconds cost nothing because no key is waiting on them.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::os::windows::ffi::OsStringExt;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use windows::core::{w, GUID, Interface, PCWSTR};
 use windows::Win32::Foundation::{
-    GetLastError, ERROR_ALREADY_EXISTS, ERROR_SUCCESS, HWND, LRESULT, LPARAM, POINT,
-    RECT, WPARAM,
+    GetLastError, D2DERR_RECREATE_TARGET, ERROR_ALREADY_EXISTS, ERROR_SUCCESS, HWND, LRESULT,
+    LPARAM, POINT, RECT, WPARAM,
 };
 use windows::Win32::Graphics::Direct2D::Common::{
     D2D1_ALPHA_MODE_PREMULTIPLIED, D2D1_PIXEL_FORMAT, D2D_RECT_F, D2D_SIZE_U,
@@ -83,7 +83,7 @@ use windows::Win32::UI::WindowsAndMessaging::{
     CREATESTRUCTW, DefWindowProcW, DestroyMenu, DestroyWindow, DispatchMessageW,
     FindWindowExW, GetClassNameW, GetClientRect, GetCursorPos, GetForegroundWindow,
     GetMessageW, GetGUIThreadInfo, GetShellWindow, GetWindowLongPtrW, GetWindowThreadProcessId,
-    IsWindowVisible,
+    HHOOK, IsChild, IsWindowVisible,
     FindWindowW, KillTimer, LoadCursorW, LoadIconW, PostMessageW, PostQuitMessage, RegisterClassExW,
     RegisterWindowMessageW, SetForegroundWindow, SetTimer, SetWindowLongPtrW, SetWindowsHookExW,
     SetWindowPos, ShowWindow, TrackPopupMenu, TranslateMessage, UnhookWindowsHookEx,
@@ -188,9 +188,34 @@ const INVALID_KEY_COOLDOWN: Duration = Duration::from_secs(1);
 /// they are for -- and the preview simply notices what moved.
 const SELECTION_POLL_MS: u32 = 500;
 
-/// The bar above the page, and the padding inside it, in the page's own units.
+/// The bar above the page, and the padding inside it, in device pixels -- the bar is
+/// drawn as a rectangle of the client area, and the runs on it are placed against
+/// that rectangle's own width, so the two have to be counted the same way.
 const BAR_H: f32 = 42.0;
 const BAR_PAD: f32 = 14.0;
+
+/// The DPI the preview's render target is made at, and never changed from.
+///
+/// Pinned, and for the same reason the reader's is. A D2D target made at `d` maps one
+/// of its own units to `d / 96` physical pixels, and every coordinate this file hands
+/// Direct2D is already a physical pixel: `BAR_H` is compared against `GetClientRect`,
+/// the bar's runs are placed against the client width, and `build_ops` is given the
+/// window's real dpi so `Page.ops` is laid out at `k = dpi / 72` against that same
+/// pixel width. Handing that display list a target made at the window's own dpi
+/// therefore multiplies all of it by `d / 96` a second time: on a 150% monitor the
+/// page is laid out 1.5x the client and painted 1.5x again, so its right and bottom
+/// thirds fall off the window with nothing to scroll them back into view, and the
+/// title bar's own runs land at 150% of the spot `shape_bar` measured for them.
+///
+/// `GetDpiForWindow` is still what drives `k` above, so a point of type still grows
+/// with the display and the page still re-lays-out when the preview is opened onto a
+/// monitor of a different scale. The scaling has already happened once, into the
+/// display list; this constant only says the drawing after it does not do it twice.
+///
+/// It is a copy of `view::TARGET_DPI` rather than a shared constant on purpose: the
+/// two are pinned to the same number because the D2D rule above is the same number,
+/// not because they talk to each other, and this file is a window of its own.
+const PEEK_TARGET_DPI: f32 = 96.0;
 
 const TRAY_ID: u32 = 1;
 const POLL_TIMER: usize = 1;
@@ -200,6 +225,11 @@ const POLL_TIMER: usize = 1;
 /// actually notice, so something has to keep asking.
 const SERVICE_TIMER: usize = 2;
 const SERVICE_TICK_MS: u32 = 1000;
+/// What one message on the hooks' own thread is allowed to cost. The system's
+/// `LowLevelHooksTimeout` is a hard 300 ms and is not configurable: past it
+/// Windows removes both hooks from the thread, silently, and the service is
+/// deaf to the desktop until something puts them back.
+const HOOK_BUDGET: Duration = Duration::from_millis(300);
 const MENU_AUTOSTART: usize = 100;
 const MENU_EXIT: usize = 101;
 
@@ -223,29 +253,7 @@ pub fn daemon() -> crate::Result<()> {
     }
 
     let hwnd = unsafe { create_service_window() }?;
-    // The documented home for a hook that never leaves the process is user32.
-    let hook = unsafe {
-        SetWindowsHookExW(
-            WH_KEYBOARD_LL,
-            Some(hook_proc),
-            Some(GetModuleHandleW(None)?.into()),
-            0,
-        )
-        .map_err(|e| -> crate::Error { format!("keyboard hook: {e}").into() })?
-    };
-    // The mouse watches for a leaving the foreground cannot hear: a preview of a
-    // desktop icon sits on the desktop, which is already the foreground of its own
-    // click -- a click on it moves the foreground nowhere. The click itself is
-    // the leaving instead.
-    let mouse = unsafe {
-        SetWindowsHookExW(
-            WH_MOUSE_LL,
-            Some(mouse_proc),
-            Some(GetModuleHandleW(None)?.into()),
-            0,
-        )
-        .map_err(|e| -> crate::Error { format!("mouse hook: {e}").into() })?
-    };
+    let (keyboard, mouse) = install_hooks()?;
     // A foreground change ends the invalid-key cooldown: the window the typing
     // happened in is gone, and the next space is a fresh request.
     let event_hook = unsafe {
@@ -267,7 +275,11 @@ pub fn daemon() -> crate::Result<()> {
         hold_started: None,
         invalid_at: None,
         shown: false,
-        vocabulary_down: None,
+        vocabulary_down: HashSet::new(),
+        focus_close: focus_close(),
+        click_close: click_close(),
+        hooks: (keyboard, mouse),
+        hooks_stale: false,
         peek: None,
     });
     SERVICE.with(|slot| slot.set(Some(&mut *service as *mut Service)));
@@ -282,6 +294,7 @@ pub fn daemon() -> crate::Result<()> {
         }
     }
 
+    let hooks = service.hooks;
     SERVICE.with(|slot| slot.set(None));
     unsafe {
         let _ = KillTimer(Some(hwnd), SERVICE_TIMER);
@@ -292,11 +305,37 @@ pub fn daemon() -> crate::Result<()> {
         if !event_hook.is_invalid() {
             let _ = UnhookWinEvent(event_hook);
         }
-        let _ = UnhookWindowsHookEx(hook);
-        let _ = UnhookWindowsHookEx(mouse);
+        let _ = UnhookWindowsHookEx(hooks.0);
+        let _ = UnhookWindowsHookEx(hooks.1);
         let _ = Shell_NotifyIconW(NIM_DELETE, &tray_icon(hwnd));
     }
     Ok(())
+}
+
+/// The pair of hooks the whole desktop is answered by, and the only place they are
+/// ever installed: once at the start, and again whenever the system has taken one
+/// away. Both are answered by this thread's message loop, so both are the system's
+/// to remove, and it removes them silently once this thread spends longer than
+/// `HOOK_BUDGET` inside a single message.
+fn install_hooks() -> crate::Result<(HHOOK, HHOOK)> {
+    unsafe {
+        // The documented home for a hook that never leaves the process is user32.
+        let module = GetModuleHandleW(None)
+            .map_err(|e| -> crate::Error { format!("hook module: {e}").into() })?;
+        let keyboard = SetWindowsHookExW(WH_KEYBOARD_LL, Some(hook_proc), Some(module.into()), 0)
+            .map_err(|e| -> crate::Error { format!("keyboard hook: {e}").into() })?;
+        // The mouse watches for a leaving the foreground cannot hear: a preview of a
+        // desktop icon sits on the desktop, which is already the foreground of its own
+        // click -- a click on it moves the foreground nowhere. The click itself is
+        // the leaving instead.
+        match SetWindowsHookExW(WH_MOUSE_LL, Some(mouse_proc), Some(module.into()), 0) {
+            Ok(mouse) => Ok((keyboard, mouse)),
+            Err(error) => {
+                let _ = UnhookWindowsHookEx(keyboard);
+                Err(crate::Error::from(format!("mouse hook: {error}")))
+            }
+        }
+    }
 }
 
 /// One peek service per session, the same bargain the reader makes. The handle is
@@ -383,11 +422,23 @@ struct Service {
     invalid_at: Option<Instant>,
     /// Mirrored from the preview window so the hook can ask "is it up" in O(1).
     shown: bool,
-    /// The virtual key whose press the hook swallowed for the preview and whose
-    /// release has not come back yet. The release is swallowed wherever the focus
+    /// The virtual keys whose press the hook swallowed for the preview and whose
+    /// releases have not come back yet. A release is swallowed wherever the focus
     /// has moved since: a release the foreground never saw a press for is a
-    /// keystroke of its own.
-    vocabulary_down: Option<u32>,
+    /// keystroke of its own. A set, because one key held down is no reason to
+    /// lose the pairing of a second one taken since.
+    vocabulary_down: HashSet<u32>,
+    /// The peek switches, read once per message instead of once per keystroke and
+    /// once per click. The hooks ask the registry nothing; a hive an installer
+    /// holds open would make every one of those reads wait on it.
+    focus_close: bool,
+    click_close: bool,
+    /// The hooks themselves, kept so one the system took away can be put back.
+    hooks: (HHOOK, HHOOK),
+    /// Set when a message on this thread has been seen running past the budget a
+    /// low-level hook is allowed, which is the only evidence there is that a hook
+    /// is gone: a removed hook and a quiet desktop look the same from in here.
+    hooks_stale: bool,
     peek: Option<Box<Peek>>,
 }
 
@@ -433,8 +484,14 @@ unsafe extern "system" fn service_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPA
         return unsafe { DefWindowProcW(hwnd, msg, wp, lp) };
     }
     let service = unsafe { &mut *(raw as *mut Service) };
+    // The peek switches are read here, once per message, rather than from inside
+    // the hooks: a registry query on the hooks' own thread spends the patience
+    // the system allows that thread, and an installer holding the hive makes
+    // every one of them wait for it. Nothing posts a message for every key.
+    service.read_settings();
     match msg {
         WM_APP_SPACE => {
+            let started = Instant::now();
             let visible = service
                 .peek
                 .as_ref()
@@ -459,6 +516,10 @@ unsafe extern "system" fn service_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPA
                     }
                 }
             }
+            // A shell walk and a typeset are what this message is made of, and on a
+            // folder of large documents over a network share they can be the ones
+            // the system takes the hooks away for. It says so on the way out.
+            let _ = note_hook_overrun(started);
             LRESULT(0)
         }
         WM_APP_RELEASE => {
@@ -527,7 +588,7 @@ unsafe extern "system" fn service_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPA
                 .as_ref()
                 .and_then(|p| p.source)
                 .is_some_and(|src| unsafe { GetForegroundWindow() } != src);
-            if service.shown && moved && focus_close() {
+            if service.shown && moved && service.focus_close {
                 service.close_preview();
             }
             LRESULT(0)
@@ -539,14 +600,23 @@ unsafe extern "system" fn service_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPA
             // so the preview answers to nothing at all, for good. The hardware is the
             // truth here, and it costs one call to ask.
             //
-            // This is also the only thing that heals a hook the system took away: a
+            // It is also the only thing that can heal a hook the system took away: a
             // low-level hook stops being called the moment its thread stops answering,
-            // and nothing says so. The flag it was maintaining simply stays put.
+            // and nothing says so. What a message of ours spent is the one trace the
+            // overrun leaves, so the overdue flag is what puts the pair back -- and
+            // only when it is set, since installing over a live hook would answer
+            // every keystroke on the desktop twice.
+            service.rearm_hooks();
             if service.space_down && !pressed(VK_SPACE) {
                 trace("peek: a space the hook never saw released is down no longer");
                 service.space_down = false;
                 service.hold_started = None;
             }
+            // The same question of every key whose release is still owed. A hook
+            // taken away in the middle of a swallowed keystroke leaves the pairing
+            // behind, and a service that must never eat a press forever cannot go
+            // on swallowing one.
+            service.vocabulary_down.retain(|vk| pressed(VIRTUAL_KEY(*vk as u16)));
             LRESULT(0)
         }
         WM_APP_TRAY if lp.0 as u32 == WM_RBUTTONUP => {
@@ -565,6 +635,42 @@ unsafe extern "system" fn service_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPA
 }
 
 impl Service {
+    /// The switches the hooks ask about, answered from here instead of from the
+    /// registry: read once per message, which the service timer guarantees happens
+    /// every second whether or not anything else does.
+    fn read_settings(&mut self) {
+        self.focus_close = focus_close();
+        self.click_close = click_close();
+    }
+
+    /// Put back a hook the system removed, when one of our messages has been
+    /// measured running past what it allows one. The old pair goes first: a handle
+    /// Windows already took back is simply unhooking a handle that is not there,
+    /// while a second install over a live hook would leave the desktop's every
+    /// keystroke being answered twice.
+    fn rearm_hooks(&mut self) {
+        if !self.hooks_stale {
+            return;
+        }
+        self.hooks_stale = false;
+        unsafe {
+            let _ = UnhookWindowsHookEx(self.hooks.0);
+            let _ = UnhookWindowsHookEx(self.hooks.1);
+        }
+        match install_hooks() {
+            Ok(hooks) => {
+                self.hooks = hooks;
+                trace("peek: a hook the system took away is answering again");
+            }
+            Err(error) => {
+                // Nothing to re-arm with. The service keeps its icon and its window
+                // and tries again next second, rather than ending over it.
+                eprintln!("peek hooks: {error}");
+                self.hooks_stale = true;
+            }
+        }
+    }
+
     fn show_preview(&mut self, path: PathBuf) {
         if self.peek.is_none() {
             match Peek::new() {
@@ -648,6 +754,20 @@ fn close_preview_service() {
     }
 }
 
+/// Say, from anywhere on the hooks' own thread, that a message has cost more than
+/// the system allows one to cost -- and whether it did, which is the caller's
+/// answer as much as the service's: a poll that overran has nothing to gain from
+/// running again half a second later.
+fn note_hook_overrun(started: Instant) -> bool {
+    let late = started.elapsed() > HOOK_BUDGET;
+    if late {
+        if let Some(service) = SERVICE.with(|slot| slot.get()) {
+            unsafe { (*service).hooks_stale = true };
+        }
+    }
+    late
+}
+
 // ---------------------------------------------------------------- the hook
 
 /// The service window to tell about a click that leaves, and none when nothing
@@ -655,17 +775,24 @@ fn close_preview_service() {
 /// preview itself while the option that allows that is off. A click on the
 /// preview belongs to it -- a document being read is not dismissed by the click
 /// that chose to read it -- but the option exists for those who want it gone.
+///
+/// A click inside the source window is not a leaving at all: that is the very
+/// folder the preview was made from, so right-clicking a file there to reach its
+/// menu must not take the preview away in the middle of the gesture.
 fn leaving_window(pt: POINT) -> Option<HWND> {
     let service = SERVICE.with(|slot| slot.get())?;
     let service = unsafe { &*service };
-    if !service.shown || !focus_close() {
+    if !service.shown || !service.focus_close {
         return None;
     }
-    let on_preview = service
-        .peek
-        .as_ref()
-        .is_some_and(|p| unsafe { WindowFromPoint(pt) } == p.hwnd);
-    if on_preview && !click_close() {
+    let target = unsafe { WindowFromPoint(pt) };
+    let peek = service.peek.as_ref()?;
+    if Some(target) == peek.source
+        || peek.source.is_some_and(|src| unsafe { IsChild(src, target) }.as_bool())
+    {
+        return None;
+    }
+    if target == peek.hwnd && !service.click_close {
         return None;
     }
     Some(service.window)
@@ -749,12 +876,15 @@ enum Answer {
 /// release it never saw a press for, and a release is a keystroke of its own: the
 /// `Enter` of an `Enter` in a rename box is a second `Enter`, and the reader's folder
 /// gets two of them for the one that was meant.
-fn preview_answer(key: VIRTUAL_KEY, down: bool, shift: bool, ctrl: bool) -> Answer {
+///
+/// `Alt` is not one of the modifiers the preview claims: it is the folder's own
+/// prefix, and `Alt`+`Enter` is the Properties dialog a file is opened with.
+fn preview_answer(key: VIRTUAL_KEY, down: bool, shift: bool, ctrl: bool, alt: bool) -> Answer {
     let message = match key {
-        k if k == VK_ESCAPE => WM_APP_ESCAPE,
+        k if k == VK_ESCAPE && !alt => WM_APP_ESCAPE,
         // `Shift`+`Enter` is the folder's own gesture and the preview does not take it.
-        k if k == VK_RETURN && !shift => WM_APP_OPEN,
-        k if k == VK_F5 => WM_APP_RELOAD,
+        k if k == VK_RETURN && !shift && !alt => WM_APP_OPEN,
+        k if k == VK_F5 && !alt => WM_APP_RELOAD,
         _ => return Answer::Pass,
     };
     if down {
@@ -851,11 +981,17 @@ unsafe extern "system" fn hook_proc(code: i32, wp: WPARAM, lp: LPARAM) -> LRESUL
         return unsafe { CallNextHookEx(None, code, wp, lp) };
     }
 
-    // The release of a vocabulary key whose press this service swallowed goes
-    // with it, wherever the focus has moved since the press -- the pairing is
-    // what keeps a half keystroke from landing in whatever is in front now.
-    if !down && service.vocabulary_down == Some(vk) {
-        service.vocabulary_down = None;
+    // The pairing of a vocabulary key this service swallowed, on both of its edges.
+    // It sits above the `shown` guard because the pair outlives the preview the
+    // press opened: a key held down is still down when that preview closes, and a
+    // release the foreground never saw a press for is a keystroke of its own. The
+    // repeats count too -- letting those through while swallowing the release hands
+    // the folder a burst of presses with no press to end them, and its list view acts
+    // on the way down.
+    if service.vocabulary_down.contains(&vk) {
+        if !down {
+            service.vocabulary_down.remove(&vk);
+        }
         return LRESULT(1);
     }
     // The preview's own keys answer only while the foreground is still a place
@@ -865,9 +1001,18 @@ unsafe extern "system" fn hook_proc(code: i32, wp: WPARAM, lp: LPARAM) -> LRESUL
     // a form or the F5 of a browser.
     if service.shown && unsafe { foreground_reader().is_some() } {
         let key = VIRTUAL_KEY(vk as u16);
-        match preview_answer(key, down, pressed(VK_SHIFT), pressed(VK_CONTROL)) {
+        match preview_answer(
+            key,
+            down,
+            pressed(VK_SHIFT),
+            pressed(VK_CONTROL),
+            pressed(VK_MENU),
+        ) {
             Answer::Open { message, ctrl } => {
-                service.vocabulary_down = Some(vk);
+                // A second key swallowed while this one is still held joins it
+                // rather than taking its place: the release of the first is owed
+                // whatever came after.
+                service.vocabulary_down.insert(vk);
                 let _ = unsafe {
                     PostMessageW(Some(service.window), message, WPARAM(ctrl as usize), LPARAM(0))
                 };
@@ -905,7 +1050,7 @@ unsafe extern "system" fn foreground_changed(
         service.invalid_at = None;
         // A preview that lives only while its source holds the focus hears the
         // change here, the moment it happens, rather than at the next poll.
-        if service.shown && focus_close() {
+        if service.shown && service.focus_close {
             let _ = unsafe {
                 PostMessageW(Some(service.window), WM_APP_FOCUS, WPARAM(0), LPARAM(0))
             };
@@ -955,7 +1100,10 @@ unsafe fn foreground_reader() -> Option<HWND> {
                     .map(|_| fg)
             }
             _ => {
-                trace(&format!("peek: the foreground is a {class}, not a place files are chosen"));
+                // No note here: this is the answer for every keystroke typed into
+                // an ordinary window while a preview stands, and a string built per
+                // keystroke is the wrong price for a guess the caller's own trace
+                // already covers.
                 None
             }
         }
@@ -1232,9 +1380,24 @@ struct Peek {
     page: Option<crate::view::Page>,
     title: Vec<crate::view::PaintRun>,
     hint: Vec<crate::view::PaintRun>,
+    /// The glyph that puts the preview away, and the box that finds it. A preview
+    /// whose hooks the system has taken away, and a user who simply wants the
+    /// window gone, both need a way out that is not a keystroke.
+    close: Vec<crate::view::PaintRun>,
+    close_box: RECT,
     /// Bitmaps for the current page's figures, rebuilt with each file.
     images: Option<images::ImageStore>,
     path: Option<PathBuf>,
+    /// The path the last follow could not read. A file another process holds, or
+    /// one deleted under the preview, is not worth asking for again every half
+    /// second; the old page stays up and the poll says nothing until the
+    /// selection moves on.
+    failed: Option<PathBuf>,
+    /// Set when the last follow ran past what a low-level hook is allowed, and read
+    /// to leave the next tick alone: this thread is the one the desktop's hooks are
+    /// waiting on, and a file that costs a second to typeset costs no less by
+    /// being asked twice.
+    overdue: bool,
     /// The window the selection is watched in; the timer only follows it while the
     /// foreground is still that window.
     source: Option<HWND>,
@@ -1278,8 +1441,12 @@ impl Peek {
                 page: None,
                 title: Vec::new(),
                 hint: Vec::new(),
+                close: Vec::new(),
+                close_box: RECT::default(),
                 images: None,
                 path: None,
+                failed: None,
+                overdue: false,
                 source: None,
                 scroll: 0.0,
                 wheel_carry: 0,
@@ -1323,6 +1490,8 @@ impl Peek {
     /// rather than showing an empty page over it, which also means nothing came
     /// up, and that is what the answer says.
     fn show(&mut self, path: &Path) -> bool {
+        // Asked for by name, so a path that failed before is worth another try.
+        self.failed = None;
         unsafe { self.place() };
         if !self.load(path) {
             return false;
@@ -1359,6 +1528,7 @@ impl Peek {
         self.path = None;
         self.page = None;
         self.images = None;
+        self.failed = None;
         self.scroll = 0.0;
     }
 
@@ -1378,8 +1548,17 @@ impl Peek {
         if self.path.as_deref() == Some(path.as_path()) {
             return;
         }
+        // A file that has already refused to open is still refusing, and the poll
+        // runs every half second for as long as the selection rests on it. The
+        // path is remembered so the retry is the selection's move, not the clock's.
+        if self.failed.as_deref() == Some(path.as_path()) {
+            return;
+        }
         if self.load(&path) {
+            self.failed = None;
             unsafe { let _ = InvalidateRect(Some(self.hwnd), None, false); }
+        } else {
+            self.failed = Some(path);
         }
     }
 
@@ -1462,16 +1641,35 @@ impl Peek {
         ));
         self.scroll = 0.0;
         self.path = Some(path.to_owned());
-        self.shape_bar(client_w / k, k);
+        self.shape_bar(client_w, k);
         true
     }
 
-    /// The file's name on the left of the bar, the keys that work on the right. Both
-    /// are shaped through the same engine the page uses, so the bar's lettering is
-    /// the page's lettering at a smaller size.
+    /// Whether a press in the bar landed on the close glyph. It answers whatever
+    /// the click-close option says about the window at large: this preview must
+    /// never be dismissable only by a keystroke the system is free to stop
+    /// answering.
+    fn on_close_glyph(&self, x: i32, y: i32) -> bool {
+        let box_ = self.close_box;
+        !self.close.is_empty()
+            && x >= box_.left
+            && x < box_.right
+            && y >= box_.top
+            && y < box_.bottom
+    }
+
+    /// The file's name on the left of the bar, the keys that work on the right, and
+    /// the glyph that puts it all away at the end. Both are shaped through the same
+    /// engine the page uses, so the bar's lettering is the page's lettering at a
+    /// smaller size. The client width arrives in device pixels, which is the unit
+    /// every position on the bar is counted in -- a run's width is scaled into
+    /// pixels, and a right edge left in points would be short of the edge of the
+    /// window by exactly the difference the display is scaled.
     fn shape_bar(&mut self, client_w: f32, k: f32) {
         self.title.clear();
         self.hint.clear();
+        self.close.clear();
+        self.close_box = RECT::default();
         let Some(font) = self.font.as_mut() else { return };
         let name = self
             .path
@@ -1493,7 +1691,8 @@ impl Peek {
         };
         let size = self.theme.base * 0.95;
         let runs = font.shape_runs(&name, 0..name.len(), &req, size, 0.0);
-        let mut at = BAR_PAD;
+        let pad = BAR_PAD * k;
+        let mut at = pad;
         let baseline = BAR_H / 2.0 + size * k * 0.35;
         for r in &runs {
             if let Some(mut run) = paint_run(font, r, 0.0, 0.0, k, ColorRole::Text, None) {
@@ -1503,14 +1702,37 @@ impl Peek {
                 self.title.push(run);
             }
         }
-        let hint = "Esc close  \u{2190}\u{2192} files  Enter open  Ctrl+Enter reader";
         let small = self.theme.base * 0.72;
-        let runs = font.shape_runs(hint, 0..hint.len(), &req, small, 0.0);
-        let mut right = client_w - BAR_PAD;
+        // The close glyph takes the right end of the bar first, and the hint is
+        // measured backwards from whatever is left of it.
+        let glyph = "\u{2715}";
+        let runs = font.shape_runs(glyph, 0..glyph.len(), &req, small, 0.0);
         let baseline = BAR_H / 2.0 + small * k * 0.35;
+        let mut right = client_w - pad;
+        if let Some(r) = runs.first() {
+            let width = r.width() * k;
+            let x = client_w - pad - width;
+            if let Some(mut run) = paint_run(font, r, 0.0, 0.0, k, ColorRole::Muted, None) {
+                run.x = x;
+                run.baseline = baseline;
+                self.close.push(run);
+                right = x - pad;
+            }
+            // A square the height of the bar, which is a target worth hitting for a
+            // glyph the size of a comma.
+            let middle = x + width / 2.0;
+            self.close_box = RECT {
+                left: (middle - BAR_H / 2.0) as i32,
+                top: 0,
+                right: (middle + BAR_H / 2.0) as i32,
+                bottom: BAR_H as i32,
+            };
+        }
+        let hint = "Esc close  \u{2190}\u{2192} files  Enter open  Ctrl+Enter reader";
+        let runs = font.shape_runs(hint, 0..hint.len(), &req, small, 0.0);
         for r in runs.iter().rev() {
             let width = r.width() * k;
-            if right - width < at + BAR_PAD {
+            if right - width < at + pad {
                 break;
             }
             if let Some(mut run) = paint_run(font, r, 0.0, 0.0, k, ColorRole::Muted, None) {
@@ -1548,21 +1770,26 @@ impl Peek {
 
     /// The render target is rebuilt rather than resized, since the reveal is the
     /// only moment size changes. Brushes live on the target, so they go with it.
+    ///
+    /// Its `dpiX` is [`PEEK_TARGET_DPI`] and not the window's dpi: the display list
+    /// this target is about to be handed is already in physical pixels, so a target
+    /// that scaled it again would be the second half of the bug `PEEK_TARGET_DPI`
+    /// explains. Nothing here calls `SetDpi` on it afterwards for the same reason --
+    /// doing so would put the factor back.
     unsafe fn attach(&mut self) {
         unsafe {
             let mut rect = RECT::default();
             let _ = GetClientRect(self.hwnd, &mut rect);
             let w = (rect.right - rect.left).max(1) as u32;
             let h = (rect.bottom - rect.top).max(1) as u32;
-            let dpi = GetDpiForWindow(self.hwnd).max(96) as f32;
             let props = D2D1_RENDER_TARGET_PROPERTIES {
                 r#type: D2D1_RENDER_TARGET_TYPE_DEFAULT,
                 pixelFormat: D2D1_PIXEL_FORMAT {
                     format: DXGI_FORMAT_B8G8R8A8_UNORM,
                     alphaMode: D2D1_ALPHA_MODE_PREMULTIPLIED,
                 },
-                dpiX: dpi,
-                dpiY: dpi,
+                dpiX: PEEK_TARGET_DPI,
+                dpiY: PEEK_TARGET_DPI,
                 usage: D2D1_RENDER_TARGET_USAGE_NONE,
                 minLevel: D2D1_FEATURE_LEVEL_DEFAULT,
             };
@@ -1644,6 +1871,11 @@ impl Peek {
                     draw_glyph_run(&target, run, brush);
                 }
             }
+            for run in &self.close {
+                if let Some(brush) = hint_brush.as_ref() {
+                    draw_glyph_run(&target, run, brush);
+                }
+            }
             target.PushAxisAlignedClip(
                 &D2D_RECT_F { left: 0.0, top: BAR_H, right: client_w, bottom: client_h },
                 D2D1_ANTIALIAS_MODE_PER_PRIMITIVE,
@@ -1703,7 +1935,29 @@ impl Peek {
             self.page = page;
             target.PopAxisAlignedClip();
             target.SetTransform(&Matrix3x2::identity());
-            let _ = target.EndDraw(None, None);
+            // The answer to EndDraw is the only place the news of a lost device
+            // ever arrives. A GPU reset, `Win`+`Ctrl`+`Shift`+`B`, a display coming
+            // or going: the target is failed for good from then on, the next
+            // BeginDraw answers `E_INVALIDARG`, and the window keeps showing the
+            // last frame that did get presented. So the target, its cast and every
+            // brush made on it go together -- they belong to the device that left.
+            if let Err(error) = target.EndDraw(None, None) {
+                if error.code() != D2DERR_RECREATE_TARGET {
+                    // The lost device is ordinary; an answer nobody expected is not.
+                    eprintln!("peek: EndDraw answered {error}");
+                }
+                self.target = None;
+                self.rt = None;
+                self.brushes.clear();
+            }
+        }
+        // A replacement is built on the spot, since nothing else would: the window
+        // is not moving, and only a reveal would otherwise have called for it.
+        if self.target.is_none() {
+            unsafe {
+                self.attach();
+                let _ = InvalidateRect(Some(self.hwnd), None, false);
+            }
         }
         let _ = unsafe { EndPaint(self.hwnd, &ps) };
     }
@@ -1763,6 +2017,15 @@ unsafe extern "system" fn preview_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPA
             LRESULT(0)
         }
         WM_TIMER if wp.0 == POLL_TIMER => unsafe {
+            // A tick that overran leaves this one nothing to gain: the file costs
+            // what it cost half a second ago, and the thread they share is the one
+            // the desktop's hooks are waiting on. Skipping is the whole difference
+            // between one long message and a service that never answers again.
+            if peek.overdue {
+                peek.overdue = false;
+                return LRESULT(0);
+            }
+            let started = Instant::now();
             // The selection is only followed while the foreground is still the window
             // the preview came from. Anywhere else the preview keeps what it has,
             // since a page the user walked away from is not wrong to stay put --
@@ -1776,8 +2039,23 @@ unsafe extern "system" fn preview_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPA
             } else if !fg.is_invalid() && focus_close() {
                 close_preview_service();
             }
+            peek.overdue = note_hook_overrun(started);
             LRESULT(0)
         },
+        // The close glyph, and only the glyph: the way out that does not depend on
+        // a keystroke the system is free to stop answering, and so on a preview
+        // whose hooks are gone. A press anywhere else on the window is left to
+        // Windows, which is what the option about closing on a click governs.
+        WM_LBUTTONDOWN => {
+            let x = (lp.0 & 0xFFFF) as i16 as i32;
+            let y = ((lp.0 >> 16) & 0xFFFF) as i16 as i32;
+            if peek.on_close_glyph(x, y) {
+                close_preview_service();
+                LRESULT(0)
+            } else {
+                unsafe { DefWindowProcW(hwnd, msg, wp, lp) }
+            }
+        }
         // A click on the window never moves the focus anywhere: the window is a
         // topmost, non-activating popup whose press the desktop would otherwise
         // have received. Closing on it is a choice of its own, off by default.
@@ -1829,13 +2107,13 @@ mod tests {
     #[test]
     fn a_key_a_preview_answers_is_swallowed_down_and_up() {
         let down = Answer::Open { message: WM_APP_ESCAPE, ctrl: false };
-        assert_eq!(preview_answer(VK_ESCAPE, true, false, false), down);
-        assert_eq!(preview_answer(VK_ESCAPE, false, false, false), Answer::Release);
+        assert_eq!(preview_answer(VK_ESCAPE, true, false, false, false), down);
+        assert_eq!(preview_answer(VK_ESCAPE, false, false, false, false), Answer::Release);
         assert_eq!(
-            preview_answer(VK_F5, true, false, false),
+            preview_answer(VK_F5, true, false, false, false),
             Answer::Open { message: WM_APP_RELOAD, ctrl: false }
         );
-        assert_eq!(preview_answer(VK_F5, false, false, false), Answer::Release);
+        assert_eq!(preview_answer(VK_F5, false, false, false, false), Answer::Release);
     }
 
     /// `Enter` is the one that carries a choice with it, and the one whose half a
@@ -1844,17 +2122,29 @@ mod tests {
     #[test]
     fn enter_asks_for_the_reader_and_says_which_reader() {
         assert_eq!(
-            preview_answer(VK_RETURN, true, false, false),
+            preview_answer(VK_RETURN, true, false, false, false),
             Answer::Open { message: WM_APP_OPEN, ctrl: false }
         );
         assert_eq!(
-            preview_answer(VK_RETURN, true, false, true),
+            preview_answer(VK_RETURN, true, false, true, false),
             Answer::Open { message: WM_APP_OPEN, ctrl: true }
         );
-        assert_eq!(preview_answer(VK_RETURN, false, false, true), Answer::Release);
+        assert_eq!(preview_answer(VK_RETURN, false, false, true, false), Answer::Release);
         // `Shift`+`Enter` is the folder's, so the preview never takes either half of it.
-        assert_eq!(preview_answer(VK_RETURN, true, true, false), Answer::Pass);
-        assert_eq!(preview_answer(VK_RETURN, false, true, false), Answer::Pass);
+        assert_eq!(preview_answer(VK_RETURN, true, true, false, false), Answer::Pass);
+        assert_eq!(preview_answer(VK_RETURN, false, true, false, false), Answer::Pass);
+    }
+
+    /// `Alt` is the folder's own prefix, and the three keys a preview answers are all
+    /// something else under it: `Alt`+`Enter` is Properties, `Alt`+`Escape` is the
+    /// menu bar, and `Ctrl`+`Shift`+`Escape` is the thing that ends a machine. Not
+    /// one of them is the preview's to swallow.
+    #[test]
+    fn alt_belongs_to_the_folder() {
+        for vk in [VK_RETURN, VK_F5, VK_ESCAPE] {
+            assert_eq!(preview_answer(vk, true, false, false, true), Answer::Pass, "{vk:?}");
+            assert_eq!(preview_answer(vk, false, false, false, true), Answer::Pass, "{vk:?}");
+        }
     }
 
     /// Everything the preview does not answer belongs to the window that opened it --
@@ -1863,8 +2153,8 @@ mod tests {
     #[test]
     fn every_other_key_is_the_folders() {
         for vk in [VK_LEFT, VK_UP, VK_RIGHT, VK_DOWN, VK_HOME, VK_END, VK_PRIOR, VK_NEXT, VK_TAB] {
-            assert_eq!(preview_answer(vk, true, false, false), Answer::Pass, "{vk:?}");
-            assert_eq!(preview_answer(vk, false, false, false), Answer::Pass, "{vk:?}");
+            assert_eq!(preview_answer(vk, true, false, false, false), Answer::Pass, "{vk:?}");
+            assert_eq!(preview_answer(vk, false, false, false, false), Answer::Pass, "{vk:?}");
         }
     }
 }

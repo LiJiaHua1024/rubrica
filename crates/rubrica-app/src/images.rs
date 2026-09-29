@@ -18,6 +18,7 @@ use std::cell::RefCell;
 use std::collections::HashMap;
 use std::os::windows::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
+use std::time::SystemTime;
 
 use rubrica_type::units::Pt;
 use windows::core::PCWSTR;
@@ -33,14 +34,60 @@ use windows::Win32::System::Com::{CoCreateInstance, CLSCTX_INPROC_SERVER};
 /// Points per image pixel: 1/96 inch, matching CSS and the Windows DPI baseline.
 pub const PX_TO_PT: Pt = 72.0 / 96.0;
 
+/// The most pixels this reader will decode a figure of, at 64 megapixels: a 8000 x 8000
+/// image, which no page in a book has a use for.
+const MAX_PIXELS: u64 = 64 * 1024 * 1024;
+
+/// How a file looked when it was last decoded: its length and when it was last written.
+///
+/// A figure is named, not identified. The same `fig.png` is a different picture every
+/// time a build script regenerates it, and the layout worker -- which builds its own
+/// store, and so measures the new file -- would otherwise leave the window painting the
+/// old one inside the new one's box for the rest of the session. `Ctrl`+`R` does not
+/// help, because nothing in it clears the window's store.
+type Stamp = (u64, Option<SystemTime>);
+
+/// A natural size, held against the state of the file it was read from.
+type CachedSize = (Stamp, Option<(Pt, Pt)>);
+
+/// A bitmap, held against the file it was decoded from and the DPI it was made for.
+type CachedBitmap = (PathBuf, Stamp, (u32, u32));
+
+/// The state of the file behind `path`, or `None` when there is no file there at all.
+///
+/// A figure that is not written yet is a figure that will be, so a missing file is
+/// never remembered: it answers `None` and is asked again next time, rather than
+/// becoming a permanently blank box.
+fn stamp(path: &Path) -> Option<Stamp> {
+    let meta = std::fs::metadata(path).ok()?;
+    Some((meta.len(), meta.modified().ok()))
+}
+
+/// Whether a figure of `w` by `h` pixels is one this reader decodes at all. See
+/// [`MAX_PIXELS`]; the product is taken in `u64`, since two dimensions that overflow an
+/// `i32` pair would wrap back into the accepted range.
+fn decodable(w: u32, h: u32) -> bool {
+    w != 0 && h != 0 && u64::from(w) * u64::from(h) <= MAX_PIXELS
+}
+
+/// The DPI a bitmap was made for, as the two halves of what the target says.
+fn target_dpi(target: &ID2D1RenderTarget) -> (u32, u32) {
+    let (mut x, mut y) = (0f32, 0f32);
+    unsafe { target.GetDpi(&mut x, &mut y) };
+    (x.to_bits(), y.to_bits())
+}
+
 pub struct ImageStore {
     wic: IWICImagingFactory,
-    /// Natural size in points per path. A `None` entry records "tried and failed",
-    /// so a broken link is diagnosed once rather than re-opened on every relayout.
-    sizes: RefCell<HashMap<PathBuf, Option<(Pt, Pt)>>>,
-    /// Bitmaps are created through the render target so they share its format and
-    /// DPI, which means they cannot exist until one does.
-    bitmaps: RefCell<HashMap<PathBuf, Option<ID2D1Bitmap>>>,
+    /// Natural size in points per path, held against the state of the file it came from.
+    /// A `None` entry records "tried this file and failed", so a broken link is opened
+    /// once rather than on every relayout -- and only until the file changes.
+    sizes: RefCell<HashMap<PathBuf, CachedSize>>,
+    /// Bitmaps are created through the render target so they share its format and DPI,
+    /// which means they cannot exist until one does -- and they do not outlive either
+    /// the file they came from or the target's DPI, which `WM_DPICHANGED` changes in
+    /// place rather than by making a new target.
+    bitmaps: RefCell<HashMap<CachedBitmap, ID2D1Bitmap>>,
 }
 
 impl ImageStore {
@@ -56,19 +103,18 @@ impl ImageStore {
 
     /// Natural size in points, or `None` when the file cannot be decoded.
     pub fn natural_size(&self, path: &Path) -> Option<(Pt, Pt)> {
+        let stamp = stamp(path)?;
         if let Some(hit) = self.sizes.borrow().get(path) {
-            return *hit;
-        }
-        let read = (|| {
-            let frame = self.first_frame(path)?;
-            let (mut w, mut h) = (0u32, 0u32);
-            unsafe { frame.GetSize(&mut w, &mut h).ok()? };
-            if w == 0 || h == 0 {
-                return None;
+            if hit.0 == stamp {
+                return hit.1;
             }
+        }
+        let read = (|| -> Option<(Pt, Pt)> {
+            let frame = self.first_frame(path)?;
+            let (w, h) = Self::size_of(&frame)?;
             Some((w as Pt * PX_TO_PT, h as Pt * PX_TO_PT))
         })();
-        self.sizes.borrow_mut().insert(path.to_path_buf(), read);
+        self.sizes.borrow_mut().insert(path.to_path_buf(), (stamp, read));
         read
     }
 
@@ -87,13 +133,16 @@ impl ImageStore {
     }
 
     /// The GPU bitmap, converted to the premultiplied format Direct2D needs so
-    /// alpha composites correctly. Built on first use, then cached.
+    /// alpha composites correctly. Built on first use, then cached against the file it
+    /// came from and the target it was made for.
     pub fn bitmap(&self, target: &ID2D1RenderTarget, path: &Path) -> Option<ID2D1Bitmap> {
-        if let Some(hit) = self.bitmaps.borrow().get(path) {
-            return hit.clone();
+        let key = (path.to_path_buf(), stamp(path)?, target_dpi(target));
+        if let Some(hit) = self.bitmaps.borrow().get(&key) {
+            return Some(hit.clone());
         }
         let made = (|| {
             let frame = self.first_frame(path)?;
+            Self::size_of(&frame)?;
             let converter: IWICFormatConverter = unsafe { self.wic.CreateFormatConverter().ok()? };
             unsafe {
                 converter
@@ -109,8 +158,26 @@ impl ImageStore {
             };
             unsafe { target.CreateBitmapFromWicBitmap(&converter, None).ok() }
         })();
-        self.bitmaps.borrow_mut().insert(path.to_path_buf(), made.clone());
+        // A failure is not remembered, unlike a size. The commonest failure is a file
+        // still being written when the document was measured, and a blank figure that
+        // stays blank for the rest of the session is a worse answer than asking again.
+        if let Some(ref made) = made {
+            self.bitmaps.borrow_mut().insert(key, made.clone());
+        }
         made
+    }
+
+    /// The pixel size of a frame, if this reader will decode a figure that size at all.
+    ///
+    /// The size is read from the header, which costs nothing, while the decode asks the
+    /// device for `w * h * 4` bytes whatever the file weighs on disk -- and a flat
+    /// 20 000 x 20 000 PNG is a hundred kilobytes of file asking for 1.6 GB of texture.
+    /// A figure past the cap degrades to its alt text, which is a thing a reader can
+    /// still read.
+    fn size_of(frame: &IWICBitmapFrameDecode) -> Option<(u32, u32)> {
+        let (mut w, mut h) = (0u32, 0u32);
+        unsafe { frame.GetSize(&mut w, &mut h).ok()? };
+        decodable(w, h).then_some((w, h))
     }
 
     fn first_frame(&self, path: &Path) -> Option<IWICBitmapFrameDecode> {
@@ -244,5 +311,45 @@ mod tests {
         assert!((h - 121.5).abs() < 0.01, "aspect not preserved: {h}");
         let (w2, h2) = fit(240.0, 100.0, 486.0);
         assert!((w2 - 180.0).abs() < 0.01 && (h2 - 75.0).abs() < 0.01, "narrow figure upscaled: {w2}x{h2}");
+    }
+
+    /// A figure is a name, not an identity: the same `fig.png` is a different picture
+    /// each time a build script regenerates it. Without asking the file what it looks
+    /// like now, the window keeps painting the old one inside the new one's box for the
+    /// rest of the session -- the layout worker measures the new file, so the box is
+    /// right and the picture is not, and nothing the reader does puts them back in step.
+    #[test]
+    fn a_figure_that_has_been_replaced_is_not_the_one_already_decoded() {
+        let dir = std::env::temp_dir().join(format!("rubrica-figure-stamp-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("a directory to put a figure in");
+        let path = dir.join("fig.png");
+        std::fs::write(&path, b"the first figure").expect("a figure to remember");
+        let first = stamp(&path);
+        assert!(first.is_some(), "a figure that is there has a state");
+        std::fs::write(&path, b"a different figure entirely").expect("the same name, new bytes");
+        assert_ne!(stamp(&path), first, "a regenerated figure answered from the old decode");
+        // A figure that is not written yet is a figure that will be: no state, no
+        // remembered failure, and the next pass asks again.
+        let _ = std::fs::remove_file(&path);
+        assert_eq!(stamp(&path), None);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A figure is decoded at its own size, and the device is asked for `w * h * 4`
+    /// bytes of it whatever the file weighs. A flat 20 000 x 20 000 PNG is a hundred
+    /// kilobytes on disk and 1.6 GB of texture, so it is refused here and the figure
+    /// falls back to its alt text.
+    #[test]
+    fn a_figure_too_large_to_decode_is_refused_by_its_pixels() {
+        assert!(decodable(1920, 1080), "a screenshot is a figure");
+        assert!(decodable(1, MAX_PIXELS as u32), "the cap itself is inside it");
+        assert!(!decodable(20_000, 20_000), "1.6 GB of flat colour");
+        assert!(!decodable(30_000, 30_000), "3.6 GB of flat colour");
+        // Two dimensions whose product overflows an `i32` pair must not wrap back into
+        // the accepted range, and a figure of no size is no figure.
+        assert!(!decodable(65_536, 65_536));
+        assert!(!decodable(0, 100));
+        assert!(!decodable(100, 0));
     }
 }

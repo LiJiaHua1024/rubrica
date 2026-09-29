@@ -271,10 +271,11 @@ pub struct Parser<'a> {
     /// The boundaries an environment's rows were read with, claimed by the builder that
     /// read them. See [`Parser::env_rows`].
     row_rules: Vec<bool>,
-    /// How deep the braces and commands have stacked. A formula is reader-supplied
-    /// text, and `{{{{{...` or `\frac\frac\frac...` built to do exactly one thing
-    /// would otherwise recurse once per brace until the stack is gone; past the cap
-    /// the parser reads groups whole, linearly, instead of descending.
+    /// How deep the braces, commands and environments have stacked. A formula is
+    /// reader-supplied text, and `{{{{{...` or `\frac\frac\frac...` built to do
+    /// exactly one thing would otherwise recurse once per level until the stack is
+    /// gone; past the cap the parser reads them whole, linearly, instead of
+    /// descending.
     depth: usize,
     /// Consecutive script attachments -- `x^a^b^c...` wraps one Box around
     /// another per token, and unwinding that chain recurses as deep as it is
@@ -406,6 +407,12 @@ impl<'a> Parser<'a> {
     /// A `\left` group also ends at its `\right`, which is the only way the pair can be
     /// matched up, and a cell ends at the separators that structure it.
     fn list(&mut self, ctx: Ctx) -> Vec<Node> {
+        // The style this run was started in. A group nested inside a switch claims it
+        // while it is read -- that is the scope a brace group gives -- and hands it back
+        // on the way out, so the switch persists to the end of the group it was written
+        // in, which is what TeX's declarations do. Without this the rest of the outer
+        // run after a nested group lost the switch it was written in.
+        let incoming = self.style;
         let mut out: Vec<Node> = Vec::new();
         // What was collected before an `\over` or a `\choose`, which turns the whole run
         // into a fraction: TeX takes everything before the command in this group as the
@@ -476,7 +483,13 @@ impl<'a> Parser<'a> {
                     // Decoded a character at a time, so a Greek letter or a Han
                     // ideograph typed straight into the formula arrives as itself
                     // rather than as its two or three UTF-8 bytes.
-                    let Some(ch) = self.take_char() else { break };
+                    let Some(ch) = self.take_char() else {
+                        // Not a UTF-8 boundary, which only malformed input can leave
+                        // the reader at: step over the byte rather than abandoning the
+                        // rest of the formula over it.
+                        self.bump();
+                        continue;
+                    };
                     let text = self.letter(ch);
                     if ch.is_alphabetic() && self.welding {
                         if let Some(Node::Atom(s)) = out.last_mut() {
@@ -523,6 +536,9 @@ impl<'a> Parser<'a> {
             out.push(Node::Styled { body: Box::new(Node::Row(body)), style: mode });
             self.script_chain = 0;
         }
+        // Whatever switch this run was started in is still in force for whatever is
+        // written after it, which is the other half of the scope above.
+        self.style = incoming;
         out
     }
 
@@ -676,6 +692,97 @@ impl<'a> Parser<'a> {
         String::from_utf8_lossy(&self.src[start..end]).into_owned()
     }
 
+    /// The body of a `\left` read whole, without recursing: everything up to the
+    /// `\right` that closes it, the `}` that ends the group it stands in, or the end
+    /// of the input -- whichever comes first, and none of them consumed. The exit a
+    /// `\left` too deep to represent takes instead of the stack, and the same linear
+    /// scan a too-deep group gets.
+    fn skip_left_body(&mut self) -> String {
+        let start = self.at;
+        while let Some(c) = self.peek() {
+            match c {
+                // `\rightarrow` is a relation, not the closer this group is waiting for.
+                b'\\' if self.at_right() => break,
+                b'}' => break,
+                b'\\' => {
+                    self.bump();
+                    self.skip_command_name();
+                }
+                _ => {
+                    self.bump();
+                }
+            }
+        }
+        String::from_utf8_lossy(&self.src[start..self.at]).into_owned()
+    }
+
+    /// The rest of an environment read whole, without recursing: up to the `\end`
+    /// that closes it -- the grids it contains counted, so a nested one does not close
+    /// the outer one -- or the end of the input. The text between, and the name the
+    /// closing `\end` carried, are what a too-deep environment is set from.
+    fn skip_environment(&mut self) -> (String, Option<String>) {
+        let start = self.at;
+        // The grids this scan is inside of, innermost last, the first entry being
+        // the environment the caller is already in. A `begin` opens one more and an
+        // `end` closes one, so the `end` that empties the stack is the closer this
+        // scan was reading to.
+        //
+        // Counting alone was not sound. A `end` naming a grid the stack does not hold
+        // is a closer written for something else, and the only reading of it that keeps
+        // the rest of the document parseable is to take it as this environment's own
+        // closer and stop -- which is what the list of names is for.
+        let mut open: Vec<String> = Vec::new();
+        let mut end = None;
+        while let Some(c) = self.peek() {
+            match c {
+                b'\\' if self.at_end() => {
+                    // The grid this closer belongs to closes, whichever grid
+                    // that is.
+                    let name = self.eat_end();
+                    // Nothing this scan opened answers the name: this is the
+                    // closer the environment itself was waiting for.
+                    if !open.iter().any(|g| *g == name.as_deref().unwrap_or("")) {
+                        end = name;
+                        break;
+                    }
+                    // It answers an inner grid, so the outer one stays open.
+                    while open.last().is_some_and(|g| *g != name.as_deref().unwrap_or("")) {
+                        open.pop();
+                    }
+                    open.pop();
+                }
+                b'\\' => {
+                    // A `begin` in here is a grid of its own, so the closer this
+                    // one is looking for is one further on. `beginX` is not a
+                    // `begin`, and `word_at` is what tells the two apart.
+                    if self.word_at(b"\\begin") {
+                        self.bump();
+                        self.skip_command_name();
+                        open.push(self.braced_text().unwrap_or_default());
+                    } else {
+                        self.bump();
+                        self.skip_command_name();
+                    }
+                }
+                _ => {
+                    self.bump();
+                }
+            }
+        }
+        (String::from_utf8_lossy(&self.src[start..self.at]).into_owned(), end)
+    }
+
+    /// The letters of the control sequence at the cursor, and the one space TeX
+    /// consumes after it.
+    fn skip_command_name(&mut self) {
+        while self.peek().is_some_and(|c| c.is_ascii_alphabetic()) {
+            self.bump();
+        }
+        if self.peek() == Some(b' ') {
+            self.bump();
+        }
+    }
+
     /// The atom a character written in the source becomes.
     ///
     /// A letter is set in whatever alphabet the parser is inside of, which by default
@@ -696,6 +803,21 @@ impl<'a> Parser<'a> {
         self.bump(); // the backslash
         let first = self.peek()?;
         if !first.is_ascii_alphabetic() {
+            if first >= 0x80 {
+                // A multibyte character written straight after the backslash, read
+                // whole: bumping one byte of it landed the reader inside the glyph,
+                // where the next read failed to decode and the rest of the formula
+                // was silently dropped.
+                return Some(Node::Atom(match self.take_char() {
+                    Some(c) => c.to_string(),
+                    // Not a UTF-8 boundary, which only malformed input can leave the
+                    // reader at: step over the byte so the parse still moves forward.
+                    None => {
+                        self.bump();
+                        String::new()
+                    }
+                }));
+            }
             self.bump();
             return Some(match first {
                 b',' | b';' => Node::Space(if first == b',' { 3 } else { 5 }),
@@ -805,55 +927,98 @@ impl<'a> Parser<'a> {
                 }
             }
             "sqrt" => {
-                let degree = if self.peek() == Some(b'[') {
+                let mut degree = None;
+                if self.peek() == Some(b'[') {
+                    // A `[` of the degree's own is a bracket, and a degree with no
+                    // closer is not a degree at all: the reader is put back just after
+                    // the `[`, so what follows is read as the body rather than eaten
+                    // as the degree.
+                    let open = self.at;
                     self.bump();
                     let mut inner: Vec<u8> = Vec::new();
+                    let mut depth = 1usize;
                     while let Some(c) = self.bump() {
-                        if c == b']' {
-                            break;
+                        match c {
+                            b'[' => depth += 1,
+                            b']' => {
+                                depth -= 1;
+                                if depth == 0 {
+                                    break;
+                                }
+                            }
+                            _ => {}
                         }
                         inner.push(c);
                     }
-                    String::from_utf8_lossy(&inner).to_string()
-                } else {
-                    String::new()
-                };
+                    if depth == 0 {
+                        degree = Some(String::from_utf8_lossy(&inner).to_string());
+                    } else {
+                        self.at = open + 1;
+                    }
+                }
                 let body = self.argument();
                 Node::Sqrt {
                     body: Box::new(body),
-                    degree: if degree.is_empty() {
-                        None
-                    } else {
-                        Some(Box::new(Node::Atom(degree)))
-                    },
+                    degree: degree
+                        .filter(|d| !d.is_empty())
+                        .map(|d| Box::new(Node::Atom(d))),
                 }
             }
             "left" => {
-                let l = self.delim();
-                let body = Node::Row(self.list(Ctx::Group));
+                // A delimiter name this subset has no character for is shown as the
+                // word that was written, beside the fence rather than inside it --
+                // eating it is the one reading that helps nobody.
+                let mut written: Vec<Node> = Vec::new();
+                let l = match self.delim() {
+                    Ok(c) => c,
+                    Err(name) => {
+                        written.push(Node::Atom(format!("\\{name}")));
+                        '\0'
+                    }
+                };
+                let body = if self.depth >= Self::MAX_DEPTH {
+                    // Too deep to represent: the body is read whole -- linearly, no
+                    // recursion -- and shown as the text it was written as, which is
+                    // the same degraded reading a too-deep group gets.
+                    Node::Atom(self.skip_left_body())
+                } else {
+                    self.depth += 1;
+                    let body = Node::Row(self.list(Ctx::Group));
+                    self.depth -= 1;
+                    body
+                };
                 let r = if self.at_right() {
                     self.bump(); // the backslash of `\right`
-                    let start = self.at;
                     while self.peek().is_some_and(|c| c.is_ascii_alphabetic()) {
                         self.bump();
                     }
-                    let _ = start;
-                    self.delim()
+                    match self.delim() {
+                        Ok(c) => c,
+                        Err(name) => {
+                            written.push(Node::Atom(format!("\\{name}")));
+                            '\0'
+                        }
+                    }
                 } else {
                     // No closer written: the group still has to end somewhere.
                     '\0'
                 };
-                Node::Fence { left: l, right: r, body: Box::new(body) }
+                let fence = Node::Fence { left: l, right: r, body: Box::new(body) };
+                if written.is_empty() {
+                    fence
+                } else {
+                    written.push(fence);
+                    Node::Row(written)
+                }
             }
             "right" => {
-                let r = self.delim();
                 // A `.` -- or nothing at all, when the `\right` ends the input --
                 // means "no delimiter here": an empty atom, which `push` drops,
                 // rather than a NUL the shaper would carry to the page as tofu.
-                if r == '\0' {
-                    Node::Atom(String::new())
-                } else {
-                    Node::Atom(r.to_string())
+                match self.delim() {
+                    Ok('\0') => Node::Atom(String::new()),
+                    Ok(c) => Node::Atom(c.to_string()),
+                    Err(name) => Node::Atom(format!("\\{name}")),
                 }
             }
             // Upright words: read as written, spaces and all, because a formula's
@@ -955,15 +1120,30 @@ impl<'a> Parser<'a> {
             // stops at the closing brace on its own, having eaten it.
             "substack" if self.peek() == Some(b'{') => {
                 self.bump();
-                let (rows, _) = self.env_rows();
-                let cols = rows.iter().map(|r| r.len()).max().unwrap_or(0).max(1);
-                Node::Array {
-                    rows: rows.into_iter().map(|r| r.into_iter().map(Node::Row).collect()).collect(),
-                    columns: columns_for(ArrayKind::Gathered, &[], cols),
-                    kind: ArrayKind::Gathered,
-                    delimiters: None,
-                    rules: std::mem::take(&mut self.row_rules),
-                    col_rules: Vec::new(),
+                if self.depth >= Self::MAX_DEPTH {
+                    // Too deep to represent: the rows are read whole, linearly, and
+                    // shown as the text they were written as.
+                    Node::Atom(self.skip_group())
+                } else {
+                    self.depth += 1;
+                    // A grid nested in a limit is its own grid: its boundaries start
+                    // empty, and a `\hline` written here belongs to the grid this one
+                    // is inside rather than to this one.
+                    self.hline = false;
+                    let saved = std::mem::take(&mut self.row_rules);
+                    let (rows, _) = self.env_rows();
+                    let mine = std::mem::replace(&mut self.row_rules, saved);
+                    let cols = rows.iter().map(|r| r.len()).max().unwrap_or(0).max(1);
+                    let rows = rows.into_iter().map(|r| r.into_iter().map(Node::Row).collect()).collect();
+                    self.depth -= 1;
+                    Node::Array {
+                        rows,
+                        columns: columns_for(ArrayKind::Gathered, &[], cols),
+                        kind: ArrayKind::Gathered,
+                        delimiters: None,
+                        rules: mine,
+                        col_rules: Vec::new(),
+                    }
                 }
             }
             // A delimiter sized by hand rather than by what it encloses. The four
@@ -1096,17 +1276,43 @@ impl<'a> Parser<'a> {
             // `\begin` with nothing after it: the word itself, and no more eaten.
             return Node::Atom("\\begin".into());
         };
-        let Some(kind) = array_kind(&name) else {
-            let (rows, end) = self.env_rows();
+        if self.depth >= Self::MAX_DEPTH {
+            // Too deep to represent: the body is read whole -- linearly, no
+            // recursion -- and set as the text it was written as, which is the same
+            // degraded reading an unclosable environment already gets.
+            let (body, end) = self.skip_environment();
+            let rows = vec![vec![vec![Node::Atom(body)]]];
             return Self::degraded(&name, rows, end.as_deref());
+        }
+        self.depth += 1;
+        let node = self.grid(&name);
+        self.depth -= 1;
+        node
+    }
+
+    /// The grid a named environment becomes, its body read one level down. A nesting
+    /// of environments is a nesting of the whole grammar -- each grid reads its cells
+    /// through `list`, which reads them through `command` -- so it is the same cap the
+    /// brace groups take.
+    fn grid(&mut self, name: &str) -> Node {
+        // The boundaries belong to the grid being read, and a grid nested in one of
+        // its cells writes its own: one buffer cleared on entry wiped the outer
+        // grid's rules, and on the degraded paths left the inner one's behind for the
+        // outer grid to adopt.
+        let saved = std::mem::take(&mut self.row_rules);
+        let Some(kind) = array_kind(name) else {
+            let (rows, end) = self.env_rows();
+            self.row_rules = saved;
+            return Self::degraded(name, rows, end.as_deref());
         };
         // `array` is the one environment whose columns are written out, and the
         // argument has to be taken here or its braces land in the first cell.
         let (spec, col_rules) =
             if kind == ArrayKind::Array { self.column_spec() } else { (Vec::new(), Vec::new()) };
         let (rows, end) = self.env_rows();
-        if end.as_deref() != Some(name.as_str()) {
-            return Self::degraded(&name, rows, end.as_deref());
+        let mine = std::mem::replace(&mut self.row_rules, saved);
+        if end.as_deref() != Some(name) {
+            return Self::degraded(name, rows, end.as_deref());
         }
         let cols = rows.iter().map(|r| r.len()).max().unwrap_or(0).max(1);
         let columns = columns_for(kind, &spec, cols);
@@ -1115,8 +1321,8 @@ impl<'a> Parser<'a> {
             rows,
             columns,
             kind,
-            delimiters: env_delimiters(&name),
-            rules: std::mem::take(&mut self.row_rules),
+            delimiters: env_delimiters(name),
+            rules: mine,
             col_rules,
         }
     }
@@ -1233,7 +1439,10 @@ impl<'a> Parser<'a> {
         let close = self.src[self.at + 1..].iter().position(|c| *c == b'}')?;
         let s = std::str::from_utf8(&self.src[self.at + 1..self.at + 1 + close]).ok()?;
         self.at += close + 2; // past the contents and both braces
-        Some(s.to_string())
+        // A name is a word, not a span of the page: `\begin {matrix}` works, so
+        // `\begin{ matrix }` has to as well -- `eat_end` already skips the space
+        // before its braces, and this is the other half of that.
+        Some(s.trim().to_string())
     }
 
     /// The `{ccc}` / `{l|l}` argument an `array` takes. Only `l`, `c` and `r` choose an
@@ -1296,14 +1505,22 @@ impl<'a> Parser<'a> {
     /// the `.` that means "nothing here" -- which `delim` already reads for `\left`, and
     /// is read the same way here so the two spellings cannot drift apart.
     fn big(&mut self, step: u8, role: BigRole) -> Node {
-        Node::Big { delim: self.delim(), step, role }
+        match self.delim() {
+            Ok(delim) => Node::Big { delim, step, role },
+            // A name that is not one of the delimiter spellings is shown as it was
+            // written, the way any other unknown word degrades.
+            Err(name) => Node::Atom(format!("\\{name}")),
+        }
     }
 
-    fn delim(&mut self) -> char {
+    /// The one delimiter here, or the name of one this subset does not spell -- which
+    /// has been consumed, and which the caller shows rather than drops. `Ok('\0')` is
+    /// the deliberate "no delimiter here" of `\left.` and of the end of the input.
+    fn delim(&mut self) -> Result<char, String> {
         match self.peek() {
             Some(b'.') => {
                 self.bump();
-                '\0'
+                Ok('\0')
             }
             Some(b'\\') => {
                 self.bump();
@@ -1313,50 +1530,53 @@ impl<'a> Parser<'a> {
             // cursor inside the three-byte glyph and drop the rest of the formula
             // when the next read fails to decode from mid-character.
             Some(_) => match self.take_char() {
-                Some(c) => c,
+                Some(c) => Ok(c),
                 None => {
                     self.bump();
-                    '\0'
+                    Ok('\0')
                 }
             },
-            None => '\0',
+            None => Ok('\0'),
         }
     }
 
-    fn command_delim(&mut self) -> char {
+    fn command_delim(&mut self) -> Result<char, String> {
         // `\{`, `\}` and `\|` are the shorthand spellings of `lbrace`, `rbrace` and
         // `Vert`. They are single escaped characters, not words -- the word scanner
         // below collects only letters, so without these arms the escaped byte is
-        // left unconsumed: `\\left\\{x\\right\\}` would lose both delimiters and read
+        // left unconsumed: `\left\{x\right\}` would lose both delimiters and read
         // the `{` as the start of a group the `\right` never closes.
         match self.peek() {
             Some(b'{') => {
                 self.bump();
-                '{'
+                Ok('{')
             }
             Some(b'}') => {
                 self.bump();
-                '}'
+                Ok('}')
             }
             Some(b'|') => {
                 self.bump();
-                '\u{2016}'
+                Ok('\u{2016}')
             }
             _ => {
                 let start = self.at;
                 while self.peek().is_some_and(|c| c.is_ascii_alphabetic()) {
                     self.bump();
                 }
+                let name = String::from_utf8_lossy(&self.src[start..self.at]).into_owned();
                 match &self.src[start..self.at] {
-                    b"langle" => '\u{27e8}',
-                    b"rangle" => '\u{27e9}',
-                    b"lbrace" => '{',
-                    b"rbrace" => '}',
-                    b"lbrack" => '[',
-                    b"rbrack" => ']',
-                    b"vert" | b"lvert" | b"rvert" | b"mid" => '|',
-                    b"Vert" | b"lVert" | b"rVert" => '\u{2016}',
-                    _ => '\0',
+                    b"langle" => Ok('\u{27e8}'),
+                    b"rangle" => Ok('\u{27e9}'),
+                    b"lbrace" => Ok('{'),
+                    b"rbrace" => Ok('}'),
+                    b"lbrack" => Ok('['),
+                    b"rbrack" => Ok(']'),
+                    b"vert" | b"lvert" | b"rvert" | b"mid" => Ok('|'),
+                    b"Vert" | b"lVert" | b"rVert" => Ok('\u{2016}'),
+                    // Not a delimiter name: the caller shows the word rather than
+                    // losing the delimiter's own text.
+                    _ => Err(name),
                 }
             }
         }
@@ -1901,6 +2121,18 @@ mod tests {
         crate::plain(&sexp(&parse(src)))
     }
 
+    /// Every literal run in a tree, in the order it was written: a grid that degraded
+    /// to its own text is one Atom holding all of it, so telling the document after
+    /// the grid from the last letter of the grid is a question of what follows that
+    /// run rather than of what it contains.
+    fn atoms_of(n: &Node) -> Vec<String> {
+        match n {
+            Node::Atom(s) => vec![s.clone()],
+            Node::Row(v) => v.iter().flat_map(atoms_of).collect(),
+            _ => Vec::new(),
+        }
+    }
+
     /// How many letters of `src` came out in the face's own math italic.
     fn italics(src: &str) -> usize {
         sexp(&parse(src))
@@ -2003,6 +2235,24 @@ mod tests {
                 other => panic!("not one grid: {other:?}"),
             },
             other => panic!("not one grid: {other:?}"),
+        }
+    }
+
+    /// The boundaries of every grid in a formula, outermost first, which is how a rule
+    /// written inside a nested grid is told from one written beside it.
+    fn grid_rules(n: &Node, out: &mut Vec<Vec<bool>>) {
+        match n {
+            Node::Array { rules, rows, .. } => {
+                out.push(rules.clone());
+                for row in rows {
+                    for cell in row {
+                        grid_rules(cell, out);
+                    }
+                }
+            }
+            Node::Row(v) => v.iter().for_each(|c| grid_rules(c, out)),
+            Node::Fence { body, .. } => grid_rules(body, out),
+            _ => {}
         }
     }
 
@@ -2439,5 +2689,184 @@ mod tests {
             })
             .expect("the environment is still a grid");
         assert_eq!(rules, vec![false, false], "no rule was claimed from before the begin");
+    }
+
+    #[test]
+    fn a_left_group_too_deep_to_nest_is_read_whole() {
+        // `\left` nested a few thousand deep recursed once per pair with no cap
+        // at all, and a formula is a file the reader opened. Past the cap the body
+        // is scanned linearly and set as the text it was written as.
+        let n = 130;
+        let got = of(&format!("{}x{}", "\\left(".repeat(n), ")".repeat(n)));
+        assert!(got.contains("\\left("), "the body past the cap is literal text: {got}");
+        // Well inside the cap nothing is degraded: every pair is still a pair.
+        let few = of(&format!("{}x{}", "\\left(".repeat(20), ")".repeat(20)));
+        assert!(!few.contains("\\left("), "a shallow nesting is still a nesting: {few}");
+    }
+
+    #[test]
+    fn an_environment_too_deep_to_nest_is_read_whole() {
+        // The same cap, one construct further out: a grid reads its cells through
+        // `list`, which reads them through `command`, so a nesting of environments
+        // recursed just as far as a nesting of braces did.
+        let n = 130;
+        let got = of(&format!("{}a{}", "\\begin{matrix}".repeat(n), "\\end{matrix}".repeat(n)));
+        assert!(got.contains("\\begin{matrix}"), "the grid past the cap is literal text: {got}");
+        let few = of(&format!("{}a{}", "\\begin{matrix}".repeat(10), "\\end{matrix}".repeat(10)));
+        assert!(!few.contains("\\begin{matrix}"), "a shallow nesting is still a grid: {few}");
+        // `\substack` reads its rows through the same reader, and is capped with it.
+        let stack = of(&format!("{}a{}", "\\substack{".repeat(n), "}".repeat(n)));
+        assert!(stack.contains("\\substack{"), "the stack past the cap is literal text: {stack}");
+    }
+
+    #[test]
+    fn a_grid_nested_in_a_grid_too_deep_leaves_the_rest_of_the_formula() {
+        // The `begin` inside a too-deep body raised the open count and no `end`
+        // could bring it back down, so the scan ran to the end of the input and
+        // everything written after the grid -- the rest of the formula, the whole
+        // document -- was swallowed into its literal text. A nested `end` closes
+        // the grid it was written with, and the outer one is the closer this one
+        // was waiting for, so the cursor resumes after it.
+        //
+        // Two grids nested inside the collapsed body: the whole shape that used to
+        // desynchronise the parse, with a `c` standing for the document written
+        // after the formula. The nesting has to reach the layout cap before the
+        // grids inside the body are read whole themselves, or there is nothing for
+        // the scan to lose track of.
+        let lead = 100;
+        let src = format!(
+            "{lead}\\begin{{matrix}}\\begin{{matrix}}a\\end{{matrix}}b\\end{{matrix}}c",
+            lead = "\\begin{matrix}".repeat(lead)
+        );
+        let atoms = atoms_of(&parse(&src));
+        // The deepest literal run is the grid the depth cap collapsed. What now
+        // follows it is the document written after the formula -- but when the scan
+        // ran on to the end of the input it was the last line of the grid instead,
+        // glued in behind braces the author had already closed, and the document
+        // still rendered, so nothing looked wrong.
+        let collapsed =
+            atoms.iter().max_by_key(|t| t.len()).expect("the collapsed grid was set");
+        // The inner grid closed inside the collapsed run, at the `end` written
+        // with it rather than at the end of the input: the letter that follows
+        // is then the document past the formula, and the one that does not is
+        // glued in behind a brace the author had already closed.
+        assert!(
+            collapsed.ends_with("a\\end{matrix}b\\end{matrix}")
+                && atoms.last().is_some_and(|t| crate::plain(t) == "c"),
+            "the grid closed inside the collapsed run, and the document is its own letter past it: {atoms:?}"
+        );
+
+        // One grid nested inside the collapsed body, closed by its own `end`, and
+        // a letter of the document after it.
+        let nested = parse(&format!(
+            "{lead}\\begin{{matrix}}\\begin{{matrix}}b\\end{{matrix}}c\\end{{matrix}}d",
+            lead = "\\begin{matrix}".repeat(lead)
+        ));
+        let atoms = atoms_of(&nested);
+        let collapsed =
+            atoms.iter().max_by_key(|t| t.len()).expect("the collapsed grid was set");
+        assert!(
+            collapsed.contains("b\\end{matrix}c") && after_is(&atoms, "d"),
+            "the nested grid closed where it did, and the document survived: {atoms:?}"
+        );
+
+        // An unknown command is not a `begin`: `beginX` shares its first six letters
+        // and must not open a grid that the scan would then have to count back down,
+        // which is how the rest of the formula was lost.
+        let not_begin = parse(&format!(
+            "{lead}b\\beginX\\end{{matrix}}c",
+            lead = "\\begin{matrix}".repeat(lead)
+        ));
+        let atoms = atoms_of(&not_begin);
+        assert!(
+            after_is(&atoms, "c"),
+            "an unknown command does not unbalance the scan: {atoms:?}"
+        );
+    }
+
+    /// Whether the last literal run of a tree is the letter `c`.
+    fn after_is(atoms: &[String], c: &str) -> bool {
+        atoms.last().is_some_and(|t| crate::plain(t) == c)
+    }
+    #[test]
+    fn a_nested_grid_keeps_its_own_rules_to_itself() {
+        // The boundaries were one shared buffer cleared on entry, so a grid nested
+        // in one of these cells wiped the top rule the outer grid had already
+        // collected -- and, on the degraded path, left the inner grid's rules behind
+        // for the outer grid to adopt.
+        assert_eq!(
+            rules_of("\\begin{array}\\hline 1 \\\\ \\substack{a\\\\b} \\\\ 2\\end{array}"),
+            vec![true, false, false, false]
+        );
+        assert_eq!(
+            rules_of("\\begin{array}\\hline 1 \\\\ \\begin{matrix}a\\end{matrix} \\\\ 2\\end{array}"),
+            vec![true, false, false, false]
+        );
+        assert_eq!(
+            rules_of("\\begin{array}\\hline 1 \\\\ \\begin{psst}a\\end{psst} \\\\ 2\\end{array}"),
+            vec![true, false, false, false],
+            "a grid that degrades takes its rules with it"
+        );
+        // A `\hline` written before the `\substack` belongs to the grid the substack
+        // stands in, the same rule a `\hline` before a `\begin` follows.
+        let mut got = Vec::new();
+        grid_rules(
+            &parse("\\begin{array}\\hline 1 \\\\ \\hline \\substack{a} \\\\ 2\\end{array}"),
+            &mut got,
+        );
+        assert_eq!(got, vec![vec![true, false, false, false], vec![false, false]]);
+    }
+
+    #[test]
+    fn a_backslash_before_a_multibyte_character_keeps_the_rest_of_the_formula() {
+        // One byte of the two-byte `α` was taken for a character of its own, which
+        // left the reader inside the glyph: the next read could not decode, and the
+        // rest of the formula was dropped rather than shown.
+        assert_eq!(of("\\frac{1}{2}\\α + 1"), "((frac 1 2) α + 1)");
+    }
+
+    #[test]
+    fn a_sqrt_degree_with_no_closer_is_not_a_degree() {
+        // The degree was read to the end of the input, so `x^2 + 1` became the index
+        // and the radical had an empty body.
+        assert_eq!(of("\\sqrt[x^2 + 1"), "((sup (sqrt x) 2) + 1)");
+        // A `[` of the degree's own is a bracket, so the closer is the one that
+        // matches the opening one rather than the first `]` after it.
+        assert_eq!(of("\\sqrt[[3]]{x}"), "(sqrt [3] x)");
+    }
+
+    #[test]
+    fn an_environment_name_is_read_without_the_space_around_it() {
+        // One space after a command name is consumed, which is why `\begin {matrix}`
+        // worked and `\begin{ matrix }` did not -- and the whole grid degraded to
+        // the prose it was written as.
+        assert_eq!(of("\\begin{ matrix }a\\end{ matrix }"), of("\\begin{matrix}a\\end{matrix}"));
+        assert_eq!(
+            of("\\begin{array}{ c }a\\end{array}"),
+            of("\\begin{array}{c}a\\end{array}"),
+            "the column spec is read the same way"
+        );
+    }
+
+    #[test]
+    fn a_delimiter_name_with_no_shape_of_its_own_is_shown() {
+        // The word was eaten and drew nothing at all, so a typo in a delimiter
+        // spelled out in full was invisible on the page.
+        assert_eq!(of("\\big\\foo x"), "(\\foo x)");
+        assert_eq!(of("\\left\\foo x\\right)"), "(\\foo (fence -) x))");
+        assert_eq!(of("x\\right\\foo"), "(x \\foo)");
+    }
+
+    #[test]
+    fn a_style_switch_lasts_to_the_end_of_the_group_it_was_written_in() {
+        // A group nested inside a switch claims it while it is read -- that is the
+        // scope a brace group gives -- and gives it back on the way out, so the `c`
+        // written after the inner group is still in the switch the outer one asked
+        // for, which is what TeX's declarations do.
+        assert_eq!(
+            of("\\displaystyle{a\\displaystyle{b}c}"),
+            "(style Display (style Display (a (style Display b) c)))"
+        );
+        assert_eq!(of("\\displaystyle a"), "(style Display a)");
     }
 }

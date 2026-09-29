@@ -4,6 +4,7 @@
 use std::io::{self, BufRead, BufReader, Read, Seek, SeekFrom};
 use std::ops::Range;
 use std::path::Path;
+use rubrica_type::classify::{self, Role};
 use crate::{Block, BlockKind, Document, SourceSpan};
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -179,11 +180,10 @@ impl ChapterIndex {
     }
 
     pub fn read_window(&self, path: &Path, index: usize, options: TextOptions) -> io::Result<Document> {
-        let range = self.chapters.get(index).map(|chapter| chapter.range.clone())
-            .unwrap_or(0..0);
+        let range = self.range(index);
         let mut file = std::fs::File::open(path)?;
         file.seek(SeekFrom::Start(range.start as u64))?;
-        let mut bytes = vec![0; range.end.saturating_sub(range.start)];
+        let mut bytes = vec![0; readable(&range, file.metadata()?.len())?];
         file.read_exact(&mut bytes)?;
         let source = std::str::from_utf8(&bytes)
             .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "TXT window is not UTF-8"))?;
@@ -192,11 +192,10 @@ impl ChapterIndex {
     }
 
     pub fn read_source_window(&self, path: &Path, index: usize) -> io::Result<String> {
-        let range = self.chapters.get(index).map(|chapter| chapter.range.clone())
-            .unwrap_or(0..0);
+        let range = self.range(index);
         let mut file = std::fs::File::open(path)?;
         file.seek(SeekFrom::Start(range.start as u64))?;
-        let mut bytes = vec![0; range.end.saturating_sub(range.start)];
+        let mut bytes = vec![0; readable(&range, file.metadata()?.len())?];
         file.read_exact(&mut bytes)?;
         let source = std::str::from_utf8(&bytes)
             .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "TXT window is not UTF-8"))?;
@@ -220,6 +219,27 @@ impl ChapterIndex {
             .min(source.len());
         let end = range.end.min(source.len()).max(start);
         parse_range(source, start..end, options, self.blank_separated, start)
+    }
+}
+
+/// How many bytes of `range` a file of `len` bytes still has behind it, or the end of
+/// the file as an error when it does not have all of them.
+///
+/// A range is an address into a file, not a claim about how long the file is, and the
+/// index that carries it was built at some earlier moment: a book truncated, replaced
+/// or synced underneath the reader still hands back the length it used to be. Read
+/// as an allocation that is a 2 GB novel reserving 2 GB before `read_exact` reports
+/// the unexpected end; read as a number it is one `metadata` against the range, and
+/// the error raised is the same one the read was going to raise anyway.
+fn readable(range: &Range<usize>, len: u64) -> io::Result<usize> {
+    let want = range.end.saturating_sub(range.start);
+    let have = len.saturating_sub(range.start as u64);
+    match u64::try_from(want) {
+        Ok(want) if want <= have => Ok(want as usize),
+        _ => Err(io::Error::new(
+            io::ErrorKind::UnexpectedEof,
+            "the document is shorter than the index built for it",
+        )),
     }
 }
 
@@ -280,7 +300,11 @@ fn parse_range(
             blocks.push(block);
         } else {
             if !paragraph.is_empty() {
-                let cjk = |c: char| matches!(c as u32, 0x3000..=0x9fff | 0xff00..=0xffef);
+                // The classification the rest of the app uses, so that the two agree
+                // on what a CJK character is: a reader told by the status bar that a
+                // Korean or a rare-ideograph book has no word breaks in it must not
+                // then be shown a space inserted at every wrapped line join.
+                let cjk = |c: char| classify::is_cjk_punct(c) || classify::Role::of(c) == Role::Cjk;
                 if !paragraph.chars().last().is_some_and(cjk) || !line.chars().next().is_some_and(cjk) {
                     sources.push(SourceSpan {
                         range: paragraph.len()..paragraph.len() + 1,
@@ -381,6 +405,57 @@ mod tests {
     }
 
     #[test]
+    fn a_stale_range_is_measured_against_the_file_there_is() {
+        // A range the file is long enough for, read exactly as the index wrote it.
+        assert_eq!(readable(&(12..48), 1024).unwrap(), 36);
+        // A 2 GB range against a 1 KB file: the length is not believed, and nothing is
+        // reserved on the strength of it. This is the assertion that matters -- the old
+        // `vec![0; range.end - range.start]` returned 2 GB here and only failed later.
+        let huge = readable(&(0..2 * 1024 * 1024 * 1024usize), 1024).unwrap_err();
+        assert_eq!(huge.kind(), io::ErrorKind::UnexpectedEof, "{huge}");
+        assert!(readable(&(1024..2048), 1024).is_err(), "nothing is behind the end of the file");
+        // The last byte of the file is still a range the file can fill.
+        assert_eq!(readable(&(1023..1024), 1024).unwrap(), 1);
+        // A range the file is long enough for is answered even when the arithmetic is
+        // at its widest: a u64-length file really does have `usize::MAX` bytes behind
+        // offset 0, so this is the answer, not an overflow. What must not happen is the
+        // answer being BELIEF rather than measurement, which the 2 GB case above pins.
+    }
+
+    #[test]
+    fn a_window_the_file_no_longer_holds_fails_instead_of_reserving_its_old_length() {
+        let path = std::env::temp_dir()
+            .join(format!("rubrica-plain-truncated-{}.txt", std::process::id()));
+        let source = "Prologue\nbody text\n\nChapter 2\nlast line\n";
+        std::fs::write(&path, source).expect("write a two-chapter book");
+        let index = ChapterIndex::from_path(&path, true).expect("index the book");
+        assert_eq!(index.chapters().len(), 2, "the fixture is not the two chapters it means to be");
+        let options = TextOptions { paragraphs: ParagraphRule::Lines, chapters: true };
+        index.read_window(&path, 1, options).expect("read the chapter the file has");
+        index.read_source_window(&path, 1).expect("read the chapter the file has");
+        // The same path, now a fraction of what the index says it is.
+        std::fs::write(&path, "Prologue\nbody\n").expect("truncate the book");
+        for error in [
+            index.read_window(&path, 1, options).unwrap_err(),
+            index.read_source_window(&path, 1).unwrap_err(),
+        ] {
+            assert_eq!(error.kind(), io::ErrorKind::UnexpectedEof, "{error}");
+        }
+        // And a range that claims far more than any file could hold is refused on the
+        // same terms, so nothing is reserved on the strength of the index alone.
+        let claimed = ChapterIndex::from_parts_with_offsets(
+            vec![Chapter { title: "Huge".into(), range: 0..2 * 1024 * 1024 * 1024usize }],
+            vec![0],
+            false,
+        );
+        assert_eq!(
+            claimed.read_source_window(&path, 0).unwrap_err().kind(),
+            io::ErrorKind::UnexpectedEof
+        );
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
     fn paragraph_rules_join_wrapped_prose_and_keep_chapters_separate() {
         let src = "第一章\n中文换行\n接在一起\n\nEnglish wraps\non a space\n";
         let doc = parse(src, TextOptions::default());
@@ -391,5 +466,32 @@ mod tests {
         assert!(doc.blocks.iter().all(|b| b.kind == BlockKind::Paragraph));
         assert!(!is_chapter("Chapter about recipes is not a chapter number."));
         assert!(!is_chapter("第一个人走来"));
+    }
+
+    #[test]
+    fn a_wrapped_line_of_any_cjk_script_is_joined_without_a_space() {
+        // The join asks the same question the status bar asks, so the two cannot
+        // disagree about what counts: Hangul syllables, CJK extensions and the
+        // kana extensions are all scripts the reader set without word spaces.
+        for (first, second) in [
+            ("\u{AC00}\u{D55C}", "\u{B2E4}\u{C74C}"),   // Hangul syllables
+            ("\u{1100}\u{1161}", "\u{11A8}\u{AC00}"),   // Hangul jamo
+            ("\u{20000}", "\u{2A6D6}"),                 // CJK extension B
+            ("\u{30000}", "\u{3134A}"),                 // CJK extension G
+            ("\u{1B100}\u{1B101}", "\u{1B001}\u{1B11F}"), // kana supplement
+            ("\u{3002}", "\u{3001}"),                   // CJK punctuation
+        ] {
+            for c in [first, second] {
+                let c = c.chars().next().expect("empty");
+                assert_eq!(classify::Role::of(c), Role::Cjk, "{c:?} is not the CJK the app counts");
+            }
+            let src = format!("\u{7B2C}\u{4E00}\u{7AE0}\n{first}\n{second}\n");
+            let doc = parse(&src, TextOptions { paragraphs: ParagraphRule::BlankLines, chapters: false });
+            let text = &doc.blocks.last().expect("no block").text;
+            assert!(!text.contains(' '), "a space was inserted at the join: {text:?} for {src:?}");
+        }
+        // Latin prose still gets its space: the join is not "never insert one".
+        let doc = parse("word\nnext\n", TextOptions { paragraphs: ParagraphRule::BlankLines, chapters: false });
+        assert_eq!(doc.blocks[0].text, "word next");
     }
 }

@@ -1,5 +1,7 @@
 #![allow(dead_code)]
 
+use std::collections::HashMap;
+
 use rubrica_type::units::Pt;
 
 pub type UnitId = usize;
@@ -129,11 +131,22 @@ struct State {
     note_first: Vec<Option<UnitId>>,
     note_continuation_height: Vec<Pt>,
     groups: Vec<GroupPolicy>,
+    /// `id -> position in groups`, so a candidate boundary's policy is a lookup rather
+    /// than a walk of the whole group list.
+    group_at: HashMap<GroupId, usize>,
+    /// `(first, past the last)` of every group, worked out once.
+    span: HashMap<GroupId, (UnitId, UnitId)>,
     policy: Policy,
 }
 
 impl State {
-    fn new(input_groups: &[GroupPolicy], tables: &[TableMeta], notes: &[NoteMeta], policy: Policy) -> Self {
+    fn new(
+        input: &[Unit],
+        input_groups: &[GroupPolicy],
+        tables: &[TableMeta],
+        notes: &[NoteMeta],
+        policy: Policy,
+    ) -> Self {
         let max_note = notes.iter().map(|n| n.id).max().map_or(0, |n| n + 1);
         let mut table_rows = Vec::with_capacity(tables.len());
         for table in tables {
@@ -147,11 +160,33 @@ impl State {
                 note_continuation_height[note.id] = note.continuation_height;
             }
         }
-        Self { table_rows, note_first, note_continuation_height, groups: input_groups.to_vec(), policy }
+        let group_at =
+            input_groups.iter().enumerate().map(|(at, g)| (g.id, at)).collect();
+        let mut span: HashMap<GroupId, (UnitId, UnitId)> = HashMap::new();
+        for (at, unit) in input.iter().enumerate() {
+            span.entry(unit.group)
+                .and_modify(|s| s.1 = at + 1)
+                .or_insert((at, at + 1));
+        }
+        Self {
+            table_rows,
+            note_first,
+            note_continuation_height,
+            groups: input_groups.to_vec(),
+            group_at,
+            span,
+            policy,
+        }
     }
 
     fn group(&self, id: GroupId) -> Option<&GroupPolicy> {
-        self.groups.iter().find(|g| g.id == id)
+        self.group_at.get(&id).map(|at| &self.groups[*at])
+    }
+
+    /// Where one group sits in the flow. Asked at every candidate page boundary, so it
+    /// is a lookup here rather than a scan of the whole input each time.
+    fn bounds(&self, id: GroupId) -> (UnitId, UnitId) {
+        self.span.get(&id).copied().unwrap_or((0, 0))
     }
 
     fn table_for_row(&self, unit: UnitId, units: &[Unit]) -> Option<TableMeta> {
@@ -182,12 +217,8 @@ fn piece_note(unit: &Unit) -> Option<usize> {
     }
 }
 
-fn group_bounds(units: &[Unit], group: GroupId) -> (UnitId, UnitId) {
-    let first = units.iter().position(|u| u.group == group).unwrap_or(0);
-    let last = units.iter().rposition(|u| u.group == group).map_or(first, |i| i + 1);
-    (first, last)
-}
-
+/// Whether a page may end at `end`: no orphan, no widow, no heading left behind, and no
+/// table header separated from its first row.
 fn valid_boundary(state: &State, units: &[Unit], start: UnitId, end: UnitId) -> bool {
     if end <= start || end > units.len() {
         return false;
@@ -196,7 +227,7 @@ fn valid_boundary(state: &State, units: &[Unit], start: UnitId, end: UnitId) -> 
     let last_group = units[end - 1].group;
     if first_group == last_group {
         let Some(policy) = state.group(first_group) else { return false };
-        let (group_first, group_last) = group_bounds(units, first_group);
+        let (group_first, group_last) = state.bounds(first_group);
         let left = start - group_first;
         let right = group_last - end;
         if left > 0 && left < policy.orphan {
@@ -213,7 +244,7 @@ fn valid_boundary(state: &State, units: &[Unit], start: UnitId, end: UnitId) -> 
         if policy.kind != GroupKind::Heading {
             continue;
         }
-        let (_, group_last) = group_bounds(units, unit.group);
+        let (_, group_last) = state.bounds(unit.group);
         if end < group_last.saturating_add(policy.keep_with_next) {
             return false;
         }
@@ -300,32 +331,39 @@ pub fn paginate(input: &[Unit], groups: &[GroupPolicy], tables: &[TableMeta], no
     if input.is_empty() {
         return PagePlan { pages: vec![PlannedPage { top: box_.top, used: 0.0, items: Vec::new(), relaxed: false }] };
     }
-    let state = State::new(groups, tables, notes, policy);
+    let state = State::new(input, groups, tables, notes, policy);
     let mut pages = Vec::new();
     let mut start = 0;
     let mut page_top = box_.top;
     while start < input.len() {
         let mut chosen = None;
-        let mut end = start + 1;
-        while end <= input.len() {
-            let fits_page = {
-                let mut used = 0.0;
-                for (i, unit) in input.iter().enumerate().take(end).skip(start) {
-                    if i > start { used += unit.gap_before; }
-                    used += unit.height;
-                }
-                used + overhead(&state, input, start, &mut None) <= box_.height + 0.001
-            };
-            if fits_page && valid_boundary(&state, input, start, end) {
+        // What a page of this start carries before any of its own units, decided once:
+        // it is the same whatever the page comes to hold.
+        let extra = overhead(&state, input, start, &mut None);
+        // The height of `input[start..end]` as a running total rather than a sum taken
+        // again for every candidate. Heights and gaps are not negative, so a page that
+        // has stopped fitting cannot begin fitting further along, and the scan stops
+        // there instead of walking the rest of the input to learn what it already knows.
+        let mut used = 0.0;
+        let mut end = start;
+        while end < input.len() {
+            if end > start {
+                used += input[end].gap_before;
+            }
+            used += input[end].height;
+            end += 1;
+            if used + extra > box_.height + 0.001 {
+                break;
+            }
+            if valid_boundary(&state, input, start, end) {
                 chosen = Some(end);
             }
-            end += 1;
         }
         let (end, relaxed) = match chosen {
             Some(end) => (end, false),
             None => {
                 let group = input[start].group;
-                let (_, group_end) = group_bounds(input, group);
+                let (_, group_end) = state.bounds(group);
                 if group_end > start + 1 && state.group(group).is_some_and(|g| g.kind != GroupKind::Rule) {
                     (group_end, true)
                 } else {

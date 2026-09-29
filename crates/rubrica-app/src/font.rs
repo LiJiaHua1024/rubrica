@@ -159,6 +159,11 @@ const SHAPED_CACHE_CAP: usize = 65_536;
 /// itemizer, so a paragraph is analysed once however often its pieces are measured.
 const ANALYZED_CACHE_CAP: usize = 65_536;
 
+/// The family drawn with when the request names none that this machine has. Every
+/// Windows that can create a font engine has it, so a run of text is never dropped for
+/// want of a face to draw it with.
+const LAST_RESORT_FAMILY: &str = "Segoe UI";
+
 struct LayeredMap<K: std::hash::Hash + Eq, V> {
     hot: HashMap<K, V>,
     cold: HashMap<K, V>,
@@ -384,13 +389,14 @@ impl FontEngine {
         Some(gs)
     }
 
-    fn covers(&self, idx: usize, text: &str) -> bool {
-        self.glyphs_for(idx, text).is_some_and(|g| g.iter().all(|&x| x != 0))
-    }
-
-    /// Longest prefix of `text` the face can render.
-    fn covered_prefix(&self, idx: usize, text: &str) -> usize {
-        let Some(glyphs) = self.glyphs_for(idx, text) else { return 0 };
+    /// The leading run of `text` the face can render, in bytes, from one
+    /// `GetGlyphIndices` over the whole of it.
+    ///
+    /// Asked as a number rather than as two questions because each question is a full
+    /// pass over the text: a face either covers it to the end or it stops at a
+    /// character, and which of the two has to be known before either can be answered.
+    fn coverage(&self, idx: usize, text: &str) -> Option<usize> {
+        let glyphs = self.glyphs_for(idx, text)?;
         let mut n = 0usize;
         for (c, g) in text.chars().zip(glyphs) {
             if g == 0 {
@@ -398,16 +404,17 @@ impl FontEngine {
             }
             n += c.len_utf8();
         }
-        n
+        Some(n)
     }
 
-    /// Pick the face for `text`, honouring the Latin/CJK split.
+    /// Pick the face for `text`, honouring the Latin/CJK split, and report with it how
+    /// much of the text that face can render.
     ///
-    /// `None` means no candidate face could be opened at all, which only happens on
-    /// a machine with no fonts; callers treat that as "render nothing" rather than
-    /// substituting a face silently, because a wrong font is harder to notice than
-    /// a missing one.
-    fn resolve_face(&self, req: &FaceRequest, text: &str) -> Option<usize> {
+    /// `None` means no candidate face could be opened at all, or none of them has even
+    /// the first character: callers draw what is left with [`Self::last_resort_face`]
+    /// rather than dropping it, because a wrong font is harder to notice than a
+    /// `.notdef` box and a dropped run is not drawn at all.
+    fn resolve_face(&self, req: &FaceRequest, text: &str) -> Option<(usize, usize)> {
         let cjk = text.chars().next().is_some_and(cjk_char);
         let mut order: Vec<&str> = if cjk {
             vec![req.cjk_family.as_str(), req.family.as_str()]
@@ -422,16 +429,37 @@ impl FontEngine {
         for family in order {
             let italic = if cjk { req.cjk_italic.unwrap_or(req.italic) } else { req.italic };
             let Some(idx) = self.face_for(family, req.weight, italic) else { continue };
-            if self.covers(idx, text) {
-                return Some(idx);
+            // One probe answers both halves of the question, so a candidate that comes
+            // back neither covering nor empty costs a single pass over the text.
+            let Some(covered) = self.coverage(idx, text) else { continue };
+            if covered == text.len() {
+                return Some((idx, covered));
             }
             // Keep the first face that at least rendered something: a partial
             // prefix still beats dropping the run.
-            if partial.is_none() && self.covered_prefix(idx, text) > 0 {
-                partial = Some(idx);
+            if partial.is_none() && covered > 0 {
+                partial = Some((idx, covered));
             }
         }
         partial
+    }
+
+    /// A face to draw with when nothing on the request's list has the text at all.
+    ///
+    /// The requested family if this machine has it, then the first fallback that is
+    /// installed, then Segoe UI -- which is on every Windows that has a font engine to
+    /// ask. The run then shapes to `.notdef`, which is a box a reader can see and a
+    /// report can count, instead of vanishing. Every candidate goes through the
+    /// resolved-face cache, so a request made once per character of a long run costs
+    /// one `String` key and no new COM object after the first.
+    fn last_resort_face(&self, req: &FaceRequest) -> Option<usize> {
+        let cjk = req.cjk_italic.unwrap_or(req.italic);
+        self.face_for(&req.family, req.weight, req.italic)
+            .or_else(|| self.face_for(&req.cjk_family, req.weight, cjk))
+            .or_else(|| {
+                req.fallback.iter().find_map(|f| self.face_for(f, req.weight, req.italic))
+            })
+            .or_else(|| self.face_for(LAST_RESORT_FAMILY, req.weight, req.italic))
     }
 
     /// The itemization of the paragraph under measurement, or of any other text the
@@ -507,19 +535,26 @@ impl FontEngine {
             let mut at = 0usize;
             while at < slice.len() {
                 let rest = &slice[at..];
-                // Nothing on the request's list has the next character. Draw it from the
-                // requested face anyway: `.notdef` is a box a reader can see and a report can
-                // count, while stopping here turns the rest of the run into invisible text.
-                let face = match self.resolve_face(req, rest) {
-                    Some(f) => f,
-                    None => match self.face_for(&req.family, req.weight, req.italic) {
-                        Some(f) => f,
-                        // No face at all -- a machine with no fonts, or a family that was
-                        // uninstalled mid-run. There is nothing left to draw with.
-                        None => break,
-                    },
+                // Nothing on the request's list has even the next character. Draw what
+                // is left of the run in one piece from the last resort face: `.notdef` is
+                // a box a reader can see and a report can count, while stopping here
+                // turns the rest of the run into invisible text.
+                //
+                // One piece rather than one character is also what keeps this loop linear
+                // in the length of the run. Taking a single character and asking again
+                // re-probed the whole remainder against every candidate family on every
+                // iteration, so text no installed font covers -- a vendor's private-use
+                // glyphs, a rare script -- cost the square of its own length to measure.
+                let (face, taken) = match self.resolve_face(req, rest) {
+                    Some((face, covered)) => {
+                        (face, covered.max(first_char_len(rest)))
+                    }
+                    None => {
+                        // No face at all: a machine with no fonts, and nothing to draw with.
+                        let Some(face) = self.last_resort_face(req) else { break };
+                        (face, rest.len())
+                    }
                 };
-                let taken = self.covered_prefix(face, rest).max(first_char_len(rest));
                 let chunk = &rest[..taken];
                 let mut runs = self.shape_with_face(chunk, item.range.start + at, face, size, tracking, &item);
                 out.append(&mut runs);
@@ -1018,5 +1053,95 @@ mod tests {
         assert_eq!(os2_strikeout(&table(0, 275)), None);
         // A table too short to hold the fields is the same answer: nothing to read.
         assert_eq!(os2_strikeout(&[0u8; 12]), None);
+    }
+
+    /// A run of `count` private-use codepoints: what a PDF-to-Markdown conversion of a
+    /// Chinese textbook with vendor glyphs leaves behind, and what no installed family
+    /// is likely to cover.
+    fn private_use(count: u32) -> String {
+        (0..count).map(|i| char::from_u32(0xE000 + i % 0x1000).expect("in the PUA")).collect()
+    }
+
+    /// Whether the runs come back covering `text` from end to end, which is what "the
+    /// text was drawn" means: a run that was dropped is not a shorter run, it is a gap.
+    fn covers_text(runs: &[GlyphRun], text: &str) -> bool {
+        if runs.is_empty() {
+            return false;
+        }
+        // The runs come back in visual order, so their extents are merged rather than
+        // walked in the order they happen to have been drawn in.
+        let mut spans: Vec<(usize, usize)> =
+            runs.iter().map(|r| (r.text.start, r.text.end)).collect();
+        spans.sort_unstable();
+        let mut at = 0usize;
+        for (start, end) in spans {
+            if start > at {
+                return false;
+            }
+            at = at.max(end);
+        }
+        at >= text.len()
+    }
+
+    /// A request whose family this machine has, with the fallbacks a theme carries
+    /// beside it -- five candidates, so a run that finds no face in any of them pays
+    /// five probes.
+    fn installed_request() -> FaceRequest {
+        FaceRequest {
+            family: "Segoe UI".into(),
+            cjk_family: "Microsoft YaHei".into(),
+            fallback: vec!["Segoe UI Symbol".into(), "Segoe UI Emoji".into(), "Arial".into()],
+            weight: 400,
+            italic: false,
+            ..Default::default()
+        }
+    }
+
+    /// Measuring a run nothing can render is linear in its length, not the square of
+    /// it. The old loop took one character and asked again, re-probing the whole
+    /// remainder against every candidate each time: 20 000 characters cost 100 000
+    /// `GetGlyphIndices` over 20 000 characters, and again on every repaint.
+    #[test]
+    fn a_run_no_installed_face_covers_is_measured_in_one_pass() {
+        let Ok(engine) = FontEngine::new() else { return };
+        if !engine.probe() {
+            return;
+        }
+        let text = private_use(20_000);
+        let started = std::time::Instant::now();
+        let runs = engine.shape_runs(&text, 0..text.len(), &installed_request(), 13.5, 0.0);
+        let took = started.elapsed();
+        assert!(covers_text(&runs, &text), "uncovered text was not all drawn");
+        // Generous, because this is a bound rather than a measurement -- but the old
+        // shape of the loop needed minutes here, and the whole point is that it does not.
+        assert!(took.as_secs() < 10, "20 000 uncovered characters took {took:?}");
+    }
+
+    /// Text that no family on the request can render is still drawn, as `.notdef`.
+    ///
+    /// The families of a `Book` profile or a typography preset are named whether or not
+    /// they are installed, and a Windows Server Core image or a container is missing
+    /// most of them. When the request's own fallback list ran out as well, the run used
+    /// to stop there and the text from that character to the end of the line simply was
+    /// not on the page -- no glyph, no box, nothing for a reader to notice.
+    #[test]
+    fn a_family_this_machine_does_not_have_does_not_take_the_text_with_it() {
+        let Ok(engine) = FontEngine::new() else { return };
+        if !engine.probe() {
+            return;
+        }
+        let text = private_use(4_000);
+        let req = FaceRequest {
+            family: "Rubrica No Such Family".into(),
+            cjk_family: "Rubrica Neither Does This One".into(),
+            fallback: vec![],
+            weight: 400,
+            italic: false,
+            ..Default::default()
+        };
+        let runs = engine.shape_runs(&text, 0..text.len(), &req, 13.5, 0.0);
+        assert!(covers_text(&runs, &text), "text was dropped from a missing family");
+        assert!(runs.iter().any(|r| r.glyphs.contains(&0)),
+            "and it should be drawn as .notdef boxes, not silently substituted");
     }
 }

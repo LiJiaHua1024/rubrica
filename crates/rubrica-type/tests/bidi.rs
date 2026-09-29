@@ -69,3 +69,15 @@ fn directional_cuts_do_not_introduce_word_breaks() {
     assert_eq!(lines.len(), 1, "UBA run boundaries are not UAX #14 opportunities");
     assert_eq!(lines[0].0, "abc123בא");
 }
+
+#[test]
+fn an_overfull_rtl_line_hangs_leftward_into_its_own_padding() {
+    // Ten points a character and a twenty-point measure: the one Hebrew word is twice
+    // its column. A right-to-left paragraph is aligned at its right edge, so the
+    // excess belongs on the left -- inside the box's own padding, which is what a
+    // table cell has to offer. Clamping the start at zero sent it the other way,
+    // over whatever stands to the right of the cell instead.
+    let lines = visual("שלום", 20.0);
+    assert_eq!(lines.len(), 1, "the word cannot be split, so it must be one line");
+    assert!(lines[0].1 < 0.0, "an overfull RTL line must start left of its measure, at {}", lines[0].1);
+}

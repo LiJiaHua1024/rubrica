@@ -48,6 +48,7 @@ pub(crate) fn plain(s: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::layout::MAX_DEPTH;
 
 
     /// A face with predictable metrics: every glyph is half an em wide, seven tenths
@@ -1100,5 +1101,149 @@ mod tests {
         let empty = set("\\begin{matrix}\\end{matrix}", SZ, true, &mut m);
         assert_eq!(empty.width, 0.0);
         assert!(empty.shapes.is_empty());
+    }
+
+    #[test]
+    fn a_tree_too_deep_to_lay_out_is_set_as_its_own_text() {
+        // Every construct here lays its body out by recursing into it, so a tree
+        // built to do nothing but nest walked the stack away however deep the
+        // parser's own cap happened to be. Past the layout's cap the subtree is
+        // one ordinary run of the text it was written as: the arrangement is lost,
+        // which is this engine's standing bargain, and the stack is not.
+        let mut n = Node::Atom("x".into());
+        for _ in 0..300 {
+            n = Node::Fence { left: '(', right: ')', body: Box::new(n) };
+        }
+        let mut m = Mock::mathy();
+        let f = layout(&n, SZ, true, &mut m);
+        assert_finite(&f);
+        let text = runs(&f);
+        assert_eq!(text.len(), 1, "the collapsed subtree is one run: {text:?}");
+        // The whole of the source, not just its length: `source_of` walks the
+        // subtree with an explicit stack, and a stack reads the last thing pushed
+        // first -- so every arm must push its parts in the reverse of the order it
+        // wants them read back in. Checking only the length let every one of them
+        // hand the reader the braces of a fence backwards. The first `MAX_DEPTH`
+        // fences are laid out normally; the run below them is the source of the
+        // rest, wrapped in a `\left ... \right` pair of its own for each of them.
+        let inner = 300 - MAX_DEPTH;
+        assert_eq!(
+            text[0].0,
+            format!("{}\\left(x\\right){}", "\\left(".repeat(inner - 1), "\\right)".repeat(inner - 1)),
+            "the run carries the source of the whole collapsed subtree, not just the \
+             letter at the bottom of it: {text:?}"
+        );
+        assert!(f.width > 0.0 && f.ascent > 0.0);
+    }
+
+    /// A node buried under enough wrappers that the layout's depth cap collapses it
+    /// into its own source text, and the source text it becomes.
+    ///
+    /// The wrappers have to be ones the layout recurses into, not ones it stops at:
+    /// `Styled` hands its body straight to `lay`, so the count here is the count of
+    /// `lay` calls on the way down and the arm at the bottom is the first one past
+    /// the cap.
+    fn collapsed(arm: Node) -> String {
+        let mut n = arm;
+        for _ in 0..MAX_DEPTH + 1 {
+            n = Node::Styled {
+                body: Box::new(n),
+                style: crate::parse::MathStyle::Display,
+            };
+        }
+        let mut m = Mock::mathy();
+        let f = layout(&n, SZ, true, &mut m);
+        assert_finite(&f);
+        let text = runs(&f);
+        assert_eq!(text.len(), 1, "the collapsed subtree is one run: {text:?}");
+        text[0].0.clone()
+    }
+
+    /// Every arm of [`layout::source_of`] that drives the work stack, checked at a
+    /// depth the layout will not descend into: this is the source the reader is
+    /// shown, so an arm that pushes its text in the wrong order shows the script,
+    /// the radical, the fence, the big operator and the grid of a collapsed subtree
+    /// reversed.
+    #[test]
+    fn a_collapsed_subtree_comes_back_as_the_source_it_was_written_as() {
+        let x = || Node::Atom("x".into());
+        let n = || Node::Atom("n".into());
+
+        // The arms that got their scripts, radical or delimiters backwards.
+        assert_eq!(collapsed(Node::Sup { base: Box::new(x()), sup: Box::new(n()) }), "x^{n}");
+        assert_eq!(collapsed(Node::Sub { base: Box::new(x()), sub: Box::new(n()) }), "x_{n}");
+        assert_eq!(
+            collapsed(Node::SubSup { base: Box::new(x()), sub: Box::new(n()), sup: Box::new(n()) }),
+            "x_{n}^{n}"
+        );
+        assert_eq!(
+            collapsed(Node::Sqrt { body: Box::new(x()), degree: Some(Box::new(n())) }),
+            "\\sqrt[n]{x}"
+        );
+        // A radical with no degree was never broken; it is here so that a change to
+        // the degree arm cannot quietly take the plain one with it.
+        assert_eq!(collapsed(Node::Sqrt { body: Box::new(x()), degree: None }), "\\sqrt{x}");
+        assert_eq!(
+            collapsed(Node::Fence { left: '(', right: ')', body: Box::new(x()) }),
+            "\\left(x\\right)"
+        );
+        // A `\right` that stands for nothing is the `.` TeX spells it with, not a NUL.
+        assert_eq!(
+            collapsed(Node::Fence { left: '\0', right: ')', body: Box::new(x()) }),
+            "\\left.x\\right)"
+        );
+        assert_eq!(
+            collapsed(Node::BigOp {
+                op: "\\sum".into(),
+                limits: Limits::Default,
+                sub: Some(Box::new(n())),
+                sup: Some(Box::new(x())),
+            }),
+            "\\sum_{n}^{x}"
+        );
+        // One script only: the other one's brace must not survive it.
+        assert_eq!(
+            collapsed(Node::BigOp {
+                op: "\\lim".into(),
+                limits: Limits::Always,
+                sub: None,
+                sup: None,
+            }),
+            "\\lim"
+        );
+        assert_eq!(
+            collapsed(Node::BigOp {
+                op: "\\int".into(),
+                limits: Limits::Never,
+                sub: Some(Box::new(n())),
+                sup: None,
+            }),
+            "\\int_{n}"
+        );
+        assert_eq!(
+            collapsed(Node::BigOp {
+                op: "\\sum".into(),
+                limits: Limits::Default,
+                sub: None,
+                sup: Some(Box::new(n())),
+            }),
+            "\\sum^{n}"
+        );
+        // `\end` last, and each row of a grid after the one before it.
+        assert_eq!(
+            collapsed(Node::Array {
+                rows: vec![
+                    vec![Node::Atom("a".into()), Node::Atom("b".into())],
+                    vec![Node::Atom("c".into())],
+                    vec![Node::Atom("d".into()), Node::Atom("e".into())],
+                ],
+                columns: vec![],
+                kind: crate::parse::ArrayKind::Matrix,
+                delimiters: None,
+                rules: vec![],
+                col_rules: vec![],
+            }),
+            "\\begin{a & b\\\\c\\\\d & e\\end{}"
+        );
     }
 }

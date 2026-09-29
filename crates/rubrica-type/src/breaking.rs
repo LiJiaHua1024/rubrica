@@ -181,6 +181,15 @@ struct Edge {
     hi: usize,
 }
 
+/// Demerits charged for a line the solver kept only because every alternative was
+/// wider.
+///
+/// TeX's `create_new_active_node` puts such a line on the page rather than losing
+/// the text, and says in the cost that it had no choice. The number has to outrank
+/// every other line a paragraph can be set with, or a plan that does have a legal
+/// answer somewhere would choose this one.
+const RESCUED: f64 = 1.0e12;
+
 fn badness(ratio: Pt) -> i32 {
     if ratio <= 0.0 {
         0
@@ -298,11 +307,16 @@ fn score(
     let sh = if opts.tight_box { 0.0 } else { f64::from(shrink) };
     let eps = f64::from(EPSILON);
     let (ratio, bad) = if delta > eps && opts.ragged {
-        // Ragged alignment leaves free space at the edge. A one-word line has no
-        // internal glue at all, but that must not make its unused margin illegal.
+        // Ragged alignment leaves free space at the edge, and that free space is the
+        // whole story: the line is scored on how much of the measure it leaves, at
+        // its own worth. A one-word line has no internal glue at all, but that must
+        // not make its unused margin illegal. Tripling the ratio before scoring made
+        // a line two-thirds empty read as a third-empty one -- badness is cubic, so
+        // twenty-seven times worse -- and inflated the badness and fitness class
+        // every `Line` of a ragged block reports.
         let r = if stretch >= INFINITY / 2.0 { 0.0 }
             else { (delta / f64::from(target.max(EPSILON))) as Pt };
-        (r, badness(3.0 * r))
+        (r, badness(r))
     } else if delta > eps {
         if st <= eps {
             (10.0, 10000)
@@ -325,9 +339,16 @@ fn score(
         return None;
     }
     let fit = fitness(ratio);
-    let mut adj = bad + 100;
+    // TeX's demerits are the square of the line's badness, and a badness here is a
+    // whole number only because `Line` reports it as one. The demerits are computed
+    // from the curve rather than from the rounded value: scored as the integer,
+    // every line better than four fifths full costs the same single point, and a
+    // ragged block -- where lines live between half a measure and all of it -- had
+    // no reason to fill its measure at all. The solver took whichever of the
+    // equally cheap breaks it met first, which is the loosest one.
+    let mut adj = (100.0 * f64::from(ratio).powi(3)).min(10_000.0) + 100.0;
     if bad >= 10000 {
-        adj = 100_000;
+        adj = 100_000.0;
     }
     // Fitness classes may not jump the ladder two rungs at a time: TeX charges
     // `\adjdemerits` for it, graded here by the size of the fall. Two rungs pay
@@ -337,11 +358,11 @@ fn score(
     let jump = fit.abs_diff(prev_fit);
     if jump > 1 {
         adj += match jump {
-            2 => opts.lousy_demerits,
-            _ => opts.awful_demerits.saturating_add(opts.nasty_demerits),
+            2 => f64::from(opts.lousy_demerits),
+            _ => f64::from(opts.awful_demerits.saturating_add(opts.nasty_demerits)),
         };
     }
-    Some((bad, fit, (f64::from(adj.max(0)) / 100.0).powi(2)))
+    Some((bad, fit, (adj.max(0.0) / 100.0).powi(2)))
 }
 
 /// Cut an over-long piece at break opportunities until every piece is within
@@ -547,6 +568,9 @@ fn solve(
         let mut best: Option<(f64, usize)> = None;
         let mut next_active: Vec<usize> = Vec::with_capacity(active.len() + 1);
         let mut stop = false;
+        // The overfull line that overflows least, kept in case refusing it -- and
+        // everything else -- leaves the active list with nothing in it.
+        let mut rescue: Option<(f64, usize)> = None;
 
         for &e in &active {
             if stop {
@@ -583,6 +607,10 @@ fn solve(
                 && f64::from(natural) - f64::from(shrink)
                     > f64::from(line_target + hang) + f64::from(EPSILON)
             {
+                let over = f64::from(natural) - f64::from(shrink) - f64::from(line_target + hang);
+                if rescue.is_none_or(|(worst, _)| over < worst) {
+                    rescue = Some((over, e));
+                }
                 continue;
             }
             let Some((_bad, _fit, demerits)) = score(
@@ -610,9 +638,54 @@ fn solve(
             next_active.push(e);
         }
 
-        let Some((cost, prev)) = best else {
-            active = next_active;
-            continue;
+        let (cost, prev) = match best {
+            Some(best) => best,
+            // TeX's `create_new_active_node`. A start refused for being overfull can
+            // never work again -- every later break only lengthens the line -- so the
+            // list loses it, and when that empties the list there is no edge left to
+            // carry: none is ever created again, the piece's terminal is unreachable,
+            // and the whole paragraph falls into `desperate` with every line ragged
+            // and every demerit infinite. One token wider than the measure was enough.
+            //
+            // So the least-bad line just refused goes on the page anyway and the piece
+            // continues from the item after it. The text is all still there, the
+            // program keeps moving, and the token hangs in the one place it has to.
+            None if next_active.is_empty() => {
+                let Some((_, e)) = rescue else {
+                    active = next_active;
+                    continue;
+                };
+                let ed = edges[e];
+                let pw = match items[k] {
+                    Item::Penalty { width, .. } => width,
+                    _ => 0.0,
+                };
+                let line_target = opts.target(first_line && at_start[e]);
+                let (range, natural, stretch, shrink) = trim(items, sums, ed.start, k, pw);
+                let hang = if natural > line_target {
+                    hanging_width(para, items, range, opts.hanging_punctuation)
+                } else { 0.0 };
+                // Scored with the tolerance lifted: a line this far overfull cannot be
+                // underfull, so the only way `score` could still refuse it is a bug --
+                // and reporting it as the worst line on the page is the safe answer to
+                // one.
+                let (_, _, demerits) = score(
+                    natural,
+                    stretch + extra_stretch,
+                    shrink,
+                    line_target,
+                    hang,
+                    i32::MAX,
+                    ed.fitness,
+                    opts,
+                )
+                .unwrap_or((10000, 3, 0.0));
+                (ed.cost + RESCUED + demerits, e)
+            }
+            None => {
+                active = next_active;
+                continue;
+            }
         };
         let ed = edges[prev];
         let pw = match items[k] {
@@ -634,7 +707,7 @@ fn solve(
             ed.fitness,
             opts,
         )
-        .expect("the winning edge scored legal above");
+        .expect("the edge chosen above scored legal, rescue included");
         let idx = edges.len();
         edges.push(Edge {
             prev,

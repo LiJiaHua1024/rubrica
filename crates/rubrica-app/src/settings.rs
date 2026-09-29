@@ -161,23 +161,32 @@ impl Batch {
     pub(crate) fn text(&self, name: &str) -> Option<String> {
         let wide = utf16(name);
         let mut kind = REG_SZ;
-        // The length is asked for first, because a path can be any length and the buffer it
-        // is read into has to be cut to size beforehand.
+        // The length and the type are asked for together, before anything is allocated:
+        // a path can be any length, so the buffer it is read into has to be cut to size
+        // beforehand -- and a value of some other type is never measured into a string
+        // at all. The key is editable and a `REG_BINARY` under a path's name is a
+        // hand-edit away.
         let mut len = 0u32;
         let sought = unsafe {
             RegQueryValueExW(
                 self.key,
                 PCWSTR(wide.as_ptr()),
                 None,
-                None,
+                Some(&mut kind),
                 None,
                 Some(&mut len),
             )
         };
-        if sought != ERROR_SUCCESS || len == 0 {
+        if sought != ERROR_SUCCESS || kind != REG_SZ || len == 0 {
             return None;
         }
-        let mut units = vec![0u16; len as usize / 2];
+        // `len` is a byte count and nothing guarantees it is even -- a value written by
+        // something other than this program may not be -- so the buffer is rounded up a
+        // whole unit. Sizing it as `len / 2` and then telling the registry it had `len`
+        // bytes hands it a pointer to an address it does not own and writes one byte
+        // past the end of the allocation.
+        let mut units = vec![0u16; len as usize / 2 + 1];
+        let mut room = (units.len() * 2) as u32;
         let read = unsafe {
             RegQueryValueExW(
                 self.key,
@@ -185,15 +194,15 @@ impl Batch {
                 None,
                 Some(&mut kind),
                 Some(units.as_mut_ptr() as *mut u8),
-                Some(&mut len),
+                Some(&mut room),
             )
         };
         if read != ERROR_SUCCESS || kind != REG_SZ {
             return None;
         }
-        // `len` comes back as the bytes actually copied, terminator included, and a value
+        // `room` comes back as the bytes actually copied, terminator included, and a value
         // written by something other than this program may not have one.
-        let taken = (len as usize / 2).min(units.len());
+        let taken = (room as usize / 2).min(units.len());
         Some(String::from_utf16_lossy(&units[..taken]).trim_end_matches('\0').to_string())
     }
 }
@@ -1066,6 +1075,29 @@ mod tests {    use super::*;
     /// one open key rather than one value of it at a time.
     fn opened_under(sub: &str) -> Option<PathBuf> {
         Batch::open(sub).and_then(|batch| read_opened(&batch))
+    }
+
+    /// A value that is not a string is never measured into a string's buffer.
+    ///
+    /// The key is editable, and these are the values a hand-edit leaves under a name this
+    /// program reads as a path: another type, and a byte count that is not even. Sized as
+    /// `len / 2` units and then told the buffer was `len` bytes long, the read hands
+    /// `RegQueryValueExW` an address it does not own and writes past the end of it --
+    /// one byte for a one-byte value, seven for a seven-byte one, into a heap this
+    /// process then keeps using.
+    #[test]
+    fn a_value_that_is_not_a_string_is_never_sized_into_one() {
+        let sub = "Software\\Rubrica Test Odd Text";
+        clear(sub);
+        assert_eq!(text(sub, "Document"), None, "nothing written is no path");
+        try_write_binary(sub, OPENED, b"A").expect("a one-byte value under a path's name");
+        assert_eq!(text(sub, OPENED), None);
+        try_write_binary(sub, OPENED, b"ABCDEFG").expect("a seven-byte value");
+        assert_eq!(text(sub, OPENED), None);
+        // And an empty value of the right type is still a path of no length, as it was.
+        write_text(sub, OPENED, "C:\\books\\a.md");
+        assert_eq!(text(sub, OPENED).as_deref(), Some("C:\\books\\a.md"));
+        clear(sub);
     }
 
     /// The values that belong to a document rather than to the page: which one to come

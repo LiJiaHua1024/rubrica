@@ -32,12 +32,27 @@ pub fn table_bytes(face: &IDWriteFontFace, tag: &[u8; 4]) -> Option<Vec<u8>> {
     let read = file.read(&mut head).ok()?;
     head.truncate(read);
     let (offset, len) = table_range(&head, index, tag)?;
+    let size = file.metadata().ok()?.len();
+    if !within(offset, len, size) {
+        return None;
+    }
     // A table's own bytes, not the whole file: a Chinese collection runs to tens of
     // megabytes, and only this range is ever wanted.
     let mut bytes = vec![0u8; len as usize];
     file.seek(SeekFrom::Start(offset)).ok()?;
     file.read_exact(&mut bytes).ok()?;
     Some(bytes)
+}
+
+/// Whether `(offset, len)` names bytes a file of `size` bytes actually has.
+///
+/// Both numbers come out of the font's own table directory, which is four bytes each of
+/// something this reader does not check anything else about. A font claiming a
+/// multi-gigabyte table is not a font this program has to hold in memory to find out
+/// that: read as a claim, it is a range past the end of the file; read as an allocation,
+/// it is gigabytes reserved before `read_exact` reports the end.
+fn within(offset: u64, len: u64, size: u64) -> bool {
+    len <= size && offset.checked_add(len).is_some_and(|end| end <= size)
 }
 
 /// The unchanging part of a font-file key: eight bytes identifying the file's state as the
@@ -212,6 +227,22 @@ mod tests {
         let f = sfnt(&[&record(b"OS/2", 1000, 96)]);
         assert_eq!(table_range(&f[..f.len() - 4], 0, b"OS/2"), None);
         assert_eq!(table_range(&[], 0, b"OS/2"), None);
+    }
+
+    /// The directory's length is a claim, and the file is the fact. Allocated before
+    /// the read, a font asking for a four-gigabyte `MATH` table is a reader that
+    /// reserves four gigabytes to discover the file is not that big.
+    #[test]
+    fn a_table_longer_than_the_file_is_not_allocated() {
+        // An ordinary table inside the file, and one ending on its very last byte.
+        assert!(within(900, 120, 4096));
+        assert!(within(4000, 96, 4096));
+        // Four gigabytes claimed by a 4 KB header, and a range that runs off the end.
+        assert!(!within(900, 4_000_000_000, 4096));
+        assert!(!within(4000, 200, 4096));
+        // Nothing at all in the file, and a range that would not fit a `u64` to describe.
+        assert!(!within(0, 1, 0));
+        assert!(!within(u64::MAX, 2, u64::MAX));
     }
 
     /// A key as DirectWrite hands one over: the eight state bytes and the `2a 00` marker

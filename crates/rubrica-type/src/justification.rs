@@ -176,7 +176,12 @@ impl<'a> LinePlacer<'a> {
         }
         let width: Pt = slots.iter().map(|s| s.w).sum();
         let target = if line.natural > line.target { line.target + line.hang } else { line.target };
-        let mut x = if p.level.is_rtl() { (target - width).max(0.0) } else { 0.0 };
+        // A right-to-left paragraph is aligned at its right edge, so a line wider
+        // than its measure overflows to the *left* -- into the cell's own padding,
+        // where a heading of the right-to-left world belongs. Clamping at zero sent
+        // it the other way instead, straight over the neighbour standing to the
+        // right of the box the line was set in.
+        let mut x = if p.level.is_rtl() { target - width } else { 0.0 };
         crate::BidiInfo::reorder_visual(&slot_levels).into_iter().map(|i| {
             let mut slot = slots[i];
             slot.x = x;

@@ -209,16 +209,43 @@ impl<'a> MathTable<'a> {
     /// Italics correction for a glyph, in design units. Zero for glyphs the font
     /// does not correct, which is most non-math glyphs.
     pub fn italics_correction(&self, glyph: u16) -> i16 {
-        let r = Reader::new(self.data);
-        if self.glyph_info + 2 > self.data.len() {
+        // `MathGlyphInfo` is optional in a version 1.1 table, and an absent one is
+        // an offset of zero. Followed anyway it lands in the middle of the table,
+        // where the constant records look like partial substables and inventions
+        // follow: a glyph the font never listed is corrected, and every superscript
+        // and accent built on it is displaced by a number nobody wrote. No
+        // correction is the only answer a font with no subtable can give.
+        if self.glyph_info == 0 {
             return 0;
         }
-        let info = self.glyph_info + r.u16(self.glyph_info) as usize;
+        let r = Reader::new(self.data);
+        // `MathGlyphInfo` is four `Offset16`s and no version header of its own, so
+        // the first two bytes of it already are the distance to the corrections table
+        // -- not the extended-shape coverage four bytes further in, which is the
+        // `MathKernInfo` a real font puts there and a coverage-shaped run of one
+        // thousand six hundred fake glyphs to a reader who followed it.
+        if self.glyph_info + 8 > self.data.len() {
+            return 0;
+        }
+        let italics = r.u16(self.glyph_info);
+        // Zero is how a `MathGlyphInfo` that carries no corrections at all writes this
+        // field, the same way it writes an absent subtable anywhere else in the table.
+        // Left alone it resolves the header back onto itself, and the version numbers
+        // in it are then read as a coverage format, a glyph count and a correction.
+        if italics == 0 {
+            return 0;
+        }
+        // Like every other offset in the MATH table, that one is measured from the
+        // start of the subtable that holds it, so the corrections table is
+        // `MathGlyphInfo` plus its own distance from `MathGlyphInfo`.
+        let info = self.glyph_info + italics as usize;
         if info + 4 > self.data.len() {
             return 0;
         }
-        // Both offsets are from the beginning of the italics table, not the file.
-        let cov = rel(&r, info, 0);
+        // The coverage's offset is measured from the beginning of the corrections
+        // table, and sits at its own start -- not at the start of the file, whose
+        // first u16 is the MATH major version and belongs to no subtable.
+        let cov = rel(&r, info, info);
         let n = r.u16(info + 2) as usize;
         let i = match self.coverage_index(cov, glyph) {
             Some(i) if (i as usize) < n => i as usize,
@@ -639,4 +666,224 @@ mod tests {
         assert_eq!(t.grow(300, 100).map(|g| g[0].glyph), Some(311));
         assert_eq!(t.grow(302, 100).map(|g| g[0].glyph), None, "past the listed ranges");
     }
+
+    #[test]
+    fn a_font_with_no_glyph_info_corrects_nothing() {
+        // `MathGlyphInfo` is optional in a version 1.1 table, and an absent one is
+        // an offset of zero. Read as a table anyway, its first u16 -- the major
+        // version -- is taken for the record's size and a coverage is read out of
+        // the constants behind it, which is a correction the font never wrote, for
+        // a glyph it never listed. Every superscript, accent and bar placed against
+        // one is displaced.
+        let bytes = two_glyphs(); // built with no MathGlyphInfo
+        let t = MathTable::parse(&bytes, 2048).expect("the fixture is a version 1 table");
+        for glyph in [0u16, 1, 100, 200, 999, 3000] {
+            assert_eq!(t.italics_correction(glyph), 0, "glyph {glyph} is corrected by nothing");
+        }
+    }
+
+    /// Append zero bytes until the table reaches `at`, so that a subtable written
+    /// afterwards is preceded by dead space a reader cannot shortcut across.
+    fn pad_to(t: &mut Vec<u8>, at: usize) {
+        while t.len() < at {
+            t.push(0);
+        }
+    }
+
+    const GLYPH_INFO: usize = 16;
+    const CORRECTIONS: usize = 40;
+    const CORRECTION_COV: usize = 60;
+    /// The constants sit past everything else, so no offset under test resolves into
+    /// them, and the table is still long enough to declare.
+    const FAR_CONSTANTS: usize = 250;
+
+    /// A `MATH` table with a `MathGlyphInfo` in it, and the corrections that live
+    /// inside it placed *after* the header rather than before it -- so that every
+    /// offset on the way there has to be resolved against its own parent to arrive.
+    ///
+    /// `MathGlyphInfo` is four `Offset16`s and nothing else: no version header of
+    /// its own, so the first of the four already is the distance to the corrections.
+    /// A 12-byte header with two version fields in it would leave +0 pointing at a
+    /// 1, which is every version number the table writes, and a reader following
+    /// it would find no corrections at all.
+    ///
+    /// `italics` is written into the header as-is, so passing zero builds the font
+    /// that ships a `MathGlyphInfo` and no corrections in it.
+    fn corrections(italics: u16) -> Vec<u8> {
+        let mut t = Vec::new();
+        put(&mut t, 1);
+        put(&mut t, 0);
+        put(&mut t, FAR_CONSTANTS as u16);
+        put(&mut t, GLYPH_INFO as u16);
+        put(&mut t, 0); // no MathVariants; this fixture is about the glyph info
+        pad_to(&mut t, GLYPH_INFO);
+        // ---- MathGlyphInfo, whose every offset is measured from here, and which
+        // carries no version fields of its own.
+        put(&mut t, italics); // the corrections themselves
+        put(&mut t, 0); // no top accent attachment
+        put(&mut t, 0); // no extended shape coverage
+        put(&mut t, 0); // no kern info
+        pad_to(&mut t, CORRECTIONS);
+        // ---- MathItalicsCorrectionInfo, and its coverage measured from here.
+        put(&mut t, (CORRECTION_COV - CORRECTIONS) as u16);
+        put(&mut t, 3); // corrections listed
+        for value in [120i16, -45, 0] {
+            put(&mut t, value as u16); // the correction itself
+            put(&mut t, 0); // and no device table to scale it by
+        }
+        pad_to(&mut t, CORRECTION_COV);
+        // ---- Coverage format 1, listing the three glyphs in order.
+        put(&mut t, 1);
+        put(&mut t, 3);
+        put(&mut t, 100);
+        put(&mut t, 200);
+        put(&mut t, 300);
+        // ---- The constants themselves. No test here reads one; the table only has
+        // to be long enough to declare them, or it is refused at parse time.
+        pad_to(&mut t, FAR_CONSTANTS + constant::COUNT * 4);
+        t
+    }
+
+    #[test]
+    fn an_italic_correction_is_read_from_the_glyph_info_that_lists_it() {
+        let bytes = corrections((CORRECTIONS - GLYPH_INFO) as u16);
+        let t = MathTable::parse(&bytes, 2048).expect("the fixture is a version 1 table");
+        // Each of these is a different number in a different record. An offset
+        // resolved from the wrong base cannot tell one from another: it either finds
+        // no coverage at all, or a coverage built out of the header's version fields
+        // that lists no glyph, and every superscript and accent in the document is
+        // displaced by the same amount because of it.
+        assert_eq!(t.italics_correction(100), 120);
+        assert_eq!(t.italics_correction(200), -45);
+        assert_eq!(t.italics_correction(300), 0, "listed, and corrected by nothing");
+        // Between the listed glyphs, and outside the table entirely: no correction.
+        assert_eq!(t.italics_correction(150), 0, "150 is not in the coverage");
+        assert_eq!(t.italics_correction(9999), 0, "9999 is not in the coverage");
+    }
+
+    #[test]
+    fn a_glyph_info_with_no_corrections_in_it_corrects_nothing() {
+        // The same header, with a zero where the corrections table would be. That
+        // zero is an absent subtable, and following it anyway reads the header's own
+        // version numbers as a coverage format, a correction count and corrections.
+        let bytes = corrections(0);
+        let t = MathTable::parse(&bytes, 2048).expect("the fixture is a version 1 table");
+        for glyph in [0u16, 100, 200, 300, 9999] {
+            assert_eq!(t.italics_correction(glyph), 0, "glyph {glyph} is corrected by nothing");
+        }
+    }
+
+    /// The `MATH` table of a real font, read straight out of the one Windows
+    /// ships that has corrections in it: the fixture above hand-writes the layout
+    /// the specification gives, and this checks the reader against a table somebody
+    /// else wrote -- the reading at +4 found a coverage-shaped run inside
+    /// `MathKernInfo` and read nothing but zero corrections from it, so every
+    /// superscript in a document set in Cambria was displaced by a number that was
+    /// never written down.
+    #[test]
+    fn a_real_fonts_italics_corrections_are_read_from_the_right_offset() {
+        // A font that is not installed is the ordinary case on a machine that is not
+        // Windows or has no Cambria, and the fixture above still pins the layout;
+        // the bytes are read once, with no cache behind them.
+        let Some(table) = cambria_math() else {
+            return;
+        };
+        // Through the same path the real face uses: `MathTable` over the raw table
+        // bytes, and the units per em the collection reports.
+        let t = MathTable::parse(&table.bytes, table.units_per_em)
+            .expect("cambria has a MATH table");
+        assert_ne!(t.glyph_info, 0, "cambria ships a MathGlyphInfo");
+        // The first `Offset16` of `MathGlyphInfo` is the corrections, not the
+        // extended-shape coverage three fields on: the coverage's own offset lands a
+        // reader inside `MathKernInfo`, where it reads a coverage of fifteen hundred
+        // fake glyphs and a correction of nothing at all -- so every superscript in a
+        // document set in Cambria was displaced by a number that was never written
+        // down. Cambria corrects 81 glyphs; reading none of them is what `+4` gave.
+        let corrected: Vec<_> =
+            (0..2000u16).filter(|&g| t.italics_correction(g) != 0).collect();
+        assert!(
+            corrected.len() > 10,
+            "cambria corrects 81 glyphs; reading {} of them is what the bug answered              with, not the font",
+            corrected.len()
+        );
+        // And at least one of the numbers is the designer's own: the italic-corrected
+        // glyphs of a text face carry corrections measured in tens of design units,
+        // not a stray bit of the table read as a value.
+        let widest =
+            corrected.iter().map(|&g| t.italics_correction(g)).max().expect("there is one");
+        assert!(widest > 10, "a real correction is tens of units wide: {widest}");
+    }
+
+    /// The `MATH` table of a real font that has italics corrections, read out of
+    /// the file it is installed in: the shape of the collection and of the table
+    /// directory is the same one `table` reads from the file's start.
+    struct Cambria {
+        bytes: Vec<u8>,
+        units_per_em: u16,
+    }
+
+    /// A `TrueType Collection` is a header, a list of offsets to per-font table
+    /// directories, and those directories: each font's tables are found by tag
+    /// in its own directory, so a MATH table in a collection is the MATH table of
+    /// the face it was read against.
+    fn cambria_math() -> Option<Cambria> {
+        // Windows only, and a font this machine may not have. `None` rather than a
+        // failure elsewhere.
+        let raw = std::fs::read(r"C:\Windows\Fonts\cambria.ttc").ok()?;
+        // `ttcf`: the tag, a version, the number of fonts, and that many offsets.
+        let n_fonts = u32::from_be_bytes(raw.get(8..12)?.try_into().unwrap());
+        for f in 0..n_fonts {
+            let dir = {
+                let at = 12 + 4 * f as usize;
+                u32::from_be_bytes(raw.get(at..at + 4)?.try_into().unwrap()) as usize
+            };
+            // A table directory is a count, three search fields, and that many
+            // 16-byte entries, each a tag, a checksum, an offset and a length.
+            let n_tables =
+                u32::from_be_bytes(raw.get(dir..dir + 4)?.try_into().unwrap()) as usize;
+            for i in 0..n_tables {
+                let e = dir + 12 + i * 16;
+                if raw.get(e..e + 4)? != b"MATH" {
+                    continue;
+                }
+                let at = u32::from_be_bytes(raw.get(e + 8..e + 12)?.try_into().unwrap())
+                    as usize;
+                let len = u32::from_be_bytes(raw.get(e + 12..e + 16)?.try_into().unwrap())
+                    as usize;
+                // `head` carries the units per em the face designs at, which is
+                
+                // what a `MathTable` is built against.
+                let upem = if raw.get(e..e + 4)? == b"MATH" {
+                    head_upem(&raw, dir)?
+                } else {
+                    2048
+                };
+                return Some(Cambria {
+                    bytes: raw.get(at..at + len)?.to_vec(),
+                    units_per_em: upem,
+                });
+            }
+        }
+        None
+    }
+
+    /// The units per em of the font whose table directory is `dir`, read from its
+    /// `head` table: the field a face's whole design is measured in, and the one
+    /// `MathTable` needs alongside the bytes.
+    fn head_upem(raw: &[u8], dir: usize) -> Option<u16> {
+        let n_tables = u32::from_be_bytes(raw.get(dir..dir + 4)?.try_into().unwrap()) as usize;
+        for i in 0..n_tables {
+            let e = dir + 12 + i * 16;
+            if raw.get(e..e + 4)? != b"head" {
+                continue;
+            }
+            // `head` is 54 bytes; unitsPerEm sits at +18, as a big-endian u16.
+            let at = u32::from_be_bytes(raw.get(e + 8..e + 12)?.try_into().unwrap()) as usize;
+            let be = raw.get(at + 18..at + 20)?;
+            return Some(u16::from_be_bytes([be[0], be[1]]));
+        }
+        None
+    }
 }
+
+// rebuilt

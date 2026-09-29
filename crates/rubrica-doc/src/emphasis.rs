@@ -55,6 +55,8 @@ pub(crate) fn relax(t: &mut Text<'_>) {
     }
     let code: Vec<Range<usize>> =
         t.spans.iter().filter(|s| s.style.contains(InlineStyle::CODE)).map(|s| s.range.clone()).collect();
+    let link: Vec<Range<usize>> =
+        t.spans.iter().filter(|s| s.style.contains(InlineStyle::LINK)).map(|s| s.range.clone()).collect();
     let runs: Vec<Run> = runs(t.text).into_iter().filter(|r| !inside_code(&code, r)).collect();
     let mut stack: Vec<usize> = Vec::new();
     let mut pairs: Vec<(Range<usize>, Range<usize>, InlineStyle)> = Vec::new();
@@ -63,9 +65,16 @@ pub(crate) fn relax(t: &mut Text<'_>) {
             // Only a run of the same length pairs, so `**粗*体**` loses its nesting
             // rather than gaining a guess at one: the outer pair is the reading the
             // author plainly meant, and the inner `*` stays text inside it.
-            if let Some(open) = stack.iter().rposition(|&j| runs[j].len == r.len) {
-                pairs.push((runs[open].range.clone(), r.range.clone(), flag(r.len)));
-                stack.truncate(open);
+            if let Some(at) = stack.iter().rposition(|&j| runs[j].len == r.len) {
+                let open = runs[stack[at]].range.clone();
+                if stays_within(&open, &r.range, &code) && stays_within(&open, &r.range, &link) {
+                    pairs.push((open, r.range.clone(), flag(r.len)));
+                }
+                // Either way the opener is spent. A run that has already reached
+                // across a code span or a link to find this closer has crossed
+                // something it may not cross, and pairing it with a further one
+                // would reach further still.
+                stack.truncate(at);
                 continue;
             }
         }
@@ -116,6 +125,26 @@ fn runs(text: &str) -> Vec<Run> {
 /// print. A formula cannot hold one: it reaches the text as a placeholder.
 fn inside_code(code: &[Range<usize>], r: &Run) -> bool {
     code.iter().any(|c| c.start < r.range.end && r.range.start < c.end)
+}
+
+/// Whether a candidate pair wraps its ink without reaching across a run of one
+/// style: everything between the two delimiters is either inside a single such run
+/// or clear of all of them.
+///
+/// A code span and a link are both things the emphasis may not swallow. Reaching
+/// across one to find a delimiter on the other side styles what the author had
+/// already closed: in `见**[书](x)**后文。` the emphasis would fall on `书` and both
+/// stars, where the author closed the link before the second one. Across a code
+/// span it restyles code, which this module's own rule says cannot happen. A pair
+/// lying wholly inside one run is the reading the author meant and is kept.
+fn stays_within(open: &Range<usize>, close: &Range<usize>, runs: &[Range<usize>]) -> bool {
+    let pair = open.start..close.end;
+    runs.iter().all(|r| !overlaps(&pair, r) || (r.start <= pair.start && pair.end <= r.end))
+}
+
+/// Whether two byte ranges share any byte.
+fn overlaps(a: &Range<usize>, b: &Range<usize>) -> bool {
+    a.start < b.end && b.start < a.end
 }
 
 /// Whether the run may open emphasis here.

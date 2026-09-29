@@ -27,6 +27,11 @@ use windows::Win32::UI::WindowsAndMessaging::{
 /// dropped rather than parsed.
 const TAG: usize = u32::from_be_bytes(*b"RUBR") as usize;
 
+/// The most a forwarded payload may claim to carry, in bytes. A file list is a few
+/// hundred bytes a name, and 64 KB is a hundred-odd of them; `cbData` is the sender's
+/// number, and the mark above is a fixed constant any local process can post.
+const MAX_FORWARD: u32 = 64 * 1024;
+
 /// Held for the life of the process. The system releases the mutex if the process dies,
 /// so a crashed reader is never a locked one.
 pub struct SingleInstance(HANDLE);
@@ -213,6 +218,14 @@ pub fn take_forward(lp: LPARAM) -> Option<Vec<PathBuf>> {
     if copy.cbData == 0 || copy.lpData.is_null() {
         return Some(Vec::new());
     }
+    // The length is the sender's to name, and it is what the slice below is built from
+    // and what the paths are then cut out of. Windows has already copied `cbData` bytes
+    // into this process for the length of the call, so the read itself stays inside
+    // them -- but a length of four billion describes no list of documents, and reading
+    // it as one walks far past the end of what was actually sent.
+    if copy.cbData > MAX_FORWARD {
+        return None;
+    }
     let words =
         unsafe { std::slice::from_raw_parts(copy.lpData.cast::<u16>(), copy.cbData as usize / 2) };
     let mut paths = Vec::new();
@@ -228,4 +241,43 @@ pub fn take_forward(lp: LPARAM) -> Option<Vec<PathBuf>> {
         start = i + 1;
     }
     Some(paths)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::ffi::c_void;
+
+    /// A payload of `wide` under `mark`, posted the way another process would.
+    fn posted(mark: usize, wide: &[u16], cb_data: u32) -> Option<Vec<PathBuf>> {
+        let mut copy = COPYDATASTRUCT {
+            dwData: mark,
+            cbData: cb_data,
+            lpData: wide.as_ptr() as *mut c_void,
+        };
+        take_forward(LPARAM(&mut copy as *mut COPYDATASTRUCT as isize))
+    }
+
+    /// A list of documents arrives, another program's mark does not, and a length no
+    /// list of documents has is refused before anything is read out of it.
+    ///
+    /// The mark is a fixed published constant, so it is not an accident that this is
+    /// reachable: any local process can post a `WM_COPYDATA` carrying it and a `cbData`
+    /// of four billion over a buffer of a dozen bytes.
+    #[test]
+    fn a_payload_larger_than_a_list_of_documents_is_not_taken() {
+        let wide: Vec<u16> = "C:\\books\\one.md\0C:\\books\\two.md\0\0".encode_utf16().collect();
+        let size = (wide.len() * 2) as u32;
+        assert_eq!(
+            posted(TAG, &wide, size),
+            Some(vec![PathBuf::from("C:\\books\\one.md"), PathBuf::from("C:\\books\\two.md")])
+        );
+        // A length past the cap is refused before the buffer behind it is read at all,
+        // which is the whole point: the sender's number and the sender's allocation are
+        // not the same thing, and only one of them is a list of documents.
+        assert!(posted(TAG, &wide, MAX_FORWARD + 1).is_none());
+        assert!(posted(TAG, &wide, u32::MAX).is_none());
+        // Another program's mark is not ours, however well it is sized.
+        assert!(posted(TAG + 1, &wide, size).is_none());
+    }
 }

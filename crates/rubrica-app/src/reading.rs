@@ -119,10 +119,31 @@ pub fn scan_chapters(path: &Path, requested: Encoding, detect: bool) -> io::Resu
     Ok(ChapterIndex::from_parts_with_offsets(chapters, decoded_starts, blank_separated))
 }
 
+/// How many bytes of `range` a file of `len` bytes still has behind it, or `None` when
+/// it does not have all of them.
+///
+/// The range comes from an index built when the file was longer, so a document that has
+/// been truncated since is still described by the length it used to be. Read as an
+/// allocation that is a 2 GB novel reserving 2 GB before `read_exact` reports the
+/// unexpected end; read as a number it is one `metadata` against the range, and the
+/// answer is the same end of file the read was going to report anyway.
+fn readable(range: &std::ops::Range<usize>, len: u64) -> Option<usize> {
+    let want = range.end.saturating_sub(range.start);
+    let have = len.saturating_sub(range.start as u64);
+    (u64::try_from(want).is_ok_and(|want| want <= have)).then_some(want)
+}
+
 fn read_range(path: &Path, range: std::ops::Range<usize>, encoding: Encoding) -> io::Result<Decoded> {
     let mut file = std::fs::File::open(path)?;
     file.seek(SeekFrom::Start(range.start as u64))?;
-    let mut bytes = vec![0; range.end.saturating_sub(range.start)];
+    let len = file.metadata()?.len();
+    let want = readable(&range, len).ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::UnexpectedEof,
+            "the document is shorter than the index built for it",
+        )
+    })?;
+    let mut bytes = vec![0; want];
     file.read_exact(&mut bytes)?;
     decode(&bytes, encoding)
 }
@@ -450,5 +471,42 @@ mod tests {
         assert_eq!(decode(&[0xc7, 0xd1], Encoding::EucKr).unwrap().text, "한");
         assert!(natural_cmp("chapter2.txt", "chapter10.txt").is_lt());
         assert!(natural_cmp("第9章.txt", "第11章.txt").is_lt());
+    }
+
+    /// A range is an address into a file, not a claim about how long the file is. The
+    /// claim is checked against the file before it is turned into an allocation, which
+    /// is the difference between a 2 GB novel that has been truncated to 1 KB costing a
+    /// `metadata` and the same novel reserving 2 GB before the read finds the end.
+    #[test]
+    fn a_range_from_a_stale_index_is_measured_against_the_file_there_is() {
+        // A chapter the file is long enough for, read exactly as the index wrote it.
+        assert_eq!(readable(&(12..48), 1024), Some(36));
+        // A 2 GB range against a 1 KB file: the length is not believed, and nothing is
+        // reserved on the strength of it.
+        assert_eq!(readable(&(0..2 * 1024 * 1024 * 1024), 1024), None);
+        assert_eq!(readable(&(1024..2048), 1024), None, "nothing is behind the end of the file");
+        // The last byte of the file is still a range the file can fill.
+        assert_eq!(readable(&(1023..1024), 1024), Some(1));
+    }
+
+    /// And end to end: a book indexed and then truncated under the reader's feet fails
+    /// on the short file rather than on the length it used to have.
+    #[test]
+    fn a_chapter_the_document_no_longer_has_fails_instead_of_reserving_its_old_length() {
+        let path = std::env::temp_dir()
+            .join(format!("rubrica-truncated-{}.txt", std::process::id()));
+        std::fs::write(&path, "Prologue\nbody text\n\nChapter 2\nlast line\n")
+            .expect("write a two-chapter book");
+        let index = scan_chapters(&path, Encoding::Big5, true).expect("index the book");
+        assert_eq!(index.chapters().len(), 2, "the fixture is not the two chapters it means to be");
+        assert!(read_chapter(&path, &index, 1, Encoding::Big5, TextOptions::default()).is_ok());
+        // The same path, now a fraction of what the index says it is.
+        std::fs::write(&path, "Prologue\nbody\n").expect("truncate the book");
+        let error = match read_chapter(&path, &index, 1, Encoding::Big5, TextOptions::default()) {
+            Ok(_) => panic!("a chapter the file no longer holds was read"),
+            Err(error) => error,
+        };
+        assert_eq!(error.kind(), io::ErrorKind::UnexpectedEof, "{error}");
+        let _ = std::fs::remove_file(path);
     }
 }

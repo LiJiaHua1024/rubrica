@@ -223,11 +223,17 @@ impl Paragraph {
                     run = 0.0;
                 }
                 // A penalty's own width is ink it draws when the break is taken,
-                // so it belongs to the fragment the break would end.
-                Item::Penalty { width, .. } => {
+                // so it belongs to the fragment the break would end -- but only when
+                // the break is one the solver has to take. A discretionary is one it
+                // may take and may refuse, and a conservative answer is the *wide*
+                // one: ending the fragment at every point reported the word a
+                // fraction of the width it occupies, and a column sized from that
+                // answer could not hold the word it came from.
+                Item::Penalty { width, forced: true, .. } => {
                     widest = widest.max(run + width);
                     run = 0.0;
                 }
+                Item::Penalty { width, .. } => run += width,
             }
         }
         widest.max(run)
@@ -333,7 +339,10 @@ impl StyleSpan {
 /// Segment `text` into nodes and interleave glue.
 ///
 /// `breaks` are byte offsets at which UAX #14 permits a line break (offset 0 and
-/// the end of the string excluded), and `mandatory` the subset that *requires* one.
+/// the end of the string excluded), each carrying a flag saying whether the source
+/// *requires* one. That flag, not the character at the break, is what becomes a
+/// forced line: a caller's list that omits it cannot make the builder recognise
+/// every separator, which is why [`emit_space`] still answers from the run itself.
 pub fn build(
     text: &str,
     breaks: &[(usize, bool)],
@@ -393,7 +402,7 @@ pub fn build(
     // character boundary is a slicing panic waiting to happen, and a point right
     // after an explicit hyphen lands where the author's own `-` already breaks --
     // taking it as a discretionary would draw a second hyphen over the first.
-    let hyphen_set: Vec<usize> = opts
+    let mut hyphen_set: Vec<usize> = opts
         .hyphens
         .iter()
         .copied()
@@ -405,6 +414,14 @@ pub fn build(
                 && !text[..at].ends_with('-')
         })
         .collect();
+    // This list is as long as the block: the reader hands a code fence a
+    // discretionary point at every character boundary, and a megabyte of code is a
+    // million points. Membership is asked once per segment and a linear scan makes
+    // the whole build quadratic in the block's own size -- hours of frozen layout,
+    // re-run on every scroll and resize. The points are a set, and a sorted one
+    // answers in a logarithm.
+    hyphen_set.sort_unstable();
+    hyphen_set.dedup();
     for at in &hyphen_set {
         cuts.push((*at, false));
     }
@@ -429,11 +446,14 @@ pub fn build(
     allowed.sort_unstable();
     allowed.dedup();
 
-    let mut segments: Vec<Range<usize>> = Vec::with_capacity(cuts.len());
+    // Each segment with the flag of the cut that ends it: a mandatory break is the
+    // one opportunity UAX #14 does not let the source decline, and only the flag
+    // knows which cut was that.
+    let mut segments: Vec<(Range<usize>, bool)> = Vec::with_capacity(cuts.len());
     let mut start = 0usize;
-    for (end, _) in &cuts {
+    for (end, required) in &cuts {
         if *end > start {
-            segments.push(start..*end);
+            segments.push((start..*end, *required));
             start = *end;
         }
     }
@@ -447,14 +467,14 @@ pub fn build(
     // one applies at all, and whether the line may be drawn there.
     let mut prev: Option<(Role, char)> = None;
 
-    for seg in segments.iter() {
+    for (seg, mandatory) in &segments {
         let slice = &text[seg.clone()];
         // UAX #14 attaches a shared space or newline to whichever side of the
         // opportunity its tables happen to fall on, so whitespace has to be peeled
         // from *both* ends. Left inside a box it is counted in the advance and again
         // as glue, and a newline kept inside a box never becomes a break at all.
-        let lead = slice.len() - slice.trim_start().len();
-        let core = slice[lead..].trim_end();
+        let lead = slice.len() - slice.trim_start_matches(is_stripped).len();
+        let core = slice[lead..].trim_end_matches(is_stripped);
         let ws_start = seg.start + lead + core.len();
         let trailing = &text[ws_start..seg.end];
 
@@ -504,8 +524,23 @@ pub fn build(
             prev = Some((role, core.chars().next_back().unwrap()));
         }
 
-        let split_here = hyphen_set.contains(&seg.end) && trailing.is_empty();
-        if split_here {
+        let split_here = hyphen_set.binary_search(&seg.end).is_ok() && trailing.is_empty();
+        if *mandatory {
+            // `\hfil\break`, which is what a forced break is in TeX: the line ends
+            // where the author said so and is then left flush at its natural width.
+            // Without the filler the line is justified like any other, and because a
+            // Chinese line's glue is stretchable anywhere, three characters after a
+            // hard break would be spread across the whole column. UAX #14 says where
+            // these are; guessing from the characters missed a BK, a ZL and a ZP.
+            p.items.push(Item::Glue {
+                base: 0.0,
+                stretch: INFINITY,
+                shrink: 0.0,
+                breakable: true,
+            });
+            p.items.push(Item::Penalty { penalty: i32::MIN, forced: true, width: 0.0, hyphen: None });
+            prev = None;
+        } else if split_here {
             let style = StyleSpan::resolve(opts.spans, seg.end, opts.style_of);
             let h = p.nodes.len() as u32;
             p.nodes.push(Node {
@@ -546,12 +581,35 @@ pub fn build(
     p
 }
 
+/// Whether a code point is stripped from the ends of a segment before it is
+/// measured.
+///
+/// Only ASCII whitespace is inter-word air: a run of it collapses to one word space
+/// and what falls at a line's edge is dropped, and this module does the same to the
+/// runs that reach [`emit_space`]. Every other White_Space character is a glyph the
+/// author wrote, and U+3000 is the one that matters most -- a full-width indent.
+/// Peeled as a word space it both lost its width and became a break opportunity, so
+/// an indented Chinese paragraph came out flush left with the indent deleted from
+/// the measure altogether. The three line separators are stripped too, for a
+/// different reason: nothing draws them, and what follows them is a new line
+/// rather than another word.
+fn is_stripped(ch: char) -> bool {
+    matches!(
+        ch,
+        ' ' | '\t' | '\n' | '\r' | '\u{b}' | '\u{c}' | '\u{85}' | '\u{2028}' | '\u{2029}'
+    )
+}
+
 /// Emit the item for a run of literal whitespace, and record that the following
 /// box needs no script-recipe glue because this space already separates them.
 fn emit_space(p: &mut Paragraph, prev: &mut Option<(Role, char)>, ws: &str, opts: &BuildOptions) {
-    // Every mandatory separator UAX #14 can name, not only `\n`: a CR, FF or NEL
-    // that reaches this far is a line the author ended, just spelled differently.
-    if ws.contains(['\n', '\r', '\u{c}', '\u{85}']) {
+    // A cut that ends a segment is normally told to be mandatory by UAX #14, and
+    // that is what [`build`] acts on; this is the same answer worked out from the
+    // run itself, for a caller that hands over a break list without the flag. Every
+    // mandatory separator UAX #14 can name, not only `\n`: a CR, a VT, a NEL, a
+    // line or paragraph separator is a line the author ended, just spelled
+    // differently.
+    if ws.contains(['\n', '\r', '\u{b}', '\u{c}', '\u{85}', '\u{2028}', '\u{2029}']) {
         // `\hfil\break`, which is what a forced break is in TeX: the line ends where
         // the author said so and is then left flush at its natural width. Without the
         // filler the line is justified like any other, and because a Chinese line's

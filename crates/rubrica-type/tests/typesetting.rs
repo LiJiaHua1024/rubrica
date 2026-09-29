@@ -43,6 +43,15 @@ fn set_ems(text: &str, ems: Pt) -> (Paragraph, Plan) {
     set(text, ems * SIZE)
 }
 
+/// A measure that gives a full-width character its em, which is what the CJK cases
+/// are about -- the ASCII half-em model above would make a full-width space and a
+/// half-width one indistinguishable.
+fn set_cjk(text: &str, column: Pt) -> (Paragraph, Plan) {
+    let spacing = Spacing::for_size(SIZE);
+    let mut measure = MonospaceMeasure { size: SIZE, factor: 1.0 };
+    typeset(text, &spacing, StyleId(0), &[], &BreakOptions::new(column), &mut measure)
+}
+
 fn set_indent(text: &str, column: Pt, indent: Pt) -> (Paragraph, Plan) {
     let spacing = Spacing::for_size(SIZE);
     let mut measure = MonospaceMeasure { size: SIZE, factor: 0.5 };
@@ -441,6 +450,40 @@ fn a_full_width_mark_carries_its_own_air() {
 }
 
 #[test]
+fn an_ideographic_space_is_ink_and_not_a_word_space() {
+    // U+3000 is a full-width character, not the run of ASCII whitespace a browser
+    // collapses. Peeled as one it lost its width and became a break opportunity, so
+    // a two-character indent came out flush left with both spaces dropped from the
+    // measure altogether, and a mid-text one set as a third of an em with a line
+    // allowed to break on either side of it.
+    let indent = "\u{3000}\u{3000}";
+    let indented = format!("{indent}这是缩进段落。");
+    let (para, plan) = set_cjk(&indented, 24.0 * SIZE);
+    let (_, plain) = set_cjk("这是缩进段落。", 24.0 * SIZE);
+    assert_eq!(plan.lines.len(), 1, "the case must fit on one line");
+    assert_eq!(
+        plan.lines[0].natural,
+        plain.lines[0].natural + 2.0 * SIZE,
+        "the indent is not on the line it opens"
+    );
+    // It is a node of its own, so it is a full-width mark like any other and may
+    // surrender only its blank side bearing.
+    assert!(matches!(para.items[0], Item::Box { .. }), "the paragraph opens on glue: {:?}", para.items[0]);
+    assert!(para.nodes.iter().any(|n| &indented[n.text.clone()] == "\u{3000}"));
+
+    // Mid-text the same character is a whole em of ink rather than a third of one.
+    let (para, plan) = set_cjk("中\u{3000}文", 24.0 * SIZE);
+    assert_eq!(plan.lines.len(), 1, "a three-em line must not break");
+    assert_eq!(plan.lines[0].natural, 3.0 * SIZE, "a full-width space is a full em");
+    let breaks: Vec<_> = para
+        .items
+        .iter()
+        .filter(|it| matches!(**it, Item::Glue { base, breakable, .. } if breakable && base > 0.0))
+        .collect();
+    assert!(breaks.is_empty(), "an ideographic space is a break opportunity with no glue: {breaks:?}");
+}
+
+#[test]
 fn hard_break_ends_a_line_and_only_the_final_line_is_ragged() {
     let text = "alpha beta gamma delta epsilon zeta eta theta\none two three four five six seven eight nine ten";
     let (para, plan) = set(text, 20.0 * SIZE);
@@ -610,6 +653,35 @@ fn a_ragged_block_is_never_stretched_to_the_measure() {
     assert!(plan.lines[0].natural > 0.85 * column, "ragged lines under-filled the measure");
 }
 
+#[test]
+fn a_ragged_line_is_scored_on_the_measure_it_leaves_empty() {
+    // A heading set flush left, its first line two fifths empty because the word
+    // after it is a monster. The free space at the edge is the whole story, and the
+    // number the `Line` carries is the cubic badness of exactly that: two fifths
+    // empty is a decent line, and reading it as seven tenths of a measure empty --
+    // badness is cubic, so twenty-seven times worse -- reported a loose heading as a
+    // hopeless one in a number every caller reads.
+    let text = "Chapter One Supercalifragilistic";
+    let spacing = Spacing::for_size(SIZE);
+    let mut measure = MonospaceMeasure { size: SIZE, factor: 0.5 };
+    let mut opts = BreakOptions::new(12.5 * SIZE);
+    opts.ragged = true;
+    let (para, plan) = typeset(text, &spacing, StyleId(0), &[], &opts, &mut measure);
+    assert_eq!(plan.lines.len(), 2, "the monster forces a break");
+    let line = &plan.lines[0];
+    assert_eq!(text_of(&para, text, line), "ChapterOne", "the monster forced the break after the second word");
+    let r = (f64::from(line.target) - f64::from(line.natural)) / f64::from(line.target);
+    assert!(r > 0.4, "the case must sit where the two answers differ, r = {r}");
+    assert_eq!(
+        line.badness,
+        (100.0 * r * r * r) as i32,
+        "badness {} is not the free space's own {r}",
+        line.badness
+    );
+    assert_eq!(line.fitness, 0, "two fifths of a measure empty is a decent line");
+    assert_eq!(line_width(&place(&para, line)), line.natural, "a ragged line is not stretched");
+}
+
 /// A line of code the reader cannot scroll sideways to reach is not text that hangs a
 /// little -- it is text that does not exist. So a block that asked to break rather than
 /// hang must be able to, even when the only place to break is inside a token and the
@@ -672,6 +744,46 @@ fn an_unsplittable_word_is_overfull_not_missing() {
     let (_, plan) = set("antiestablishmentarianism", 20.0);
     assert_eq!(plan.lines.len(), 1, "text must never be dropped, even when nothing fits");
     assert!(plan.lines[0].badness >= 10000);
+}
+
+#[test]
+fn a_token_wider_than_the_measure_does_not_kill_the_solver() {
+    // A token no break can split, in a column too narrow to hold it. The line to it
+    // is refused for being overfull, and a refused start can never work again, so the
+    // active list loses it -- and when that emptied the list no edge was ever created
+    // again, the piece's terminal was unreachable, all three passes returned `None`
+    // and the whole paragraph fell into `desperate`: every line flush left, every one
+    // `ragged: true` with `badness == 10000`, and infinite demerits. One token in a
+    // paragraph, and everything around it stopped being typeset.
+    //
+    // TeX puts such a line on the page and starts the next one after it
+    // (`create_new_active_node`), and so does this now. The two cases are the two
+    // ways a measure narrows under a token: the column itself, and a list marker
+    // hanging out to the left of it.
+    let src = "the extraordinarily word";
+    for hang in [0.0, 2.0 * SIZE] {
+        let (para, plan) = set_hang(src, 6.0 * SIZE, hang);
+        assert!(plan.demerits.is_finite(), "the paragraph fell back to `desperate`");
+        assert!(
+            plan.lines.iter().any(|l| !l.is_ragged()),
+            "every line is `ragged: true`: the greedy path answered instead of the solver"
+        );
+        let joined: String = plan.lines.iter().map(|l| text_of(&para, src, l)).collect();
+        assert_eq!(joined, src.replace(' ', ""), "text was lost or repeated");
+        // The token itself cannot fit and has to hang; the lines around it are still
+        // the solver's, still justified, and still inside the measure.
+        let wide = plan
+            .lines
+            .iter()
+            .find(|l| text_of(&para, src, l).contains("extraordinarily"))
+            .expect("the wide token is not on the page at all");
+        assert!(wide.is_overfull(), "a token wider than the measure must be reported as hanging");
+        assert!(!wide.ragged, "a hanging line is one the solver chose, not a greedy one");
+        for l in plan.lines.iter().filter(|l| !l.is_overfull()) {
+            let w = line_width(&place(&para, l));
+            assert!(w <= l.target + 0.5, "line hangs {w} in a {} measure", l.target);
+        }
+    }
 }
 
 #[test]
@@ -1068,6 +1180,28 @@ fn a_token_with_no_break_in_it_is_one_fragment() {
 }
 
 #[test]
+fn a_discretionary_point_does_not_end_a_fragment() {
+    // A dictionary point is a break the solver *may* take, not one it must, and a
+    // conservative answer is the wide one. Ending the fragment at every point
+    // reported the word a fraction of the width it occupies, so a column sized from
+    // that answer could not hold the word the answer came from.
+    let text = "extraordinarily";
+    let mut measure = MonospaceMeasure { size: SIZE, factor: 0.5 };
+    let points = [2usize, 6, 10];
+    let para = rubrica_type::paragraph::paragraph_from_text_hyphenated(
+        text,
+        &Spacing::for_size(SIZE),
+        StyleId(0),
+        &[],
+        &Hyphenation { points: &points, width: 4.0 },
+        &mut measure,
+    );
+    // Fifteen characters at half an em, plus the three hyphens the one fragment holds
+    // together -- any of which the solver may draw into that line.
+    assert_eq!(para.widest_fragment(), 15.0 * SIZE * 0.5 + 3.0 * 4.0);
+}
+
+#[test]
 fn a_paragraph_that_ends_in_a_hard_break_grows_no_blank_line() {
     // The trailing break is the line's end, not a line of its own: the piece after
     // it holds the `\parfillskip` glue and nothing else, and set as-is it was a
@@ -1113,11 +1247,23 @@ fn a_hard_break_in_a_hanging_block_continues_at_the_hanging_measure() {
 
 #[test]
 fn every_mandatory_separator_forces_a_line() {
-    // UAX #14 names CR, FF and NEL mandatory separators alongside LF; the builder
-    // heard only the one it spells with, and "a\rb" set as "a b".
-    let (para, plan) = set("a\rb", 6.0 * SIZE);
-    let texts: Vec<_> = plan.lines.iter().map(|l| text_of(&para, "a\rb", l)).collect();
-    assert_eq!(texts, ["a", "b"], "CR is a line the author ended, not a space");
+    // UAX #14 names a handful of mandatory separators, and the builder heard the one
+    // it spells with `\n`: a CR, a VT, a NEL, a line separator and a paragraph
+    // separator all set as "a b", a word space where the author ended a line.
+    for (name, sep) in [
+        ("LF", '\n'),
+        ("CR", '\r'),
+        ("VT", '\u{b}'),
+        ("FF", '\u{c}'),
+        ("NEL", '\u{85}'),
+        ("ZL", '\u{2028}'),
+        ("ZP", '\u{2029}'),
+    ] {
+        let src = format!("a{sep}b");
+        let (para, plan) = set(&src, 6.0 * SIZE);
+        let texts: Vec<_> = plan.lines.iter().map(|l| text_of(&para, &src, l)).collect();
+        assert_eq!(texts, ["a", "b"], "{name} is a line the author ended, not a space");
+    }
 }
 
 #[test]
@@ -1188,3 +1334,4 @@ fn a_piece_with_no_soft_items_still_splits_and_terminates() {
         .sum();
     assert_eq!(total, src.len(), "the run survived the split whole");
 }
+

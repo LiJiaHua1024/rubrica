@@ -155,6 +155,14 @@ const PUNCT_MU: Pt = 2.0 / 18.0;
 /// between two columns, which is what one column gap therefore is -- is the number
 /// the shape of a matrix is read from.
 const ARRAY_COL_GAP: Pt = THICK_MU;
+
+/// How deep into the node tree the layout will descend. Every construct here lays its
+/// body out by recursing into it, and a formula is reader-supplied text: a tree built
+/// to do nothing but nest would walk the stack away whatever the parser made of it.
+/// Past this a subtree is set as the source text it was written as -- the reader loses
+/// the arrangement, which is this file's standing bargain, rather than the process
+/// losing the stack.
+pub(crate) const MAX_DEPTH: usize = 100;
 /// A `cases` condition stands further from its value than two matrix columns do,
 /// because it is read as a separate clause rather than as more data.
 const CASES_COND_GAP: Pt = 8.0 / 18.0;
@@ -214,13 +222,15 @@ impl Mb {
 
 /// Lay `node` out at `size`, as a display or an inline formula.
 pub fn layout(node: &Node, size: Pt, display: bool, m: &mut dyn MathMeasure) -> Formula {
-    let mut e = Engine { m };
+    let mut e = Engine { m, depth: 0 };
     let (shapes, b) = e.lay(node, Style { size, display, cramped: false });
     Formula { shapes, width: b.width, ascent: b.ascent, descent: b.descent }
 }
 
 struct Engine<'a> {
     m: &'a mut dyn MathMeasure,
+    /// How far down the node tree the walk is. See [`MAX_DEPTH`].
+    depth: usize,
 }
 
 impl Engine<'_> {
@@ -251,7 +261,26 @@ impl Engine<'_> {
         st.size * one * two
     }
 
+    /// Every construct below reaches its body through here, so the depth is counted
+    /// in one place rather than in every signature that would have to carry it.
     fn lay(&mut self, n: &Node, st: Style) -> (Vec<Shape>, Mb) {
+        if self.depth >= MAX_DEPTH {
+            return self.too_deep(n, st);
+        }
+        self.depth += 1;
+        let out = self.lay_at(n, st);
+        self.depth -= 1;
+        out
+    }
+
+    /// A subtree too deep to lay out, set as the source text it was written as: one
+    /// ordinary run, measured like any other atom, so the line keeps the words the
+    /// author wrote even though their arrangement is gone.
+    fn too_deep(&mut self, n: &Node, st: Style) -> (Vec<Shape>, Mb) {
+        self.atom(&source_of(n), st)
+    }
+
+    fn lay_at(&mut self, n: &Node, st: Style) -> (Vec<Shape>, Mb) {
         match n {
             Node::Atom(s) => self.atom(s, st),
             Node::Row(v) => self.row(v, st),
@@ -1273,6 +1302,177 @@ impl Engine<'_> {
     }
 }
 
+/// One piece of the source text [`source_of`] is building: either a fixed string
+/// standing for a construct, or a node whose own text still has to be gathered.
+enum Step<'a> {
+    Text(String),
+    Node(&'a Node),
+}
+
+/// The source text of a node, read through an explicit stack rather than by
+/// recursion: this is what a subtree too deep to lay out is set from, and walking it
+/// recursively would be the very descent the depth cap exists to stop. The brackets
+/// are TeX's own spellings, so what the reader is shown is what was written as far as
+/// a tree this engine can still name.
+fn source_of(n: &Node) -> String {
+    let mut out = String::new();
+    let mut work = vec![Step::Node(n)];
+    // Pushed last, read first: each arm below pushes its closing text, then its
+    // parts, then its opening text, so the traversal is left to right.
+    while let Some(step) = work.pop() {
+        match step {
+            Step::Text(t) => out.push_str(&t),
+            Step::Node(Node::Atom(s)) => out.push_str(s),
+            Step::Node(Node::Row(v)) => work.extend(v.iter().rev().map(Step::Node)),
+            Step::Node(Node::Frac { num, den, .. }) => {
+                work.push(Step::Text("}".into()));
+                work.push(Step::Node(den));
+                work.push(Step::Text("}{".into()));
+                work.push(Step::Node(num));
+                work.push(Step::Text("\\frac{".into()));
+            }
+            Step::Node(Node::Sup { base, sup }) => {
+                work.push(Step::Text("}".into()));
+                work.push(Step::Node(sup));
+                work.push(Step::Text("^{".into()));
+                work.push(Step::Node(base));
+            }
+            Step::Node(Node::Sub { base, sub }) => {
+                work.push(Step::Text("}".into()));
+                work.push(Step::Node(sub));
+                work.push(Step::Text("_{".into()));
+                work.push(Step::Node(base));
+            }
+            Step::Node(Node::SubSup { base, sub, sup }) => {
+                // TeX spells both scripts of one base, superscript first -- and each
+                // closing brace is its own step on the stack, above the run it
+                // closes, or the two of them collapse into one another.
+                work.push(Step::Text("}".into()));
+                work.push(Step::Node(sup));
+                work.push(Step::Text("^{".into()));
+                work.push(Step::Text("}".into()));
+                work.push(Step::Node(sub));
+                work.push(Step::Text("_{".into()));
+                work.push(Step::Node(base));
+            }
+            Step::Node(Node::Sqrt { body, degree }) => {
+                work.push(Step::Text("}".into()));
+                work.push(Step::Node(body));
+                match degree {
+                    // The degree is written between the brackets, so they belong to
+                    // the opening rather than to the closing -- and `\sqrt` itself is
+                    // the first thing the reader gets, so it is the last thing pushed.
+                    Some(d) => {
+                        work.push(Step::Text("]{".into()));
+                        work.push(Step::Node(d));
+                        work.push(Step::Text("\\sqrt[".into()));
+                    }
+                    None => work.push(Step::Text("\\sqrt{".into())),
+                }
+            }
+            Step::Node(Node::Fence { left, right, body }) => {
+                work.push(Step::Text(delim_source(*right)));
+                work.push(Step::Text("\\right".into()));
+                work.push(Step::Node(body));
+                work.push(Step::Text(delim_source(*left)));
+                work.push(Step::Text("\\left".into()));
+            }
+            Step::Node(Node::BigOp { op, sub, sup, .. }) => {
+                // Read first the last thing written: a superscript then a subscript,
+                // so that what comes back is `\sum_{i}^{n}` and not the bytes in
+                // between. The stack empties from the top down, so each closing brace
+                // is above the run it closes -- and a script the author left off leaves
+                // its brace off with it.
+                if let Some(sup) = sup {
+                    work.push(Step::Text("}".into()));
+                    work.push(Step::Node(sup));
+                    work.push(Step::Text("^{".into()));
+                }
+                if let Some(sub) = sub {
+                    work.push(Step::Text("}".into()));
+                    work.push(Step::Node(sub));
+                    work.push(Step::Text("_{".into()));
+                }
+                work.push(Step::Text(op.clone()));
+            }
+            Step::Node(Node::Accent { base, wide, .. }) => {
+                work.push(Step::Text("}".into()));
+                work.push(Step::Node(base));
+                work.push(Step::Text(if *wide { "\\widehat{" } else { "\\hat{" }.into()));
+            }
+            Step::Node(Node::Bar { body, side }) => {
+                work.push(Step::Text("}".into()));
+                work.push(Step::Node(body));
+                work.push(Step::Text(
+                    match side {
+                        BarSide::Over => "\\overline{",
+                        BarSide::Under => "\\underline{",
+                    }
+                    .into(),
+                ));
+            }
+            Step::Node(Node::Brace { body, side }) => {
+                work.push(Step::Text("}".into()));
+                work.push(Step::Node(body));
+                work.push(Step::Text(
+                    match side {
+                        BarSide::Over => "\\overbrace{",
+                        BarSide::Under => "\\underbrace{",
+                    }
+                    .into(),
+                ));
+            }
+            Step::Node(Node::Big { delim, .. }) => out.push_str(&delim_source(*delim)),
+            Step::Node(Node::Stack { base, label, side }) => {
+                work.push(Step::Text("}".into()));
+                work.push(Step::Node(base));
+                work.push(Step::Text("}{".into()));
+                work.push(Step::Node(label));
+                work.push(Step::Text(
+                    match side {
+                        BarSide::Over => "\\overset{",
+                        BarSide::Under => "\\underset{",
+                    }
+                    .into(),
+                ));
+            }
+            Step::Node(Node::Boxed { body }) => {
+                work.push(Step::Text("}".into()));
+                work.push(Step::Node(body));
+                work.push(Step::Text("\\boxed{".into()));
+            }
+            Step::Node(Node::Space(_)) => out.push(' '),
+            Step::Node(Node::Styled { body, .. }) => work.push(Step::Node(body)),
+            Step::Node(Node::Array { rows, .. }) => {
+                work.push(Step::Text("\\end{}".into()));
+                for (i, row) in rows.iter().enumerate().rev() {
+                    if i + 1 < rows.len() {
+                        work.push(Step::Text("\\\\".into()));
+                    }
+                    for (j, cell) in row.iter().enumerate().rev() {
+                        if j + 1 < row.len() {
+                            work.push(Step::Text(" & ".into()));
+                        }
+                        work.push(Step::Node(cell));
+                    }
+                }
+                work.push(Step::Text("\\begin{".into()));
+            }
+        }
+    }
+    out
+}
+
+/// A delimiter as TeX writes one, with the `.` that means "none here" rather than the
+/// NUL this crate speaks internally.
+fn delim_source(c: char) -> String {
+    if c == '\0' {
+        ".".into()
+    } else {
+        c.to_string()
+    }
+}
+
 /// Move a sub-layout's shapes into place, appending them to the caller's list.
 fn translate(shapes: &[Shape], dx: Pt, dy: Pt, out: &mut Vec<Shape>) {
     if dx == 0.0 && dy == 0.0 {
@@ -1483,3 +1683,4 @@ fn column_gap(kind: ArrayKind, j: usize, size: Pt) -> Pt {
         _ => base,
     }
 }
+

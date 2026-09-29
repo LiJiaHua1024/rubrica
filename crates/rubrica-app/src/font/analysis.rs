@@ -54,8 +54,13 @@ impl IDWriteTextAnalysisSource_Impl for Analysis_Impl {
 impl IDWriteTextAnalysisSink_Impl for Analysis_Impl {
     fn SetScriptAnalysis(&self, position: u32, length: u32, script: *const DWRITE_SCRIPT_ANALYSIS) -> Result<()> {
         let mut scripts = self.scripts.borrow_mut();
-        let end = (position as usize + length as usize).min(scripts.len());
-        for s in &mut scripts[position as usize..end] {
+        // This is the one raw slice into a COM-supplied index in the reader, and a
+        // panic inside one of these callbacks aborts the process with no caller to
+        // report to. `position` is the caller's to name and `length` runs from wherever
+        // it lands, so both are clipped to the window rather than believed.
+        let start = (position as usize).min(scripts.len());
+        let end = start.saturating_add(length as usize).min(scripts.len());
+        for s in &mut scripts[start..end] {
             *s = unsafe { *script };
         }
         Ok(())
@@ -84,4 +89,58 @@ pub(super) fn scripts(
     unsafe { analyzer.AnalyzeScript(&source, 0, len as u32, &sink)?; }
     let result = scripts.borrow().clone();
     Ok(result)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use windows::core::Interface;
+
+    const MARK: u16 = 0x1234;
+    const UNREACHED: u16 = 0xbeef;
+
+    fn marked(script: u16) -> DWRITE_SCRIPT_ANALYSIS {
+        DWRITE_SCRIPT_ANALYSIS { script, ..Default::default() }
+    }
+
+    /// A sink over a window of `len` slots, and the window itself to read back.
+    fn sink(len: usize) -> (IDWriteTextAnalysisSink, Rc<RefCell<Vec<DWRITE_SCRIPT_ANALYSIS>>>) {
+        let scripts = Rc::new(RefCell::new(vec![DWRITE_SCRIPT_ANALYSIS::default(); len]));
+        let source: IDWriteTextAnalysisSource = Analysis {
+            text: vec![0u16; len],
+            locale: vec![0u16],
+            scripts: scripts.clone(),
+        }
+        .into();
+        (source.cast().expect("the sink of the same source"), scripts)
+    }
+
+    /// A position and a length are both the caller's to name, and a range taken as
+    /// given reaches past the allocation -- `scripts[position..end]` with a `position`
+    /// of nine and a window of four is a panic inside a COM callback, which under
+    /// `panic = "abort"` is the process gone. Clipped, both cases keep their meaning:
+    /// a length running off the end fills what is left of the window, and a start
+    /// beyond it has no part of itself inside and writes nothing at all.
+    #[test]
+    fn a_script_range_is_clipped_to_the_window_behind_it() {
+        let (sink, scripts) = sink(4);
+        // The ordinary case: a run inside the window, set as named.
+        unsafe { sink.SetScriptAnalysis(1, 2, &marked(MARK)) }.expect("inside the window");
+        assert_eq!(scripts.borrow()[1].script, MARK);
+        assert_eq!(scripts.borrow()[2].script, MARK);
+        assert_eq!(scripts.borrow()[0].script, 0, "the run took more than it named");
+        assert_eq!(scripts.borrow()[3].script, 0);
+        // A length far past the end of the window: the two slots that are there, and
+        // nothing beyond them.
+        unsafe { sink.SetScriptAnalysis(2, 4_000_000_000, &marked(UNREACHED)) }
+            .expect("off the end");
+        assert_eq!(scripts.borrow()[2].script, UNREACHED);
+        assert_eq!(scripts.borrow()[3].script, UNREACHED);
+        assert_eq!(scripts.borrow().len(), 4, "the window was written past");
+        // A start past the end of the window writes nothing at all, and in particular
+        // does not wrap round to its front.
+        unsafe { sink.SetScriptAnalysis(9, 1, &marked(UNREACHED)) }.expect("past the end");
+        assert_eq!(scripts.borrow()[0].script, 0, "a start past the end wrapped to the front");
+        assert_eq!(scripts.borrow().len(), 4);
+    }
 }

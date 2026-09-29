@@ -28,7 +28,7 @@ use printpdf::{
 };
 use windows::core::{w, BOOL, Interface, PCWSTR};
 use windows::Win32::Foundation::GENERIC_WRITE;
-use windows::Win32::Foundation::{COLORREF, FILETIME, HWND, LPARAM, LRESULT, POINT, RECT, SYSTEMTIME, WPARAM};
+use windows::Win32::Foundation::{COLORREF, D2DERR_RECREATE_TARGET, FILETIME, HWND, LPARAM, LRESULT, POINT, RECT, SYSTEMTIME, WPARAM};
 use windows::Win32::Graphics::Direct2D::Common::{
     D2D1_ALPHA_MODE_PREMULTIPLIED, D2D1_COLOR_F, D2D1_PIXEL_FORMAT, D2D_RECT_F, D2D_SIZE_U,
 };
@@ -84,7 +84,7 @@ use windows::Win32::UI::Controls::Dialogs::{
 use windows::Win32::UI::Shell::{DragAcceptFiles, DragFinish, DragQueryFileW, ShellExecuteW, HDROP};
 use windows::Win32::UI::WindowsAndMessaging::{
     AppendMenuW, WM_APP, CS_DBLCLKS, CS_HREDRAW, CS_VREDRAW, CREATESTRUCTW, CreatePopupMenu,
-    CreateWindowExW, DefWindowProcW, DestroyMenu, DispatchMessageW,
+    CreateWindowExW, DefWindowProcW, DestroyMenu, DestroyWindow, DispatchMessageW,
     GWLP_USERDATA, GetCaretBlinkTime, GetClientRect, GetCursorPos, GetSystemMetrics, GetWindowLongPtrW, GetMessageW, GetWindowPlacement,
     HCURSOR, HMENU, HWND_TOP, HTCLIENT, HTCAPTION, HTBOTTOM, HTBOTTOMLEFT, HTBOTTOMRIGHT, HTLEFT, HTRIGHT,
     HTTOP, HTTOPLEFT, HTTOPRIGHT, IDC_ARROW, IDC_HAND, IsZoomed, KillTimer, LoadCursorW, MF_CHECKED,
@@ -93,12 +93,12 @@ use windows::Win32::UI::WindowsAndMessaging::{
     SW_MAXIMIZE, SW_MINIMIZE, SW_SHOWNORMAL, SetTimer,
     SetWindowLongPtrW, SetWindowPos, ShowWindow, SW_SHOWMAXIMIZED, SW_RESTORE, TPM_RETURNCMD,
     SWP_FRAMECHANGED, SWP_NOMOVE, SWP_NOSIZE, TPM_RIGHTBUTTON, TrackPopupMenuEx, PeekMessageW, PM_REMOVE, TranslateMessage, WM_CONTEXTMENU, WM_NULL, WNDCLASSEXW,
-    WM_DESTROY, WM_DPICHANGED, WM_ERASEBKGND, WM_EXITSIZEMOVE, WM_KEYDOWN, WM_MOUSEWHEEL,
+    WM_DESTROY, WM_NCDESTROY, WM_DPICHANGED, WM_ERASEBKGND, WM_EXITSIZEMOVE, WM_KEYDOWN, WM_MOUSEWHEEL,
     WM_CAPTURECHANGED, WM_CLOSE, WM_NCCALCSIZE, WM_NCCREATE, WM_NCHITTEST, WM_PAINT, WM_SETCURSOR, WM_SIZE, WM_TIMER, WS_EX_APPWINDOW, WS_OVERLAPPEDWINDOW,
     SWP_NOACTIVATE, SWP_NOZORDER, WM_COPYDATA, WM_DROPFILES, WM_LBUTTONDOWN, WM_LBUTTONDBLCLK, WM_LBUTTONUP,
     WM_MBUTTONDOWN, WM_MOUSEMOVE, WM_SYSKEYDOWN, CallWindowProcW, EN_CHANGE, ES_AUTOHSCROLL, GetParent,
     GetWindowTextW, GWLP_WNDPROC, MoveWindow, SendMessageW, SW_HIDE, SW_SHOW, WM_CHAR, WM_COMMAND,
-    WM_CTLCOLOREDIT, WM_GETTEXTLENGTH, WM_SETFONT, WINDOWPLACEMENT, WINDOW_STYLE, WNDPROC,
+    WM_CTLCOLOREDIT, WM_GETTEXTLENGTH, WM_SETFONT, WM_SETFOCUS, WM_KILLFOCUS, WINDOWPLACEMENT, WINDOW_STYLE, WNDPROC,
     WS_CHILD, WS_VISIBLE,
 };
 use windows_numerics::{Matrix3x2, Vector2};
@@ -548,6 +548,100 @@ pub fn op_top(op: &Op) -> f32 {
     }
 }
 
+/// The op's lowest ink, in the display list's own coordinates.
+///
+/// A top says where an op begins, which is all a sort key can be and all the band
+/// search compares in bulk. It is not enough to find the band by itself: a code
+/// block's background is one `Rect` as tall as the whole fence, filed before the
+/// lines it sits behind, so the ops after it are inside it rather than under it. An
+/// op is in the band because of where it ends, and the ends of a list sorted only by
+/// top are not sorted at all -- which is what this exists to say.
+///
+/// A run's ink is its baseline plus its em, which no ascender or descender passes, and
+/// a list of none has no ink of its own and answers as the top did -- so that an empty
+/// op can never report a bottom far below the page and a caller comparing ends is not
+/// surprised by one. A line's runs are taken deepest-first rather than last-first: a
+/// raised mark ends at its own baseline plus its own em, which is neither the line's
+/// nor the last run's, and the deepest of them is the one that names the line's bottom.
+pub fn op_bottom(op: &Op) -> f32 {
+    match op {
+        Op::Runs(runs) => runs.iter().fold(op_top(op), |low, r| low.max(r.baseline + r.em)),
+        Op::Image { y, h, .. } | Op::Rect { y, h, .. } => y + h,
+        Op::Line { y0, y1, thickness, .. } => y0.max(*y1) + thickness,
+    }
+}
+
+/// The running maximum of [`op_bottom`] over a list of ops: `reach[i]` is the lowest
+/// ink any of `ops[0..=i]` puts on the page.
+///
+/// This is the one number a band needs about a list whose tops are ordered and whose
+/// bottoms are not. An op can reach far below the ops filed after it -- a fence's panel
+/// is one `Rect` as tall as the whole block, filed before the lines it paints behind --
+/// so a bottom on its own cannot be searched for and a look-back from the search's
+/// answer cannot be walked: the ops between a panel and the window are the block's own
+/// lines and every one of them ends above it. A running maximum is non-decreasing, so
+/// it can be searched directly, and it says exactly how far down the ops at or before
+/// an index reach: an op is still worth considering while the maximum under it is below
+/// the band's top edge, and is not worth considering the moment it is not.
+///
+/// It is also what makes the band exact rather than approximate. The ops that reach
+/// below a fixed amount of look-back are not the only tall ones -- a full-page figure,
+/// a table's rules and a quote's rule all do -- and an op of any height at all is found
+/// here no matter how far down it reaches.
+fn op_reach(ops: &[Op]) -> Vec<Pt> {
+    let mut reach: Vec<Pt> = Vec::with_capacity(ops.len());
+    extend_reach(&mut reach, ops);
+    reach
+}
+
+/// Grow a running maximum of bottoms by another batch of ops, as a layout hands one
+/// over. The fold starts from what the ops already filed reached, so a page that
+/// arrived in batches has the same reach as the same page that arrived whole.
+fn extend_reach(reach: &mut Vec<Pt>, ops: &[Op]) {
+    let mut low = reach.last().copied().unwrap_or(f32::NEG_INFINITY);
+    for op in ops {
+        low = low.max(op_bottom(op));
+        reach.push(low);
+    }
+}
+
+/// The slice of a display list that can put ink between `top` and `bottom`.
+///
+/// `sorted` is the list's own answer to "is this in reading order", which a page has
+/// about its ops and a note's bubble has about its own. An unordered list is drawn
+/// whole: there is no band to be found in it.
+///
+/// The upper end is one binary search, because the tops are ordered. The lower end is
+/// not the first op below `top`, because a sorted list is not a list of bottoms: a
+/// fence's panel is one `Rect` as tall as the whole block, filed before the lines inside
+/// it, so every op after it is inside it rather than under it, and a band that begins at
+/// the first code line leaves the one op that paints the background behind the code out
+/// of it entirely -- for every window scrolled into a fence, right down to the bottom of
+/// it. Nor can it be widened by walking back while an op still ends inside the band,
+/// because the ops between a panel and the band are the block's own lines and every one
+/// of them ends above it: such a walk stops at the second line of the fence with the
+/// panel still out of reach.
+///
+/// So the lower end is a second binary search, over the running maximum of the bottoms
+/// ([`op_reach`]) rather than over the tops. It is exact -- an op of any height is in
+/// the band from anywhere the band can see it -- and it costs one pass over the ops
+/// when they are laid out and one binary search a frame.
+fn visible_band(
+    ops: &[Op],
+    reach: &[Pt],
+    top: Pt,
+    bottom: Pt,
+    sorted: bool,
+) -> std::ops::Range<usize> {
+    debug_assert_eq!(reach.len(), ops.len(), "one reach per op, or the band is not this list's");
+    if !sorted {
+        return 0..ops.len();
+    }
+    let first = reach.partition_point(|r| *r < top);
+    let past = ops.partition_point(|op| op_top(op) <= bottom);
+    first..past.max(first)
+}
+
 /// Fold a batch of display-list ops into the page's, and keep the page's answer to
 /// "is this ordered by y" true as it goes.
 ///
@@ -560,7 +654,12 @@ pub fn op_top(op: &Op) -> f32 {
 ///
 /// Once the answer is no, it stays no: a later batch cannot repair an earlier one, and
 /// the ops themselves are still appended, since an unordered page is drawn in full.
-fn ops_in_order(into: &mut Vec<Op>, was_ordered: &mut bool, batch: Vec<Op>) {
+///
+/// `reach` is the page's running maximum of bottoms, which the batch is folded into the
+/// same way: it is what the band is found by, and a page built a batch at a time has the
+/// same reach as the same page built whole.
+fn ops_in_order(into: &mut Vec<Op>, reach: &mut Vec<Pt>, was_ordered: &mut bool, batch: Vec<Op>) {
+    extend_reach(reach, &batch);
     if !*was_ordered {
         into.extend(batch);
         return;
@@ -665,6 +764,12 @@ struct LayoutRequest {
     /// the old one wholesale -- so handing one to a layout is a reference count and
     /// not a walk of every block's text, spans and tables.
     doc: Arc<Document>,
+    /// The directory a relative image path is written against: the folder the document
+    /// was opened from, and the only place the reader's `![](fig.png)` can be found.
+    /// The worker has no window and no page to ask, so it is handed here -- leaving it
+    /// out resolves every figure against the process's own working directory, and a
+    /// document that crosses the async threshold is a document whose figures vanish.
+    base: Option<PathBuf>,
     theme: Theme,
     page_w: f32,
     dpi: f32,
@@ -694,7 +799,7 @@ fn spawn_layout(
         // The profile's math store and the image sizes are the same work the window
         // would do for this document; a relayout redoes them, which is why the
         // caches that outlive a document live on the window's engine.
-        let mut objects = Objects::new(images.as_ref(), None, &mut math);
+        let mut objects = Objects::new(images.as_ref(), request.base.as_deref(), &mut math);
         let mut sink = RemoteSink {
             epoch: request.epoch,
             cancel,
@@ -841,6 +946,18 @@ struct NoteBubble {
     /// or a figure, and a bubble that showed only the words would show a code block
     /// as what is presumably an error message.
     ops: Vec<Op>,
+    /// The running maximum of [`op_bottom`] over `ops`, one entry per op, built where
+    /// the ops above are finished. The bubble is the one place a display list is
+    /// assembled for something that is not the page, and it is found by the same band
+    /// search the page is: a note carrying a figure or a fence has an op as tall as the
+    /// page's, and the cut that trims the ops above leaves the reach to be taken again
+    /// over what is left.
+    reach: Vec<Pt>,
+    /// Whether those ops are in reading order, which is what lets the painter find the
+    /// panel's visible band by binary search. The page's own answer says nothing about
+    /// a note: a note carrying a table lays its cells out column by column, so one
+    /// page can be ordered and the note floating over it not.
+    sorted: bool,
     /// How tall the note came out, which is the bubble's content height: a note that
     /// was cut reports the height it was cut at, not the height it would have had.
     height: Pt,
@@ -966,6 +1083,24 @@ impl Selection {
     }
 }
 
+/// How far `x` stands from the run of ink a line draws: nothing at all inside it, and
+/// the gap to its nearer edge outside it.
+///
+/// A table's cells are told apart by this. They are indexed a column at a time, so a
+/// whole row of them shares one y, and the pointer's x is the only thing that says
+/// which cell of the row a click means.
+fn span_gap(l: &SelLine, x: f32) -> f32 {
+    let Some(lo) = l.xs.first().copied() else { return f32::MAX };
+    let hi = l.ends.last().copied().unwrap_or(lo).max(lo);
+    if x < lo {
+        lo - x
+    } else if x > hi {
+        x - hi
+    } else {
+        0.0
+    }
+}
+
 /// Where a pointer at `x`, `y` (device pixels from the top of the document) lands in the
 /// page's text. Above the first line and below the last both clamp rather
 /// than miss: a drag thrown past the top of the page means all of it from the start.
@@ -979,6 +1114,30 @@ pub fn caret_at(sel: &[SelLine], x: f32, y: f32) -> Caret {
     let mut line = sel.partition_point(|l| y >= l.y + l.h);
     if line >= sel.len() {
         line = sel.len() - 1;
+    }
+    // A table is where that stops being true. Its cells are indexed one column at a
+    // time, so a whole row of them carries one y and the search alone lands in the
+    // row's first cell whatever x the pointer is over -- a click in the third column
+    // marks the first, and a drag out of it highlights it. The row is walked instead,
+    // and the walk ends where the row does: every cell of a row opens at the row's top
+    // and a cell's own further lines carry the tab join, while the first cell of the row
+    // below carries neither. A click that is not on a table answers in the one step it
+    // took to find that out.
+    let row_top = sel[line].y;
+    let mut gap = span_gap(&sel[line], x);
+    for (j, cell) in sel.iter().enumerate().skip(line + 1) {
+        if cell.y != row_top && cell.join != Join::Tab {
+            break;
+        }
+        // A cell of the row the pointer is not inside is a cell it did not mean.
+        if y < cell.y || y >= cell.y + cell.h {
+            continue;
+        }
+        let here = span_gap(cell, x);
+        if here < gap {
+            line = j;
+            gap = here;
+        }
     }
     let l = &sel[line];
     // The nearest boundary, because a character's own ink starts a point or two to the
@@ -1099,8 +1258,11 @@ fn word_kind(c: char) -> WordKind {
         WordKind::Ideograph
     } else if c.is_alphanumeric() {
         WordKind::Word
-    } else if c == '_' || c == '-' || c == '’' {
-        // The apostrophe that joins contractions is inside the word, not after it.
+    } else if c == '_' || c == '-' || c == '’' || c == '\'' {
+        // The apostrophe that joins contractions is inside the word, not after it, and
+        // which apostrophe an author typed is not something a reader can see: the
+        // straight quote is the one most Markdown files use, and `don't` has to be one
+        // double-click like `don’t` is.
         WordKind::Word
     } else {
         WordKind::Mark
@@ -1266,7 +1428,14 @@ pub fn next_caret(sel: &[SelLine], from: Caret, m: Motion) -> Caret {
             let right = matches!(m, Motion::Right | Motion::WordRight);
             let line = if right { (at.line + 1).min(last) } else { at.line.saturating_sub(1) };
             if line == at.line { return at; }
-            return caret_at(sel, if right { f32::MIN } else { f32::MAX }, sel[line].y + sel[line].h * 0.5);
+            // A line that reads backwards is walked by where it draws, but a crossing
+            // is a crossing and takes the same ends a plain line does: the start of
+            // the next line going right, the end of the last going left. Answering it
+            // with the visual edge instead put Right and Left on opposite sides of
+            // the break, so Right-then-Left did not come back and a Shift held across
+            // the crossing would not un-cross the selection it had just made.
+            let target = &sel[line];
+            return Caret { line, ch: if right { 0 } else { target.chars.len() } };
         }
     }
     let moved = match m {
@@ -1473,6 +1642,11 @@ pub struct View {
     /// Whether [`Self::ops`] is non-decreasing by [`op_top`], which is what lets a
     /// paint binary-search the visible band. Recomputed whenever ops are replaced.
     ops_sorted: bool,
+    /// The running maximum of [`op_bottom`] over [`Self::ops`], one entry per op, which
+    /// is what the binary search for the band's lower edge runs over. Kept beside the
+    /// ops and the same length as them, and built once per layout: a frame asks of it
+    /// and never rebuilds it.
+    ops_reach: Vec<Pt>,
     /// Bumped whenever `sel_index` is replaced, which is the only thing that can
     /// make a cached find [`Needle`] stale. A keystroke in the find bar re-asks the
     /// same page, and rebuilding the needle's characters for every one of them is
@@ -1740,7 +1914,8 @@ impl TabLayout {
 /// and failing that, a run around the tab being read -- the one tab that cannot be spared
 /// -- with the rest behind the overflow control. The run is centred on the active tab and
 /// clamped at both ends of the list, so the strip shows the same pills for a given tab
-/// until the window or the tab list changes.
+/// until the window or the tab list changes. A band too narrow even for one pill at that
+/// floor still shows the tab being read, below the floor, beside the overflow control.
 ///
 /// `hover` is the pill the pointer is on, and it moves nothing: the pill keeps the width
 /// it was given and its neighbours keep their places. All it changes is that one label's
@@ -1792,6 +1967,16 @@ fn tab_layout(natural: &[(TabId, f32)], band: (f32, f32), active: usize, hover: 
                     chosen = (start, run);
                     break;
                 }
+            }
+            if chosen.1.is_empty() {
+                // A band too narrow even for one pill at the floor still shows the tab
+                // being read. The run above is empty when no capacity fits, and a strip
+                // with nothing on it answers no click at all -- the tab being read could
+                // not be closed and the hidden tabs could not be reached -- so the one
+                // pill goes as narrow as the room allows rather than not going at all,
+                // below the floor if it has to.
+                let one = if button.is_some() { pill_room } else { room };
+                chosen = (here, vec![one.clamp(0.0, TAB_MIN_W)]);
             }
             (chosen.0, chosen.1, button)
         }
@@ -1918,12 +2103,25 @@ impl TabPage {
     }
 }
 
+/// How far down the document the reader may scroll, in points: the content less the
+/// viewport, with a line of the body size below it so the last line of the page can
+/// reach the top of the window.
+///
+/// One number for the offset, the thumb that draws it and the percentage that reports
+/// it, because they are one question asked three ways. A thumb that reaches the end of
+/// its track while a line is still below it, beside a status bar already reading 100%,
+/// is the same disagreement told twice -- and the answer is a line short of the end
+/// because `clamp_scroll` and the percentage both have it.
+fn max_scroll_of(content_h: Pt, base: Pt, view_h: Pt) -> Pt {
+    (content_h + base - view_h).max(0.0)
+}
+
 /// Thumb geometry, in device independent pixels, or `None` when the document fits.
 ///
 /// Kept free of `View` so the arithmetic -- thumb height as the viewport fraction,
 /// and the scroll-to-position mapping that must stay consistent with it -- can be
 /// tested without a render target or a window.
-fn thumb_rect(content_h: Pt, client_w: f32, client_h: f32, scroll: Pt, dpi: f32) -> Option<(f32, f32, f32, f32)> {
+fn thumb_rect(content_h: Pt, base: Pt, client_w: f32, client_h: f32, scroll: Pt, dpi: f32) -> Option<(f32, f32, f32, f32)> {
     let k = scale_of(dpi);
     let doc = content_h * k;
     if doc <= client_h + 1.0 {
@@ -1932,9 +2130,39 @@ fn thumb_rect(content_h: Pt, client_w: f32, client_h: f32, scroll: Pt, dpi: f32)
     let track = 10.0;
     let x = client_w - track - 3.0;
     let h = (client_h * client_h / doc).max(28.0);
-    let max_scroll = (content_h - client_h / k).max(0.0);
+    // The same end the offset is clamped to and the percentage is measured against, so
+    // the thumb reaches the foot of its track exactly when the page is at the end of
+    // the document rather than a line before it.
+    let max_scroll = max_scroll_of(content_h, base, client_h / k);
     let frac = if max_scroll > 0.0 { (scroll / max_scroll).clamp(0.0, 1.0) } else { 0.0 };
     Some((x, frac * (client_h - h).max(0.0), track, h))
+}
+
+/// The three window controls, from the corner inwards: close, maximise, minimise.
+const CAPTION_ORDER: [CapBtn; 3] = [CapBtn::Close, CapBtn::Max, CapBtn::Min];
+
+/// The rectangle the window control at `index` is drawn into, in the window's own
+/// pixels: the strip's whole height, counted back from the right-hand corner.
+///
+/// Kept free of `View`, and named once, because the painter fills this and the hit
+/// test asks of the same arithmetic and the two must not end up describing two
+/// different places. They used to write the arithmetic out separately, which was safe
+/// only as long as one D2D unit was one pixel -- a `dpi/96` on the render target
+/// moved the ink out of the window and left the test looking exactly where the
+/// control no longer was.
+fn caption_button_rect(index: f32, client_w: f32) -> (f32, f32, f32, f32) {
+    let left = client_w - (index + 1.0) * CAPTION_BTN_W;
+    (left, 0.0, left + CAPTION_BTN_W, TOPBAR_H)
+}
+
+/// The window control under a window point, if the point is on one.
+///
+/// The same partition `caption_button_rect` draws, read from the corner: the point
+/// names a control by how many widths of strip stand between it and the right edge.
+fn caption_button_at(x: f32, y: f32, client_w: f32) -> Option<CapBtn> {
+    if !(0.0..TOPBAR_H).contains(&y) { return None; }
+    let index = ((client_w - x) / CAPTION_BTN_W).floor();
+    (0.0..CAPTION_ORDER.len() as f32).contains(&index).then(|| CAPTION_ORDER[index as usize])
 }
 
 /// Points to device independent pixels at the target's DPI.
@@ -1943,14 +2171,77 @@ fn scale_of(dpi: f32) -> f32 {
     dpi / 72.0
 }
 
-/// The render target's own unit, in the physical pixels a child window is placed by.
+/// The DPI the window's render target is made at, and never changed from.
 ///
-/// Not `scale_of`: that one counts points in units of a 1/dpi inch, and a child window
-/// is placed in pixels of a 1/96 inch. The two agree at a dpi of about 83, which no
-/// monitor reports, and a box placed by the wrong one of them lands off the window.
+/// Pinned, deliberately, and not because the window is unscaleable. A D2D target made
+/// at `d` maps one of its own units to `d / 96` physical pixels, and every coordinate
+/// this file hands Direct2D is a *physical* pixel: the display list is laid out against
+/// `GetClientRect`'s width, the hit tests are the raw `lParam` of a click, the chrome is
+/// `TOPBAR_H` against `client_h`, and `DrawGlyphRun` is given a `fontEmSize` that has
+/// already been multiplied by `scale_of`. A target made at the window's own dpi
+/// therefore multiplies all of them by `d / 96` a second time -- a page laid out
+/// `client_w` wide is painted `client_w * d / 96` wide, so the right and bottom of it
+/// fall off the window with no way to scroll to them; the window controls are drawn
+/// outside the frame while the click test that names them still answers, which is an
+/// invisible close button; and a click lands on a different line than the one drawn
+/// under it. At a dpi of 96 the factor is exactly 1.0, every one of those vanishes,
+/// and nothing ever noticed -- which is also why the test suite, which is written at
+/// 96, was green throughout.
+///
+/// This is not a claim that the window ignores the monitor's scale. `self.dpi` still
+/// is the window's real dpi, and `scale_of` still divides it by 72, so a point of type
+/// still grows with the display and the page still re-lays-out on a crossing. The
+/// scaling has already happened, once, into the display list; this constant only says
+/// the drawing after it does not do it twice. Do not "fix" the `dpiX` below back to
+/// `self.dpi`, and do not put a `SetDpi` back on this target: either one puts the
+/// factor back, and there is no test in this file that can catch it, because the
+/// display list can only be handed to a real render target on a real monitor.
+const TARGET_DPI: f32 = 96.0;
+
+/// One render-target unit, in the physical pixels a child window is placed by.
+///
+/// The D2D rule, and the whole of it: a target made at `target_dpi` puts
+/// `target_dpi / 96` physical pixels in one of its units. The window's target is pinned
+/// to [`TARGET_DPI`], so this is 1.0 on every monitor, and it is named here so the one
+/// place that has to turn a drawn coordinate into a placed one has a single answer to
+/// consult.
+///
+/// It used to be written `96 / dpi` and handed the *window's* dpi, which was wrong
+/// under either convention: it took the factor from the window where the factor belongs
+/// to the target, and then inverted it. Against a target made at the window's own dpi
+/// that put the find box at `96/dpi` units where the panel it sits on was drawn at
+/// `dpi/96` units -- on a 150% monitor a box under two thirds the size of the bar and
+/// nowhere near its left edge. At a dpi of 96 the two forms coincide, so the mistake
+/// only ever showed up on the monitors nobody tests on.
 #[inline]
-fn unit_px(dpi: f32) -> f32 {
-    96.0 / dpi
+fn unit_px(target_dpi: f32) -> f32 {
+    target_dpi / 96.0
+}
+
+/// The window's render target: its format, and the DPI whose unit every coordinate
+/// this file hands Direct2D is written in.
+///
+/// A function rather than a literal in `attach` for exactly one reason: this is then
+/// the single place that knows what a drawn unit is worth, and a test can ask it the
+/// same question the window manager asks. Everything else in the file is written
+/// against `self.dpi` and must keep being; the `dpiX` here is the one that has to
+/// stay at [`TARGET_DPI`], and the reason is a paragraph long and lives there.
+fn window_target_properties() -> D2D1_RENDER_TARGET_PROPERTIES {
+    D2D1_RENDER_TARGET_PROPERTIES {
+        r#type: D2D1_RENDER_TARGET_TYPE_DEFAULT,
+        pixelFormat: D2D1_PIXEL_FORMAT {
+            format: DXGI_FORMAT_B8G8R8A8_UNORM,
+            alphaMode: D2D1_ALPHA_MODE_PREMULTIPLIED,
+        },
+        // 96, whatever the monitor says. `self.dpi` is the window's *real* dpi and
+        // still drives `scale_of`, the layout and the wheel -- the display has already
+        // been scaled once, into the display list, and this is where the drawing is
+        // forbidden from scaling it a second time. See `TARGET_DPI`.
+        dpiX: TARGET_DPI,
+        dpiY: TARGET_DPI,
+        usage: D2D1_RENDER_TARGET_USAGE_NONE,
+        minLevel: D2D1_FEATURE_LEVEL_DEFAULT,
+    }
 }
 
 /// How far the document's top sits above the window's, in device independent pixels,
@@ -2039,6 +2330,16 @@ impl History {
     fn leave(&mut self, from: Visit) {
         self.past.push(from);
         self.future.clear();
+    }
+
+    /// The place a step would land on, read rather than taken.
+    ///
+    /// A step can fail where it lands -- a share that has gone quiet, a drive that has
+    /// been pulled -- and the reader is left where they were. Taking the place off the
+    /// road first would spend the step on a move that did not happen and leave the
+    /// place they tried to go back to nowhere to be found.
+    fn peek(&self, back: bool) -> Option<Visit> {
+        self.end(back).last().cloned()
     }
 
     /// Step back, leaving the place being stood on where it can be come forward to.
@@ -2140,8 +2441,9 @@ fn find_panel(client_w: f32) -> (f32, f32, f32, f32) {
 
 /// The text box inside the panel, in the panel's own units -- the ones `find_panel`
 /// hands back, so the two can be asked of each other whether they agree. A child window
-/// is placed in physical pixels, which is a different thing; `position_edit` is where
-/// the two are turned into one another.
+/// is placed in physical pixels, which is a different coordinate system even where the
+/// two are the same size; `position_edit` is where they are turned into one another,
+/// and it is the only place that is allowed to multiply anything.
 fn find_edit(client_w: f32) -> (i32, i32, i32, i32) {
     let (x, y, w, h) = find_panel(client_w);
     let box_w = (w - 2.0 * FIND_PAD - FIND_COUNT).max(48.0);
@@ -2172,6 +2474,36 @@ fn find_count(focus: usize, hits: usize) -> String {
 
 fn find_count_in(lang: Language, focus: usize, hits: usize) -> String {
     i18n::find_count(lang, focus, hits)
+}
+
+/// The first line of `sel` still reaching into a window whose top edge is at `top`,
+/// or `None` when the window has scrolled past the last of them.
+///
+/// The bottom of a document is such a place: `clamp_scroll` will let the top edge fall
+/// below the last line, and there is then no line anybody is looking at. Reporting the
+/// first one would be a claim about a place the reader is not at.
+fn top_line_in(sel: &[SelLine], top: f32) -> Option<usize> {
+    let line = sel.partition_point(|l| l.y + l.h <= top);
+    (line < sel.len()).then_some(line)
+}
+
+/// Which of `marks` a search starts on, given the line at the top of the window.
+///
+/// The first hit at or below it: a reader who has typed a word wants the page's answer
+/// to start where they were looking, not at the first line of the document three
+/// screens above. Hits stand in reading order, so the line they name only grows.
+///
+/// Past the last line every hit is behind the reader, and the nearest one to where they
+/// actually are is the last -- which is what the clamp says, since the partition would
+/// otherwise answer with the count of the hits, and the bar would read "7 of 6". The
+/// same clamp is what makes `Enter` wrap round to the first hit rather than to the
+/// second, which is where `(len + 1) % len` lands when the focus is one past the end.
+fn find_focus(marks: &[Selection], top: Option<usize>) -> usize {
+    let at = match top {
+        Some(top) => marks.partition_point(|m| m.from.line < top),
+        None => marks.len(),
+    };
+    at.min(marks.len().saturating_sub(1))
 }
 
 /// An 8-bit colour, the shape GDI wants for the one window this painter cannot reach.
@@ -2838,6 +3170,7 @@ pub fn run(path: Option<PathBuf>, extra: Vec<PathBuf>) -> Result<()> {
         line_break_override: None,
         ops: Vec::new(),
         ops_sorted: true,
+        ops_reach: Vec::new(),
         sel_version: 1,
         find_needle: None,
         layout_job: None,
@@ -3018,7 +3351,27 @@ pub fn run(path: Option<PathBuf>, extra: Vec<PathBuf>) -> Result<()> {
         // reader's settings for this document, the text, the parse. A failure here still
         // refuses to start -- through `main`, which shows why -- but by now there is a
         // window for the reason to be shown beside.
-        view.finish_startup(saved)?;
+        //
+        // The window is torn down *before* the error goes back rather than on the way
+        // out of the function. A bare `?` would drop the `Box` while `Rubrica.Main` is
+        // still registered, still owned by the shell, and still holding a
+        // `GWLP_USERDATA` that points at freed memory -- and the reader is about to be
+        // shown a `MessageBox`, whose modal loop dispatches to every window on the
+        // thread: within half a second the dead window is walking freed `ops` on a
+        // `WM_PAINT` and flipping a freed caret on a `WM_TIMER`. `std::process::exit`
+        // does not save it either, since `ExitProcess` destroys the window and delivers
+        // a `WM_DESTROY` to the same dangling pointer on the way out. So the timers are
+        // killed, the pointer is cleared, and the window is destroyed here, while the
+        // allocation it names is still there; after this the error is the only thing
+        // left standing, and the modal loop behind it has nothing to dispatch to.
+        if let Err(error) = view.finish_startup(saved) {
+            let _ = KillTimer(Some(hwnd), APPEARANCE_TIMER);
+            let _ = KillTimer(Some(hwnd), DOCUMENT_TIMER);
+            let _ = KillTimer(Some(hwnd), CARET_TIMER);
+            SetWindowLongPtrW(hwnd, GWLP_USERDATA, 0);
+            let _ = DestroyWindow(hwnd);
+            return Err(error);
+        }
 
         // Documents named alongside the first, each opened as its own tab in the order
         // named -- the walk a reader taking them by hand would take. They wait for the
@@ -3257,6 +3610,33 @@ fn is_written(seen: Option<Stamp>, now: Option<Stamp>) -> bool {
     now.is_some() && now != seen
 }
 
+/// The step a drag held against an edge of the page takes, or `None` for a pointer that
+/// is not against one.
+///
+/// The bands are bounded by the *content* area rather than by the whole client, and
+/// `bottom` is [`View::content_bottom`] -- the client less the status bar. A selection
+/// dragged up over the tab strip or down into the bar is a pointer over chrome, not
+/// over text, and a page that scrolled under it would slide the line the reader is
+/// marking through their feet while the pointer never touched it. The same is true of
+/// the band's outer half in the other direction: a pointer below the status bar's top
+/// edge is on the bar, and the bar is not the foot of anything the reader can see.
+///
+/// The band is narrow and the step small because this is asked of every pointer message
+/// while the button is down near an edge, including the ones that do not move: too fast
+/// reads as a page flipping under a stationary cursor.
+fn edge_scroll_step(y: f32, bottom: f32) -> Option<Pt> {
+    const EDGE: f32 = 20.0;
+    const STEP: Pt = 6.0;
+    if y < TOPBAR_H || y > bottom { return None; }
+    if y < TOPBAR_H + EDGE {
+        Some(-STEP)
+    } else if y > bottom - EDGE {
+        Some(STEP)
+    } else {
+        None
+    }
+}
+
 /// A count with thousands separators, the way a total is read at a glance rather than
 /// counted digit by digit.
 fn group_digits(n: usize) -> String {
@@ -3364,12 +3744,43 @@ unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM)
                 if let Err(error) = crate::settings::record_workspace(&v.workspace.snapshot()) {
                     eprintln!("workspace: {error}");
                 }
+                // The two GDI objects a find box brings with it, and the only two the
+                // window ever makes. `WM_SETFONT` hands the font to the control and the
+                // ownership stays here, and the control is not destroyed along with the
+                // window, so nothing else is going to free either: a reader who opens the
+                // find box and then closes the window leaks two GDI handles, every time.
+                // The brush goes the way `set_dark` takes it.
+                v.drop_edit_font();
+                if let Some(brush) = v.edit_brush.take() {
+                    let _ = DeleteObject(HGDIOBJ(brush.0));
+                }
+            }
+            // Every timer this window arms, killed while the pointer they dispatch to is
+            // still the right one. A timer outliving its window is not a leak but a
+            // dispatcher: `WM_TIMER` keeps arriving at a `GWLP_USERDATA` that no longer
+            // names a `View` -- the appearance poll reading a freed palette, the caret
+            // beat flipping a freed flag, the page tick indexing a freed list. Timers die
+            // with their window on their own, but these five are named in five places and
+            // this is the one moment all five are known.
+            for timer in [APPEARANCE_TIMER, DOCUMENT_TIMER, CARET_TIMER, PAGE_TIMER, NOTE_TIMER] {
+                let _ = KillTimer(Some(hwnd), timer);
             }
             // The frame goes with the place for the same reason: the usual way to close a
             // window is its own `X`, which asks nothing of the process on the way out.
             record_geometry(hwnd);
             PostQuitMessage(0);
             LRESULT(0)
+        }
+        // The last message a window is sent, and the one delivered whether or not anyone
+        // asked for it: the system's own teardown sends it, and so does the
+        // `DestroyWindow` on a start-up that refused to read its document. Clearing the
+        // pointer here -- before the `Box` behind it is dropped on the way out of `run` --
+        // is what makes any *future* early return harmless too: with nothing stored, the
+        // default arm below answers `DefWindowProcW` for whatever the shell sends next
+        // and never reaches freed memory.
+        WM_NCDESTROY => {
+            SetWindowLongPtrW(hwnd, GWLP_USERDATA, 0);
+            DefWindowProcW(hwnd, msg, wp, lp)
         }
         // The caption is the strip's job, and the answer cannot wait for the view: the
         // system asks while the window is being created, before `WM_NCCREATE` has hung
@@ -3658,17 +4069,7 @@ impl View {
         self.client_w = (r.right - r.left).max(1) as f32;
         self.client_h = (r.bottom - r.top).max(1) as f32;
         self.dpi = GetDpiForWindow(hwnd).max(96) as f32;
-        let props = D2D1_RENDER_TARGET_PROPERTIES {
-            r#type: D2D1_RENDER_TARGET_TYPE_DEFAULT,
-            pixelFormat: D2D1_PIXEL_FORMAT {
-                format: DXGI_FORMAT_B8G8R8A8_UNORM,
-                alphaMode: D2D1_ALPHA_MODE_PREMULTIPLIED,
-            },
-            dpiX: self.dpi,
-            dpiY: self.dpi,
-            usage: D2D1_RENDER_TARGET_USAGE_NONE,
-            minLevel: D2D1_FEATURE_LEVEL_DEFAULT,
-        };
+        let props = window_target_properties();
         let hp = D2D1_HWND_RENDER_TARGET_PROPERTIES {
             hwnd,
             pixelSize: D2D_SIZE_U { width: self.client_w as u32, height: self.client_h as u32 },
@@ -3886,12 +4287,21 @@ impl View {
                 DefWindowProcW(hwnd, msg, wp, lp)
             }
             WM_DPICHANGED => {
-                let anchor = anchor_at(&self.sel_index, self.scroll, scale_of(self.dpi));
+                // No relayout of its own, and that is the whole point of the arm.
+                // `SetWindowPos` below is a synchronous message send: it lays the page out
+                // by way of a nested `WM_SIZE` before it returns, and that `WM_SIZE`
+                // already takes the anchor, bumps the epoch and re-asks the page and the
+                // find box for their geometry. Doing it again here doubled the work --
+                // a heavy document started a worker job that the duplicate cancelled a
+                // millisecond later, so a crossing between monitors emptied the page and
+                // left the reader watching a blank window for twice as long as the
+                // crossing took.
                 let new_dpi = GetDpiForWindow(hwnd).max(96) as f32;
                 let r = &*(lp.0 as *const RECT);
-                if let Some(t) = &self.hwnd_target {
-                    t.SetDpi(new_dpi, new_dpi);
-                }
+                // The target is made at `TARGET_DPI` and stays there: `new_dpi` is the
+                // window's scale, which the display list and the layout have already
+                // been built against, and handing it to `SetDpi` would multiply every
+                // coordinate in the window by it a second time. See `TARGET_DPI`.
                 self.client_w = (r.right - r.left).max(1) as f32;
                 self.client_h = (r.bottom - r.top).max(1) as f32;
                 let _ = SetWindowPos(
@@ -3909,15 +4319,12 @@ impl View {
                 // remembered before the crossing is one that cannot be restored to anywhere
                 // useful.
                 record_geometry(hwnd);
-                if let Some(t) = &self.target {
-                    t.SetDpi(self.dpi, self.dpi);
-                }
                 // The box's letters were made for the monitor it is leaving, and a font is
                 // sized in pixels, so it has to be made again rather than scaled up.
                 self.drop_edit_font();
-                // New pixels are a new wrapping for every tab as well.
-                self.layout_epoch += 1;
-                self.relayout_from_anchor(anchor);
+                // The find box alone, and only because the font it was just given is the
+                // one that has gone: `layout_find` is what makes the next one, in the
+                // pixels of the monitor the window is now on.
                 self.layout_find();
                 let _ = InvalidateRect(Some(hwnd), None, false);
                 LRESULT(0)
@@ -3928,9 +4335,13 @@ impl View {
                     let mut pt = POINT::default();
                     let _ = GetCursorPos(&mut pt);
                     let _ = ScreenToClient(hwnd, &mut pt);
-                    if let Some(index) = self.wide_region_at(pt.x as f32, pt.y as f32) {
-                        self.wide_active = Some(index);
-                    }
+                    // The region under the pointer, or none of them: setting the answer
+                    // either way is what makes the region being panned follow the
+                    // pointer. Left as it was, a reader who panned a table and then
+                    // moved over the prose beside it would shift a region that is no
+                    // longer on screen, and the wheel would repaint a page that has not
+                    // changed -- a dead mouse rather than a wrong page.
+                    self.wide_active = self.wide_region_at(pt.x as f32, pt.y as f32);
                     if self.pan_wide(ticks) {
                         let _ = InvalidateRect(Some(hwnd), None, false);
                     } else {
@@ -4174,6 +4585,30 @@ impl View {
                     return LRESULT(0);
                 }
                 self.popup_menu(x, y, hwnd);
+                LRESULT(0)
+            }
+            // A caret only blinks where the keyboard is, and this window is very often not
+            // where the keyboard is. `Ctrl+F` hands it to the find box, a reader who puts
+            // the caret down and then types there pays two full-window D2D repaints a
+            // second for a mark nobody can see behind the search bar, and the reader who
+            // alt-tabs away pays them for as long as they are gone. The timer is killed
+            // and the phase put back to the visible one, so the caret is *on* -- not
+            // mid-blink, not stuck dark -- at the moment the window comes back.
+            WM_KILLFOCUS => {
+                self.caret_on = true;
+                let _ = unsafe { KillTimer(Some(hwnd), CARET_TIMER) };
+                let _ = InvalidateRect(Some(hwnd), None, false);
+                LRESULT(0)
+            }
+            // The other half, and the reason the kill is not simply a one-way door: the
+            // beat is armed again for a caret that is still standing, and only then. A
+            // page with no caret on it -- the common case, and the whole of every
+            // start-up before the reader clicks -- never starts ticking at all.
+            WM_SETFOCUS => {
+                if self.caret.is_some() {
+                    self.restart_caret_beat(hwnd);
+                }
+                let _ = InvalidateRect(Some(hwnd), None, false);
                 LRESULT(0)
             }
             WM_TIMER => {
@@ -4956,22 +5391,17 @@ impl View {
     /// Scroll the page when a drag is held against its top or bottom edge, so a
     /// selection longer than the viewport can be finished without letting go.
     ///
-    /// The band is narrow and the step small because this runs on every pointer message
-    /// while the button is down near an edge, including the ones that do not move: too
-    /// fast reads as a page flipping under a stationary cursor.
+    /// The bands are the page's own, so a drag held over the tab strip or the status bar
+    /// does not scroll a page it is nowhere near; see [`edge_scroll_step`].
     fn auto_scroll(&mut self, y: f32, _hwnd: HWND) {
-        const EDGE: f32 = 20.0;
-        const STEP: Pt = 6.0;
         if self.reading_mode == ReadingMode::Stack {
             // A page turn clears the transient drag state; letting edge auto-scroll start
             // one half way through a selection would turn the next pointer message into a
             // document-start caret. Cross-page selection is a separate gesture for now.
             return;
         }
-        if y < EDGE {
-            self.scroll_by(-STEP);
-        } else if y > self.client_h - EDGE {
-            self.scroll_by(STEP);
+        if let Some(step) = edge_scroll_step(y, self.content_bottom()) {
+            self.scroll_by(step);
         }
     }
 
@@ -5536,9 +5966,16 @@ impl View {
                 self.status ^= item;
                 crate::settings::record_status_items(self.status);
                 // A bar that has just appeared or gone has changed the page's height,
-                // so the wrapping -- not the text -- has to be built again.
-                self.layout_epoch += 1;
-                self.relayout();
+                // so the wrapping -- not the text -- has to be built again. And the
+                // reader is left *where they were*, rather than wherever the new
+                // extent of the document allows: taking the last item off the bar
+                // shortens the page by a line's worth, and a plain `relayout` never
+                // clamps -- a reader sitting at the foot of a long document is left
+                // with `scroll` past the new end, which shows as a blank gap under the
+                // last line and a thumb that disagrees with the percentage beside it
+                // until they happen to press the wheel. The anchor-preserving variant
+                // ends in `snap_to_page`, which is the clamp.
+                self.relayout_in_place(hwnd);
             }
             Command::Typography => {
                 let plain = self.plain_override.unwrap_or_else(|| reading::is_plain(self.path.as_deref()));
@@ -5973,7 +6410,7 @@ impl View {
             return;
         }
         let view_h = (self.content_bottom() - TOPBAR_H).max(1.0) / scale_of(self.dpi);
-        let max = (self.content_h + self.theme.base - view_h).max(0.0);
+        let max = max_scroll_of(self.content_h, self.theme.base, view_h);
         self.scroll = self.scroll.clamp(0.0, max);
     }
 
@@ -6093,6 +6530,10 @@ impl View {
                 // copied block by block on the thread that was about to answer the
                 // reader's next click.
                 doc: Arc::clone(&self.doc),
+                // A relative figure is written against the folder the document was
+                // opened from, and the worker has no page to ask: the same answer the
+                // synchronous path and a note's bubble give it themselves.
+                base: self.path.as_deref().and_then(|p| p.parent()).map(Path::to_path_buf),
                 theme: self.theme.clone(),
                 page_w,
                 dpi: self.dpi,
@@ -6106,6 +6547,7 @@ impl View {
         // answer that outlived the list it was about is how a page ends up walking
         // every op it has, on every frame, to draw the band in front of the reader.
         self.ops_sorted = true;
+        self.ops_reach.clear();
         self.sel_index.clear();
         self.sel_version += 1;
         self.hotspots.clear();
@@ -6185,12 +6627,25 @@ impl View {
                     // believes it is ordered when a wide table laid its cells out column
                     // by column paints only the band a binary search can find.
                     let mut ordered = self.ops_sorted;
-                    ops_in_order(&mut self.ops, &mut ordered, chunk.ops);
+                    ops_in_order(&mut self.ops, &mut self.ops_reach, &mut ordered, chunk.ops);
                     self.ops_sorted = ordered;
                     self.sel_version += 1;
                     self.sel_index.extend(chunk.sel);
                     self.hotspots.extend(chunk.hots);
                     self.wide_regions.extend(chunk.wide);
+                    // The search is asked of the page that is *now* here, once per
+                    // batch, rather than of the wrapping this layout is replacing.
+                    // `begin_layout_job` cleared the index it was measured against and
+                    // the version that keys the needle cache has just moved, so without
+                    // this the highlights and the count beside them keep describing lines
+                    // that no longer exist -- and `draw_page_overlays` marks them against
+                    // an index that is still being built, which for a large file is
+                    // seconds of a search bar counting hits the reader cannot see.
+                    // The `Finished` arm asks again over the finished page; this is the
+                    // same question asked of a partial one.
+                    if let Some(query) = self.find.as_ref().map(|f| f.query.clone()) {
+                        self.apply_find(&query, false);
+                    }
                 }
                 LayoutMessage::Finished { epoch, finals } if epoch == job.epoch => {
                     trace("content-complete");
@@ -6238,6 +6693,21 @@ impl View {
         // creation: by the time a page is laid out the frame is already up, and a
         // document that never shows a figure still pays only the factory.
         self.ensure_images();
+        // A layout already running is stopped here rather than inside `begin_layout_job`,
+        // because the *synchronous* path below never goes near it. That is the whole of
+        // the bug: a reader with a 600-block document open has a worker laying it out,
+        // and then opens a small one in the same tab. `set_doc` replaces the document,
+        // the heavy test says no, the page is built here on this thread -- and the old
+        // job is still on the books, still on the same epoch, so the next batch it
+        // posts passes the `epoch == job.epoch` check in `layout_messages` and appends
+        // the *first* document's display list, selection lines and hotspots to the
+        // second one's. The page renders as a mixture of two documents, `content_h`
+        // jumps, and the find index is built over the merge. Dropping the job here
+        // closes its `Receiver` as well as telling it to stop, so the worker's next
+        // `send` fails and the run ends at the window it was already up to.
+        if let Some(job) = self.layout_job.take() {
+            job.cancel.store(true, Ordering::Relaxed);
+        }
         // A worker takes the layout when there is a lot of it -- many blocks, or a
         // few blocks so large they cost as much as many: a log folded into one
         // paragraph by Markdown is one block and hundreds of kilobytes of work.
@@ -6286,9 +6756,17 @@ impl View {
             scale_of(self.dpi),
         );
         self.ops = page.ops;
+        self.ops_reach = op_reach(&self.ops);
         self.ops_sorted = self.ops.windows(2).all(|w| op_top(&w[0]) <= op_top(&w[1]));
         self.hotspots = page.hotspots;
         self.wide_regions = page.wide_regions;
+        // The pan belongs to the region it was made on, and the regions are new: a
+        // window narrowed far enough will leave a table out of the list altogether, and
+        // then the index the reader was panning names whatever took its place. Put away
+        // with the old list, since an offset into a region that is no longer wide
+        // enough to pan is not a place the reader can be taken back to.
+        self.wide_active = None;
+        self.wide_offset = 0.0;
         self.note_tops = page.note_tops;
         self.anchor_tops = page.anchor_tops;
         // A selection is a pair of places in the old wrapping. Lines have moved, so
@@ -6392,10 +6870,13 @@ impl View {
         }
         let (x, y, w, h) = find_edit((self.client_w - self.content_dx()).max(1.0));
         // The bar and the box are drawn in the render target's unit, and the window
-        // manager places a child in pixels of its own. The tree's width is in that same
-        // unit as the bar, so it is carried across with the rest of it rather than added
-        // to a number already in pixels.
-        let k = unit_px(self.dpi);
+        // manager places a child in pixels of its own -- two coordinate systems, and
+        // this the one place that turns the first into the second. It is a conversion
+        // of 1.0 because the target is pinned to `TARGET_DPI`, not because the monitor
+        // is at 96: `self.dpi` is what the page was laid out against and has no part in
+        // it. The tree's width is in the same unit as the bar, so it is carried across
+        // with the rest of it rather than added to a number already in pixels.
+        let k = unit_px(TARGET_DPI);
         let at = |u: i32| (u as f32 * k) as i32;
         let _ = MoveWindow(
             edit,
@@ -6480,13 +6961,12 @@ impl View {
         let needle = &self.find_needle.as_ref().unwrap().1;
         let marks: Vec<Selection> =
             needle.hits(query).iter().filter_map(|h| needle.span(h)).collect();
-        // The first hit at or below the top edge of the window: a reader who has typed a
-        // word wants the page's answer to start where they were looking, not at the first
-        // line of the document three screens above. Hits stand in reading order, so the
-        // line they name only grows.
+        // A window scrolled past the last line is looking at nothing, and there is no
+        // line to start a search at. The last hit is the one nearest it, and the page is
+        // not scrolled: there is nowhere below the end of the document for it to go.
         let top = self.top_line();
-        let focus = marks.partition_point(|m| m.from.line < top);
-        if scroll {
+        let focus = find_focus(&marks, top);
+        if scroll && top.is_some() {
             if let Some(m) = marks.get(focus) {
                 self.scroll_to_caret(m.from);
             }
@@ -6496,12 +6976,8 @@ impl View {
     }
 
     /// The line the window is looking at, which is where a search begins.
-    fn top_line(&self) -> usize {
-        let top = scroll_dip(self.scroll, self.dpi);
-        let line = self.sel_index.partition_point(|l| l.y + l.h <= top);
-        // Past the last line means the whole document scrolled by, which reports
-        // the same line the scan it replaces reported.
-        if line == self.sel_index.len() { 0 } else { line }
+    fn top_line(&self) -> Option<usize> {
+        top_line_in(&self.sel_index, scroll_dip(self.scroll, self.dpi))
     }
 
     /// `Enter`, and `Shift`+`Enter`: walk the hits the search has already found, bringing
@@ -7178,6 +7654,12 @@ fn layout_block(
     } else { None };
     let panel_top = y;
     let mut panel_bottom = y;
+    // Where this block's own ops begin, which is where a rule that marks the block has
+    // to stand. Pushed after them, such a rule carried the block's own top while sitting
+    // below the lines it decorates -- a top before the op in front of it, which the
+    // page's binary search over ops reads as a page out of reading order and never
+    // recovers from.
+    let block_at = ops.len();
     // How far into this block's text the selection index has reached, which is shared
     // by every line of it because the space between two of them is in neither.
     let mut consumed = 0usize;
@@ -7356,7 +7838,14 @@ fn layout_block(
             text.y = baseline;
             math_texts.push(text);
         }
-        ops.push(Op::Runs(runs));
+        // A line with nothing in it pushes no op at all. An empty run list has no
+        // baseline to be found from, so `op_top` would answer 0 for it -- an op above
+        // every other on the page, and one that latches the list's "is this in reading
+        // order" to false for the rest of the session, which is what makes a single
+        // blank line inside a fence cost a walk of every op on every frame.
+        if !runs.is_empty() {
+            ops.push(Op::Runs(runs));
+        }
         if let Some((kind, x, content_w, visible_w)) = line_wide {
             let index = wide.len();
             wide.push(WideRegion {
@@ -7395,8 +7884,11 @@ fn layout_block(
 
     if let Some(role) = bg_role {
         let pad = theme.base * 0.45;
+        // In front of the block's own ops, which is where a background belongs -- and
+        // where counting back a line's worth of ops no longer reaches it, now that a
+        // line with nothing in it pushes none.
         ops.insert(
-            ops.len().saturating_sub(plan.lines.len()),
+            block_at,
             Op::Rect {
                 x: (left - pad) * k,
                 y: (panel_top - pad * 0.6) * k,
@@ -7407,7 +7899,11 @@ fn layout_block(
         );
     }
     if b.quote_depth > 0 {
-        ops.push(Op::Line {
+        // The bar down the side of the block, standing in front of the block's own ops
+        // rather than behind them: it is drawn out in the margin, where it is over
+        // nothing, and this is the order the list has to be in for the page to find the
+        // band in front of the reader by asking half of it.
+        ops.insert(block_at, Op::Line {
             x0: (left - theme.base * 0.5) * k,
             y0: panel_top * k,
             x1: (left - theme.base * 0.5) * k,
@@ -7451,7 +7947,7 @@ impl View {
     /// of the reader -- and one still being laid out measures against what it has so far.
     fn progress_percent(&self) -> u32 {
         let view = (self.content_bottom() - TOPBAR_H).max(1.0) / scale_of(self.dpi);
-        let max = (self.content_h + self.theme.base - view).max(0.0);
+        let max = max_scroll_of(self.content_h, self.theme.base, view);
         if max <= 0.0 {
             return 100;
         }
@@ -7582,7 +8078,7 @@ impl View {
             })
     }
     fn thumb_rect(&self) -> Option<(f32, f32, f32, f32)> {
-        thumb_rect(self.content_h, self.client_w, (self.content_bottom() - TOPBAR_H).max(1.0), self.scroll, self.dpi)
+        thumb_rect(self.content_h, self.theme.base, self.client_w, (self.content_bottom() - TOPBAR_H).max(1.0), self.scroll, self.dpi)
     }
 
     fn tab_title(tab: &Tab) -> String {
@@ -7736,13 +8232,7 @@ impl View {
     /// the strip's right-hand end and are the strip's own height tall, counted from
     /// the corner inwards: close, maximise, minimise.
     fn caption_button_at(&self, x: f32, y: f32) -> Option<CapBtn> {
-        if !(0.0..TOPBAR_H).contains(&y) { return None; }
-        match ((self.client_w - x) / CAPTION_BTN_W).floor() as i32 {
-            0 => Some(CapBtn::Close),
-            1 => Some(CapBtn::Max),
-            2 => Some(CapBtn::Min),
-            _ => None,
-        }
+        caption_button_at(x, y, self.client_w)
     }
 
     /// What a window control does, once its press has been kept to its release.
@@ -8066,8 +8556,8 @@ impl View {
         let red = self.cap_red_brush.clone();
         let red_pressed = self.cap_red_press_brush.clone();
         let white = self.cap_ink_brush.clone();
-        for (i, btn) in [CapBtn::Close, CapBtn::Max, CapBtn::Min].iter().enumerate() {
-            let left = self.client_w - (i as f32 + 1.0) * CAPTION_BTN_W;
+        for (i, btn) in CAPTION_ORDER.iter().enumerate() {
+            let (left, _, _, _) = caption_button_rect(i as f32, self.client_w);
             let cx = left + CAPTION_BTN_W * 0.5;
             let cy = TOPBAR_H * 0.5;
             let hot = self.cap_hot == Some(*btn);
@@ -8151,7 +8641,7 @@ impl View {
     fn scroll_to_thumb(&mut self, pointer_y: f32) {
         let Some((_, _, _, th)) = self.thumb_rect() else { return };
         let view = (self.content_bottom() - TOPBAR_H).max(1.0);
-        let max_scroll = (self.content_h - view / scale_of(self.dpi)).max(0.0);
+        let max_scroll = max_scroll_of(self.content_h, self.theme.base, view / scale_of(self.dpi));
         let room = (view - th).max(1.0);
         let centre = (pointer_y - TOPBAR_H - th * 0.5).clamp(0.0, room);
         self.scroll = centre / room * max_scroll;
@@ -8200,6 +8690,7 @@ impl View {
         std::mem::swap(&mut page.doc, &mut self.doc);
         std::mem::swap(&mut page.counts, &mut self.counts);
         std::mem::swap(&mut page.ops, &mut self.ops);
+        self.ops_reach = op_reach(&self.ops);
         self.ops_sorted = self.ops.windows(2).all(|w| op_top(&w[0]) <= op_top(&w[1]));
         std::mem::swap(&mut page.reading_mode, &mut self.reading_mode);
         std::mem::swap(&mut page.page_starts, &mut self.page_starts);
@@ -8720,23 +9211,35 @@ impl View {
         // an open note is anchored to. `reopen` repaints either way, so putting the
         // note away here costs nothing and saves a panel following them across a jump.
         self.close_note_bubble();
+        // Read where the reader is from before the move, and the place to move to
+        // without taking it. The road behind them changes only once the step has
+        // actually landed: a page on a share that has gone quiet raises a dialog and
+        // leaves them where they were, and a place spent on a move that did not happen
+        // is a place they cannot be taken back to -- `Alt`+`Right` would answer a
+        // forward step with nothing behind it.
         let here = self.here();
-        let there = if back {
-            self.history.back(here)
-        } else {
-            self.history.forward(here)
-        };
-        let Some(there) = there else {
+        let Some(there) = self.history.peek(back) else {
             // Nowhere to go, which the menu dims and the key cannot prevent. A reader who
             // has been at one page since the window opened presses Alt+left on instinct,
             // and the answer is that nothing moves.
             return;
         };
-        self.reopen(there, hwnd);
+        if !self.reopen(there, hwnd) {
+            return;
+        }
+        if back {
+            self.history.back(here);
+        } else {
+            self.history.forward(here);
+        }
     }
 
     /// Stand on a remembered place: the page it was on, at the offset it was left at.
-    fn reopen(&mut self, there: Visit, hwnd: HWND) {
+    ///
+    /// Answers whether the reader is standing on it afterwards, which is false where the
+    /// place cannot be read: the step is abandoned rather than faked, and the caller
+    /// leaves the road behind them as it was, so the same step can be asked for again.
+    fn reopen(&mut self, there: Visit, hwnd: HWND) -> bool {
         self.cancel_page_transition();
         if let Some(path) = &there.path {
             // A step back to a heading on the page already open is the common kind of
@@ -8747,10 +9250,10 @@ impl View {
             if self.path.as_deref() != Some(path.as_path()) {
                 match self.try_show_document(path, hwnd) {
                     Ok(()) => {}
-                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => return,
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => return false,
                     Err(error) => {
                         show_error(hwnd, &document_open_error_in(path, &error, self.lang));
-                        return;
+                        return false;
                     }
                 }
             }
@@ -8762,6 +9265,7 @@ impl View {
         self.scroll = there.scroll;
         self.snap_to_page();
         let _ = unsafe { InvalidateRect(Some(hwnd), None, false) };
+        true
     }
 
     /// The common dialog. Returns the chosen path, if the user did not cancel.
@@ -8793,6 +9297,12 @@ impl View {
         let Some(target) = self.target.clone() else { return };
         unsafe {
             self.ensure_brushes();
+            // The binding drops `BeginDraw`'s own result, and there is nothing in it to
+            // act on: the only failure it has is `E_INVALIDARG`, which means this
+            // function left a clip or a transform open, which no reader can bring about.
+            // A *device* loss is reported by `EndDraw`, and both exits below read it --
+            // by the time it returns, the clip and the transform above have been unwound
+            // by `EndDraw` itself, so the recovery path is balanced like every other.
             target.BeginDraw();
             let bg = d2d(self.palette.bg);
             target.Clear(Some(&bg));
@@ -8821,7 +9331,7 @@ impl View {
                 }
                 target.SetTransform(&Matrix3x2::identity());
                 self.draw_status_bar(&target);
-                let _ = target.EndDraw(None, None);
+                if let Err(error) = target.EndDraw(None, None) { self.draw_failed(error.code()); }
                 return;
             }
             let content_dx = self.content_dx();
@@ -8838,7 +9348,16 @@ impl View {
             // document y = `top` is the first line under the strip, at client y = TOPBAR_H.
             let top = up + TOPBAR_H;
             let bottom = top + (self.content_bottom() - TOPBAR_H).max(1.0);
-            self.draw_document(&target, &self.ops, up, top, bottom, true);
+            self.draw_document(
+                &target,
+                &self.ops,
+                &self.ops_reach,
+                up,
+                top,
+                bottom,
+                self.ops_sorted,
+                true,
+            );
             self.draw_preview(&target);
             // Search marks, selection bands, and the caret all belong to the page that
             // is currently in front. Their line indexes stay global, so snapping to a
@@ -8870,7 +9389,56 @@ impl View {
             }
             target.SetTransform(&Matrix3x2::identity());
             self.draw_status_bar(&target);
-            let _ = target.EndDraw(None, None);
+            if let Err(error) = target.EndDraw(None, None) { self.draw_failed(error.code()); }
+        }
+    }
+
+    /// What a frame that could not be drawn leaves behind, and what stands in its place.
+    ///
+    /// `D2DERR_RECREATE_TARGET` is not a failed picture, it is the whole device gone: a
+    /// monitor unplugged or reconnected, a resolution or refresh-rate change, a driver
+    /// reset, `Win`+`Ctrl`+`Shift`+`B`. Every later call against the old target is then a
+    /// silent no-op -- it returns `S_OK` and draws nothing -- and because `WM_PAINT`
+    /// ends in `ValidateRect` the window is never asked to paint again anyway. A reader
+    /// who lost their display gets a blank rectangle with a live title bar, a live caret
+    /// and a live scrollbar, and it stays that way until the process is restarted.
+    ///
+    /// So the target and every brush made from it are dropped -- they name a device that
+    /// is not there -- and made again at once. What survives is the window's own: the
+    /// display list, the scroll, the tabs, the find query. Those are what the new target
+    /// is asked to draw, and no relayout is wanted or needed: a new device is new glass
+    /// for the same page, not new wrapping for the same text.
+    ///
+    /// Any other failure is somebody's bug rather than the hardware's, so it is written
+    /// to stderr and the target is kept: replacing it would not help, and a target that
+    /// cannot be made at all stays `None`, which leaves `paint` returning early and
+    /// stops a broken device from repainting in a loop.
+    unsafe fn draw_failed(&mut self, hr: windows::core::HRESULT) {
+        if hr != D2DERR_RECREATE_TARGET {
+            eprintln!("draw: {hr:?}");
+            return;
+        }
+        let hwnd = self.hwnd;
+        self.target = None;
+        self.hwnd_target = None;
+        self.brushes.clear();
+        self.sel_brush = None;
+        self.hit_brush = None;
+        self.focus_brush = None;
+        self.frame_brush = None;
+        self.cap_red_brush = None;
+        self.cap_red_press_brush = None;
+        self.cap_ink_brush = None;
+        self.cap_press_brush = None;
+        // `attach` is the window's own way of making a target -- the same call, at the
+        // same window DPI, from the same live client rect -- and everything else it does
+        // is a repeat of what it did when the window was created.
+        self.attach(hwnd);
+        // Only a repaint the reader can see. A target that could not be made leaves
+        // `None` behind, and `paint` then has nothing to draw with and returns before
+        // `EndDraw`, so there is no cycle here to fall into.
+        if self.target.is_some() {
+            let _ = InvalidateRect(Some(hwnd), None, false);
         }
     }
 
@@ -8970,7 +9538,16 @@ impl View {
         target.PushAxisAlignedClip(&content_rect, D2D1_ANTIALIAS_MODE_PER_PRIMITIVE);
         if paint.paints_text() {
             target.SetTransform(&Matrix3x2::translation(tx, 0.0));
-            self.draw_document(target, &self.ops, up, band_top, band_bottom, true);
+            self.draw_document(
+                target,
+                &self.ops,
+                &self.ops_reach,
+                up,
+                band_top,
+                band_bottom,
+                self.ops_sorted,
+                true,
+            );
             if paint.paints_marks() {
                 self.draw_page_overlays(target, up, band_top, band_bottom);
             }
@@ -9243,6 +9820,14 @@ impl View {
             };
             tops.push(last);
         }
+        // Read the same way for the painter: the band it cuts the bubble at is found by
+        // binary search over these tops, and that is only an answer if the list is
+        // ordered. It is the note's own answer and not the page's -- a note carrying a
+        // table lays its cells out column by column, and a page that is ordered can
+        // still be showing one. Taking it here rather than there is free: the tops are
+        // already in hand, and truncating a prefix and adding an ellipsis below the
+        // last line kept both leave the order they were in.
+        let sorted = tops.windows(2).all(|w| w[0] <= w[1]);
         let (keep, cut) = bubble_cut(&tops, room, mark);
         ops.truncate(keep);
         if let Some(baseline) = cut {
@@ -9283,7 +9868,9 @@ impl View {
         Some(NoteBubble {
             note: index,
             measure,
+            reach: op_reach(&ops),
             ops,
+            sorted,
             height: if cut.is_some() { max_h } else { y },
         })
     }
@@ -9334,7 +9921,16 @@ impl View {
         };
         target.PushAxisAlignedClip(&inner, D2D1_ANTIALIAS_MODE_PER_PRIMITIVE);
         target.SetTransform(&Matrix3x2::translation(inner.left, inner.top));
-        self.draw_document(target, &bubble.ops, 0.0, -1.0, inner.bottom - inner.top, false);
+        self.draw_document(
+            target,
+            &bubble.ops,
+            &bubble.reach,
+            0.0,
+            -1.0,
+            inner.bottom - inner.top,
+            bubble.sorted,
+            false,
+        );
         target.PopAxisAlignedClip();
         let restore = if self.reading_mode == ReadingMode::Stack {
             Matrix3x2::identity()
@@ -9348,37 +9944,40 @@ impl View {
     /// continuous viewport and each card in the stack; only `up` and the visible band
     /// change between them, and a note's bubble brings a list of its own.
     ///
+    /// `sorted` is `ops`' own answer to whether it is in reading order, which the page
+    /// knows about its ops and a note's bubble about its own: asking the page would be
+    /// asking one list about another, and a note carrying a table lays its cells out
+    /// column by column where the page it floats over does not.
+    ///
+    /// `reach` is that same list's running maximum of bottoms, one entry per op, built
+    /// where the list was: the page builds it in its layout, a bubble where its own ops
+    /// are assembled. It is what the band's lower edge is found by, and it travels with
+    /// the list because the painter asks of it once a frame and must not build it.
+    ///
     /// `shift_wide` says these are the page's ops, which is what the pan of a wide
     /// table applies to. A bubble's ops are set in its own origin and know nothing of
     /// the region the reader may have panned on the page underneath, so asking about
     /// that region for them would move the note to match a gesture it is not part of.
+    #[allow(clippy::too_many_arguments)]
     unsafe fn draw_document(
         &self,
         target: &ID2D1RenderTarget,
         ops: &[Op],
+        reach: &[Pt],
         up: Pt,
         top: Pt,
         bottom: Pt,
+        sorted: bool,
         shift_wide: bool,
     ) {
-        // The display list is in reading order and an op never rises above the one
-        // before it, so the visible band is a contiguous slice: find its ends by
-        // binary search rather than testing a whole document's ops per frame. The
-        // first op is stepped back one in case its ink is tall enough to reach into the
-        // band from above it.
         let pan = |x: f32, y: f32| if shift_wide { self.shift_at(x, y) } else { 0.0 };
-        let (first, past) = if self.ops_sorted {
-            let first = ops.partition_point(|op| op_top(op) < top).saturating_sub(1);
-            (first, ops.partition_point(|op| op_top(op) <= bottom).max(first))
-        } else {
-            (0, ops.len())
-        };
+        let band = visible_band(ops, reach, top, bottom, sorted);
         let mut shifted: Vec<PaintRun> = Vec::new();
-        for op in &ops[first..past] {
+        for op in &ops[band] {
             match op {
                 Op::Rect { x, y, w, h, color } => {
                     let dx = pan(*x, *y);
-                    if y + h < top || *y > bottom {
+                    if op_bottom(op) < top || *y > bottom {
                         continue;
                     }
                     let role = *color;
@@ -9410,7 +10009,7 @@ impl View {
                 }
                 Op::Image { path, x, y, w, h } => {
                     let dx = pan(*x, *y);
-                    if y + h < top || *y > bottom {
+                    if op_bottom(op) < top || *y > bottom {
                         continue;
                     }
                     let Some(store) = self.images.as_ref() else { continue };
@@ -9971,6 +10570,33 @@ fn layout_table(
     }
     let header_index = table_headers.len();
     table_headers.push(TableHeaderFragment { y: grid_top, height: head_h, ops: header_ops });
+    // The grid's vertical rules, placed here rather than after the rows. The boundaries
+    // are the widths themselves rather than `grid_w` divided up: a cell is laid out at
+    // its column's measured width, and a rule between two other numbers would sit on
+    // top of somebody's ink. The grid's own two edges are rules too -- an open right
+    // side reads as a table cut off, not as a table ended.
+    //
+    // They stand in front of the rows because the list is read as a sequence of tops:
+    // a rule pushed after them carried the grid's own top while sitting below every op
+    // in front of it, and the page's binary search over ops reads that as a page out of
+    // reading order and never recovers from it. Their height is the grid's, which the
+    // rows have only just told, so it is filled in below; their top is the header's
+    // bottom, which is where the rows begin and what the op before them says too.
+    let vrules_at = ops.len();
+    let mut edge = left;
+    for i in 0..=widths.len() {
+        if i > 0 {
+            edge += widths[i - 1];
+        }
+        ops.push(Op::Line {
+            x0: edge * k,
+            y0: y * k,
+            x1: edge * k,
+            y1: y * k,
+            thickness: rule * 0.6 * k,
+            color: ColorRole::Faint,
+        });
+    }
     for r in &t.rows {
         y += paint_row(r, y, false, ops, hots, sel);
         // A cell that wraps has no other ending. Without a rule under each row, the
@@ -9986,30 +10612,11 @@ fn layout_table(
             color: ColorRole::Faint,
         });
     }
-    // Last, because a column rule spans a height the rows have only just told. The
-    // boundaries are the widths themselves rather than `grid_w` divided up: a cell is
-    // laid out at its column's measured width, and a rule between two other numbers
-    // would sit on top of somebody's ink. The grid's own two edges are rules too --
-    // an open right side reads as a table cut off, not as a table ended.
-    ops.push(Op::Line {
-        x0: left * k,
-        y0: grid_top * k,
-        x1: left * k,
-        y1: y * k,
-        thickness: rule * 0.6 * k,
-        color: ColorRole::Faint,
-    });
-    let mut x = left;
-    for w in widths.iter() {
-        x += w;
-        ops.push(Op::Line {
-            x0: x * k,
-            y0: grid_top * k,
-            x1: x * k,
-            y1: y * k,
-            thickness: rule * 0.6 * k,
-            color: ColorRole::Faint,
-        });
+    // The grid's bottom is known, so the vertical rules reach it.
+    for op in &mut ops[vrules_at..vrules_at + widths.len() + 1] {
+        if let Op::Line { y1, .. } = op {
+            *y1 = y * k;
+        }
     }
     // The header panel is drawn before its text, so its height can only be filled
     // in once the first row has been measured.
@@ -10451,6 +11058,18 @@ fn hyphenation_for(
 /// `width` is expressed in DIPs and `scale` controls the output pixel density. The
 /// layout is built at `72 * scale` DPI so the coordinates in `Page.ops` are already
 /// pixels and the offscreen target does not apply a second scale.
+///
+/// `scale` is a resolution multiplier and nothing else: the page is `width` points wide
+/// at every scale and the canvas is `width * scale` pixels wide, so the same document
+/// exports the same page at 1x, 2x and 3x. It used to hand `build_ops` the bare `width`,
+/// which -- since `build_in_chunks` divides that by `scale_of(dpi)` to get the measure in
+/// points, and `scale_of(72 * scale)` is exactly `scale` -- laid the page out as a
+/// `width / scale` point measure and drew it `width` pixels across a canvas of
+/// `width * scale`. A 400pt page at scale 2 was typeset as a 200pt column in the left
+/// quarter of an 800px canvas, with line breaks belonging to a measure half the one the
+/// flag promised. The measure does not change with the resolution, so the client width
+/// handed down is now `width * scale`, which `build_in_chunks` divides by that same
+/// `scale` back out to the `width` points of measure it was asked for.
 pub(crate) fn export_png(
     source: &str,
     input_path: Option<&Path>,
@@ -10505,7 +11124,7 @@ pub(crate) fn export_png(
         &mut font,
         &theme,
         &doc,
-        width,
+        width * scale,
         72.0 * scale,
         &mut objects,
         hyphenator.as_ref(),
@@ -10518,6 +11137,24 @@ pub(crate) fn export_png(
     unsafe { write_png(&page, output, pixel_width, pixel_height, dark, store.as_ref()) }
 }
 
+/// Paint a [`Page`] into a bitmap and write it out.
+///
+/// The offscreen target is made at [`TARGET_DPI`] for the same reason the window's is:
+/// one of its units has to be one physical pixel. `export_png` hands `build_ops` a dpi
+/// of `72 * scale`, so `scale_of` there is exactly `scale` and every coordinate already
+/// in `Page.ops` is an output pixel -- a `width`-point page spans `width * scale` of
+/// them, which is exactly the `pixel_width` the bitmap is created with. That identity
+/// is what the client width of `width * scale` in `export_png` exists for: handed the
+/// bare `width` it laid a `width / scale` point page, whose display list spans only
+/// `width` pixels of a `width * scale` bitmap and so fills a `scale`th of the canvas.
+///
+/// It used to be made at 72 instead, which is not a neutral choice but a second
+/// multiplication: a target at `d` maps one of its units to `d / 96` physical pixels,
+/// so at 72 every coordinate was drawn three quarters of its own size, anchored at the
+/// top left. A 400pt page exported at scale 1 put its first ink pixel at x=26 instead
+/// of the x=35 its 35.1px margin asked for, and left a quarter of the canvas blank
+/// down the right and the bottom. The doc comment above `export_png` already claimed
+/// the opposite of what the target did, and it was right; only the `dpiX` was wrong.
 unsafe fn write_png(
     page: &Page,
     output: &Path,
@@ -10544,8 +11181,11 @@ unsafe fn write_png(
             format: DXGI_FORMAT_B8G8R8A8_UNORM,
             alphaMode: D2D1_ALPHA_MODE_PREMULTIPLIED,
         },
-        dpiX: 72.0,
-        dpiY: 72.0,
+        // 96, not 72 and not a dpi of its own. `Page.ops` came out of `build_ops`
+        // already measured in output pixels, so this target's job is to be a pass
+        // through and not a second scaling of one. See the doc comment above.
+        dpiX: TARGET_DPI,
+        dpiY: TARGET_DPI,
         usage: D2D1_RENDER_TARGET_USAGE_NONE,
         minLevel: D2D1_FEATURE_LEVEL_DEFAULT,
     };
@@ -10737,6 +11377,40 @@ fn translate_pdf_op(op: &Op, dy: f32) -> Op {
     translated
 }
 
+/// Whether an op has any ink in the band that runs from `top` for `band` points.
+///
+/// A page walks the whole document's op list to find the slice of it that is its own,
+/// so this runs once per op per page and has to be cheap: it asks the question and
+/// leaves the op alone, where answering it after a deep clone -- four `Vec`s, two
+/// `String`s and a COM `AddRef` apiece -- made the export quadratic in the length of
+/// the document.
+///
+/// The tests are the ones the PDF writer's drawing arms make, so the two cannot drift
+/// into disagreeing about which page owns an op; where an arm goes on to clip (a
+/// figure is cut at the band edge and its remainder handed to the page below, a rule
+/// is trimmed to the band) this deliberately says yes a little too often rather than
+/// dropping something the arm would have drawn.
+#[cfg(feature = "pdf")]
+fn op_intersects_band(op: &Op, top: Pt, band: Pt) -> bool {
+    match op {
+        Op::Rect { y, w, h, .. } => {
+            let y0 = *y - top;
+            y0 + *h > 0.0 && y0 < band && *w > 0.0 && *h > 0.0
+        }
+        Op::Line { y0, y1, .. } => {
+            let (a, b) = (*y0 - top, *y1 - top);
+            !((a < 0.0 && b < 0.0) || (a >= band && b >= band))
+        }
+        Op::Image { y, w, h, .. } => {
+            let local_y = *y - top;
+            local_y + *h > 0.0 && local_y < band && *w > 0.0 && *h > 0.0
+        }
+        Op::Runs(runs) => runs
+            .iter()
+            .any(|run| !run.glyphs.is_empty() && (run.baseline - top) >= 0.0 && (run.baseline - top) < band),
+    }
+}
+
 fn page_index_at(starts: &[Pt], scroll: Pt) -> usize {
     if starts.is_empty() { return 0; }
     starts.partition_point(|top| *top <= scroll + 0.01).saturating_sub(1)
@@ -10803,7 +11477,15 @@ fn reader_page_starts(sel: &[SelLine], anchors: &[Pt], height: Pt, page_height: 
             .iter()
             .copied()
             .find(|top| *top >= previous && *top < y && y - *top <= height * 2.0);
-        let start = heading.unwrap_or(y);
+        // `previous` is itself an anchor whenever the last break landed on a heading --
+        // either the heading branch took `start = heading` or `start = y` was a heading
+        // line's top, which is exactly the anchor recorded for it. A candidate that
+        // lands back on `previous` therefore moves the break nowhere, and taking it
+        // still fails the test below, so nothing is pushed and `limit` never advances:
+        // the lines between the old limit and the next start are drawn on no page at
+        // all. A heading that is already the page's first line keeps the page; the
+        // break has to land strictly beyond it.
+        let start = heading.filter(|top| *top > previous + 0.01).unwrap_or(y);
         if start > previous + 0.01 {
             starts.push(start);
             limit = start + page_height;
@@ -10866,6 +11548,21 @@ fn write_pdf(
     let mut missing_font_faces = Vec::new();
     let mut images: HashMap<PathBuf, (printpdf::XObjectId, usize, usize)> = HashMap::new();
     let palette = Palette::of(dark);
+    // The part of a figure that reaches past the bottom of the page it was placed on,
+    // waiting for the page below to draw it at zero. A rule and a filled box are
+    // clipped instead, because clipping them loses nothing -- a rule is a rule -- but
+    // a figure is not: cut at the band edge the bottom of the picture is simply gone,
+    // and the viewer cutting the rest off at the MediaBox is not a smaller loss, it is
+    // the same one. The remainder is a figure of its own, so the page that takes it
+    // measures it against its own band like any other, and a figure taller than two
+    // pages keeps handing what is left down.
+    let mut carry: Vec<Vec<Op>> = vec![Vec::new(); page_starts.len()];
+    // Which of the document's figures have already handed their bottom to the page
+    // below. The figure itself is not drawn again once it has: its top is off the top
+    // of every page from there on, and what the page below draws in its place covers
+    // exactly the strip the figure would have shown there, so drawing both would put
+    // the same band of picture on two pages.
+    let mut handed_down: Vec<bool> = vec![false; page.ops.len()];
 
     for (page_index, top) in page_starts.iter().copied().enumerate() {
         let content_height = page_starts
@@ -10945,8 +11642,40 @@ fn write_pdf(
             ops.push(PdfOp::EndMarkedContent);
             ops.push(PdfOp::EndTextSection);
         }
-        source_ops.extend(page.ops.iter().map(|op| translate_pdf_op(op, content_shift)));
-        for op in &source_ops {
+        // What the page below inherited, first. It is kept in the document's own
+        // coordinates rather than this page's, so that the shift a repeated header or
+        // a continued footnote reserves on the page that takes it applies to the
+        // figure the way it applies to everything else laid out there.
+        source_ops.extend(
+            std::mem::take(&mut carry[page_index])
+                .iter()
+                .map(|op| translate_pdf_op(op, content_shift)),
+        );
+        // The document's own ops come after the header, the footnote and the carried
+        // remainder, so the first `from_page` slots are none of those. The band test
+        // below drops some of the rest too, so a slot does not name the op's place in
+        // `page.ops` either -- `page_slots` is that answer, in push order, and the
+        // image arm needs it to say which figure it has just handed down.
+        let from_page = source_ops.len();
+        let mut page_slots: Vec<usize> = Vec::new();
+        // The band test runs before the clone, not after. A page walks the whole
+        // document's op list to find the slice of it that is its own, and a deep clone
+        // of every op in that list -- four Vecs, two Strings and a COM AddRef each --
+        // only to drop all but one page's worth is what made export quadratic: a
+        // hundred thousand lines spent minutes in the clone alone. The test is the one
+        // the drawing arms make below, lifted out so the two cannot disagree, and it
+        // is stated in the pre-shift frame, which is what `top - content_shift` is.
+        for (index, op) in page.ops.iter().enumerate() {
+            if handed_down[index] {
+                continue;
+            }
+            if !op_intersects_band(op, top - content_shift, content_height) {
+                continue;
+            }
+            source_ops.push(translate_pdf_op(op, content_shift));
+            page_slots.push(index);
+        }
+        for (slot, op) in source_ops.iter().enumerate() {
             match op {
                 Op::Rect { x, y, w, h, color } => {
                     let y0 = *y - top;
@@ -10992,7 +11721,44 @@ fn write_pdf(
                 }
                 Op::Image { path, x, y, w, h } => {
                     let local_y = *y - top;
-                    if local_y + *h <= 0.0 || local_y >= content_height || *w <= 0.0 || *h <= 0.0 {
+                    if *w <= 0.0 || *h <= 0.0 || local_y >= content_height {
+                        continue;
+                    }
+                    // A figure whose top stands above this page was drawn by the page it
+                    // starts on, which handed its bottom down here. What it would show
+                    // between the top of this band and the bottom of it is exactly what
+                    // that remainder shows, so drawing it again would put the same band
+                    // of picture on two pages.
+                    if local_y < 0.0 && slot >= from_page {
+                        continue;
+                    }
+                    if local_y + *h <= 0.0 {
+                        continue;
+                    }
+                    // The part of the figure the band reaches is shown from the
+                    // figure's own top -- a crop and not a squash, since the width is
+                    // scaled the same way -- and what hangs past the bottom becomes a
+                    // figure of its own, placed at the band edge, which the page below
+                    // treats as it treats any other and hands down again in turn. A
+                    // figure taller than the page is therefore cut into as many pieces
+                    // as it takes rather than being cut off once.
+                    let spill = (local_y + *h - content_height).max(0.0);
+                    if spill > 0.0 {
+                        if let Some(next) = carry.get_mut(page_index + 1) {
+                            next.push(Op::Image {
+                                path: path.clone(),
+                                x: *x,
+                                y: *y + (content_height - local_y) - content_shift,
+                                w: *w,
+                                h: spill,
+                            });
+                        }
+                        if slot >= from_page {
+                            handed_down[page_slots[slot - from_page]] = true;
+                        }
+                    }
+                    let visible = (*h - spill).min(content_height - local_y.max(0.0));
+                    if visible <= 0.0 {
                         continue;
                     }
                     let (id, pixel_w, pixel_h) = if let Some(hit) = images.get(path) {
@@ -11007,9 +11773,9 @@ fn write_pdf(
                     };
                     let transform = XObjectTransform {
                         translate_x: Some(printpdf::Pt(*x)),
-                        translate_y: Some(printpdf::Pt(height - local_y - *h)),
+                        translate_y: Some(printpdf::Pt(height - local_y - visible)),
                         scale_x: Some(*w / pixel_w.max(1) as f32),
-                        scale_y: Some(*h / pixel_h.max(1) as f32),
+                        scale_y: Some(visible / pixel_h.max(1) as f32),
                         dpi: Some(72.0),
                         no_auto_scale: true,
                         ..Default::default()
@@ -11115,10 +11881,19 @@ fn write_pdf(
             ops,
         ));
     }
+    // A face the embedder will not take costs the reader the ink of the runs it
+    // carried, not the whole document. An exotic, variable or colour font used once
+    // anywhere in a long text used to end the export here, with no PDF written at all
+    // and nothing but this message to say why -- and the maths layer's identical
+    // failure, two arms above, has always dropped its fragment and gone on. It says
+    // what was dropped on stderr and writes the pages that did resolve.
     if !missing_font_faces.is_empty() {
         missing_font_faces.sort_unstable();
         missing_font_faces.dedup();
-        return Err(format!("PDF cannot embed font(s): {}", missing_font_faces.join(", ")).into());
+        eprintln!(
+            "Rubrica: PDF cannot embed font(s), the text they carried is left out: {}",
+            missing_font_faces.join(", ")
+        );
     }
     let bytes = pdf.save(
         &PdfSaveOptions { optimize: true, subset_fonts: true, ..PdfSaveOptions::default() },
@@ -11368,6 +12143,14 @@ pub fn build_in_chunks(
     let mut wide_emitted: usize = 0;
     let mut table_headers: Vec<TableHeaderFragment> = Vec::new();
     let mut table_spans: Vec<TableSpan> = Vec::new();
+    // Table headers the batches have already carried away, for the same reason the
+    // wide regions have a counter of their own. A span names its table's header by
+    // index into the sink's list, and `table_headers` restarts at nothing in every
+    // window, so without this the second table of a document drew the first table's
+    // header -- its panel, its rule and its text, set at the wrong column widths --
+    // above its own rows. `TableSpan` was the one index-carrying structure the wide
+    // rebasing did not already cover.
+    let mut headers_emitted: usize = 0;
     let mut note_spans: Vec<NoteSpan> = Vec::new();
     let mut math_texts: Vec<MathTextFragment> = Vec::new();
     let mut breaks = HyphenCount::default();
@@ -11489,6 +12272,14 @@ pub fn build_in_chunks(
                     }
                 }
                 wide_emitted += wide.len();
+                // The same rebasing for a span's header: it is an index into the sink's
+                // list, and `table_headers` is about to be taken, so the count of the
+                // headers the batches already carry is what this batch's own indices
+                // have to sit on top of.
+                for span in &mut table_spans {
+                    span.header += headers_emitted;
+                }
+                headers_emitted += table_headers.len();
                 let mut sel = std::mem::take(&mut sel);
                 sel.sort_by(|a, b| {
                     a.y.total_cmp(&b.y).then_with(|| {
@@ -11703,9 +12494,10 @@ pub fn build_in_chunks(
     // They are not blocks, so they add nothing to the count the window tracks the
     // layout's progress by.
     emit!(0);
-    // The counter has served its one purpose -- rebasing hot indices batch by
-    // batch -- and nothing reads it again.
+    // The counters have served their one purpose -- rebasing hot and header indices
+    // batch by batch -- and nothing reads them again.
     let _ = wide_emitted;
+    let _ = headers_emitted;
     // The four fragment lists rode out with the batches, where the sink that
     // assembles a page reads them; carrying copies here would mean taking from
     // buffers the batches already drained.
@@ -11724,6 +12516,43 @@ mod tests {
     use super::*;
 
     const DPI: f32 = 96.0;
+
+    /// The body size a thumb test measures the end of the scroll against: the last line
+    /// of the document reaches the top of the window, and the end of the range is a line
+    /// past the content rather than at it.
+    const THUMB_BASE: f32 = 12.0;
+
+    /// The two bands a held drag listens in, which are the page's own and not the
+    /// window's. The page runs from under the tab strip to above the status bar, and
+    /// everything outside that belongs to the window rather than to the text.
+    #[test]
+    fn an_edge_drag_scrolls_only_where_the_page_is() {
+        let client = 600.0;
+        // With the status bar on, the page stops `STATUS_H` short of the foot -- the same
+        // arithmetic `View::content_bottom` does.
+        let bottom = client - STATUS_H;
+
+        // Over the tab strip: a pointer there is on the window's own furniture, and the
+        // page under it did not move.
+        assert_eq!(edge_scroll_step(0.0, bottom), None);
+        assert_eq!(edge_scroll_step(TOPBAR_H - 1.0, bottom), None);
+        // And over the status bar, all the way down and past the foot: unticking the last
+        // item used to hand the bar's whole band to the page.
+        assert_eq!(edge_scroll_step(bottom + 1.0, bottom), None);
+        assert_eq!(edge_scroll_step(client, bottom), None);
+
+        // The bands themselves, at the page's own two edges -- which is the whole reason
+        // a selection longer than the window can be finished without letting go.
+        assert_eq!(edge_scroll_step(TOPBAR_H, bottom), Some(-6.0));
+        assert_eq!(edge_scroll_step(TOPBAR_H + 19.0, bottom), Some(-6.0));
+        assert_eq!(edge_scroll_step(bottom, bottom), Some(6.0));
+        assert_eq!(edge_scroll_step(bottom - 19.0, bottom), Some(6.0));
+
+        // And the middle of the page, where a drag is only being made.
+        assert_eq!(edge_scroll_step(TOPBAR_H + 20.0, bottom), None);
+        assert_eq!(edge_scroll_step(bottom - 20.0, bottom), None);
+        assert_eq!(edge_scroll_step((TOPBAR_H + bottom) / 2.0, bottom), None);
+    }
 
     #[test]
     fn a_missing_document_gets_a_friendly_open_message() {
@@ -11838,13 +12667,13 @@ mod tests {
     #[test]
     fn no_thumb_when_the_document_fits() {
         // 800 DIP of viewport at 96 dpi is 600pt of page.
-        assert!(thumb_rect(500.0, 1000.0, 800.0, 0.0, DPI).is_none());
-        assert!(thumb_rect(600.0, 1000.0, 800.0, 0.0, DPI).is_none());
+        assert!(thumb_rect(500.0, THUMB_BASE, 1000.0, 800.0, 0.0, DPI).is_none());
+        assert!(thumb_rect(600.0, THUMB_BASE, 1000.0, 800.0, 0.0, DPI).is_none());
     }
 
     #[test]
     fn thumb_height_is_the_viewport_fraction_of_the_document() {
-        let (_, _, _, h) = thumb_rect(2400.0, 1000.0, 800.0, 0.0, DPI).unwrap();
+        let (_, _, _, h) = thumb_rect(2400.0, THUMB_BASE, 1000.0, 800.0, 0.0, DPI).unwrap();
         // doc = 2400pt * 1.3333 = 3200dip; 800*800/3200 = 200
         assert!((h - 200.0).abs() < 0.5, "thumb {h}");
     }
@@ -11853,27 +12682,50 @@ mod tests {
     fn thumb_travel_maps_onto_the_scrollable_range() {
         let content = 2400.0;
         let view = 800.0;
-        let (_, y0, _, h) = thumb_rect(content, 1000.0, view, 0.0, DPI).unwrap();
+        let base = THUMB_BASE;
+        let (_, y0, _, h) = thumb_rect(content, base, 1000.0, view, 0.0, DPI).unwrap();
         assert!(y0.abs() < 0.01, "at the top the thumb must sit at 0, got {y0}");
-        let max_scroll = content - view / scale_of(DPI);
-        let (_, y_end, _, _) = thumb_rect(content, 1000.0, view, max_scroll, DPI).unwrap();
+        // The end of the range is the one the offset is clamped to and the percentage is
+        // measured against, so the thumb only reaches the track's foot there.
+        let max_scroll = max_scroll_of(content, base, view / scale_of(DPI));
+        let (_, y_end, _, _) = thumb_rect(content, base, 1000.0, view, max_scroll, DPI).unwrap();
         assert!((y_end - (view - h)).abs() < 0.5, "at the bottom the thumb must reach the track end: {y_end} vs {}", view - h);
         // Midway in the scroll range is midway along the track.
-        let (_, y_mid, _, _) = thumb_rect(content, 1000.0, view, max_scroll * 0.5, DPI).unwrap();
+        let (_, y_mid, _, _) = thumb_rect(content, base, 1000.0, view, max_scroll * 0.5, DPI).unwrap();
         assert!((y_mid - (view - h) * 0.5).abs() < 1.0, "mid scroll -> {y_mid}");
     }
 
     #[test]
     fn thumb_stays_inside_the_client_width() {
-        let (x, _, track, _) = thumb_rect(2400.0, 400.0, 800.0, 0.0, DPI).unwrap();
+        let (x, _, track, _) = thumb_rect(2400.0, THUMB_BASE, 400.0, 800.0, 0.0, DPI).unwrap();
         assert!(x + track <= 400.0, "thumb overhangs the window: {x}+{track}");
         assert!(x > 0.0);
     }
 
     #[test]
     fn scrolling_past_the_end_clamps_instead_of_leaving_the_track() {
-        let (_, y_over, _, h) = thumb_rect(2400.0, 1000.0, 800.0, 99_000.0, DPI).unwrap();
+        let (_, y_over, _, h) = thumb_rect(2400.0, THUMB_BASE, 1000.0, 800.0, 99_000.0, DPI).unwrap();
         assert!(y_over + h <= 800.0 + 0.5, "thumb left the viewport: {y_over}+{h}");
+    }
+
+    /// The offset, the thumb that draws it and the percentage that reports it are one
+    /// question asked three ways. Measured against the content alone -- which is what
+    /// the thumb used to do -- it was answered a line early: the thumb reached the foot
+    /// of its track while a line of the document was still below it, beside a status bar
+    /// already reading 100%.
+    #[test]
+    fn the_thumb_reaches_the_end_of_its_track_at_the_end_of_the_document() {
+        let content = 2400.0;
+        let base = THUMB_BASE;
+        let view = 800.0;
+        let end = max_scroll_of(content, base, view / scale_of(DPI));
+        let (_, y_end, _, h) = thumb_rect(content, base, 1000.0, view, end, DPI).unwrap();
+        assert!((y_end - (view - h)).abs() < 0.5, "the thumb stops short of the track: {y_end}");
+        // What the thumb used to measure against, and where it left the thumb then.
+        let short = (content - view / scale_of(DPI)).max(0.0);
+        assert!(end > short, "the end of the scroll is the end of the content, not a line before it");
+        let (_, y_short, _, _) = thumb_rect(content, base, 1000.0, view, short, DPI).unwrap();
+        assert!(y_short < (view - h) - 1.0, "and the old measure left a line below the thumb");
     }
 
     #[test]
@@ -11900,6 +12752,189 @@ mod tests {
                 c.line, 1,
                 "a pointer at the painted place reaches the painted line"
             );
+        }
+    }
+
+    /// The DPIs a real monitor reports: unscaled, and the two scalings Windows offers.
+    const SCALES: [f32; 4] = [96.0, 120.0, 144.0, 192.0];
+
+    /// The invariant the whole window stands on, and the one the render target's DPI
+    /// field used to break.
+    ///
+    /// Stated. Let the window be on a monitor of `dpi` and let `k = scale_of(dpi)`. A
+    /// document *point* `P` is held by the display list at document pixel `Y = P * k`.
+    /// Paint lifts the list by `up = scroll_dip(scroll, dpi) = scroll * k` and hands the
+    /// result to a target pinned at `TARGET_DPI`, whose unit is `u = unit_px(TARGET_DPI)`
+    /// physical pixels, so `P` is painted at physical client y `(Y - up) * u`. A click is
+    /// handed a physical client y, and `document_y` adds the scroll back. The two ends
+    /// agree exactly when
+    ///
+    /// ```text
+    /// document_y((Y - up) * u, scroll, dpi) == Y     for every P, scroll and dpi
+    /// ```
+    ///
+    /// which reduces to `u == 1`. With the target made at the window's own dpi, `u` was
+    /// `dpi / 96`: at 150% a click landed a third of a line above the line drawn under
+    /// it, at 200% it landed off the window, and at 96% `u` was 1 and nothing showed --
+    /// which is why the whole suite, written at 96, was green.
+    ///
+    /// There is no window and no monitor in this test, so what it puts a finger on is
+    /// the two ends of that equation and the factor between them, read from
+    /// `window_target_properties` -- the same value `attach` hands Direct2D.
+    #[test]
+    fn a_painted_point_is_the_point_a_click_there_asks_for_at_every_dpi() {
+        let props = window_target_properties();
+        assert_eq!(props.dpiX, props.dpiY, "a target whose two axes disagree has no unit");
+        let u = unit_px(props.dpiX);
+        for dpi in SCALES {
+            let k = scale_of(dpi);
+            // The strip is the chrome offset both ends share: the first line under it is
+            // at client `TOPBAR_H`, and it is the same line a click there names.
+            for scroll in [0.0, 20.0, 400.0] {
+                let up = scroll_dip(scroll, dpi);
+                assert!(
+                    (document_y(TOPBAR_H, scroll, dpi) - (TOPBAR_H + up)).abs() < 1e-3,
+                    "at {dpi} dpi the strip is not where the page starts under it"
+                );
+                for p in [0.0, 10.0, 96.5, 600.0, 2500.0] {
+                    // Where the display list holds the point...
+                    let y = p * k;
+                    // ...where the reader is shown it, and
+                    let physical = (y - up) * u;
+                    // ...what a click there is asked of the list.
+                    let asked = document_y(physical, scroll, dpi);
+                    assert!(
+                        (asked - y).abs() < 1e-3,
+                        "at {dpi} dpi a click {physical}px down the window asked of document \
+                         {asked}, and the line painted there is {y}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// The find bar's panel is painted on the render target; its box is a child window,
+    /// and `MoveWindow` on a Per-Monitor-V2 parent counts the parent's *physical* pixels.
+    /// The two are placed by different systems out of the same rectangle, so they only
+    /// land on each other while a drawn unit is a placed pixel -- the conversion that
+    /// used to be `96 / dpi` and put the box under two thirds the bar's size, nowhere
+    /// near its left edge, on any monitor past 100%.
+    #[test]
+    fn the_find_box_lands_on_the_panel_it_is_drawn_over_at_every_dpi() {
+        let u = unit_px(window_target_properties().dpiX);
+        for dpi in SCALES {
+            for w in [640.0, 1080.0, 1920.0] {
+                // The tree docks the panel to the right of the window as well, and
+                // `position_edit` carries that offset across rather than adding it to a
+                // number already in pixels, so it is asked about here too.
+                for dx in [0.0, 200.0] {
+                    let (px, py, pw, ph) = find_panel(w);
+                    let (ex, ey, ew, eh) = find_edit(w);
+                    // Drawn: the box `draw_find` frames, which it fills a pixel proud of
+                    // on every side so what shows is a line of exactly one unit.
+                    let (fl, ft, fr, fb) = (ex as f32 - 1.0, ey as f32 - 1.0, (ex + ew) as f32 + 1.0, (ey + eh) as f32 + 1.0);
+                    assert!(fl + dx >= px + dx - 0.5, "at {dpi} dpi the box left the bar: {fl}");
+                    // The count's room is measured inside the panel, which the dock
+                    // shifts whole, so it is the same question with or without a tree.
+                    assert!(
+                        (ex + ew) as f32 <= px + pw - FIND_COUNT + 1.0,
+                        "at {dpi} dpi the box took the count's room"
+                    );
+                    assert!(ft >= py - 0.5 && fb <= py + ph + 0.5, "at {dpi} dpi the box left the bar's height");
+                    // Placed: what `position_edit` hands `MoveWindow`, which counts the
+                    // parent's own pixels and knows nothing of the target. It must be
+                    // the box the frame was drawn around, to the pixel.
+                    let (el, et, er, eb) = (ex as f32 * u, ey as f32 * u, (ex + ew) as f32 * u, (ey + eh) as f32 * u);
+                    assert!(
+                        (el, et) == (fl + 1.0, ft + 1.0) && (er, eb) == (fr - 1.0, fb - 1.0),
+                        "at {dpi} dpi a {u}x conversion placed the box at {el},{et}..{er},{eb} where \
+                         the frame was drawn at {fl},{ft}..{fr},{fb}"
+                    );
+                    assert!(
+                        et >= py - 0.5 && eb <= py + ph + 0.5,
+                        "at {dpi} dpi the box was placed off the top of the bar"
+                    );
+                }
+            }
+        }
+    }
+
+    /// Chrome is measured in the window's own pixels against `client_w`/`client_h`, and
+    /// hit-tested against the same numbers. A `dpi/96` on the render target moved the
+    /// ink out of the window and left the tests looking exactly where the control no
+    /// longer was -- an invisible strip of screen where a click still closed the reader.
+    /// The three must be inside the window, and must be the same place.
+    #[test]
+    fn the_window_controls_are_inside_the_window_and_press_where_they_are_drawn() {
+        let u = unit_px(window_target_properties().dpiX);
+        for dpi in SCALES {
+            for client_w in [320.0, 800.0, 1280.0, 1920.0] {
+                for (i, btn) in CAPTION_ORDER.iter().enumerate() {
+                    let (l, t, r, b) = caption_button_rect(i as f32, client_w);
+                    assert!(
+                        l * u >= -0.5 && r * u <= client_w + 0.5,
+                        "at {dpi} dpi the {btn:?} control was painted at {l}..{r} in a {client_w}px window"
+                    );
+                    assert!(t * u >= -0.5 && b * u <= TOPBAR_H + 0.5, "at {dpi} dpi the control left the strip");
+                    // Every pixel of the painted rectangle presses the control painted in
+                    // it -- not its centre alone, which is what a rounding seam would
+                    // leave pressed.
+                    for x in (l * u).round() as i32..=((r - 1.0) * u).round() as i32 {
+                        assert_eq!(
+                            caption_button_at(x as f32 + 0.5, b * u * 0.5, client_w),
+                            Some(*btn),
+                            "at {dpi} dpi the {btn:?} control is painted at {l}..{r} but {x} presses something else"
+                        );
+                    }
+                }
+                // And the strip ends where it is drawn to end: a pixel to the right of
+                // the last control is the window's, and answers nothing.
+                assert_eq!(
+                    caption_button_at(client_w * u + 0.5, TOPBAR_H * 0.5 * u, client_w),
+                    None,
+                    "at {dpi} dpi something answers past the end of the window controls"
+                );
+            }
+        }
+    }
+
+    /// The three bands the window is cut into -- strip, page, status bar -- are all
+    /// measured in the window's own pixels, so none of them may leave it at any scale,
+    /// and the thumb drawn from the same numbers may not either.
+    #[test]
+    fn the_bands_of_the_window_are_inside_it_at_every_dpi() {
+        let u = unit_px(window_target_properties().dpiX);
+        for dpi in SCALES {
+            for (client_w, client_h) in [(320.0, 240.0), (800.0, 600.0), (1920.0, 1080.0)] {
+                for status in [0.0, STATUS_H] {
+                    // `View::content_bottom`, restated: the viewport ends at the top of
+                    // the bar and never above the strip, even in a window too short for
+                    // both of them.
+                    let bottom = (client_h - status).max(TOPBAR_H + 1.0);
+                    let inside = |l: f32, t: f32, r: f32, b: f32, what: &str| {
+                        assert!(
+                            l * u >= -0.5 && t * u >= -0.5 && r * u <= client_w + 0.5
+                                && b * u <= client_h + 0.5,
+                            "at {dpi} dpi the {what} at {l},{t}..{r},{b} left a {client_w}x{client_h} window"
+                        );
+                    };
+                    // The strip, the bar, and the page between them: what the window
+                    // draws, in the units it draws it in.
+                    inside(0.0, 0.0, client_w, TOPBAR_H, "tab strip");
+                    inside(0.0, client_h - status, client_w, client_h, "status bar");
+                    inside(0.0, TOPBAR_H, client_w, bottom, "page");
+                    // And the thumb, which is the reader's only grip on the edge of the
+                    // window and is drawn from the same client numbers as the bands.
+                    for scroll in [0.0, 500.0, 90_000.0] {
+                        let view = (bottom - TOPBAR_H).max(1.0);
+                        if let Some((tx, ty, tw, th)) =
+                            thumb_rect(2400.0, THUMB_BASE, client_w, view, scroll, dpi)
+                        {
+                            inside(tx, ty + TOPBAR_H, tx + tw, ty + TOPBAR_H + th, "thumb");
+                        }
+                    }
+                }
+            }
         }
     }
 
@@ -11934,6 +12969,65 @@ mod tests {
         };
         let starts = pdf_page_starts(&page, 800.0);
         assert_eq!(starts, vec![0.0, 780.0]);
+    }
+
+    /// The heading-keep rule must not be able to stand still.
+    ///
+    /// `previous` is an anchor whenever the last break landed on a heading, and a
+    /// candidate that lands back on it is not a break at all: nothing is pushed, the
+    /// limit never moves, and the lines between the old limit and the next start are
+    /// drawn on no page. A heading above a figure is enough -- the figure's line is
+    /// taller than the page, so the heading is still in range -- and the bottom of the
+    /// picture is what disappears.
+    #[cfg(feature = "pdf")]
+    #[test]
+    fn a_heading_a_page_already_starts_on_never_eats_the_lines_under_it() {
+        let line = |y, h| SelLine {
+            source: None,
+            y,
+            h,
+            join: Join::None,
+            chars: Vec::new(),
+            copies: Vec::new(),
+            xs: Vec::new(),
+            ends: Vec::new(),
+        };
+        let sel = vec![
+            line(700.0, 30.0),
+            line(780.0, 30.0),
+            line(820.0, 30.0),
+            // Taller than the page, so twice its height leaves the stale heading in
+            // range and the break search finds it again.
+            line(1300.0, 400.0),
+            line(1700.0, 20.0),
+        ];
+        let page = Page {
+            ops: Vec::new(),
+            height: 1_800.0,
+            column: 400.0,
+            left: 0.0,
+            hotspots: Vec::new(),
+            note_tops: Vec::new(),
+            anchor_tops: vec![780.0],
+            sel,
+            hyphens: HyphenCount::default(),
+            wide_regions: Vec::new(),
+            table_headers: Vec::new(),
+            table_spans: Vec::new(),
+            note_spans: Vec::new(),
+            math_texts: Vec::new(),
+        };
+        let starts = pdf_page_starts(&page, 800.0);
+        for line in &page.sel {
+            assert!(
+                starts.iter().any(|top| {
+                    *top <= line.y + 0.01 && line.y + line.h <= *top + 800.0 + 0.01
+                }),
+                "the line at {} for {} falls between pages, and no page draws it: {starts:?}",
+                line.y,
+                line.h
+            );
+        }
     }
 
     #[test]
@@ -12099,7 +13193,7 @@ mod tests {
         let (px, py, pw, ph) = find_panel(1080.0);
         // The reader has to be able to grip the scroll with the bar up -- it appeared
         // because they pressed a key, not because they asked for something to lean on.
-        let (tx, _, track, _) = thumb_rect(2400.0, 1080.0, 800.0, 0.0, DPI).unwrap();
+        let (tx, _, track, _) = thumb_rect(2400.0, THUMB_BASE, 1080.0, 800.0, 0.0, DPI).unwrap();
         assert!(px + pw <= tx, "the bar is over the thumb's track: {} > {}", px + pw, tx);
         assert!(!in_find_panel(tx + track / 2.0, py + ph / 2.0, 1080.0), "and the grip is still a press");
         // The box sits inside the panel, with the count's room left at its right -- in
@@ -12114,11 +13208,14 @@ mod tests {
     /// window manager puts a third of a window further right than the one it was drawn
     /// over, and off the edge of the window besides -- still taking the query, still
     /// focused, and showing the reader nothing at all of what they have typed.
+    ///
+    /// The factor is asked of the *target's* dpi, which is what `position_edit` asks of
+    /// and the window's own dpi never was.
     #[test]
     fn the_box_lands_inside_the_window_the_manager_will_place_it_in() {
+        let k = unit_px(window_target_properties().dpiX);
         for w in [640.0, 1080.0, 1920.0] {
             let (ex, ey, ew, eh) = find_edit(w);
-            let k = unit_px(DPI);
             assert!((ex as f32 + ew as f32) * k <= w + 1.0, "the box went over the edge at {w}px");
             assert!(
                 (ey as f32 + eh as f32) * k <= FIND_TOP + FIND_H + 1.0,
@@ -12387,6 +13484,45 @@ mod tests {
         assert_eq!(caret_at(&[], 10.0, 10.0), Caret { line: 0, ch: 0 }, "an empty page has one place");
     }
 
+    /// A table is indexed a column at a time, so a whole row of its cells carries one
+    /// y and only the pointer's x says which cell of it a click means. Answered by the
+    /// line under the pointer alone, every click in a row marks the row's first cell,
+    /// and a drag out of the third column highlights the first.
+    #[test]
+    fn a_click_in_a_table_row_lands_in_the_cell_the_pointer_is_over() {
+        // Two rows of three cells, laid out the way a grid lays them out: cell by cell
+        // down a row, every cell of a row opening at the row's top, and the row below
+        // opening lower. The order the cells are indexed in is the order a copy reads
+        // them in, so it cannot be sorted by y -- only read with it.
+        let cell = |text: &str, x: f32, y: f32, join: Join| {
+            let mut line = sel_line(text, y, join);
+            for v in line.xs.iter_mut().chain(line.ends.iter_mut()) {
+                *v += x;
+            }
+            line
+        };
+        let row = CHAR * 2.0;
+        let sel = vec![
+            cell("aaa", 0.0, 100.0, Join::Newline),
+            cell("bbb", 100.0, 100.0, Join::Tab),
+            cell("ccc", 200.0, 100.0, Join::Tab),
+            cell("ddd", 0.0, 100.0 + row, Join::Newline),
+            cell("eee", 100.0, 100.0 + row, Join::Tab),
+            cell("fff", 200.0, 100.0 + row, Join::Tab),
+        ];
+        assert_eq!(caret_at(&sel, 210.0, 101.0), Caret { line: 2, ch: 1 }, "the third cell is the third cell");
+        assert_eq!(caret_at(&sel, 110.0, 101.0), Caret { line: 1, ch: 1 });
+        assert_eq!(caret_at(&sel, 10.0, 101.0), Caret { line: 0, ch: 1 });
+        // A pointer out in the margin is nearest the first cell, as it always was.
+        assert_eq!(caret_at(&sel, -40.0, 101.0), Caret { line: 0, ch: 0 });
+        // The second row answers for itself at the same x: the walk stops at its first
+        // cell, which opens lower and says so.
+        assert_eq!(caret_at(&sel, 210.0, 101.0 + row), Caret { line: 5, ch: 1 });
+        // And the order the cells are indexed in is still the order a copy reads.
+        let across = Selection { from: Caret { line: 0, ch: 0 }, to: Caret { line: 2, ch: 3 } };
+        assert_eq!(selection_text(&sel, across), "aaa\tbbb\tccc");
+    }
+
     #[test]
     fn a_selection_reads_back_the_separators_between_its_pieces() {
         let sel = [
@@ -12443,6 +13579,21 @@ mod tests {
         let inside = word_at(&sel, Caret { line: 0, ch: 3 });
         assert_eq!((inside.from.ch, inside.to.ch), (0, 11), "the hyphen is inside the word");
         assert_eq!(selection_text(&sel, inside), "well-formed");
+    }
+
+    /// Which apostrophe an author typed is not something a reader can see, and nothing
+    /// between the file and the page turns one into the other: `don't` has to be one
+    /// double-click, and it is the straight quote most Markdown files use.
+    #[test]
+    fn the_apostrophe_inside_a_contraction_is_the_word_which_one_it_is() {
+        assert_eq!(word_kind('\''), WordKind::Word);
+        assert_eq!(word_kind('’'), WordKind::Word);
+        for (text, want) in [("don't stop", "don't"), ("don’t stop", "don’t")] {
+            let sel = [sel_line(text, 0.0, Join::None)];
+            let w = word_at(&sel, Caret { line: 0, ch: 1 });
+            assert_eq!((w.from.ch, w.to.ch), (0, 5), "{text:?}");
+            assert_eq!(selection_text(&sel, w), want, "{text:?}");
+        }
     }
 
     #[test]
@@ -13069,6 +14220,185 @@ mod tests {
     }
 
     #[test]
+    fn a_step_that_cannot_land_leaves_the_road_where_it_was() {
+        let mut h = History::default();
+        h.leave(at(0.0));
+        h.leave(at(12.0));
+        // Where a step would land is read, not taken: asking costs the reader nothing,
+        // and the same question can be asked as often as the key is pressed.
+        assert_eq!(h.peek(true), Some(at(12.0)));
+        assert_eq!(h.peek(true), Some(at(12.0)), "and still the same place after asking twice");
+        assert_eq!(h.peek(false), None, "with nothing ahead of them either");
+        assert_eq!(h.past.len(), 2, "the road behind is the length it was");
+        assert!(h.future.is_empty(), "and nothing pushed onto the far side of it by asking");
+
+        // A step whose page cannot be read -- a share that has gone quiet, which raises a
+        // dialog and leaves the reader where they were -- spends nothing. The place they
+        // tried to go back to is still behind them, so the same step can be asked for
+        // once the share answers; had it been popped first, `Alt`+`Right` would have
+        // found an empty road behind and the place would be gone for good.
+        assert_eq!(h.back(at(30.0)), Some(at(12.0)));
+        assert_eq!(h.peek(false), Some(at(30.0)), "and forward is the page they did not leave");
+        assert_eq!(h.past.len(), 1, "behind which is the page before the one they stood on");
+    }
+
+    #[test]
+    fn a_tall_op_is_found_by_its_bottom_and_not_by_looking_back_one() {
+        // A prose line, then a fenced block: the panel is one `Rect` as tall as the whole
+        // fence, filed before the lines inside it, which are the height a run's ink is --
+        // the baseline up to the baseline plus its em. Tops, the only key there is, run
+        // 0, 40, 50, 70, 90, 110, 120, so the list is ordered by anything a search has.
+        let box_ = |y: f32, h: f32| Op::Rect { x: 0.0, y, w: 400.0, h, color: ColorRole::Surface };
+        let ops = vec![
+            box_(0.0, 14.0),
+            box_(40.0, 120.0),
+            box_(50.0, 14.0),
+            box_(70.0, 14.0),
+            box_(90.0, 14.0),
+            box_(110.0, 14.0),
+            box_(120.0, 14.0),
+        ];
+        let reach = op_reach(&ops);
+        let panel = 1;
+        assert!(ops.windows(2).all(|w| op_top(&w[0]) <= op_top(&w[1])), "the list is in order");
+        assert_eq!(op_bottom(&ops[0]), 14.0, "a line of prose ends just under its baseline");
+        assert_eq!(op_bottom(&ops[panel]), 160.0, "the panel reaches to the bottom of the fence");
+        let rule = Op::Line { x0: 0.0, y0: 90.0, x1: 0.0, y1: 60.0, thickness: 2.0, color: ColorRole::Muted };
+        assert_eq!(op_bottom(&rule), 92.0, "a rule is as tall as its lower end and its stroke");
+        // The reach carries the panel down the whole fence: every index from the panel to
+        // the last line answers 160, because the panel reaches below every line inside it
+        // and no line inside it reaches below the panel -- not even the last, which ends
+        // at 134, four units short of the fence's bottom.
+        assert_eq!(reach, vec![14.0, 160.0, 160.0, 160.0, 160.0, 160.0, 160.0]);
+
+        // The window's top edge has fallen inside the fence, in the fourth code line's own
+        // ink, with two more lines between it and the panel. The tops alone would answer
+        // at the fourth line and leave the panel out: the panel is filed before the lines
+        // it paints behind, and the ops between it and the window all end above it, so
+        // neither its top nor a back-walk over the bottoms says it is there. The reach
+        // does -- it has been 160 since the panel -- and the band begins at the panel
+        // rather than three lines into the fence with no surface behind the code.
+        let band = visible_band(&ops, &reach, 115.0, 175.0, true);
+        assert!(band.contains(&panel), "the panel is in the band, at {band:?}");
+        assert!(band.contains(&6), "and so is the last line of the fence");
+        // Above the fence, and from below its last line, the same answer: the panel is in
+        // the band for as long as any of the block it belongs to is on screen.
+        assert!(visible_band(&ops, &reach, 0.0, 175.0, true).contains(&panel), "from above it");
+        assert!(visible_band(&ops, &reach, 130.0, 175.0, true).contains(&panel), "and from below it");
+        // The far end of the walk is the head of the block, and the band stops at the ops
+        // the layout actually filed: the panel is the first op of the fence, and the band
+        // begins at it, with the line of prose above the fence left out -- that line ends
+        // at 14, well above the window, and the reach says so without being asked twice.
+        assert_eq!(band.start, panel, "so the walk reached the head of the block and no further");
+        assert_eq!(visible_band(&ops, &reach, 0.0, 30.0, true), 0..1, "and the band stops where it does");
+
+        // A page of ordinary lines costs the same everywhere: the reach rises by a line's
+        // own height each op, so a window a long way down a long page still tests only the
+        // ops it can see. The band is not wider than it has to be -- the point of the
+        // search -- so the hundred-unit window at 19,000 of two thousand lines holds the
+        // six ops it touches and walks back not one op further.
+        let prose: Vec<Op> = (0..2000).map(|i| box_(i as f32 * 20.0, 14.0)).collect();
+        let reach = op_reach(&prose);
+        let band = visible_band(&prose, &reach, 19_000.0, 19_100.0, true);
+        assert!(band.contains(&950), "the lines on screen are in the band");
+        assert_eq!(band.end - band.start, 6, "and the walk reaches only as far as the reach is below the top");
+        assert!(band.len() * 8 < prose.len(), "which is nothing beside the page above it");
+
+        // An op taller than any look-back is the whole of why the reach exists. A
+        // full-page figure is one `Op::Image` as tall as the picture, with no height cap
+        // anywhere: the reader scrolls into the middle of it and the reach still says the
+        // ops filed so far reach below the window, so the band starts before the figure
+        // and every part of it is drawn. A look-back of 2048 stops short of it and the
+        // reader scrolls 2500 units into a blank window.
+        let figure = 1;
+        let tall =
+            vec![box_(0.0, 14.0), Op::Image { path: "tall.png".into(), x: 0.0, y: 100.0, w: 400.0, h: 5000.0 }, box_(5140.0, 14.0)];
+        let reach = op_reach(&tall);
+        assert_eq!(reach[figure], 5100.0, "the reach carries the figure to its own bottom");
+        assert_eq!(op_bottom(&tall[figure]), 5100.0, "which is that far below the figure's top");
+        // From the figure's own top edge, and from the middle of it half a mile deep,
+        // the figure is in the band, and nothing before it is: the reach never falls back
+        // below the figure, so the band starts at it and not at the line above it.
+        for top in [100.0, 110.0, 2500.0, 5099.0] {
+            let band = visible_band(&tall, &reach, top, top + 100.0, true);
+            assert!(band.contains(&figure), "from {top} the figure is in the band, at {band:?}");
+            assert_eq!(band.start, 1, "and nothing before it is worth drawing either");
+        }
+        // A window over the top of the page draws the line above the figure as well:
+        // that line is in the band because it is on screen, not because the figure needs
+        // it to be.
+        assert_eq!(visible_band(&tall, &reach, 0.0, 100.0, true), 0..2, "the line and the figure under it");
+        // The line under the figure is an op of its own, and a window that reaches it
+        // draws it too -- which is the band being no wider than it has to be: the same
+        // window sitting inside the figure stops at the figure and at nothing else.
+        assert_eq!(visible_band(&tall, &reach, 5099.0, 5199.0, true), 1..3, "the figure and the line under it");
+        // A window whose top edge is past the figure's own bottom has read the figure and
+        // has no use for it: the band starts at the line under it instead.
+        assert_eq!(visible_band(&tall, &reach, 5150.0, 5250.0, true), 2..3, "the figure is left behind");
+
+        // A list in no order has no band to be found in it, so it is drawn whole. This is
+        // the answer about the list in hand, never one list's answer asked about another:
+        // a page can be in order while the note floating over it is not.
+        let mut jumbled = ops.clone();
+        jumbled.swap(0, 4);
+        assert!(!jumbled.windows(2).all(|w| op_top(&w[0]) <= op_top(&w[1])), "out of order now");
+        assert_eq!(visible_band(&jumbled, &op_reach(&jumbled), 115.0, 175.0, false), 0..7);
+    }
+
+    #[test]
+    fn a_search_starts_near_the_reader_rather_than_past_the_end_of_the_list() {
+        // Six, six and eight characters, stacked at the height the test helper gives
+        // every line, and at one pixel to the point so the numbers below are read as
+        // the geometry they are.
+        let sel = vec![
+            sel_line("first!", 0.0, Join::None),
+            sel_line("second", 12.0, Join::None),
+            sel_line("thirdone", 24.0, Join::None),
+        ];
+        assert_eq!(top_line_in(&sel, 0.0), Some(0));
+        assert_eq!(top_line_in(&sel, 12.0), Some(1));
+        // A line whose bottom edge is exactly at the top of the window is above it.
+        assert_eq!(top_line_in(&sel, 24.0), Some(2));
+        // The bottom of a document is a real place to be and the top edge of the window
+        // can fall past the last line there, so there is no line to start a search at.
+        // The first line is not the answer either: it is three screens above the reader,
+        // and scrolling to the hit they are already past throws them off the end.
+        assert_eq!(top_line_in(&sel, 36.0), None, "the window has scrolled past the last line");
+        assert_eq!(top_line_in(&sel, 999.0), None);
+        assert_eq!(top_line_in(&[], 0.0), None);
+
+        // Six hits, three lines apart, so the second sits at line 3 and the last at 15.
+        let hits = |n: usize| -> Vec<Selection> {
+            (0..n)
+                .map(|i| Selection {
+                    from: Caret { line: i * 3, ch: 0 },
+                    to: Caret { line: i * 3, ch: 2 },
+                })
+                .collect()
+        };
+        let six = hits(6);
+        assert_eq!(find_focus(&six, Some(0)), 0, "the first hit at or below the top of the window");
+        assert_eq!(find_focus(&six, Some(4)), 2);
+        assert_eq!(find_focus(&six, Some(16)), 5, "past the last hit, the last hit is the one");
+        assert_eq!(find_focus(&six, None), 5, "as it is for a window past the end of the page");
+        // The count the bar prints, which is what read "7 of 6": the focus is an index
+        // into the hits, and it may never name one that is not there.
+        assert_eq!(find_count(find_focus(&six, Some(16)), six.len()), "6 of 6");
+        assert_eq!(find_count(6, 6), "7 of 6", "which is what an unclamped focus printed");
+        // `Enter` walks that same index, and a focus one past the end sends it to the
+        // second hit rather than round to the first.
+        let wrapped = |focus: usize, n: usize| (focus + 1) % n;
+        assert_eq!(wrapped(6, 6), 1, "a focus past the end lands on the second hit");
+        let clamped = find_focus(&six, None);
+        assert_eq!(wrapped(clamped, six.len()), 0, "and the last one wraps to the first");
+
+        // A query that found nothing has no focus to clamp, and still counts.
+        assert_eq!(find_focus(&[], Some(0)), 0);
+        assert_eq!(find_focus(&[], None), 0);
+        assert_eq!(find_count(0, 0), "no match", "which the bar says in words");
+    }
+
+    #[test]
     fn a_place_survives_a_reflow_because_characters_do_not_move() {
         // Six, six and eight characters, stacked at the height the test helper gives
         // every line, and at one pixel to the point so the numbers below are the
@@ -13263,6 +14593,88 @@ mod tests {
     }
 
     /// A layout hands its finish to the window whatever its last batch carried.
+    /// A span names its table's header by index, and the index has to be the one the
+    /// sink ended up with.
+    ///
+    /// The header list is drained into every batch, so it restarts at nothing in each
+    /// window, while the spans and the headers themselves are concatenated into one
+    /// list the export reads. A table laid out after the first window therefore named
+    /// the first table's header, and its continuation pages drew that header -- panel,
+    /// rule and all -- at the second table's column widths.
+    #[test]
+    fn a_table_after_the_first_batch_names_its_own_header() {
+        let Ok(mut font) = FontEngine::new() else { return };
+        if !font.probe() {
+            return;
+        }
+        // Far enough apart that the second table cannot land in the first window,
+        // which is twelve blocks.
+        let filler = "Filler paragraph.\n\n".repeat(20);
+        let source = format!(
+            "| a | b |\n|:--|--:|\n| 1 | 2 |\n\n{filler}\n| c | d |\n|:--|--:|\n| 3 | 4 |\n"
+        );
+        let doc = Document::parse(&source);
+        let mut math = crate::math::MathStore::new();
+        let mut objects = Objects::new(None, None, &mut math);
+        let page = build_ops(&mut font, &Theme::default(), &doc, 700.0, DPI, &mut objects, None);
+        assert_eq!(
+            page.table_spans.len(),
+            2,
+            "the document did not lay out two tables: {:?}",
+            page.table_spans.len()
+        );
+        assert_eq!(page.table_headers.len(), 2, "a table laid out no header fragment");
+        for span in &page.table_spans {
+            let header = page
+                .table_headers
+                .get(span.header)
+                .unwrap_or_else(|| panic!("a span points at header {}, and there are two", span.header));
+            assert!(
+                (header.y - span.y).abs() < 0.01,
+                "a table at {} draws the header of the table at {}",
+                span.y,
+                header.y
+            );
+        }
+    }
+
+    /// The display list is searched, not walked, for the band in front of the reader,
+    /// and the search is only honest while the tops come out in reading order. A block
+    /// quote, a grid and a blank line inside a fence each used to put an op above the
+    /// one before it, and one inversion is enough: the answer latches, and from then on
+    /// every frame walks every op the page has.
+    #[test]
+    fn a_quote_a_grid_and_a_blank_line_leave_the_list_in_reading_order() {
+        let Ok(mut font) = FontEngine::new() else { return };
+        if !font.probe() {
+            return;
+        }
+        // Prose either side of each of the three, so a rule that is pushed behind the
+        // block it marks is caught against the op in front of it and not just against
+        // the top of the document.
+        let doc = Document::parse(concat!(
+            "Before the quote.\n\n",
+            "> A quoted line long enough to wrap onto a second line of its own.\n\n",
+            "Between the quote and the fence.\n\n",
+            "```\ncode\n\nmore code\n```\n\n",
+            "Before the grid.\n\n",
+            "| a | b | c |\n|:--|:--|:--|\n| 1 | 2 | 3 |\n\n",
+            "After the grid.\n",
+        ));
+        let mut math = crate::math::MathStore::new();
+        let mut objects = Objects::new(None, None, &mut math);
+        let page = build_ops(&mut font, &Theme::default(), &doc, 700.0, DPI, &mut objects, None);
+        assert!(page.ops.len() > 8, "the page laid out too little to say anything: {}", page.ops.len());
+        for (i, w) in page.ops.windows(2).enumerate() {
+            assert!(
+                op_top(&w[0]) <= op_top(&w[1]),
+                "op {i} sits above the one before it: {} > {}",
+                op_top(&w[0]),
+                op_top(&w[1]),
+            );
+        }
+    }
+
     /// The height the content reaches is what the reader scrolls against and what
     /// the page breaks are read from, and a document with no notes always ends on
     /// an empty batch -- so the batch may be dropped, never the finish.
@@ -13278,6 +14690,33 @@ mod tests {
         let page = build_ops(&mut font, &Theme::default(), &doc, 700.0, DPI, &mut objects, None);
         assert!(page.height > 0.0, "the page never said how tall its content is");
         assert!(page.column > 0.0, "the page never said how wide its measure is");
+    }
+
+    /// A figure on a page the window laid out and one a worker laid out have to be
+    /// looked for in the same folder. A worker has no page to ask, so the folder travels
+    /// in its request: handed nothing, every relative path in it was resolved against
+    /// the process's own working directory instead, and a document that grew past the
+    /// threshold where a layout goes async came out with placeholders where it had
+    /// pictures.
+    #[test]
+    fn a_worker_layout_is_handed_the_folder_its_figures_are_written_against() {
+        let doc = Arc::new(Document::parse("![a figure](fig.png)\n"));
+        let path = PathBuf::from("notes").join("a.md");
+        let request = LayoutRequest {
+            epoch: 0,
+            doc,
+            base: path.parent().map(Path::to_path_buf),
+            theme: Theme::default(),
+            page_w: 700.0,
+            dpi: DPI,
+            hyphenate: false,
+        };
+        let resolved = ImageStore::resolve(request.base.as_deref(), "fig.png");
+        assert!(
+            resolved.to_string_lossy().contains("notes"),
+            "a figure resolved against nothing at all: {resolved:?}",
+        );
+        assert!(resolved.ends_with("fig.png"), "and lost its own name: {resolved:?}");
     }
 
     /// A strip of `count` pills, each asking for one of a few widths, so a name long
@@ -13375,6 +14814,25 @@ mod tests {
         assert!(tight.hidden() > 0, "the tabs were shaved below the floor rather than counted");
         for (_, _, width, _) in &tight.pills {
             assert!(*width >= TAB_MIN_W);
+        }
+    }
+
+    /// A band too narrow even for one pill at the floor used to answer nothing: the run
+    /// of pills was sized to nothing, and with it the control that stands for the tabs
+    /// that do not fit, so a window around 226 DIPs had a strip that drew nothing and
+    /// could not say which document the reader was in.
+    #[test]
+    fn a_band_too_narrow_for_a_pill_still_shows_the_tab_being_read() {
+        let asked = asked_widths(3);
+        for room in [1.0, 20.0, 40.0, 72.0, 109.0, TAB_MIN_W + TAB_GAP] {
+            let layout = tab_layout(&asked, band_of(client_w_with_room(room)), 1, None);
+            assert_eq!(layout.pills.len(), 1, "no pill at all in {room} of room");
+            assert_eq!(layout.pills[0].0, asked[1].0, "and it is not the tab being read");
+            assert!(layout.pills[0].2 > 0.0, "a pill of no width is no pill");
+            assert_eq!(layout.pills.len() + layout.hidden(), asked.len(), "a tab went missing");
+            if room >= TAB_OVERFLOW_W {
+                assert!(layout.overflow.is_some(), "the hidden tabs are unreachable in {room} of room");
+            }
         }
     }
 
@@ -13516,6 +14974,24 @@ mod bidi_tests {
         let rects = selection_rects(&sel, all);
         assert_eq!(rects.len(), 1);
         assert!((rects[0].0 + rects[0].2 - 450.0).abs() < 0.001);
+    }
+
+    /// Where a line draws is how its own arrows walk it. Crossing a break is a
+    /// crossing, and it takes the same ends everywhere: answered with the visual edge
+    /// of the far line, Right and Left landed on opposite sides of it, so Right then
+    /// Left did not come back to where the caret had been and a selection held across
+    /// the crossing would not un-cross itself.
+    #[test]
+    fn crossing_a_break_off_a_bidi_line_lands_where_a_plain_line_does() {
+        let sel = [bidi_line("אב", 1.0), bidi_line("abc", 1.0)];
+        assert!(sel[0].xs.windows(2).any(|w| w[1] < w[0]), "the line does not read backwards");
+        assert_eq!(next_caret(&sel, Caret { line: 0, ch: 0 }, Motion::Right), Caret { line: 1, ch: 0 });
+        assert_eq!(next_caret(&sel, Caret { line: 1, ch: 0 }, Motion::Left), Caret { line: 0, ch: 2 });
+        // The same two crossings on a page of plain lines, which is the convention the
+        // two above have to answer to.
+        let plain = [bidi_line("abc", 1.0), bidi_line("de", 1.0)];
+        assert_eq!(next_caret(&plain, Caret { line: 0, ch: 3 }, Motion::Right), Caret { line: 1, ch: 0 });
+        assert_eq!(next_caret(&plain, Caret { line: 1, ch: 0 }, Motion::Left), Caret { line: 0, ch: 3 });
     }
 
     #[test]

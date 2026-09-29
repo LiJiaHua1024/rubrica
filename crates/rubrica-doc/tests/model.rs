@@ -1003,3 +1003,201 @@ fn a_closing_fence_may_trail_whitespace_and_quoted_fences_still_shield_tex() {
     let prose = doc.blocks.iter().find(|b| b.text.contains("quoted")).unwrap();
     assert!(prose.text.contains('\u{fffc}'), "the TeX became a formula object: {}", prose.text);
 }
+
+// --- list items -------------------------------------------------------------
+
+#[test]
+fn an_items_first_block_is_whatever_the_author_wrote_first() {
+    // A tight item emits no `Tag::Paragraph`, so the marker has nowhere to sit
+    // unless the block that opens carries it. Opening a paragraph to hold it
+    // instead made a fence, a heading and a grid all prose that was set as
+    // justified body text and vanished from the outline.
+    let fence = Document::parse("- ```rust\n  fn main() {}\n  ``` \n");
+    let b = &fence.blocks[0];
+    assert_eq!(b.kind, BlockKind::Code, "a fence is a fence wherever it is written");
+    assert_eq!(b.text, "fn main() {}", "{b:?}");
+    assert_eq!(b.lang.as_deref(), Some("rust"), "the fence keeps its language");
+    assert_eq!(b.list.map(|l| l.depth), Some(0), "and the item's marker");
+    assert_eq!(b.item_depth, Some(0));
+    assert!(b.ragged(), "code set justified is a defect");
+
+    let heading = Document::parse("- # Title\n- second\n");
+    assert_eq!(
+        kinds("- # Title\n- second\n"),
+        vec![BlockKind::Heading(1), BlockKind::Paragraph],
+        "a heading inside an item is a heading, and reaches the outline"
+    );
+    assert_eq!(heading.blocks[0].text, "Title");
+    assert_eq!(heading.blocks[0].list.map(|l| l.depth), Some(0));
+
+    let grid = Document::parse("- | a | b |\n  |---|---|\n  | c | d |\n");
+    assert_eq!(grid.blocks.len(), 1, "{:?}", grid.blocks);
+    let b = &grid.blocks[0];
+    assert_eq!(b.kind, BlockKind::Table, "the grid is a grid: {b:?}");
+    let t = b.table.as_ref().expect("no table");
+    assert_eq!(t.head.iter().map(|c| c.text.clone()).collect::<Vec<_>>(), ["a", "b"]);
+    assert_eq!(t.rows[0].iter().map(|c| c.text.clone()).collect::<Vec<_>>(), ["c", "d"]);
+    // The marker and the column it indents have to agree, or the grid is drawn
+    // at a width its own item continuation does not use.
+    assert_eq!(b.list.map(|l| l.depth), Some(0));
+    assert_eq!(b.item_depth, Some(0));
+}
+
+#[test]
+fn an_item_that_never_held_a_block_leaves_its_marker_behind() {
+    // The marker is held until the item's first block opens, so an item that held
+    // none has to give it back: the next block in the file is not its own.
+    let doc = Document::parse("-\n\nplain paragraph\n");
+    let p = doc.blocks.iter().find(|b| b.text.contains("plain")).expect("prose");
+    assert_eq!(p.list, None, "a marker escaped its item: {p:?}");
+    assert_eq!(p.item_depth, None);
+}
+
+#[test]
+fn a_task_marker_and_the_words_it_opens_share_one_block() {
+    // A tight task item has no block of its own until something opens one, and the
+    // checkbox is among the first things in it.
+    let doc = Document::parse("- [x] done\n- [ ] todo\n");
+    assert_eq!(doc.blocks[0].task, Some(true));
+    assert_eq!(doc.blocks[0].text, "done");
+    assert_eq!(doc.blocks[0].list.map(|l| l.depth), Some(0));
+    assert_eq!(doc.blocks[1].task, Some(false));
+}
+
+#[test]
+fn nesting_deep_past_the_depth_counter_saturates_instead_of_wrapping() {
+    // 256 levels is 512 bytes of input, and a checked build would abort the whole
+    // process on a file the reader merely opened; a release build wrapped the
+    // count round to zero and lost the item's continuation column with it.
+    for levels in [256usize, 300] {
+        let deep = "- ".repeat(levels) + "x";
+        let b = &Document::parse(&deep).blocks[0];
+        assert_eq!(b.text, "x");
+        assert_eq!(b.list.map(|l| l.depth), Some(u8::MAX), "{levels} levels");
+        assert_eq!(b.item_depth, Some(u8::MAX), "{levels} levels");
+    }
+    for levels in [256usize, 300] {
+        let deep = "> ".repeat(levels) + "x";
+        let b = &Document::parse(&deep).blocks[0];
+        assert_eq!(b.text, "x");
+        assert_eq!(b.quote_depth, u8::MAX, "{levels} levels");
+    }
+    // The counts still unwind, and a shallow document is untouched.
+    assert_eq!(Document::parse("- a\n- b\n").blocks[0].item_depth, Some(0));
+    assert_eq!(Document::parse("> a\n").blocks[0].quote_depth, 1);
+}
+
+// --- display math -----------------------------------------------------------
+
+#[test]
+fn a_display_delimiter_is_read_through_quote_markers_and_trailing_blanks() {
+    let math = |src: &str| -> (Vec<BlockKind>, Vec<rubrica_doc::ObjectKind>) {
+        let doc = Document::parse(src);
+        (
+            doc.blocks.iter().map(|b| b.kind).collect(),
+            doc.blocks.iter().flat_map(|b| &b.objects).map(|o| o.kind.clone()).collect(),
+        )
+    };
+    // The `>` markers sit above the delimiter and come off before the test, the
+    // same way they do for a fence.
+    let (kinds, objects) = math("> \\[\n> x^2\n> \\]\n");
+    assert_eq!(objects, [rubrica_doc::ObjectKind::Math { source: " x^2 ".into(), display: true }], "{kinds:?}");
+    assert_eq!(Document::parse("> \\[\n> x^2\n> \\]\n").blocks[0].quote_depth, 1, "still quoted");
+    // Trailing blanks are CommonMark's to allow on a closing line, and this is a
+    // closing line.
+    let (_, objects) = math("\\[   \nx\n\\]   \n");
+    assert_eq!(objects.len(), 1, "{:?}", objects);
+    assert!(matches!(objects[0], rubrica_doc::ObjectKind::Math { display: true, .. }), "{objects:?}");
+    // A delimiter with a list marker in front of it is not one: rewriting only the
+    // closer left a `$$` printed where the author wrote a bracket.
+    let (kinds, objects) = math("- \\[\n  x^2\n  \\]\n");
+    assert!(objects.is_empty(), "a half-rewritten pair: {objects:?}");
+    assert_eq!(kinds, [BlockKind::Paragraph]);
+    assert_eq!(Document::parse("- \\[\n  x^2\n  \\]\n").blocks[0].text, "[ x^2 ]");
+    // And an unpaired closer is an escaped bracket, as it is mid-sentence.
+    assert_eq!(Document::parse("prose \\] here\n").blocks[0].text, "prose ] here");
+    assert!(Document::parse("prose \\] here\n").blocks[0].objects.is_empty());
+}
+
+// --- image alt text ---------------------------------------------------------
+
+#[test]
+fn an_images_alt_text_takes_every_inline_the_author_wrote_in_it() {
+    // Only `Event::Text` used to be diverted, so everything else in the alt was set
+    // as running prose beside the figure and lost from the alt itself.
+    let image = |src: &str| {
+        let b = &Document::parse(src).blocks[0];
+        assert_eq!(b.objects.len(), 1, "{b:?}");
+        match &b.objects[0].kind {
+            rubrica_doc::ObjectKind::Image { src, alt } => (src.clone(), alt.clone()),
+            other => panic!("not a figure: {other:?}"),
+        }
+    };
+    assert_eq!(image("![a `b` c](x.png)\n"), ("x.png".into(), "a b c".into()));
+    assert_eq!(image("![a $y$ b](i.png)\n"), ("i.png".into(), "a y b".into()));
+    assert_eq!(image("![a<br>b](i.png)\n"), ("i.png".into(), "a\nb".into()));
+    assert_eq!(image("![a\nb](i.png)\n"), ("i.png".into(), "a b".into()));
+    // A figure named inside another's alt is part of that name, not a second box:
+    // CommonMark reads the outer alt as `a b c`.
+    assert_eq!(image("![a ![b](j.png) c](i.png)\n"), ("i.png".into(), "a b c".into()));
+    // Whichever way it is read, none of it may be set beside the figure.
+    for src in ["![a `b` c](x.png)\n", "![a $y$ b](i.png)\n", "![a<br>b](i.png)\n", "![a ![b](j.png) c](i.png)\n"] {
+        let b = &Document::parse(src).blocks[0];
+        assert_eq!(b.text, "\u{FFFC}", "alt text leaked into prose: {b:?}");
+    }
+}
+
+// --- source view ------------------------------------------------------------
+
+#[test]
+fn a_code_blocks_source_spans_stop_where_its_text_does() {
+    // The trailing newline the fence's close takes off the text is taken off the
+    // sources too: they used to keep the range they were given, which reached past
+    // the end of the text they address, so a consumer that trusted one to be a
+    // range into `text` mis-sliced.
+    let b = &Document::parse("```\nabc\n\n```\n").blocks[0];
+    assert_eq!(b.text, "abc");
+    assert_eq!(
+        b.sources,
+        vec![rubrica_doc::SourceSpan { range: 0..3, source: 4 }],
+        "the span must not reach past the text it maps"
+    );
+    assert!(b.sources.iter().all(|s| s.range.end <= b.text.len()), "{:?}", b.sources);
+    assert_eq!(rubrica_doc::source_at(&b.sources, b.text.len()), Some(7), "the byte after the code");
+}
+
+// --- emphasis ---------------------------------------------------------------
+
+#[test]
+fn emphasis_never_pairs_across_a_code_span_or_a_link() {
+    // The delimiters stood on either side of a code span, so the pair styled the
+    // code as bold -- which the module's own rule says cannot happen -- and, across
+    // a link, styled the text *after* it.
+    let b = &Document::parse("\u{4ED6}\u{8BF4}**`\u{201C}`**\u{7C97}\u{4F53}\u{3002}\n").blocks[0];
+    let code = b.spans.iter().find(|s| s.style.contains(InlineStyle::CODE)).expect("no code run");
+    assert!(!code.style.contains(InlineStyle::STRONG), "code is never emphasised: {:?}", b.spans);
+    assert_eq!(&b.text[code.range.clone()], "\u{201C}");
+    assert!(!b.text.contains('\u{4E3B}'), "a partner was found across the code span: {:?}", b.text);
+    // Two pairs in one paragraph, the second opener not the first run in the text:
+    // the pairing reached for the run at the opener's place in the stack rather than
+    // at the run the stack held there, and cut the same bytes twice.
+    let shared = Document::parse("\u{89C1}[A**\u{201C}\u{7C97}\u{201D}**](x)\u{540E}\u{6587}**\u{201C}\u{5C3E}\u{201D}**\u{3002}\n");
+    let b = &shared.blocks[0];
+    assert_eq!(b.text, "\u{89C1}A\u{201C}\u{7C97}\u{201D}\u{540E}\u{6587}\u{201C}\u{5C3E}\u{201D}\u{3002}");
+    assert_eq!(&b.text[b.actions[0].range.clone()], "A\u{201C}\u{7C97}\u{201D}");
+    let strong: Vec<&str> = b.spans.iter().filter(|s| s.style.contains(InlineStyle::STRONG))
+        .map(|s| &b.text[s.range.clone()]).collect();
+    assert_eq!(strong, ["\u{201C}\u{7C97}\u{201D}", "\u{201C}\u{5C3E}\u{201D}"], "{strong:?}");
+    // And a pair whose two ends are on either side of a link is not a pair: the
+    // link is closed, and the words after it are the author's own again.
+    let across = Document::parse("\u{89C1}**[\u{4E66}](x)**\u{540E}\u{6587}\u{3002}\n");
+    let b = &across.blocks[0];
+    assert_eq!(&b.text[b.actions[0].range.clone()], "\u{4E66}", "the link keeps its target");
+    assert!(!b.spans.iter().any(|s| s.style.contains(InlineStyle::STRONG)),
+        "the emphasis reached past the link: {:?}", b.spans);
+    // A pair lying wholly inside one link is what the author meant, and stays.
+    let inside = Document::parse("\u{89C1}[\u{7B2C}**\u{201C}\u{4E00}\u{201D}**\u{7AE0}](https://example.com/x)\u{3002}\n");
+    let b = &inside.blocks[0];
+    assert_eq!(&b.text[b.actions[0].range.clone()], "\u{7B2C}\u{201C}\u{4E00}\u{201D}\u{7AE0}");
+    assert!(b.spans.iter().any(|s| s.style.contains(InlineStyle::STRONG)));
+}

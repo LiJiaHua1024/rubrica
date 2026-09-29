@@ -374,11 +374,7 @@ impl Document {
         boundaries.dedup();
         let mut b = Block::literal(BlockKind::Code, source.to_string());
         b.lang = Some("markdown-source".into());
-        b.spans = boundaries.windows(2).filter(|r| r[0] < r[1]).map(|r| {
-            let style = marked.iter().filter(|(m, _)| m.start <= r[0] && m.end >= r[1])
-                .fold(InlineStyle::EMPTY, |style, (_, add)| style | *add);
-            Span { range: r[0]..r[1], style }
-        }).collect();
+        b.spans = source_spans(&marked, &boundaries);
         Document { blocks: vec![b], footnotes: Vec::new() }
     }
 
@@ -412,6 +408,48 @@ impl Document {
         }
         st.finish()
     }
+}
+
+/// The style of every stretch between two boundaries, in one sweep rather than one
+/// pass over the marks per stretch.
+///
+/// A mark covers every window that begins at or after it starts and ends at or
+/// before it ends, which -- both lists being sorted -- is a contiguous run of them.
+/// So the answer is a difference array: each mark counts itself in at the first
+/// window it covers and back out after the last, and a running tally per style bit
+/// is the OR that folding the marks over each window gives. A file is read this way
+/// on every source view, and the pass it replaces grew with the square of its size.
+fn source_spans(marked: &[(std::ops::Range<usize>, InlineStyle)], boundaries: &[usize]) -> Vec<Span> {
+    let mut delta = vec![[0i32; 8]; boundaries.len() + 1];
+    for (range, style) in marked {
+        // The windows `[boundaries[i], boundaries[i + 1]]` a mark covers: those that
+        // begin at or after it starts, up to the last that ends at or before it ends.
+        let first = boundaries.partition_point(|&at| at < range.start);
+        let last = boundaries.partition_point(|&at| at <= range.end).saturating_sub(1);
+        if first >= last {
+            continue;
+        }
+        let mut bits = style.bits();
+        while bits != 0 {
+            let bit = bits.trailing_zeros() as usize;
+            bits &= bits - 1;
+            delta[first][bit] += 1;
+            delta[last][bit] -= 1;
+        }
+    }
+    let mut open = [0i32; 8];
+    boundaries
+        .windows(2)
+        .enumerate()
+        .filter(|(_, r)| r[0] < r[1])
+        .map(|(i, r)| {
+            for bit in 0..8 {
+                open[bit] += delta[i][bit];
+            }
+            let bits = (0..8).fold(0, |bits, bit| bits | i32::from(open[bit] > 0) << bit);
+            Span { range: r[0]..r[1], style: InlineStyle(bits as u8) }
+        })
+        .collect()
 }
 
 /// Reader preferences that change Markdown's interpretation without changing the file.
@@ -453,6 +491,10 @@ fn tex_delimiters(src: &str) -> Option<String> {
     let mut out = String::with_capacity(src.len());
     // The character and run length of a code fence that is still open.
     let mut fence: Option<(char, usize)> = None;
+    // Whether a `\[` has been rewritten, so a `\]` is only rewritten for the `\[`
+    // it closes. An equation opening with no close, or a stray close, is prose: a
+    // lone `$$` would be printed as one.
+    let mut display_open = false;
     for line in src.split_inclusive('\n') {
         let body = line.trim_end_matches(['\n', '\r']);
         let text = body.trim_start();
@@ -484,9 +526,30 @@ fn tex_delimiters(src: &str) -> Option<String> {
             continue;
         }
         let plain = fence.is_some() || indent >= 4;
-        let display = !plain && (text == "\\[" || text == "\\]");
+        // Read against `quoted`, not `text`, for the reason the fence test above
+        // gives: a blockquote's markers sit above the delimiter and come off with
+        // it. The trailing blanks CommonMark lets a closing line keep go too, since
+        // `\[   ` is the same delimiter as `\[`.
+        let bare = quoted.trim_end_matches([' ', '\t']);
+        let display = !plain && match bare {
+            "\\[" => {
+                display_open = true;
+                true
+            }
+            // A `\]` closes an equation only where a `\[` opened one. On its own it
+            // is an escaped bracket, and rewriting it alone would leave a `$$`
+            // printed where the author wrote a bracket.
+            "\\]" => std::mem::replace(&mut display_open, false),
+            _ => false,
+        };
         if display {
+            // The indent and the quote markers are the line's own syntax, not part of
+            // the delimiter: they go back, so the equation stays in the list or the
+            // quote it was written in. So do the trailing blanks, which keeps `\[` to
+            // `$$` the only edit [`rewrite_origins`] has to account for.
+            out.push_str(&body[..body.len() - quoted.len()]);
             out.push_str("$$");
+            out.push_str(&quoted[2..]);
         } else if plain {
             out.push_str(body);
         } else {
@@ -676,6 +739,13 @@ struct Builder<'a> {
     /// [`Block::item_depth`]. Nested items nest the count, so an inner list's blocks
     /// are still marked as belonging to a list.
     in_item: u8,
+    /// The marker of an item whose first block has not opened yet.
+    ///
+    /// A tight item emits no `Tag::Paragraph` of its own, so the block that opens
+    /// inside one is whatever the author wrote first -- a fence, a heading, a grid.
+    /// Holding the marker until that block opens is what lets it be the kind it is
+    /// *and* carry the marker; see [`Builder::open`].
+    pending_item: Option<ListInfo>,
     /// Definitions by label, in the order they were defined.
     notes: Vec<Draft>,
     /// How many labels have been cited, which is the next number to hand out:
@@ -685,8 +755,12 @@ struct Builder<'a> {
     /// Index into `notes` while a definition's blocks are being read, which is where
     /// [`Builder::close`] sends them instead of into the body.
     note: Option<usize>,
-    /// Accumulated while inside `Tag::Image`; its alt text is captured, not set.
-    image: Option<(String, String)>,
+    /// Destination and alt text of each `Tag::Image` that is open, outermost first.
+    ///
+    /// A stack because a figure may stand inside another's alt text, which is
+    /// where CommonMark puts it and where its words belong: the inner figure's alt
+    /// becomes part of the outer one's rather than a second box in the prose.
+    images: Vec<(String, String)>,
     /// The destination of the `Tag::Link` being read, if one is open: every run of
     /// text pushed while it is set belongs to it.
     link: Option<String>,
@@ -720,18 +794,22 @@ impl Builder<'_> {
             Event::Start(tag) => self.start(tag),
             Event::End(tag) => self.end(tag),
             Event::Text(t) => {
-                if let Some((_, alt)) = self.image.as_mut() {
-                    alt.push_str(&t);
-                } else {
+                if !self.alt(&t) {
                     self.put(&t, self.inline);
                 }
             }
             Event::Code(t) => {
+                if self.alt(&t) {
+                    return;
+                }
                 let mut st = self.inline;
                 st.insert(InlineStyle::CODE);
                 self.put(&t, st);
             }
             Event::SoftBreak => {
+                if self.alt(if self.options.keep_line_breaks { "\n" } else { " " }) {
+                    return;
+                }
                 // Mark the join before making it: the space below is what the line
                 // break looked like once CommonMark had folded it, and a definition
                 // list is only recoverable if where the fold happened survived.
@@ -742,8 +820,18 @@ impl Builder<'_> {
                 }
                 self.put(if self.options.keep_line_breaks { "\n" } else { " " }, InlineStyle::EMPTY)
             }
-            Event::HardBreak => self.put("\n", InlineStyle::EMPTY),
+            Event::HardBreak => {
+                if !self.alt("\n") {
+                    self.put("\n", InlineStyle::EMPTY);
+                }
+            }
             Event::TaskListMarker(checked) => {
+                // A tight item holds no block until one opens, and the marker is
+                // among the first things in it: like the item's first run of text,
+                // it opens the block, so that the marker and the words share one.
+                if self.cur.is_none() {
+                    self.open(BlockKind::Paragraph);
+                }
                 if let Some(b) = self.cur.as_mut() {
                     b.task = Some(checked);
                 }
@@ -755,7 +843,7 @@ impl Builder<'_> {
             // its partner are already text, and printing the markup among them would be
             // a lie about what the author meant.
             Event::InlineHtml(h) => {
-                if is_line_break(&h) {
+                if is_line_break(&h) && !self.alt("\n") {
                     self.put("\n", InlineStyle::EMPTY);
                 }
             }
@@ -766,11 +854,16 @@ impl Builder<'_> {
                 Some(buf) => buf.push_str(&h),
                 None => self.set_html(&h),
             },
-            Event::InlineMath(m) => self.push_object(ObjectKind::Math {
-                source: math_source(&m),
-                display: false,
-            }),
+            Event::InlineMath(m) => {
+                let source = math_source(&m);
+                if !self.alt(&source) {
+                    self.push_object(ObjectKind::Math { source, display: false });
+                }
+            }
             Event::DisplayMath(m) => {
+                if self.alt(&math_source(&m)) {
+                    return;
+                }
                 // The parser reports a displayed formula between blocks, with no
                 // paragraph around it. Closing first is what stops it swallowing the
                 // block that follows: `open` does nothing while one is still current.
@@ -787,9 +880,12 @@ impl Builder<'_> {
                 // `SUPERSCRIPT` is what separates them from the word they belong to,
                 // so the citation reads as a mark on the text rather than as text.
                 let n = self.cite(label.as_ref());
+                let digits = n.to_string();
+                if self.alt(&digits) {
+                    return;
+                }
                 let style = self.inline | InlineStyle::SUPERSCRIPT;
                 let cite = ActionKind::Cite(label.to_string());
-                let digits = n.to_string();
                 let sources = self.cell.as_ref().map(|c| self.sources(&digits, c.text.len()));
                 if let Some(c) = self.cell.as_mut() {
                     c.sources.extend(sources.unwrap_or_default());
@@ -804,6 +900,22 @@ impl Builder<'_> {
                     }
                 }
             }
+        }
+    }
+
+    /// Add `s` to the alt text of the figure being read, and say whether there was
+    /// one to add it to.
+    ///
+    /// Every inline event asks first: an alt is prose in its own right, and anything
+    /// that missed it -- a code span, a formula, a break -- would be set as running
+    /// text beside the figure it belongs to.
+    fn alt(&mut self, s: &str) -> bool {
+        match self.images.last_mut() {
+            Some((_, alt)) => {
+                alt.push_str(s);
+                true
+            }
+            None => false,
         }
     }
 
@@ -835,13 +947,16 @@ impl Builder<'_> {
                 self.html = Some(String::new());
             }
             Tag::Heading { level, .. } => self.open(BlockKind::Heading(as_level(level))),
-            Tag::BlockQuote(_) => self.quote_depth += 1,
+            Tag::BlockQuote(_) => self.quote_depth = self.quote_depth.saturating_add(1),
             Tag::List(start) => {
                 let ordered = start.is_some();
                 self.lists.push((
                     ListInfo {
                         ordered,
-                        depth: self.lists.len() as u8,
+                        // A file 256 lists deep is a file to be read, not a number to
+                        // wrap: the count is public and cannot be widened, so it stops
+                        // at the top of its range instead of coming back round.
+                        depth: u8::try_from(self.lists.len()).unwrap_or(u8::MAX),
                         index: start,
                     },
                     start.unwrap_or(1),
@@ -863,13 +978,12 @@ impl Builder<'_> {
                     }
                     None => ListInfo { ordered: false, depth: 0, index: None },
                 };
-                // Opened before the block: the item's own first block is inside the
+                // Counted before the block: the item's own first block is inside the
                 // item, and its continuation blocks are indented to match it.
-                self.in_item += 1;
-                self.open(BlockKind::Paragraph);
-                if let Some(b) = self.cur.as_mut() {
-                    b.list = Some(info);
-                }
+                self.in_item = self.in_item.saturating_add(1);
+                // Held rather than opened. Which block an item's first one is depends
+                // on what the author wrote first, and only the block that opens knows.
+                self.pending_item = Some(info);
             }
             Tag::Table(aligns) => {
                 self.open(BlockKind::Table);
@@ -914,7 +1028,7 @@ impl Builder<'_> {
                 }
             }
             Tag::Image { dest_url, .. } => {
-                self.image = Some((dest_url.to_string(), String::new()));
+                self.images.push((dest_url.to_string(), String::new()));
             }
             Tag::FootnoteDefinition(label) => {
                 // Definitions are parsed after the whole body, so a cited label is
@@ -978,6 +1092,9 @@ impl Builder<'_> {
             TagEnd::Item => {
                 self.close();
                 self.in_item = self.in_item.saturating_sub(1);
+                // An item that held no block at all never took its marker: dropping it
+                // here is what stops the next block outside the list from claiming it.
+                self.pending_item = None;
             }
             TagEnd::FootnoteDefinition => {
                 self.close();
@@ -995,9 +1112,15 @@ impl Builder<'_> {
                 self.link = None;
             }
             TagEnd::Image => {
-                if let Some((src, alt)) = self.image.take() {
-                    self.push_object(ObjectKind::Image { src, alt });
+                let Some((src, alt)) = self.images.pop() else { return };
+                // A figure inside another's alt text is part of the outer one's name
+                // for it, not a second box in the prose: `![a ![b](j.png) c](i.png)`
+                // is one figure, called `a b c`.
+                if let Some((_, outer)) = self.images.last_mut() {
+                    outer.push_str(&alt);
+                    return;
                 }
+                self.push_object(ObjectKind::Image { src, alt });
             }
             _ => {}
         }
@@ -1033,6 +1156,12 @@ impl Builder<'_> {
         if self.cur.is_some() {
             return;
         }
+        // A block inside a list item is the item's own when it is the first one, and
+        // a continuation of it when it is not. The first is whichever kind the author
+        // wrote, which is why the marker is waited for here rather than opened as a
+        // paragraph of its own: a fence or a heading that arrived as the item's
+        // opening block is a fence or a heading, not a paragraph holding one.
+        let list = self.pending_item.take();
         self.breaks.clear();
         self.cur = Some(Block {
             kind,
@@ -1040,7 +1169,7 @@ impl Builder<'_> {
             spans: Vec::new(),
             sources: Vec::new(),
             quote_depth: self.quote_depth,
-            list: None,
+            list,
             // The innermost open list, if an item of it is open: the level a block
             // joining now has to be indented to.
             item_depth: if self.in_item > 0 {
@@ -1147,6 +1276,12 @@ impl Builder<'_> {
                 }
                 b.spans.retain(|s| s.range.start < b.text.len());
                 for s in b.spans.iter_mut() {
+                    s.range.end = s.range.end.min(b.text.len());
+                }
+                // The same cut, for the same reason: a `SourceSpan` that reaches past
+                // the end of the text it addresses claims bytes that are not there.
+                b.sources.retain(|s| s.range.start < b.text.len());
+                for s in b.sources.iter_mut() {
                     s.range.end = s.range.end.min(b.text.len());
                 }
             }
@@ -1695,5 +1830,73 @@ fn resolve_entities(word: &str) -> String {
                 rest = after;
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod source_span_tests {
+    use super::*;
+
+    /// The spans [`Document::source`] produced by folding every mark over every
+    /// boundary window: the pass the sweep had to replace without changing a byte
+    /// of the answer.
+    fn folded(source: &str) -> Vec<Span> {
+        let mut marked = Vec::new();
+        for (event, range) in
+            Parser::new_ext(source, Options::ENABLE_TABLES | Options::ENABLE_STRIKETHROUGH).into_offset_iter()
+        {
+            let style = match event {
+                Event::Start(Tag::Heading { .. } | Tag::Strong) => InlineStyle::STRONG,
+                Event::Start(Tag::Emphasis) => InlineStyle::EMPHASIS,
+                Event::Start(Tag::Link { .. }) => InlineStyle::LINK,
+                Event::Code(_) => InlineStyle::DELIMITER,
+                Event::Html(_) | Event::InlineHtml(_) => InlineStyle::DELIMITER,
+                _ => continue,
+            };
+            marked.push((range, style));
+        }
+        let mut boundaries = vec![0, source.len()];
+        for (r, _) in &marked { boundaries.extend([r.start, r.end]); }
+        boundaries.sort_unstable();
+        boundaries.dedup();
+        boundaries.windows(2).filter(|r| r[0] < r[1]).map(|r| {
+            let style = marked.iter().filter(|(m, _)| m.start <= r[0] && m.end >= r[1])
+                .fold(InlineStyle::EMPTY, |style, (_, add)| style | *add);
+            Span { range: r[0]..r[1], style }
+        }).collect()
+    }
+
+    #[test]
+    fn the_sweep_agrees_with_the_fold_it_replaced() {
+        // Marks nested in one another, marks back to back, marks at the very first
+        // and very last byte, and a document with none at all.
+        for source in [
+            "# Title\r\n\r\n**bold** and *italic* [link](f.md) `code` ~~gone~~\r\n\
+             | a | b |\r\n|---|---|\r\n| `c` | **d** |\r\n\r\n\u{5C3E}<a>end</a>\r\n",
+            "**a**",
+            "*",
+            "",
+            "no marks at all\n",
+            "\u{6807}\u{9898} **\u{7C97}\u{4F53}**\n",
+            "<!-- x -->\n",
+        ] {
+            let swept = &Document::source(source).blocks[0].spans;
+            assert_eq!(swept, &folded(source), "{source:?}");
+            let text = &Document::source(source).blocks[0].text;
+            assert_eq!(swept.iter().map(|s| &text[s.range.clone()]).collect::<String>(), *text);
+        }
+    }
+
+    #[test]
+    fn a_large_source_is_styled_in_one_pass_over_its_marks() {
+        // The fold was quadratic and runs on every source view: 16 000 lines cost a
+        // quarter of a second, and a report walked the same path.
+        let line = "| **a** | `b` | [c](d) | *e* |";
+        let source = format!("{}\n|---|---|---|--|--|\n", vec![line; 4000].join("\n"));
+        let started = std::time::Instant::now();
+        let spans = Document::source(&source).blocks[0].spans.clone();
+        let spent = started.elapsed();
+        assert!(spent.as_secs_f64() < 1.0, "16 000 styled lines took {spent:?}");
+        assert_eq!(spans, folded(&source));
     }
 }

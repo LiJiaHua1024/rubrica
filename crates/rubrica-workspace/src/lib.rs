@@ -35,6 +35,13 @@ pub enum TabKind { Pinned, Preview }
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct TabId(pub u64);
 
+/// How many tabs a session keeps.
+///
+/// Recent documents are capped at ten; the tab strip was not, and every open tab is
+/// written to the session file whole, so a reader working through a book grew a
+/// strip -- and a file behind it -- that only ever got longer.
+pub const MAX_TABS: usize = 32;
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Tab {
     pub id: TabId,
@@ -91,7 +98,38 @@ impl TabSet {
         };
         self.items.insert(index, Tab { id, document: DocumentRef::File(file), kind });
         self.active = index;
+        self.trim();
         (id, true)
+    }
+
+    /// Hold the list within [`MAX_TABS`] by giving up the oldest tab it can.
+    ///
+    /// A tab the reader has not pinned is the first to go, and only a list of
+    /// nothing else is shortened from its oldest end: the cap is a bound, and one a
+    /// reader can lift by pinning everything is not a bound. Two tabs are never
+    /// given up however long the list gets -- the one being read, whose selection
+    /// would otherwise jump, and the sample, which is what the strip falls back to
+    /// when everything else has been closed.
+    fn trim(&mut self) {
+        while self.items.len() > MAX_TABS {
+            let reading = self.items[self.active].id;
+            let oldest = self
+                .items
+                .iter()
+                .position(|tab| tab.kind == TabKind::Preview && tab.id != reading)
+                .or_else(|| {
+                    self.items
+                        .iter()
+                        .position(|tab| tab.document != DocumentRef::Sample && tab.id != reading)
+                });
+            let Some(oldest) = oldest else { return };
+            self.items.remove(oldest);
+            if self.active > oldest {
+                self.active -= 1;
+            } else if self.active == oldest {
+                self.active = self.active.min(self.items.len() - 1);
+            }
+        }
     }
 
     pub fn replace_document(&mut self, id: TabId, document: DocumentRef) -> bool {
@@ -253,7 +291,11 @@ impl Workspace {
                 workspace.recent.touch(file);
             }
         }
-        for tab in tabs {
+        // A session file is data, not a promise: one written by a build that counted
+        // differently, or trimmed by hand, may name more tabs than the cap allows.
+        // The newest are the ones a reader was last looking at, so the oldest go.
+        let keep_from = tabs.len().saturating_sub(MAX_TABS);
+        for tab in tabs.into_iter().skip(keep_from) {
             if available(&tab.document.path) {
                 workspace.tabs.open_file(tab.document, tab.kind);
             }
@@ -486,5 +528,67 @@ mod tests {
         workspace.activate(d);
         workspace.close(d);
         assert_eq!(workspace.tabs.active().id, c);
+    }
+
+    #[test]
+    fn the_tab_list_stops_at_the_cap_and_keeps_what_is_being_read() {
+        // Every open tab is written to the session file whole, so a list with no
+        // ceiling is a session file that only ever gets longer.
+        let mut workspace = Workspace::default();
+        let mut last = None;
+        for i in 0..(MAX_TABS * 2) as u64 {
+            let (id, _) = workspace.open_file(FileRef::new(format!("{i}.md"), i), TabKind::Pinned);
+            assert!(workspace.tabs.items().len() <= MAX_TABS, "after {} files", i + 1);
+            // The tab the reader is on is the last one opened, and stays: the cap
+            // takes the oldest, not the one whose selection is live.
+            assert_eq!(workspace.tabs.active().id, id, "after {} files", i + 1);
+            assert!(workspace.tabs.find(id).is_some(), "the id handed back must name a tab");
+            last = Some(id);
+        }
+        assert_eq!(workspace.tabs.find(last.unwrap()), Some(workspace.tabs.active_index()));
+        // The sample is the strip's floor: it is never what the cap gives up.
+        assert!(workspace.tabs.items().iter().any(|t| t.document == DocumentRef::Sample));
+    }
+
+    #[test]
+    fn an_unpinned_tab_is_given_up_before_a_pinned_one() {
+        // The preview slot is the one the reader has not committed to, so it goes
+        // first; the pinned tabs around it are the ones that were asked for.
+        let mut workspace = Workspace::default();
+        for i in 0..(MAX_TABS - 1) as u64 {
+            workspace.open_file(FileRef::new(format!("{i}.md"), i), TabKind::Pinned);
+        }
+        assert_eq!(workspace.tabs.items().len(), MAX_TABS);
+        let (preview, _) = workspace.open_file(file("later.md"), TabKind::Preview);
+        workspace.open_file(file("last.md"), TabKind::Pinned);
+        assert_eq!(workspace.tabs.items().len(), MAX_TABS, "past the cap, something goes");
+        assert!(workspace.tabs.find(preview).is_none(), "the unpinned tab is the one that goes");
+    }
+
+    #[test]
+    fn a_session_file_naming_more_tabs_than_the_cap_allows_is_clamped() {
+        // A session file is data, not a promise: one written by a build that counted
+        // differently, or edited by hand, may hold more than the ceiling.
+        let last = (MAX_TABS * 2 - 1) as u64;
+        let tabs = (0..=last)
+            .map(|i| SessionTab { document: FileRef::new(format!("{i}.md"), i), kind: TabKind::Pinned })
+            .collect();
+        let snapshot = WorkspaceSnapshot {
+            session: SessionSnapshot {
+                tabs,
+                active: Some(DocumentRef::File(FileRef::new(format!("{last}.md"), last))),
+            },
+            recent: Vec::new(),
+        };
+        let restored = Workspace::restore(snapshot);
+        assert_eq!(restored.tabs.items().len(), MAX_TABS, "an unbounded strip came back");
+        let active = &restored.tabs.active().document;
+        assert!(
+            matches!(active, DocumentRef::File(f) if f.path == std::path::Path::new(&format!("{last}.md"))),
+            "the tab the file marked active: {active:?}"
+        );
+        // The clamp drops the oldest, so the tab the file marked active is one of
+        // the ones that came back and the index still names a tab that exists.
+        assert!(restored.tabs.active_index() < restored.tabs.items().len());
     }
 }
