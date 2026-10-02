@@ -43,8 +43,8 @@ use windows::Win32::Graphics::Dwm::{
 };
 use windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_B8G8R8A8_UNORM;
 use windows::Win32::Graphics::Gdi::{
-    BeginPaint, EndPaint, GetMonitorInfoW, InvalidateRect, MonitorFromPoint, PAINTSTRUCT,
-    MONITORINFO, MONITOR_DEFAULTTONEAREST,
+    BeginPaint, EndPaint, GetMonitorInfoW, InvalidateRect, MonitorFromPoint, ScreenToClient,
+    PAINTSTRUCT, MONITORINFO, MONITOR_DEFAULTTONEAREST,
 };
 use windows::Win32::System::Com::{
     CoCreateInstance, CoInitializeEx, IDataObject, IServiceProvider, CLSCTX_LOCAL_SERVER,
@@ -100,7 +100,10 @@ use windows::Win32::UI::WindowsAndMessaging::{
 };
 use windows_numerics::{Matrix3x2, Vector2};
 use crate::theme::{ColorRole, Theme};
-use crate::view::{build_ops, d2d, glyph_origin, paint_run, system_prefers_dark, utf16, Op, Objects, Palette};
+use crate::view::{
+    build_ops, d2d, glyph_origin, pan_offset, paint_run, region_shift, system_prefers_dark, utf16,
+    Op, Objects, Palette, WideRegion, WHEEL_STEP,
+};
 use crate::{hyphen, images, instance, profiles, reading, settings};
 
 /// Messages the hook posts to the service window. The hook itself never touches
@@ -849,6 +852,30 @@ fn pressed(vk: VIRTUAL_KEY) -> bool {
     (unsafe { GetAsyncKeyState(vk.0 as i32) } as u16) & 0x8000 != 0
 }
 
+/// The wide region a pointer at `(x, y)` -- the page's own pixels -- is on, or none
+/// of them. The region being panned moves with its content, so a hand that has
+/// carried a table partway across still holds it; a hand over the prose beside it
+/// finds nothing, which is what lets the same wheel scroll instead.
+fn wide_region_under(
+    regions: &[WideRegion],
+    active: Option<usize>,
+    offset: f32,
+    x: f32,
+    y: f32,
+) -> Option<usize> {
+    regions.iter().position(|r| {
+        let shift = active
+            .and_then(|i| regions.get(i))
+            .map_or(0.0, |a| region_shift(a, offset, r.x, r.y));
+        let left = r.x + shift;
+        // The region's ink runs to `content_w`, not to the measure: a grid the
+        // squeeze could not bring back paints past the reading column's right
+        // edge, and that overhang -- clipped by the window, and the very reason
+        // the hand came -- is the region's to answer for.
+        x >= left && x <= left + r.content_w && y >= r.y && y <= r.y + r.h
+    })
+}
+
 /// One line of diagnosis, sent to whoever is listening and nowhere else: a debug
 /// string costs nothing when nobody reads it, and on the day a preview refuses to
 /// appear it says which guard said no. Nothing the user sees carries it.
@@ -1406,6 +1433,12 @@ struct Peek {
     /// whole notch add up here instead of vanishing, which is what made most
     /// messages of a smooth wheel scroll nothing at all.
     wheel_carry: i32,
+    /// The wide region `Shift`+wheel is panning, and how far it has gone: the
+    /// reader's own gesture, for the table a grid this narrow cannot show whole.
+    /// The pointer names the region at every gesture, so the hand can wander off
+    /// and back without a mode to leave.
+    wide_active: Option<usize>,
+    wide_offset: f32,
 }
 
 impl Peek {
@@ -1450,6 +1483,8 @@ impl Peek {
                 source: None,
                 scroll: 0.0,
                 wheel_carry: 0,
+                wide_active: None,
+                wide_offset: 0.0,
             });
             peek.hwnd = CreateWindowExW(
                 WS_EX_TOOLWINDOW | WS_EX_TOPMOST | WS_EX_NOACTIVATE,
@@ -1640,8 +1675,43 @@ impl Peek {
             self.hyphenator,
         ));
         self.scroll = 0.0;
+        // The pan belongs to the table it was made on, and a new file brings new
+        // tables: an offset kept across files would open the next one already
+        // shifted. The reader puts its own away on a relayout for the same reason.
+        self.wide_active = None;
+        self.wide_offset = 0.0;
         self.path = Some(path.to_owned());
         self.shape_bar(client_w, k);
+        true
+    }
+
+    /// `Shift`+wheel: pan the wide region under the pointer, the gesture the reader
+    /// answers. A grid wider than this window is read a notch at a time rather than
+    /// clipped out of reach; a wheel over the prose beside it answers false, and the
+    /// caller scrolls the page as it always did.
+    fn pan_wide(&mut self, x: f32, y: f32, delta: i16) -> bool {
+        // The regions are set in the page's own pixels, and the paint's only
+        // translation is vertical: the pointer's x is already a document x, and
+        // its y needs the bar and the scroll taken back off.
+        let dpi = unsafe { GetDpiForWindow(self.hwnd) }.max(96) as f32;
+        let k = dpi / 72.0;
+        let Some(page) = self.page.as_ref() else { return false };
+        let dy = y - BAR_H + self.scroll * k;
+        let active =
+            wide_region_under(&page.wide_regions, self.wide_active, self.wide_offset, x, dy);
+        let span = active
+            .and_then(|i| page.wide_regions.get(i))
+            .map(|r| (r.content_w, r.w));
+        self.wide_active = active;
+        let Some((content_w, visible_w)) = span else { return false };
+        // A roll toward the reader moves the view toward the right edge, the
+        // browser's mapping -- the same gesture the reader answers, so the one
+        // the hand makes first, toward the clipped side, is the one that works.
+        self.wide_offset = pan_offset(
+            content_w,
+            visible_w,
+            self.wide_offset - delta as f32 / 120.0 * WHEEL_STEP * k,
+        );
         true
     }
 
@@ -1728,7 +1798,7 @@ impl Peek {
                 bottom: BAR_H as i32,
             };
         }
-        let hint = "Esc close  \u{2190}\u{2192} files  Enter open  Ctrl+Enter reader";
+        let hint = "Esc close  \u{2190}\u{2192} files  Enter open  Ctrl+Enter reader  Shift+wheel table";
         let runs = font.shape_runs(hint, 0..hint.len(), &req, small, 0.0);
         for r in runs.iter().rev() {
             let width = r.width() * k;
@@ -1888,22 +1958,41 @@ impl Peek {
                 let max_scroll = (page.height - (client_h - BAR_H) / k).max(0.0);
                 self.scroll = self.scroll.clamp(0.0, max_scroll);
                 target.SetTransform(&Matrix3x2::translation(0.0, BAR_H - self.scroll * k));
+                // The pan a Shift+wheel made: ops inside the region being panned
+                // move with it, and ink outside -- the prose above and below the
+                // table -- keeps its place. The reader's paint applies the same
+                // shift, and for the same reason a wide grid's right half would
+                // otherwise be unreachable in a window this narrow.
+                let wide_active = self.wide_active;
+                let wide_offset = self.wide_offset;
+                let pan = |x: f32, y: f32| {
+                    wide_active
+                        .and_then(|i| page.wide_regions.get(i))
+                        .map_or(0.0, |r| region_shift(r, wide_offset, x, y))
+                };
                 let rt = self.rt.clone();
                 for op in &page.ops {
                     match op {
                         Op::Rect { x, y, w, h, color } => {
+                            let dx = pan(*x, *y);
                             if let Some(brush) = self.brush(*color) {
                                 target.FillRectangle(
-                                    &D2D_RECT_F { left: *x, top: *y, right: x + w, bottom: y + h },
+                                    &D2D_RECT_F {
+                                        left: *x + dx,
+                                        top: *y,
+                                        right: x + w + dx,
+                                        bottom: y + h,
+                                    },
                                     &brush,
                                 );
                             }
                         }
                         Op::Line { x0, y0, x1, y1, thickness, color } => {
+                            let dx = pan(*x0, *y0);
                             if let Some(brush) = self.brush(*color) {
                                 target.DrawLine(
-                                    Vector2::new(*x0, *y0),
-                                    Vector2::new(*x1, *y1),
+                                    Vector2::new(*x0 + dx, *y0),
+                                    Vector2::new(*x1 + dx, *y1),
                                     &brush,
                                     *thickness,
                                     None,
@@ -1911,11 +2000,17 @@ impl Peek {
                             }
                         }
                         Op::Image { path, x, y, w, h } => {
+                            let dx = pan(*x, *y);
                             if let (Some(store), Some(rt)) = (self.images.as_ref(), rt.as_ref()) {
                                 if let Some(bitmap) = store.bitmap(rt, path) {
                                     target.DrawBitmap(
                                         &bitmap,
-                                        Some(&D2D_RECT_F { left: *x, top: *y, right: x + w, bottom: y + h }),
+                                        Some(&D2D_RECT_F {
+                                            left: *x + dx,
+                                            top: *y,
+                                            right: x + w + dx,
+                                            bottom: y + h,
+                                        }),
                                         1.0,
                                         D2D1_BITMAP_INTERPOLATION_MODE_LINEAR,
                                         None,
@@ -1925,8 +2020,18 @@ impl Peek {
                         }
                         Op::Runs(runs) => {
                             for run in runs {
-                                let Some(brush) = self.brush(run.color) else { continue };
-                                draw_glyph_run(&target, run, &brush);
+                                let dx = pan(run.x, run.baseline);
+                                if dx != 0.0 {
+                                    let mut moved = run.clone();
+                                    moved.x += dx;
+                                    if let Some(brush) = self.brush(moved.color) {
+                                        draw_glyph_run(&target, &moved, &brush);
+                                    }
+                                    continue;
+                                }
+                                if let Some(brush) = self.brush(run.color) {
+                                    draw_glyph_run(&target, run, &brush);
+                                }
                             }
                         }
                     }
@@ -2069,6 +2174,21 @@ unsafe extern "system" fn preview_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPA
             // The remainder a smooth wheel's sub-notch deltas leave behind is kept
             // for the next message rather than thrown away.
             let delta = (wp.0 as u32 >> 16) as u16 as i16;
+            // `Shift` turns the wheel into the wide table's pan, the gesture the
+            // reader answers. The pointer names the region -- WM_MOUSEWHEEL hands
+            // it over in screen coordinates, and the preview is the window under
+            // it -- and a wheel off any region falls through to the scroll below.
+            if pressed(VK_SHIFT) {
+                let mut pt = POINT {
+                    x: (lp.0 & 0xFFFF) as i16 as i32,
+                    y: ((lp.0 >> 16) & 0xFFFF) as i16 as i32,
+                };
+                let _ = unsafe { ScreenToClient(hwnd, &mut pt) };
+                if peek.pan_wide(pt.x as f32, pt.y as f32, delta) {
+                    unsafe { let _ = InvalidateRect(Some(hwnd), None, false); }
+                    return LRESULT(0);
+                }
+            }
             let notch = WHEEL_DELTA as i32;
             peek.wheel_carry = (peek.wheel_carry + delta as i32).clamp(-notch * 8, notch * 8);
             let notches = peek.wheel_carry / notch;
@@ -2156,5 +2276,55 @@ mod tests {
             assert_eq!(preview_answer(vk, true, false, false, false), Answer::Pass, "{vk:?}");
             assert_eq!(preview_answer(vk, false, false, false, false), Answer::Pass, "{vk:?}");
         }
+    }
+
+    /// A wide region and a second one below it, far enough apart that a pointer
+    /// between them is on neither.
+    fn region(y: f32) -> WideRegion {
+        WideRegion {
+            kind: crate::view::WideKind::Table,
+            x: 100.0,
+            y,
+            w: 300.0,
+            h: 50.0,
+            content_w: 500.0,
+        }
+    }
+
+    /// The gesture the reader answers starts from the same place here: the pointer
+    /// names the region on the page's own pixels, over the whole of its ink -- the
+    /// overhang a squeezed grid paints past the measure included, clipped by the
+    /// window as it is -- and finds nothing over the gaps.
+    #[test]
+    fn the_pointer_names_the_region_it_is_over() {
+        let regions = [region(200.0), region(400.0)];
+        assert_eq!(wide_region_under(&regions, None, 0.0, 200.0, 220.0), Some(0));
+        assert_eq!(wide_region_under(&regions, None, 0.0, 200.0, 420.0), Some(1));
+        // Between the two, left of both, and past either one's ink.
+        assert_eq!(wide_region_under(&regions, None, 0.0, 200.0, 380.0), None);
+        assert_eq!(wide_region_under(&regions, None, 0.0, 50.0, 220.0), None);
+        assert_eq!(wide_region_under(&regions, None, 0.0, 650.0, 220.0), None);
+        // Past the measure the grid paints on, inside the ink it could not fit:
+        // the clipped side is the one the hand goes to.
+        assert_eq!(wide_region_under(&regions, None, 0.0, 450.0, 220.0), Some(0));
+    }
+
+    /// A region being panned moves with its content: a hand that has carried it
+    /// partway across still holds it, and a hand over the ink it once covered --
+    /// the prose that never moves -- finds nothing under the old rectangle.
+    #[test]
+    fn a_panned_region_moves_with_its_content() {
+        let regions = [region(200.0)];
+        // Half panned, the ink now covers x 0..=500 rather than 100..=600.
+        assert_eq!(wide_region_under(&regions, Some(0), 100.0, 250.0, 220.0), Some(0));
+        assert_eq!(wide_region_under(&regions, Some(0), 100.0, 550.0, 220.0), None);
+    }
+
+    /// The pan belongs to the region it was made on: a second table's hit box
+    /// stays where it was, however far the first has been carried.
+    #[test]
+    fn the_region_being_panned_leaves_the_others_where_they_are() {
+        let regions = [region(200.0), region(400.0)];
+        assert_eq!(wide_region_under(&regions, Some(0), 100.0, 350.0, 420.0), Some(1));
     }
 }

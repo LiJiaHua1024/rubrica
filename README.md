@@ -148,6 +148,7 @@ workspace tree.
 | `Enter` | step to the next find match |
 | `Esc` | give up the selection, the search, the page's marking |
 | `Apps` / `Shift+F10` | the menu, without a mouse |
+| mouse wheel | scroll the page · `Ctrl` zooms · `Shift` pans a table wider than the window |
 
 Preferences live in `HKCU\Software\Rubrica`.
 
@@ -187,7 +188,7 @@ typesetting) happens off the keystroke, after a posted message.
 | `Enter` | open the file with its default program |
 | `Ctrl+Enter` | open it in a running Rubrica reader |
 | `F5` | read the file again from disk |
-| mouse wheel | scroll the page |
+| mouse wheel | scroll the page · with `Shift`, pan a table wider than the window |
 
 ## Layout of the code
 

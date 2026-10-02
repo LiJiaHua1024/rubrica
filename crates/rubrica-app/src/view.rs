@@ -169,7 +169,7 @@ const TREE_ROW_H: Pt = 24.0;
 const TREE_MIN_W: f32 = 160.0;
 const TREE_MAX_W: f32 = 360.0;
 /// Wheel notch travel, in points.
-const WHEEL_STEP: Pt = 72.0;
+pub(crate) const WHEEL_STEP: Pt = 72.0;
 /// Appearance is polled, not pushed; see `WM_TIMER` below.
 const APPEARANCE_TIMER: usize = 0x5140;
 const APPEARANCE_TICK_MS: u32 = 400;
@@ -2281,11 +2281,14 @@ fn step_measure(from: usize, delta: i32) -> usize {
     (from as i32 + delta).clamp(0, Measure::ALL.len() as i32 - 1) as usize
 }
 
-fn pan_offset(content_w: Pt, visible_w: Pt, requested: Pt) -> Pt {
+pub(crate) fn pan_offset(content_w: Pt, visible_w: Pt, requested: Pt) -> Pt {
     (requested).clamp(0.0, (content_w - visible_w).max(0.0))
 }
 
-fn region_shift(region: &WideRegion, offset: Pt, x: f32, y: f32) -> Pt {
+/// The x shift an op at `(x, y)` takes from the region being panned: the whole
+/// band moves together, and ink outside the region -- the prose beside the table
+/// -- stays where it was.
+pub(crate) fn region_shift(region: &WideRegion, offset: Pt, x: f32, y: f32) -> Pt {
     if y < region.y || y > region.y + region.h {
         return 0.0;
     }
@@ -5364,10 +5367,13 @@ impl View {
     fn pan_wide(&mut self, ticks: f32) -> bool {
         let Some(index) = self.wide_active else { return false };
         let Some(region) = self.wide_regions.get(index).cloned() else { return false };
+        // A roll toward the reader moves the view toward the right edge, the
+        // browser's mapping: the side a wide table loses to the window is the
+        // one its reader is reaching for, and that roll is the first one made.
         self.wide_offset = pan_offset(
             region.content_w,
             region.w,
-            self.wide_offset + ticks / 120.0 * WHEEL_STEP * scale_of(self.dpi),
+            self.wide_offset - ticks / 120.0 * WHEEL_STEP * scale_of(self.dpi),
         );
         true
     }
@@ -5380,7 +5386,11 @@ impl View {
                 .and_then(|active| self.wide_regions.get(active))
                 .map_or(0.0, |active| region_shift(active, self.wide_offset, r.x, r.y));
             let left = r.x + shift;
-            x >= left && x <= left + r.w && y >= r.y && y <= r.y + r.h
+            // The region's ink runs to `content_w`, not to the measure: a grid
+            // squeezed short of its natural width paints past the reading
+            // column's right edge, and that overhang -- clipped by the window,
+            // and the very reason the hand came -- is the region's to answer for.
+            x >= left && x <= left + r.content_w && y >= r.y && y <= r.y + r.h
         })
     }
 
@@ -7087,6 +7097,9 @@ impl View {
 struct Ctx<'a> {
     theme: &'a Theme,
     styles: &'a [AppStyle],
+    /// The page's own width, in points -- the client a wide table's reach is
+    /// judged against, which is where its pannable overflow begins.
+    client_pt: Pt,
     /// Typeset formulas, by cache index. Layout only reads this; interning wrote it.
     math: &'a MathStore,
     /// Which footnote a citation's label names, which is how a raised number becomes a
@@ -9744,6 +9757,10 @@ impl View {
         let ctx = Ctx {
             theme,
             styles: &styles,
+            // A bubble grows to hold its content, so there is no window edge a
+            // table inside it can overflow -- and nothing for a pan to reach:
+            // the paint never shifts a bubble's ops.
+            client_pt: Pt::MAX / 4.0,
             math: store,
             notes: &notes,
             anchors: &anchors,
@@ -10164,7 +10181,7 @@ fn layout_table(
     mut y: Pt,
 ) -> Pt {
     let Out { ops, hots, sel, hyphens, wide, table_headers, table_spans, note_spans: _, math_texts } = out;
-    let Ctx { theme, styles, k, math, wide_limit, .. } = *ctx;
+    let Ctx { theme, styles, client_pt, k, math, wide_limit, .. } = *ctx;
     let Blk { left: block_left, column, .. } = *blk;
     let mut left = block_left;
     let size = theme.base;
@@ -10627,20 +10644,30 @@ fn layout_table(
     if let Some(Op::Rect { h, .. }) = ops.get_mut(panel) {
         *h = head_h * k;
     }
-    if total > column {
+    // The region exists for one reason: part of the grid's ink sits past the
+    // window's right edge, and the pan is how it is reached. A grid the window
+    // already holds whole -- one the squeeze brought back, or one whose natural
+    // width the margins absorbed -- is fully visible where it stands, and slides
+    // off its design for nothing, so it owns no region and no pan.
+    let hidden = (left + total) - client_pt;
+    if hidden > 0.0 {
         let index = wide.len();
         wide.push(WideRegion {
             kind: WideKind::Table,
             x: left * k,
             y: grid_top * k,
-            w: column * k,
+            // The span the window can show of the grid's own reach. The pan
+            // travels `content_w - w`, which this makes exactly the hidden
+            // part: panned to its end, the grid's right edge sits flush with
+            // the window's, and not a step further into the margin.
+            w: (client_pt - left) * k,
             h: (y - grid_top) * k,
             content_w: total * k,
         });
         hots.push(Hot {
             x: left * k,
             y: grid_top * k,
-            w: column * k,
+            w: (client_pt - left) * k,
             h: (y - grid_top) * k,
             kind: HotKind::Wide(index),
         });
@@ -12338,6 +12365,7 @@ pub fn build_in_chunks(
         let ctx = Ctx {
             theme,
             styles: &styles,
+            client_pt,
             math: &*objects.math,
             notes: &notes,
             anchors: &anchors,
@@ -12436,6 +12464,7 @@ pub fn build_in_chunks(
     let ctx = Ctx {
         theme,
         styles: &styles,
+        client_pt,
         math: &*objects.math,
         notes: &notes,
         anchors: &anchors,
@@ -13685,6 +13714,7 @@ mod tests {
         let ctx = Ctx {
             theme: &theme,
             styles: &styles,
+            client_pt: 525.0,
             math: &math,
             notes: &empty,
             anchors: &anchors,
@@ -13731,6 +13761,7 @@ mod tests {
         let ctx = Ctx {
             theme: &theme,
             styles: &styles,
+            client_pt: 525.0,
             math: &math,
             notes: &empty,
             anchors: &empty,
@@ -14594,6 +14625,47 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// A region exists for one reason: ink past the window's right edge. A grid
+    /// the window holds whole -- squeezed back onto the page, or absorbed by the
+    /// margins -- owns none: panning it would only slide a fully visible table
+    /// off its design. And the one that owns a region pans exactly its hidden
+    /// width, so at the end of the travel its right edge sits flush with the
+    /// window's, not a step into the margin past it.
+    #[test]
+    fn a_region_exists_only_for_a_grid_the_window_cannot_hold() {
+        let Ok(mut font) = FontEngine::new() else { return };
+        if !font.probe() {
+            return;
+        }
+        let mut math = crate::math::MathStore::new();
+        // Tokens no break can cut, one to a column: the squeeze cannot bring
+        // this grid back onto the page, and its right edge lands past the
+        // window's.
+        let wide = Document::parse(
+            "| # | 位置 | 问题 | 修复 |\n|:--|:--|:--|:--|\n| 41 | `mathItalicsCorrectionInfoOffset` | `extendedShapeCoverageOffset` `mathKernInfoOffset` `MathGlyphInfo` | `italicsCorrectionOffset` `mathItalicsCorrectionInfoOffset` |\n",
+        );
+        let mut objects = Objects::new(None, None, &mut math);
+        let page = build_ops(&mut font, &Theme::default(), &wide, 700.0, DPI, &mut objects, None);
+        assert!(!page.wide_regions.is_empty(), "a grid past the window's edge registered no region");
+        for r in &page.wide_regions {
+            assert!(r.x + r.content_w > 700.0 + 0.5, "a region whose ink the window already holds: {r:?}");
+            let hidden = r.x + r.content_w - 700.0;
+            assert!(
+                (r.content_w - r.w - hidden).abs() < 0.5,
+                "the pan travels past the hidden ink: {r:?}"
+            );
+        }
+        // Thirty-three ideographs: one em each, a grid wider than the measure
+        // but narrow enough for the margins to absorb -- the shape that used to
+        // be pannable while fully visible.
+        let centered = Document::parse(
+            "| 甲 | 一二三四五六七八九十甲乙丙丁戊己庚辛壬癸子丑寅卯辰巳午未申酉戌亥 | x |\n|:--|:--|:--|\n| 1 | 一二三四五六七八九十甲乙丙丁戊己庚辛壬癸子丑寅卯辰巳午未申酉戌亥 | 2 |\n",
+        );
+        let mut objects = Objects::new(None, None, &mut math);
+        let page = build_ops(&mut font, &Theme::default(), &centered, 700.0, DPI, &mut objects, None);
+        assert!(page.wide_regions.is_empty(), "a grid the window holds whole registered a region");
     }
 
     /// A layout hands its finish to the window whatever its last batch carried.
