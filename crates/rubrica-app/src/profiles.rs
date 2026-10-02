@@ -201,7 +201,17 @@ impl Profile {
             self.fonts[15].clone(),
         ];
         t.fonts.math = [self.fonts[16].clone(), self.fonts[17].clone()];
-        t.fonts.fallback = vec![self.fonts[18].clone(), "Microsoft YaHei".into(), "Segoe UI Symbol".into()];
+        // The emoji face rides along with every preset, for the same reason it is in
+        // the theme's own list: it is the only face that owns what a document spells
+        // with emoji, and a preset that named only Latin and CJK drew those as empty
+        // boxes. After the symbol face, which draws the same characters without the
+        // stacked layers the emoji face prints as hatching on a one-ink page.
+        t.fonts.fallback = vec![
+            self.fonts[18].clone(),
+            "Microsoft YaHei".into(),
+            "Segoe UI Symbol".into(),
+            "Segoe UI Emoji".into(),
+        ];
         t.design_base = self.numbers[0];
         t.set_zoom(t.zoom);
         t.body_leading = Leading { latin: self.numbers[1], cjk: self.numbers[2] };
@@ -401,10 +411,15 @@ fn remembered<T: Clone>(
 mod tests {
     use super::*;
 
+    /// The default page is the one a reader meets before choosing anything, so it
+    /// carries the Chinese punctuation policy: a full-width mark is drawn with its ink
+    /// at one end of an em-wide box, and left whole it stands most of an em away from
+    /// the character beside it. What stays opt-in is the stronger treatment -- hanging
+    /// a line-ending mark out into the margin, which `Book` chooses.
     #[test]
-    fn default_profile_keeps_optional_east_asian_policies_off() {
+    fn the_default_page_reclaims_the_blank_half_of_chinese_punctuation() {
         let p = Profile::default();
-        assert_eq!(p.numbers[8], 0.0);
+        assert_eq!(p.numbers[8], 0.5);
         assert_eq!(p.numbers[9], 0.0);
         assert!(p.validate().is_ok());
     }

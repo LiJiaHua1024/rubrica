@@ -32,7 +32,10 @@ pub struct Node {
     pub text: Range<usize>,
     pub style: StyleId,
     pub advance: Pt,
-    /// Role of the first code point, used for glue selection.
+    /// Role of the first code point. It is the right-hand side of the recipe at the
+    /// boundary *before* this box; the left-hand side of the boundary after it is read
+    /// from the box's last character, which a quoted pair can make a different script
+    /// from the first.
     pub role: Role,
     /// Whether this node is opening, closing, or another full-width punctuation mark.
     pub punctuation: Option<PunctuationKind>,
@@ -92,6 +95,15 @@ pub struct Spacing {
     /// Fraction removed from a full-width punctuation mark's advance, from 0 to 0.5.
     /// The glyph itself keeps its natural outline; only its empty side bearing is
     /// reclaimed, so the next character moves closer without the mark being squeezed.
+    ///
+    /// The blank a mark carries sits on the side its ink does not: on the right of a
+    /// closing mark (，。：」) and on the left of an opening one （「《. Reclaiming it
+    /// therefore tightens the mark against whichever neighbour the font left room for
+    /// -- the text after a closing mark, the text before an opening one -- and it is
+    /// up to the painter to move an opening mark's glyph into the space its own
+    /// advance no longer covers. Only marks with a known blank side are touched: a
+    /// centred full-width symbol, the ideographic space and the ambiguous curly
+    /// quotes keep whatever width the author's text gave them.
     pub punctuation_compression: f32,
 }
 
@@ -461,11 +473,11 @@ pub fn build(
         return p;
     }
 
-    // Role and final code point of the most recent box, when a break opportunity
-    // separates two boxes with no literal space between them (the Han/Latin and
-    // ideograph cases). The role picks the glue recipe; the character decides whether
-    // one applies at all, and whether the line may be drawn there.
-    let mut prev: Option<(Role, char)> = None;
+    // The final code point of the most recent box, when a break opportunity separates
+    // two boxes with no literal space between them (the Han/Latin and ideograph
+    // cases). The character is what decides whether a recipe applies at all, and which
+    // one: it is the character the next boundary lands beside.
+    let mut prev: Option<char> = None;
 
     for (seg, mandatory) in &segments {
         let slice = &text[seg.clone()];
@@ -487,14 +499,23 @@ pub fn build(
             let first = core.chars().next().unwrap();
             let role = Role::of(first);
             let style = StyleSpan::resolve(opts.spans, range.start, opts.style_of);
-            if let Some((prev_role, prev_ch)) = prev {
+            if let Some(prev_ch) = prev {
                 // Getting here means no whitespace separates the two boxes, because
                 // any leading or trailing run of it has already been emitted as a
                 // space, which clears `prev`. So the boundary is a cut: use the
                 // script's glue only where the source really does allow a break, and
                 // otherwise join the two halves of the same word tightly.
+                //
+                // The left side of the recipe is the role of the character the boundary
+                // actually lands beside -- the previous box's *last* character -- and not
+                // the box's own role, which is read from its first. A box that opens with
+                // a Latin quote and ends in Han is both: `"对` is one box, because UAX #14
+                // breaks nothing inside a quoted pair, and reading its role from the quote
+                // gave `对`|`的` the quarter em that belongs between Han and Latin. Set in
+                // bold, `**"对的太对"**` printed as `"对 的太对`, and `**"邪修"**` as
+                // `"邪 修`.
                 if allowed.binary_search(&seg.start).is_ok() {
-                    p.items.push(punct_glue(prev_ch, first, prev_role, role, opts.spacing));
+                    p.items.push(punct_glue(prev_ch, first, Role::of(prev_ch), role, opts.spacing));
                 } else {
                     p.items.push(Item::join());
                 }
@@ -506,9 +527,22 @@ pub fn build(
                 .next()
                 .filter(|ch| is_compressible_punct(*ch))
                 .map(punctuation);
-            let compression = punctuation
-                .map(|_| opts.spacing.punctuation_compression.clamp(0.0, 0.5))
-                .unwrap_or(0.0);
+            // Only a mark whose ink sits at one end of its box has a blank side to
+            // give up. A centred full-width symbol (％ ＃ －) or the ideographic space
+            // has none, and trimming its advance would slide it off the middle of its
+            // neighbours instead of closing a gap its author never wrote.
+            //
+            // Which end that is decides what the painter has to do with the glyph: an
+            // opening mark keeps its blank on the left, so the *box* starts where the
+            // mark does and the glyph is drawn that much further left; a closing mark
+            // gives up the blank on its right, which is a plain shorter advance. See
+            // `fit_punctuation_runs` in the painter.
+            let compression = match punctuation {
+                Some(PunctuationKind::Opening | PunctuationKind::Closing) => {
+                    opts.spacing.punctuation_compression.clamp(0.0, 0.5)
+                }
+                _ => 0.0,
+            };
             let id = p.nodes.len() as u32;
             p.nodes.push(Node {
                 text: range,
@@ -521,7 +555,7 @@ pub fn build(
                 kind: NodeKind::Text,
             });
             p.items.push(Item::Box { node: id });
-            prev = Some((role, core.chars().next_back().unwrap()));
+            prev = Some(core.chars().next_back().unwrap());
         }
 
         let split_here = hyphen_set.binary_search(&seg.end).is_ok() && trailing.is_empty();
@@ -602,7 +636,7 @@ fn is_stripped(ch: char) -> bool {
 
 /// Emit the item for a run of literal whitespace, and record that the following
 /// box needs no script-recipe glue because this space already separates them.
-fn emit_space(p: &mut Paragraph, prev: &mut Option<(Role, char)>, ws: &str, opts: &BuildOptions) {
+fn emit_space(p: &mut Paragraph, prev: &mut Option<char>, ws: &str, opts: &BuildOptions) {
     // A cut that ends a segment is normally told to be mandatory by UAX #14, and
     // that is what [`build`] acts on; this is the same answer worked out from the
     // run itself, for a caller that hands over a break list without the flag. Every
@@ -646,6 +680,19 @@ fn emit_space(p: &mut Paragraph, prev: &mut Option<(Role, char)>, ws: &str, opts
 /// as `rubrica- app`, a character that is in no file.
 const NO_AIR: GlueRecipe = GlueRecipe::fixed(0.0);
 
+/// Marks that are punctuation of whichever text they stand in: a dash and an ellipsis
+/// are Chinese 破折号/省略号 and English dashes and dots both, and the engine cannot
+/// see which face draws them.
+///
+/// They are read from their neighbours instead. Beside Han they are Chinese marks
+/// whose box already carries their air -- the same second gap [`punct_glue`] refuses
+/// for `：` -- and the quarter em the mixed recipe would add showed the page as
+/// `他说 —— 这样`. Beside Latin they are Latin punctuation, set exactly as they are
+/// today.
+fn is_shared_mark(ch: char) -> bool {
+    matches!(ch, '\u{2014}' | '\u{2013}' | '\u{2026}')
+}
+
 /// The glue between two boxes the source runs together.
 ///
 /// A full-width mark carries its air inside the glyph, so the script recipe on top of
@@ -654,7 +701,12 @@ const NO_AIR: GlueRecipe = GlueRecipe::fixed(0.0);
 /// already UAX #14's answer, not this one's -- `，` and `（` are never offered as a
 /// break at all -- so all a mark changes here is the width.
 fn punct_glue(prev_ch: char, next_ch: char, prev: Role, next: Role, s: &Spacing) -> Item {
-    if is_cjk_punct(prev_ch) || is_cjk_punct(next_ch) {
+    let beside_han = |mark: char, other: Role| is_shared_mark(mark) && other == Role::Cjk;
+    if is_cjk_punct(prev_ch)
+        || is_cjk_punct(next_ch)
+        || beside_han(prev_ch, next)
+        || beside_han(next_ch, prev)
+    {
         Item::glue(&NO_AIR)
     } else {
         Item::glue(glue_recipe_for(prev, next, s))

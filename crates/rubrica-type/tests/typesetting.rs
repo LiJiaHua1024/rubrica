@@ -192,6 +192,84 @@ fn punctuation_compression_reclaims_only_full_width_marks() {
 }
 
 #[test]
+fn compression_reclaims_the_blank_only_where_a_mark_has_one() {
+    // A mark's blank is on the side its ink is not: the right of a closing mark, the
+    // left of an opening one. Both are the side a reader sees space on before the
+    // knob is turned, and both are what a shortened advance gives up -- the painter
+    // moves an opening mark's glyph into the space its box no longer covers.
+    //
+    // The full-width symbol ％ and the ideographic space are a different case: their
+    // ink is in the middle of the box (a space has none at all), so there is no blank
+    // to reclaim, and shortening them would only slide them off centre between their
+    // neighbours.
+    let text = "界，界（界％界　界";
+    let mut spacing = Spacing::for_size(SIZE);
+    spacing.punctuation_compression = 0.5;
+    let mut measure = MonospaceMeasure { size: SIZE, factor: 1.0 };
+    let (para, _) = typeset(text, &spacing, StyleId(0), &[], &BreakOptions::new(500.0), &mut measure);
+    let nodes: Vec<(char, Pt, Option<rubrica_type::classify::PunctuationKind>)> = para
+        .nodes
+        .iter()
+        .map(|n| (text[n.text.clone()].chars().next().unwrap(), n.advance, n.punctuation))
+        .collect();
+    let advance = |c: char| nodes.iter().find(|(t, _, _)| *t == c).map(|(_, a, _)| *a);
+    let kind = |c: char| nodes.iter().find(|(t, _, _)| *t == c).and_then(|(_, _, k)| *k);
+    assert_eq!(advance('，'), Some(SIZE * 0.5), "a closing mark kept its blank half");
+    assert_eq!(advance('（'), Some(SIZE * 0.5), "an opening mark kept its blank half");
+    assert_eq!(advance('界'), Some(SIZE), "an ideograph was compressed");
+    assert_eq!(advance('％'), Some(SIZE), "a centred full-width symbol was compressed");
+    assert_eq!(advance('　'), Some(SIZE), "the ideographic space was compressed");
+    assert_eq!(kind('，'), Some(rubrica_type::classify::PunctuationKind::Closing));
+    assert_eq!(kind('（'), Some(rubrica_type::classify::PunctuationKind::Opening));
+    assert_eq!(kind('％'), Some(rubrica_type::classify::PunctuationKind::Other));
+}
+
+#[test]
+fn a_dash_between_han_takes_no_air_and_the_script_glue_is_still_the_scripts() {
+    // The dash and the ellipsis belong to both scripts, and the glue model cannot see
+    // the face: beside Han they are Chinese marks whose box already holds their air,
+    // so the quarter em the mixed recipe would add is a gap the author never wrote.
+    let spacing = Spacing::for_size(SIZE);
+    let unit = SIZE * 0.5;
+    let width = |text: &str| -> Pt {
+        let mut measure = MonospaceMeasure { size: SIZE, factor: 0.5 };
+        let (para, plan) = typeset(text, &spacing, StyleId(0), &[], &BreakOptions::new(500.0), &mut measure);
+        assert_eq!(plan.lines.len(), 1, "{text:?} wrapped");
+        line_width(&place(&para, &plan.lines[0]))
+    };
+    assert_eq!(width("他说—这样"), 5.0 * unit, "a dash between Han was given air");
+    assert_eq!(width("问他……知道了"), 7.0 * unit, "an ellipsis between Han was given air");
+    // The quarter em between Han and a Latin letter is not the mark's own air but the
+    // mixed-script join, and it is untouched.
+    assert_eq!(width("中A"), 2.0 * unit + spacing.mixed.base, "the Han/Latin join went missing");
+}
+
+#[test]
+fn the_glue_beside_a_box_that_opens_with_a_quote_is_read_from_its_last_character() {
+    // `"对的` is one box: UAX #14 breaks nothing inside a quoted pair, so the ASCII
+    // quote and the Han characters after it are one node whose own role comes from its
+    // first character -- the quote, which is Western. The boundary that follows the box
+    // is nonetheless Han beside Han, and reading the left role from the quote put the
+    // quarter em meant for Han-beside-Latin between `对` and `的`: bold `**"对的太对"**`
+    // printed as `"对 的太对`, and `**"邪修"**` as `"邪 修`.
+    let spacing = Spacing::for_size(SIZE);
+    let unit = SIZE * 0.5;
+    let width = |text: &str| -> Pt {
+        let mut measure = MonospaceMeasure { size: SIZE, factor: 0.5 };
+        let (para, plan) = typeset(text, &spacing, StyleId(0), &[], &BreakOptions::new(500.0), &mut measure);
+        assert_eq!(plan.lines.len(), 1, "{text:?} wrapped");
+        line_width(&place(&para, &plan.lines[0]))
+    };
+    assert_eq!(width("\"对的太对\""), 6.0 * unit, "air appeared inside a quoted Han phrase");
+    assert_eq!(width("\"邪修\"专治"), 6.0 * unit, "air appeared inside a quoted Han phrase");
+    // A quote is glued to the character before it -- UAX #14 breaks on neither side of
+    // one -- so a quoted phrase takes no air at its opening either, and the box's own
+    // role is not what decides that: only the character the next boundary lands beside
+    // is, which is what the two assertions above are about.
+    assert_eq!(width("中\"对\""), 4.0 * unit, "a quote was pushed away from the Han before it");
+}
+
+#[test]
 fn a_closing_mark_can_hang_but_an_opening_mark_cannot() {
     let text = "甲乙。丙丁";
     let spacing = Spacing::for_size(SIZE);

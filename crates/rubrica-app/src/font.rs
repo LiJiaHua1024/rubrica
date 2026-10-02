@@ -399,7 +399,11 @@ impl FontEngine {
         let glyphs = self.glyphs_for(idx, text)?;
         let mut n = 0usize;
         for (c, g) in text.chars().zip(glyphs) {
-            if g == 0 {
+            // A variation selector has no glyph of its own -- it asks for another form
+            // of the character before it -- so every face covers it. Read as an ordinary
+            // character it is one nothing has, which is how the `️` of `⚠️` came to be
+            // drawn as a `.notdef` box beside the warning sign.
+            if g == 0 && !is_variation_selector(c) {
                 break;
             }
             n += c.len_utf8();
@@ -556,8 +560,16 @@ impl FontEngine {
                     }
                 };
                 let chunk = &rest[..taken];
-                let mut runs = self.shape_with_face(chunk, item.range.start + at, face, size, tracking, &item);
-                out.append(&mut runs);
+                // A piece that is nothing but variation selectors draws nothing at all:
+                // no face has a glyph for one standing on its own, and shaping it anyway
+                // printed the missing-glyph box -- a box for a character that is not
+                // there, which is what a selector whose base was edited away looks like.
+                // It still occupies its own (zero) width, and the index still holds the
+                // character, so copying the line hands back what the file says.
+                if !chunk.chars().all(is_variation_selector) {
+                    let mut runs = self.shape_with_face(chunk, item.range.start + at, face, size, tracking, &item);
+                    out.append(&mut runs);
+                }
                 at += taken;
             }
         }
@@ -1003,6 +1015,14 @@ pub fn cjk_char(c: char) -> bool {
         | 0x4E00..=0x9FFF | 0xF900..=0xFAFF | 0xFF00..=0xFFEF | 0x20000..=0x2FA1F)
 }
 
+/// U+FE00..=U+FE0F and U+E0100..=U+E01EF: an invisible modifier that selects a variant
+/// form of the character before it, most often the emoji presentation of a symbol that
+/// also has a text one. It draws nothing itself, so no face needs to own one -- see
+/// [`FontEngine::coverage`](FontEngine).
+fn is_variation_selector(c: char) -> bool {
+    matches!(c as u32, 0xFE00..=0xFE0F | 0xE0100..=0xE01EF)
+}
+
 fn utf16(s: &str) -> Vec<u16> {
     s.encode_utf16().chain(std::iter::once(0)).collect()
 }
@@ -1097,6 +1117,54 @@ mod tests {
         }
     }
 
+    /// A variation selector is a modifier, not a character: it asks for another form of
+    /// the glyph before it and draws nothing of its own, so no face has to have one.
+    /// Read as an ordinary character it is one nothing owns, and the piece it landed in
+    /// fell through to the last resort face -- which is how the `️` of `⚠️` came to be
+    /// printed as a `.notdef` box right beside the warning sign.
+    #[test]
+    fn a_variation_selector_needs_no_face_of_its_own() {
+        let Ok(engine) = FontEngine::new() else { return };
+        if !engine.probe() {
+            return;
+        }
+        for text in ["⚠️", "⚠️ 动手前必读", "✅ 完成 🎉"] {
+            let runs = engine.shape_runs(text, 0..text.len(), &installed_request(), 13.5, 0.0);
+            assert!(covers_text(&runs, text), "{text:?} was dropped");
+            assert!(
+                !runs.iter().any(|r| r.glyphs.contains(&0)),
+                "{text:?} drew a box for a character a face here owns: {:?}",
+                runs.iter().map(|r| (r.face, r.glyphs.clone())).collect::<Vec<_>>()
+            );
+        }
+        // And with no emoji face on the list at all -- a profile whose fallback the
+        // reader has replaced, or a machine without the font: the ⚠ is an old symbol
+        // several text faces own, and the selector after it is owned by none of them,
+        // but it must still draw nothing rather than a box.
+        let req = FaceRequest {
+            fallback: vec!["Segoe UI Symbol".into(), "Arial".into()],
+            ..installed_request()
+        };
+        let text = "⚠️ 动手前必读";
+        let runs = engine.shape_runs(text, 0..text.len(), &req, 13.5, 0.0);
+        assert!(covers_text(&runs, text), "text was dropped without an emoji face");
+        assert!(
+            !runs.iter().any(|r| r.glyphs.contains(&0)),
+            "a variation selector was drawn as a box: {:?}",
+            runs.iter().map(|r| (r.face, r.glyphs.clone())).collect::<Vec<_>>()
+        );
+        // And one whose base character has been edited away: there is nothing for it to
+        // select and nothing to draw, so it is skipped rather than printed as the box an
+        // ownerless character gets.
+        let text = "⚠ ️ 警告";
+        let runs = engine.shape_runs(text, 0..text.len(), &req, 13.5, 0.0);
+        assert!(
+            !runs.iter().any(|r| r.glyphs.contains(&0)),
+            "an orphaned variation selector drew a box: {:?}",
+            runs.iter().map(|r| (r.face, r.glyphs.clone())).collect::<Vec<_>>()
+        );
+    }
+
     /// Measuring a run nothing can render is linear in its length, not the square of
     /// it. The old loop took one character and asked again, re-probing the whole
     /// remainder against every candidate each time: 20 000 characters cost 100 000
@@ -1145,3 +1213,4 @@ mod tests {
             "and it should be drawn as .notdef boxes, not silently substituted");
     }
 }
+

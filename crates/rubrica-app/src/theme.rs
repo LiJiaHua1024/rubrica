@@ -51,7 +51,20 @@ impl Default for Fonts {
             japanese: ["Yu Gothic".into(), "Yu Gothic".into(), "MS Gothic".into()],
             korean: ["Malgun Gothic".into(), "Malgun Gothic".into(), "GulimChe".into()],
             emphasis: [String::new(), "KaiTi".into(), String::new(), String::new()],
-            fallback: vec!["Segoe UI".into(), "Microsoft YaHei".into(), "Segoe UI Symbol".into()],
+            // The emoji face, after the symbol face rather than before it: a face no
+            // list names is a face the reader never sees, and the glyph for ⚠️ or
+            // 🎉 came out as an empty box because nothing on this list owned it. It
+            // goes last because of how it draws without its palette: the emoji face
+            // builds an emoji out of several stacked layers, and a page that paints
+            // glyphs in one ink shows those layers as hatching, while the older symbol
+            // face has the same characters as a single clean outline. Anything only
+            // the emoji face owns still gets drawn (and is still better than a box).
+            fallback: vec![
+                "Segoe UI".into(),
+                "Microsoft YaHei".into(),
+                "Segoe UI Symbol".into(),
+                "Segoe UI Emoji".into(),
+            ],
             math: ["Cambria Math".into(), "Segoe UI Symbol".into()],
         }
     }
@@ -335,7 +348,13 @@ impl Default for Theme {
             // space, so this stays small.
             first_line_indent_em: 0.0,
             keep_korean_words: true,
-            punctuation_compression: 0.0,
+            // On out of the box, because the alternative is what a reader otherwise
+            // meets on the first Chinese paragraph: a full-width mark is drawn with
+            // its ink at one end of the box, so a comma or a full stop stands an em
+            // away from the character after it. Half a mark is that blank and nothing
+            // else, which is what this reclaims; a Latin page is untouched by it,
+            // since no Latin face draws its punctuation that way.
+            punctuation_compression: 0.5,
             hanging_punctuation_em: 0.0,
             ragged_below_em: 16.0,
             quote_indent_em: 1.2,

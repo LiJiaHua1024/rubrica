@@ -7216,22 +7216,37 @@ const CELL_PAD_EM: Pt = 0.6;
 /// floor for a column whose own widest unbreakable word is shorter than this.
 const CELL_MIN_EM: Pt = 3.0;
 
-/// A shaped run turned into something the painter can position: scaled to device
-/// independent pixels, seated `x` from the page edge and `dy` below the baseline of
-/// whichever line carries it.
+/// Fit a mark's runs to the advance the paragraph core charged it, and say how far
+/// left of its own slot the glyphs have to be drawn.
 ///
-/// Prose uses `dy = 0`. A formula's pieces each bring their own offset, which is why
-/// the drop is a property of the run rather than something the line loop assumes.
-fn fit_punctuation_runs(runs: &mut [GlyphRun], width: Pt) {
+/// The reclaimed fraction is a *side bearing*, and which side it sits on follows the
+/// mark's own shape. A closing mark (，。：」) carries its ink on the left of a
+/// full-width box, so a shorter advance is exactly the blank it gives up: the ink
+/// stays where the pen put it and the text that follows comes closer. An opening mark
+/// （「《 is the mirror image -- ink on the right, blank on the left -- so the same
+/// shorter advance there would keep the pen where the ink is not, and the next
+/// character would print on top of the mark. Drawing the glyph that much further left
+/// moves the gap to the side the font left it on, and the returned shift is that
+/// distance.
+fn fit_punctuation_runs(
+    runs: &mut [GlyphRun],
+    width: Pt,
+    kind: Option<rubrica_type::classify::PunctuationKind>,
+) -> Pt {
     let natural = runs.iter().map(GlyphRun::width).sum::<Pt>();
     if natural <= 0.0 || width <= 0.0 {
-        return;
+        return 0.0;
     }
     let scale = width / natural;
     for run in runs {
         for advance in &mut run.advances {
             *advance *= scale;
         }
+    }
+    if kind == Some(rubrica_type::classify::PunctuationKind::Opening) {
+        natural - width
+    } else {
+        0.0
     }
 }
 
@@ -7794,9 +7809,11 @@ fn layout_block(
             } else {
                 font.shape_runs(text, node.text.clone(), &st.face, st.size, st.tracking)
             };
-            if node.punctuation.is_some() {
-                fit_punctuation_runs(&mut shaped, node.advance);
-            }
+            let mark_shift = if node.punctuation.is_some() {
+                fit_punctuation_runs(&mut shaped, node.advance, node.punctuation)
+            } else {
+                0.0
+            };
             // A raised run hangs above this line's baseline, so its ink joins the
             // ascent and its own descent is measured from where it now stands: the
             // line grows upwards to make room for it, and a superscript never
@@ -7806,13 +7823,19 @@ fn layout_block(
             // run that falls back for a symbol -- and each takes up where the last
             // stopped, since only the whole span's width is what the line broke on.
             let mut at = line_left + slot.x;
+            // Only the run carrying the mark's own ink is drawn back into the blank
+            // its advance no longer covers; a fallback piece after it continues from
+            // where the compressed advance ends.
+            let mut back = mark_shift;
             for r in shaped {
+                let x = at - back;
+                back = 0.0;
                 if !hyphen {
-                    mark_run(text, &r, at, &mut marks);
+                    mark_run(text, &r, x, &mut marks);
                 }
                 ascent = ascent.max(r.ascent - dy);
                 descent = descent.max((r.descent + dy).max(0.0));
-                if let Some(p) = paint_run(font, &r, at, dy, k, st.color, (!hyphen).then_some(text)) {
+                if let Some(p) = paint_run(font, &r, x, dy, k, st.color, (!hyphen).then_some(text)) {
                     runs.push(p);
                     if hyphen {
                         hyphens.marks += 1;
@@ -7828,7 +7851,7 @@ fn layout_block(
                         &mut bars,
                         Rule {
                             style: node.style,
-                            x: at,
+                            x,
                             top: dy - pos - weight * 0.5,
                             w: r.width(),
                             h: weight,
@@ -7843,8 +7866,8 @@ fn layout_block(
                 // segment, because there is no character for either to name.
                 continue;
             }
-            merge_hot(&mut hit, actions, &node.text, line_left + slot.x, at);
-            segs.push((node.text.clone(), line_left + slot.x, at));
+            merge_hot(&mut hit, actions, &node.text, line_left + slot.x - mark_shift, at);
+            segs.push((node.text.clone(), line_left + slot.x - mark_shift, at));
         }
         end_rule(&mut ruled, &mut bars);
         let natural = ascent + descent;
@@ -10426,12 +10449,19 @@ fn layout_table(
                         (c.text.as_str(), node.text.clone())
                     };
                     let mut shaped = font.shape_runs(from, range.clone(), &st.face, st.size, st.tracking);
-                    if node.punctuation.is_some() {
-                        fit_punctuation_runs(&mut shaped, node.advance);
-                    }
+                    let mark_shift = if node.punctuation.is_some() {
+                        fit_punctuation_runs(&mut shaped, node.advance, node.punctuation)
+                    } else {
+                        0.0
+                    };
+                    // Same as prose: an opening mark is drawn back into the blank its
+                    // shortened advance gave up, and only its own run moves.
+                    let mut back = mark_shift;
                     for r in shaped {
+                        let drawn = at - back;
+                        back = 0.0;
                         if !hyphen {
-                            mark_run(&c.text, &r, at, &mut marks);
+                            mark_run(&c.text, &r, drawn, &mut marks);
                         }
                         // A citation inside a cell is raised like one inside prose.
                         ascent = ascent.max(r.ascent + st.raise);
@@ -10444,7 +10474,7 @@ fn layout_table(
                                 &mut bars,
                                 Rule {
                                     style: node.style,
-                                    x: at,
+                                    x: drawn,
                                     // Same offset as the raised mark it may strike through.
                                     top: -st.raise - pos - weight * 0.5,
                                     w: width,
@@ -10472,7 +10502,7 @@ fn layout_table(
                                 .collect(),
                             source,
                             clusters: r.clusters,
-                            x: at * k,
+                            x: drawn * k,
                             baseline: 0.0,
                             dy: -st.raise,
                             color: st.color,
@@ -10486,8 +10516,8 @@ fn layout_table(
                         // Ink on the line, not text in the cell.
                         continue;
                     }
-                    merge_hot(&mut hit, &c.actions, &node.text, x + pad + shift + slot.x, at);
-                    segs.push((node.text.clone(), x + pad + shift + slot.x, at));
+                    merge_hot(&mut hit, &c.actions, &node.text, x + pad + shift + slot.x - mark_shift, at);
+                    segs.push((node.text.clone(), x + pad + shift + slot.x - mark_shift, at));
                 }
                 end_rule(&mut ruled, &mut bars);
                 seat(&mut runs, ly + ascent, k);
@@ -15105,6 +15135,31 @@ mod bidi_tests {
         let rects = selection_rects(&sel, selection);
         assert_eq!(rects.len(), 1);
         assert!(rects[0].2 < 10.0);
+    }
+
+    /// Half of a full-width mark's box is blank, and which half decides what the
+    /// painter must do once the paragraph core has shortened its advance. A closing
+    /// mark keeps its ink on the left, so a shorter advance is the blank it gives up
+    /// and the glyph stays where the pen put it. An opening mark's ink is on the
+    /// right: its box has to start where the glyph does, and drawn without that shift
+    /// the character after `（` prints on top of the mark's ink -- which is exactly
+    /// what a compressed opening mark looked like before the shift existed.
+    #[test]
+    fn an_opening_mark_is_drawn_back_into_the_blank_it_gives_up() {
+        let run = || GlyphRun {
+            bidi_level: 0, face: 0, size: 10.0, text: 0..3,
+            glyphs: vec![1], advances: vec![10.0], offsets: vec![DWRITE_GLYPH_OFFSET::default()],
+            clusters: vec![0], ascent: 8.0, descent: 2.0, line_gap: 0.0,
+        };
+        let kind = rubrica_type::classify::PunctuationKind::Opening;
+        let mut opening = vec![run()];
+        let shift = fit_punctuation_runs(&mut opening, 5.0, Some(kind));
+        assert!((opening[0].width() - 5.0).abs() < 1e-4, "the run kept its old advance");
+        assert!((shift - 5.0).abs() < 1e-4, "an opening mark's glyph was not drawn back: {shift}");
+        let kind = rubrica_type::classify::PunctuationKind::Closing;
+        let mut closing = vec![run()];
+        assert_eq!(fit_punctuation_runs(&mut closing, 5.0, Some(kind)), 0.0, "a closing mark's glyph moved");
+        assert!((closing[0].width() - 5.0).abs() < 1e-4, "the run kept its old advance");
     }
 
     #[test]
