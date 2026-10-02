@@ -6,6 +6,7 @@ rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 description = "Native Windows Markdown reader using Direct2D, DirectWrite, and OpenType math"
+build = "build.rs"
 
 [dependencies]
 rubrica-type.workspace = true
@@ -52,3 +53,9 @@ printpdf = { version = "0.12.8", default-features = false, features = ["images",
 [features]
 default = []
 pdf = ["dep:printpdf"]
+
+[build-dependencies]
+# `default-features = false` drops the `toml` parser that only reads
+# `[package.metadata.winresource]`; build.rs states those strings itself, so the
+# build would otherwise pull in a serde tree to reach three literals.
+winresource = { version = "0.1", default-features = false }

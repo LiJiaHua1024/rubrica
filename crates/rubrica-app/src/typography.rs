@@ -47,6 +47,7 @@ pub fn show(owner: HWND, theme: &Theme, plain: bool, lang: Language) -> crate::R
         let wc = WNDCLASSEXW {
             cbSize: std::mem::size_of::<WNDCLASSEXW>() as u32,
             lpfnWndProc: Some(proc), hInstance: instance.into(),
+            hIcon: crate::icon::large(), hIconSm: crate::icon::small(),
             hCursor: LoadCursorW(None, IDC_ARROW)?,
             hbrBackground: windows::Win32::Graphics::Gdi::HBRUSH((COLOR_WINDOW.0 + 1) as *mut _),
             lpszClassName: PCWSTR(class.as_ptr()), ..Default::default()

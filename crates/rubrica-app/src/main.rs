@@ -14,6 +14,7 @@ mod highlight;
 mod hyphen;
 mod i18n;
 mod images;
+mod icon;
 mod instance;
 mod math;
 mod pagination;

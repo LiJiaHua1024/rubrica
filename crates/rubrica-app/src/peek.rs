@@ -84,12 +84,12 @@ use windows::Win32::UI::WindowsAndMessaging::{
     FindWindowExW, GetClassNameW, GetClientRect, GetCursorPos, GetForegroundWindow,
     GetMessageW, GetGUIThreadInfo, GetShellWindow, GetWindowLongPtrW, GetWindowThreadProcessId,
     HHOOK, IsChild, IsWindowVisible,
-    FindWindowW, KillTimer, LoadCursorW, LoadIconW, PostMessageW, PostQuitMessage, RegisterClassExW,
+    FindWindowW, KillTimer, LoadCursorW, PostMessageW, PostQuitMessage, RegisterClassExW,
     RegisterWindowMessageW, SetForegroundWindow, SetTimer, SetWindowLongPtrW, SetWindowsHookExW,
     SetWindowPos, ShowWindow, TrackPopupMenu, TranslateMessage, UnhookWindowsHookEx,
     WindowFromPoint,
     EVENT_SYSTEM_FOREGROUND, GWLP_USERDATA, GUITHREADINFO, GUITHREADINFO_FLAGS, HWND_TOPMOST,
-    IDC_ARROW, IDI_APPLICATION, KBDLLHOOKSTRUCT, LLKHF_INJECTED,
+    IDC_ARROW, KBDLLHOOKSTRUCT, LLKHF_INJECTED,
     MA_NOACTIVATE,
     MENU_ITEM_FLAGS, MF_CHECKED, MF_SEPARATOR, MF_STRING, MSG, MSLLHOOKSTRUCT, SW_HIDE, SW_SHOWNOACTIVATE, SW_SHOWNORMAL,
     SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, TPM_RETURNCMD, TPM_RIGHTBUTTON,
@@ -1346,7 +1346,7 @@ unsafe fn tray_icon(hwnd: HWND) -> NOTIFYICONDATAW {
         uID: TRAY_ID,
         uFlags: NIF_MESSAGE | NIF_ICON | NIF_TIP,
         uCallbackMessage: WM_APP_TRAY,
-        hIcon: unsafe { LoadIconW(None, IDI_APPLICATION).unwrap_or_default() },
+        hIcon: crate::icon::small(),
         szTip: tip,
         ..Default::default()
     }

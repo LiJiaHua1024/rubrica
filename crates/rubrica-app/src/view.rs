@@ -3266,6 +3266,10 @@ pub fn run(path: Option<PathBuf>, extra: Vec<PathBuf>) -> Result<()> {
             style: CS_HREDRAW | CS_VREDRAW | CS_DBLCLKS,
             lpfnWndProc: Some(wnd_proc),
             hInstance: hinst.into(),
+            // The caption, the taskbar button and Alt-Tab all read the class's icon;
+            // the embedded one is the same artwork Explorer shows for the executable.
+            hIcon: crate::icon::large(),
+            hIconSm: crate::icon::small(),
             hCursor: arrow,
             // Null on purpose: the render target covers every client pixel, and a
             // system background brush flashes white while a corner is dragged.

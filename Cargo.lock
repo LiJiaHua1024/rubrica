@@ -811,7 +811,7 @@ checksum = "a611d15b50743feb4c76b7d03edcb0e64f399c26961e4efe6975bc398be6aa3d"
 
 [[package]]
 name = "rubrica-app"
-version = "0.8.9"
+version = "0.8.10"
 dependencies = [
  "hyphenation",
  "printpdf",
@@ -822,11 +822,12 @@ dependencies = [
  "windows",
  "windows-core",
  "windows-numerics",
+ "winresource",
 ]
 
 [[package]]
 name = "rubrica-doc"
-version = "0.8.9"
+version = "0.8.10"
 dependencies = [
  "pulldown-cmark",
  "rubrica-type",
@@ -834,11 +835,11 @@ dependencies = [
 
 [[package]]
 name = "rubrica-math"
-version = "0.8.9"
+version = "0.8.10"
 
 [[package]]
 name = "rubrica-type"
-version = "0.8.9"
+version = "0.8.10"
 dependencies = [
  "unicode-bidi",
  "unicode-linebreak",
@@ -847,7 +848,7 @@ dependencies = [
 
 [[package]]
 name = "rubrica-workspace"
-version = "0.8.9"
+version = "0.8.10"
 
 [[package]]
 name = "rustc-hash"
@@ -1317,6 +1318,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "3949bd5b99cafdf1c7ca86b43ca564028dfe27d66958f2470940f73d86d75b37"
 dependencies = [
  "windows-link",
+]
+
+[[package]]
+name = "winresource"
+version = "0.1.31"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "0986a8b1d586b7d3e4fe3d9ea39fb451ae22869dcea4aa109d287a374d866087"
+dependencies = [
+ "version_check",
 ]
 
 [[package]]
