@@ -266,6 +266,57 @@ fn a_full_width_glyph_is_never_treated_as_a_narrow_latin_one() {
 }
 
 #[test]
+fn only_a_full_width_mark_may_give_up_a_blank_half() {
+    // The blank half a compressed mark reclaims is a real property of its box, so a
+    // mark may only reclaim one if the box has one. That is the width of the glyph, and
+    // the block the marks come from is not one width: `0xFF5B..=0xFF65` holds full-width
+    // `｛｝｜｟｠` beside halfwidth `｢｣､｡･`, whose ink fills its box edge to edge.
+    // Charging a halfwidth mark for a blank it does not have slid the opening `｢` a
+    // quarter of an em to the left, onto the character before it, and pulled the
+    // character after a closing `｣` into its ink.
+    //
+    // Asserted over the whole table rather than over the two characters it was found
+    // on, because the table is the thing that has to hold the rule.
+    let mut offenders = Vec::new();
+    for cp in 0u32..=0xFFFF {
+        let Some(ch) = char::from_u32(cp) else { continue };
+        if !rubrica_type::classify::is_compressible_punct(ch) {
+            continue;
+        }
+        let full_width = unicode_width::UnicodeWidthChar::width(ch) == Some(2);
+        if !full_width {
+            offenders.push(format!("U+{cp:04X}"));
+        }
+    }
+    assert!(offenders.is_empty(), "these marks were compressed although their box is not full-width: {offenders:?}");
+
+    // The two that were, and the behaviour: a halfwidth bracket keeps its whole advance,
+    // so nothing is drawn back over its neighbour.
+    let mut spacing = Spacing::for_size(SIZE);
+    spacing.punctuation_compression = 0.5;
+    // The measure charges a full em per character, so a mark that kept its whole box
+    // makes the line as wide as the characters it is made of, and one that reclaimed
+    // half of its box makes it half an em narrower.
+    let width_of = |text: &str| -> Pt {
+        let mut measure = MonospaceMeasure { size: SIZE, factor: 1.0 };
+        let (para, plan) = typeset(text, &spacing, StyleId(0), &[], &BreakOptions::new(500.0), &mut measure);
+        assert_eq!(plan.lines.len(), 1, "{text:?} wrapped");
+        line_width(&place(&para, &plan.lines[0]))
+    };
+    // The halfwidth brackets keep every bit of their box. They are no longer segmented
+    // apart from the ideographs either, because a mark worth cutting out is one whose
+    // box is worth shortening.
+    assert_eq!(width_of("｢注意｣"), 4.0 * SIZE, "a halfwidth bracket was compressed");
+    // And the full-width marks beside them in the same block still reclaim their blank.
+    assert_eq!(width_of("「注意」"), 3.0 * SIZE, "a full-width mark stopped reclaiming its blank");
+    // `｟｠` are full-width despite being neighbours of the halfwidth pair, and a
+    // hand-maintained exclusion list that missed `｢｣` spared them for no stated reason.
+    assert_eq!(width_of("｟注意｠"), 3.0 * SIZE, "｟｠ stopped reclaiming their blank");
+    // A full-width comma is unchanged by any of this: half its box is still its own.
+    assert_eq!(width_of("注意，好"), 3.5 * SIZE, "a full-width comma stopped reclaiming its blank");
+}
+
+#[test]
 fn a_dash_between_han_takes_no_air_and_the_script_glue_is_still_the_scripts() {
     // The dash and the ellipsis belong to both scripts, and the glue model cannot see
     // the face: beside Han they are Chinese marks whose box already holds their air,

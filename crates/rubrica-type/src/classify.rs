@@ -61,16 +61,19 @@ impl Role {
     }
 }
 
-/// CJK and fullwidth punctuation, which belongs to the surrounding Han run for
-/// glue purposes even though its script property is `Common`.
+/// A full-width mark whose blank half may be reclaimed, which is what makes it worth
+/// segmenting on its own so the painter can shorten its advance.
 ///
-/// Line-head and line-tail prohibitions -- 、。」 may not start a line, 「 may not
-/// end one -- are deliberately not tabled here. UAX #14 already encodes them, and
-/// a second table would only drift out of sync with the first.
-/// A full-width mark whose blank half may be reclaimed. Ambiguous Western quotes and
-/// the middle dot stay unclassified: they are often proportional in Latin prose.
+/// The test is East Asian Width, not membership of the block: the block `0xFF5B..=0xFF65`
+/// holds both `｛｝｜` -- full-width, ink at one end of an em box -- and `｢｣､｡･`, which
+/// are *halfwidth* and fill their box with ink from edge to edge. Charging the second
+/// group the first group's treatment slides an opening `｢` a quarter of an em to the
+/// left, onto the character before it, and pulls the character after a closing `｣` into
+/// its ink. The Ambiguous-width marks that share the block -- `“”‘’` and `·` -- fall out
+/// of the same test for the reason they were excluded by hand: they are narrow in a
+/// Latin face, so there is no blank half to reclaim.
 pub fn is_compressible_punct(ch: char) -> bool {
-    is_cjk_punct(ch) && !matches!(ch as u32, 0x2018..=0x201D | 0x00B7)
+    is_cjk_punct(ch) && ch.width() == Some(2)
 }
 
 pub fn punctuation(ch: char) -> PunctuationKind {
@@ -86,6 +89,12 @@ pub fn punctuation(ch: char) -> PunctuationKind {
     }
 }
 
+/// CJK and fullwidth punctuation, which belongs to the surrounding Han run for
+/// glue purposes even though its script property is `Common`.
+///
+/// Line-head and line-tail prohibitions -- 、。」 may not start a line, 「 may not
+/// end one -- are deliberately not tabled here. UAX #14 already encodes them, and
+/// a second table would only drift out of sync with the first.
 pub fn is_cjk_punct(ch: char) -> bool {
     matches!(ch as u32,
         0x3000..=0x303F      // 、。〈〉《》「」『』【】〰
