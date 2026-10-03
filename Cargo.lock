@@ -844,6 +844,7 @@ dependencies = [
  "unicode-bidi",
  "unicode-linebreak",
  "unicode-script",
+ "unicode-width",
 ]
 
 [[package]]

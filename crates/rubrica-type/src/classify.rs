@@ -1,6 +1,7 @@
 //! Script classification, used to pick the glue recipe at each boundary.
 
 use unicode_script::{Script, UnicodeScript};
+use unicode_width::UnicodeWidthChar;
 
 /// Typographic role of a code point, deciding which inter-node glue applies.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -29,6 +30,21 @@ pub enum PunctuationKind {
 impl Role {
     pub fn of(ch: char) -> Role {
         if is_cjk_punct(ch) {
+            return Role::Cjk;
+        }
+        // A glyph the CJK face draws in a full em carries its own air, whichever script
+        // property the character happens to carry. The two disagree more often than the
+        // script alone suggests: `・` is `Common` and a fullwidth `Ａ` is `Latin`, so both
+        // fall through to `Western` and were handed the quarter em that belongs to a
+        // *narrow* Latin letter -- a second gap on top of the one their box already has.
+        // `间隔・号` set as `间隔 ・ 号`, and `全角Ａ与Ｂ之间` as `全角 Ａ 与 Ｂ 之间`, the very
+        // seam this crate exists to close. East Asian Width is what says which box a face
+        // draws, and it is the property the glue recipe actually depends on.
+        //
+        // Ambiguous-width characters stay out of it. `—`, `…` and `·` are narrow in a
+        // Latin face and wide in a CJK one, and the reader cannot see which face drew
+        // them, so `is_shared_mark` reads them from their neighbours instead.
+        if ch.width() == Some(2) {
             return Role::Cjk;
         }
         match ch.script() {

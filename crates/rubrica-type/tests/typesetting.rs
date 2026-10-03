@@ -225,6 +225,47 @@ fn compression_reclaims_the_blank_only_where_a_mark_has_one() {
 }
 
 #[test]
+fn a_full_width_glyph_is_never_treated_as_a_narrow_latin_one() {
+    // The glue recipe asks whether a character is narrow, not what script it claims.
+    // The two disagree: `・` is `Common`, a fullwidth `Ａ` is `Latin`, and both are drawn
+    // in a full em by the CJK face -- so both were handed the quarter em meant for a
+    // narrow Latin letter, a second gap on top of the one their own box carries.
+    // `间隔・号` set as `间隔 ・ 号` and `全角Ａ与Ｂ之间` as `全角 Ａ 与 Ｂ 之间`.
+    let spacing = Spacing::for_size(SIZE);
+    // A full-width measure, so each of these characters really does occupy an em and a
+    // gap beside one is visible rather than lost in the arithmetic.
+    let width = |text: &str| -> Pt {
+        let mut measure = MonospaceMeasure { size: SIZE, factor: 1.0 };
+        let (para, plan) = typeset(text, &spacing, StyleId(0), &[], &BreakOptions::new(500.0), &mut measure);
+        assert_eq!(plan.lines.len(), 1, "{text:?} wrapped");
+        line_width(&place(&para, &plan.lines[0]))
+    };
+    let full_width_air = |text: &str| -> Pt {
+        let mut measure = MonospaceMeasure { size: SIZE, factor: 1.0 };
+        let (para, _) = typeset(text, &spacing, StyleId(0), &[], &BreakOptions::new(500.0), &mut measure);
+        para.items
+            .iter()
+            .filter(|it| matches!(**it, Item::Glue { base, .. } if base > 0.0))
+            .count() as Pt
+            * spacing.mixed.base
+    };
+    // The control: a genuinely narrow Latin letter still gets its quarter em, which is
+    // what makes the assertions after it say something rather than nothing.
+    assert_eq!(full_width_air("界R对"), 2.0 * spacing.mixed.base, "the Han/Latin join went missing");
+    // A full-width middle dot and a fullwidth letter are both full-em glyphs.
+    assert_eq!(full_width_air("间隔・号"), 0.0, "a full-width middle dot took the Latin quarter em");
+    assert_eq!(full_width_air("全角Ａ与Ｂ"), 0.0, "a fullwidth letter took the Latin quarter em");
+    assert_eq!(full_width_air("２０２４年"), 0.0, "a fullwidth digit took the Latin quarter em");
+    // And no air at all, so the line measures exactly the characters it is made of.
+    assert_eq!(width("间隔・号"), 4.0 * SIZE);
+    assert_eq!(width("全角Ａ与Ｂ"), 5.0 * SIZE);
+    // A narrow mark keeps the quarter em it always had: `×` and `÷` are Ambiguous-width
+    // and narrow in a Latin face, so all three of their joins to the Han beside them are
+    // spaced (`×`|`号`, `和`|`÷`, `÷`|`号`), while `号`|`和` between two ideographs is not.
+    assert_eq!(full_width_air("×号和÷号"), 3.0 * spacing.mixed.base, "a narrow symbol lost its join");
+}
+
+#[test]
 fn a_dash_between_han_takes_no_air_and_the_script_glue_is_still_the_scripts() {
     // The dash and the ellipsis belong to both scripts, and the glue model cannot see
     // the face: beside Han they are Chinese marks whose box already holds their air,
