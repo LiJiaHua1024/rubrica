@@ -17,6 +17,7 @@ use std::ops::Range;
 use std::rc::Rc;
 use std::sync::OnceLock;
 
+use rubrica_type::classify::is_cjk_punct;
 use rubrica_type::paragraph::{Measure, StyleId};
 use rubrica_type::units::Pt;
 use windows::core::{BOOL, PCWSTR, Result as WResult};
@@ -940,9 +941,36 @@ fn locale_for_text(text: &str, language: u8) -> &'static str {
     }
 }
 
+/// Which East Asian face a block is written in, read from how much of its CJK text is
+/// kana or Hangul rather than from whether any of that is present.
+///
+/// One face serves every ideograph in the block, so a single character of another
+/// script must not be able to re-face a whole paragraph. Tested for mere presence, one
+/// `の` was enough: `这是一段…含日文の注記。` had its leading Han drawn in Microsoft YaHei
+/// and its trailing `注記。` in Yu Gothic, because the particle had declared the
+/// paragraph Japanese -- one Chinese sentence set in two faces, which is exactly the
+/// kind of seam that reads as broken typesetting. Weighting the mix is what says which
+/// face the block is really written for, since a Japanese paragraph is kana throughout
+/// while Han beside an occasional particle is Chinese.
+///
+/// A Japanese paragraph is written with kana throughout, so kana have to be a real
+/// part of it rather than a character: one `の` quoted inside Chinese is a quotation,
+/// not a change of language, and two is the smallest run that is writing. Hangul is all
+/// of Korean, so Korean is read more loosely and survives the hanja it still writes in.
+/// Punctuation counts for neither -- `。` is not a Han character, and letting it stand
+/// in for one turned `日本語です。` into a Chinese paragraph.
 fn east_asian_language(text: &str) -> u8 {
-    if text.chars().any(|c| east_asian_script(c) == 1) { 1 }
-    else if text.chars().any(|c| east_asian_script(c) == 2) { 2 }
+    let (mut kana, mut hangul, mut han) = (0u32, 0u32, 0u32);
+    for c in text.chars() {
+        match east_asian_script(c) {
+            1 => kana += 1,
+            2 => hangul += 1,
+            _ if cjk_char(c) && !is_cjk_punct(c) => han += 1,
+            _ => {}
+        }
+    }
+    if hangul > 0 && hangul * 2 >= han { 2 }
+    else if kana >= 2 && kana * 2 >= han { 1 }
     else { 0 }
 }
 
@@ -967,6 +995,79 @@ mod language_tests {
         assert_eq!(east_asian_script('あ'), 1);
         assert!(cjk_char('한'));
         assert!(!cjk_char('A'));
+    }
+
+    /// One face serves every ideograph in a block, so one character of another script
+    /// must not be able to re-face the whole paragraph. Asked for mere presence, a
+    /// single `の` declared a Chinese sentence Japanese: its leading Han came out in
+    /// Microsoft YaHei and its trailing `注記。` in Yu Gothic, so one paragraph of
+    /// Chinese was set in two faces -- the same seam a reader sees as broken
+    /// typesetting, and far more visible than a stray gap.
+    #[test]
+    fn one_particle_does_not_re_face_a_chinese_paragraph() {
+        // The Chinese cases: a particle, a kana word quoted inside Chinese, a Japanese
+        // title. Each is Chinese written with something else in it.
+        for text in [
+            "这是一段普通的中文文字，含日文の注記。",
+            "中文 with some English の mixed",
+            "参考《日本語の文法》这本书的写法",
+        ] {
+            assert_eq!(east_asian_language(text), 0, "{text:?} was re-faced by its own kana");
+            assert_eq!(locale_for_text(text, 0), "zh-CN");
+        }
+        // And the languages still win their own paragraphs, kana and Hangul being what
+        // those paragraphs are mostly made of.
+        for text in ["日本語のテキストです。", "漢字とかな", "これは日本語の文章です。"] {
+            assert_eq!(east_asian_language(text), 1, "{text:?} lost its Japanese face");
+        }
+        for text in ["한글만", "漢字 한글", "한국어 문장입니다"] {
+            assert_eq!(east_asian_language(text), 2, "{text:?} lost its Korean face");
+        }
+        // A paragraph that is one kanji and one particle is not a Japanese paragraph.
+        assert_eq!(east_asian_language("文の"), 0);
+    }
+
+    /// The language a block is written in has to reach the page: with the real theme
+    /// faces, a Chinese paragraph containing one `の` used to reach Yu Gothic for its
+    /// trailing Han, which is where the mismatch became visible rather than theoretical.
+    #[test]
+    fn the_face_a_block_gets_follows_the_language_it_is_written_in() {
+        let Ok(engine) = FontEngine::new() else { return };
+        if !engine.probe() {
+            return;
+        }
+        let req = FaceRequest {
+            family: "Segoe UI".into(),
+            cjk_family: "Microsoft YaHei".into(),
+            japanese_family: "Yu Gothic".into(),
+            korean_family: "Malgun Gothic".into(),
+            fallback: vec![
+                "Segoe UI".into(),
+                "Microsoft YaHei".into(),
+                "Segoe UI Symbol".into(),
+                "Segoe UI Emoji".into(),
+            ],
+            weight: 400,
+            italic: false,
+            ..Default::default()
+        };
+        let text = "这是一段普通的中文文字，含日文の注記。";
+        let runs = engine.shape_runs(text, 0..text.len(), &req, 13.5, 0.0);
+        let families: Vec<String> =
+            runs.iter().map(|r| engine.face_family(r.face).to_string()).collect();
+        let han: Vec<&String> = families.iter().filter(|f| f.contains("YaHei")).collect();
+        let japanese: Vec<&String> = families.iter().filter(|f| f.contains("Gothic")).collect();
+        // Every Han character in the block is Chinese, so they all share one face...
+        assert!(han.len() >= 2, "the Chinese of the block was not drawn in one face: {families:?}");
+        // ...and only the kana itself is drawn in the Japanese face.
+        assert!(
+            japanese.len() <= 1 && text.contains('の'),
+            "more than the kana was drawn in a Japanese face: {families:?}"
+        );
+        // Nothing fell through to a face that owns none of this and draws it as boxes.
+        for run in &runs {
+            assert!(!run.glyphs.contains(&0), "a box was drawn for {text:?}");
+        }
     }
 
     #[test]
