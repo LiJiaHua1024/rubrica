@@ -232,7 +232,7 @@ document_y((Y - up) * u, scroll, dpi) == Y      对任意 P、scroll、dpi 成�
 | 位置 | 问题 | 不修的理由 / 建议 |
 |------|------|------------------|
 | `view.rs:3667` DPI 体系 | 渲染目标以窗口 DPI 创建（`dpiX: self.dpi`），而显示列表按**设备像素**计算（`scale_of = dpi/72`，命中测试用原始 px）：两者只在 96 DPI 一致，>100% 缩放下渲染与命中测试互相矛盾。peek 同模式 | **第二轮已重新核验并升级为本轮最大未修项**（见上文"二、第二轮：暂不修复"首行，含完整触发推演）。结论不变：需要一台 >96 DPI 的机器人工验证后再动 |
-| `view.rs:692` | worker 排版把公式 intern 进线程局部 `MathStore` 后丢弃，重文档的宽公式预览可能取到错误 store 的索引 | 正确修法是把 store 随 LayoutFinals 送回或宽区直接携带源串，涉及 Send 约束，需要设计 |
+| `view.rs:692` | worker 排版把公式 intern 进线程局部 `MathStore` 后丢弃，重文档的宽公式预览可能取到错误 store 的索引 | **已修复**：宽区域与预览改带公式键（源串+字号+display，纯数据可跨线程），`draw_preview` 在窗口自己的 store 查找、缺失则用窗口引擎现排版一次并入库。避免了 Send 约束下的 store 回传（face 索引是引擎相对的，worker 的 store 本身不可搬） |
 | `rubrica-doc/src/lib.rs:403` | `$…$` 无条件启用且 pulldown 的 flanking 只看 ASCII 空白：`成本$3，售价$5` 中间被吞成公式对象 | **与 GitHub 行为一致**（pandoc 有"闭 `$` 后跟数字不闭合"的保护，GitHub 没有）。保持 GitHub 对齐是更可辩护的默认；如要改，需仿 pandoc 的 flanking 后处理，代价是自维护一套判定 |
 | `rubrica-doc/src/emphasis.rs` 转义星 | `\*` 与 CJK 相邻时被当强调吃掉 | 修复通道分不清 `\*` 与字面 `*`，需要新增"来自转义"的样式位。改动面大、回归风险高于收益，值得单独立项 |
 | `peek.rs:162` | 预览存续时焦点关闭/点击关闭默认关，预览可能长期驻留 | 特性开关（`PeekFocusClose`）。第二轮已在关闭按钮上做到"不依赖钩子存活"，驻留策略本身仍属产品决策 |

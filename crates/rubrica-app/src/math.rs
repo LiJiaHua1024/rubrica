@@ -19,6 +19,20 @@ use windows::Win32::Graphics::DirectWrite::{
 
 use crate::font::{FaceRequest, FontEngine, GlyphRun, ObjectBox};
 
+/// What names a formula across stores: the source, the size in sixty-fourths of a
+/// point, and whether it was set as a display limit.
+///
+/// A page's styles carry an index into the one store that set it, and a store is
+/// thread-bound -- a worker layout's dies with the worker -- so the index is a number
+/// with no referent anywhere else. The key is what survives that boundary: a caller
+/// holding it can find the formula in its own store, or set it there if no store has.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct FormulaKey {
+    pub source: String,
+    pub size: i32,
+    pub display: bool,
+}
+
 /// One formula, prepared: the box the line has to make room for and the pieces to
 /// draw, all relative to the formula's own origin at its left edge and baseline.
 pub struct Entry {
@@ -39,6 +53,14 @@ pub struct Entry {
     /// requested math face that is not installed still shapes something, and the
     /// report has to say which.
     family: String,
+}
+
+impl Entry {
+    /// The key this entry is filed under, for a caller that has to find it again in
+    /// some other store than the one that set it.
+    pub fn key(&self) -> FormulaKey {
+        FormulaKey { source: self.key.0.clone(), size: self.key.1, display: self.key.2 }
+    }
 }
 
 #[derive(Default)]
@@ -160,6 +182,13 @@ impl MathStore {
 
     pub fn get(&self, i: usize) -> Option<&Entry> {
         self.entries.get(i)
+    }
+
+    /// The index of the entry filed under this key, if there is one.
+    pub fn find(&self, key: &FormulaKey) -> Option<usize> {
+        self.entries
+            .iter()
+            .position(|e| e.key.0 == key.source && e.key.1 == key.size && e.key.2 == key.display)
     }
 
     /// How many formulas are set, how much of them is shaped rather than drawn, which

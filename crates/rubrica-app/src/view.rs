@@ -822,7 +822,10 @@ fn spawn_layout(
 /// A piece of content wider than the reading column and the interaction it owns.
 #[derive(Clone, Debug, PartialEq)]
 pub enum WideKind {
-    Formula(usize),
+    /// The key names the formula in whatever store is asked, rather than by an
+    /// index into the store that set it: a worker layout's store dies with the
+    /// worker, and a region outlives it.
+    Formula(crate::math::FormulaKey),
     Image(PathBuf),
     Table,
 }
@@ -830,7 +833,7 @@ pub enum WideKind {
 #[derive(Clone, Debug, PartialEq)]
 pub enum Preview {
     Image(PathBuf),
-    Formula(usize),
+    Formula(crate::math::FormulaKey),
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -5545,7 +5548,7 @@ impl View {
                 let Some(region) = self.wide_regions.get(index).cloned() else { return };
                 match region.kind {
                     WideKind::Image(path) => self.preview = Some(Preview::Image(path)),
-                    WideKind::Formula(source) => self.preview = Some(Preview::Formula(source)),
+                    WideKind::Formula(key) => self.preview = Some(Preview::Formula(key)),
                     WideKind::Table => {
                         self.wide_active = Some(index);
                         self.wide_offset = 0.0;
@@ -7760,10 +7763,14 @@ fn layout_block(
                         line_wide = Some((WideKind::Image(file.clone()), line_left + slot.x, o.advance, column.min(o.advance)));
                     }
                     Some(ObjectSource::Math(index)) => {
-                        line_wide = Some((WideKind::Formula(*index), line_left + slot.x, o.advance, column.min(o.advance)));
-                        // Every piece arrives at its own place inside the formula's
-                        // box, so nothing here accumulates an advance.
+                        // The region carries the key rather than the store index: the
+                        // store that set this formula may be the worker's own, which
+                        // dies with the layout job, and the preview has to be able to
+                        // find (or set) the formula again from the window's store.
                         if let Some(entry) = math.get(*index) {
+                            line_wide = Some((WideKind::Formula(entry.key()), line_left + slot.x, o.advance, column.min(o.advance)));
+                            // Every piece arrives at its own place inside the formula's
+                            // box, so nothing here accumulates an advance.
                             for (r, dx, dy) in &entry.parts {
                                 if let Some(p) = paint_run(font, r, line_left + slot.x + dx, *dy, k, st.color, None) {
                                     runs.push(p);
@@ -9681,13 +9688,33 @@ impl View {
                     target.DrawBitmap(&bmp, Some(&r), 1.0, D2D1_BITMAP_INTERPOLATION_MODE_LINEAR, None);
                 }
             }
-            Preview::Formula(index) => {
-                let Some(entry) = self.maths.get(&self.profile).and_then(|store| store.get(index)) else { return };
+            Preview::Formula(key) => {
+                // The index the page's styles carry names an entry in the store that
+                // set it, and a worker layout's store died with the worker -- so what
+                // the region carries instead is the key. The window's own store may
+                // never have seen the formula; there it is set once, into the same
+                // store every later look-up shares.
+                let View { font, theme, maths, profile, .. } = self;
+                let store = maths.entry(profile.clone()).or_default();
+                let found = match store.find(&key) {
+                    Some(i) => Some(i),
+                    None => store.intern(
+                        font,
+                        &math_face(theme),
+                        &prose_face(theme),
+                        &key.source,
+                        key.size as f32 / 64.0,
+                        key.display,
+                    ),
+                };
+                let Some(entry) = found.and_then(|i| store.get(i)) else { return };
+                let object = entry.object;
+                let rules = entry.rules.clone();
                 let k = scale_of(self.dpi);
-                let scale = ((panel.right - panel.left - 32.0) / (entry.object.advance * k).max(1.0))
-                    .min((panel.bottom - panel.top - 32.0) / ((entry.object.ascent + entry.object.descent) * k).max(1.0));
-                let baseline = panel.top + (panel.bottom - panel.top + (entry.object.ascent - entry.object.descent) * scale * k) * 0.5;
-                let left = panel.left + (panel.right - panel.left - entry.object.advance * scale * k) * 0.5;
+                let scale = ((panel.right - panel.left - 32.0) / (object.advance * k).max(1.0))
+                    .min((panel.bottom - panel.top - 32.0) / ((object.ascent + object.descent) * k).max(1.0));
+                let baseline = panel.top + (panel.bottom - panel.top + (object.ascent - object.descent) * scale * k) * 0.5;
+                let left = panel.left + (panel.right - panel.left - object.advance * scale * k) * 0.5;
                 let mut runs = Vec::new();
                 for (r, x, y) in &entry.parts {
                     // `paint_run` scales the x it is handed by its own `k`, which here
@@ -9695,7 +9722,7 @@ impl View {
                     // unmultiplied and the panel's left edge is divided out the same way.
                     // Scaling here as well would spread the formula by `scale` a second
                     // time and walk its right hand out of the panel.
-                    if let Some(mut run) = paint_run(&self.font, r, (left / (k * scale)) + *x, *y * scale, k * scale, ColorRole::Text, None) {
+                    if let Some(mut run) = paint_run(font, r, (left / (k * scale)) + *x, *y * scale, k * scale, ColorRole::Text, None) {
                         // The part's lift is in points below the baseline -- negative for a
                         // numerator -- so it rejoins the rule the same way the rules below
                         // do, at `baseline + y * scale * k`.
@@ -9705,7 +9732,7 @@ impl View {
                 }
                 self.draw_runs(target, &runs, 0.0);
                 if let Some(brush) = self.brushes.get(&ColorRole::Text).cloned() {
-                    for (x, top, w, h) in &entry.rules {
+                    for (x, top, w, h) in &rules {
                         let r = D2D_RECT_F {
                             left: left + *x * scale * k,
                             top: baseline + *top * scale * k,
@@ -10728,6 +10755,32 @@ fn squeeze_grid(widths: &mut [Pt], floors: &[Pt], column: Pt) -> Pt {
     widths.iter().sum()
 }
 
+/// The face a formula's structure is set from: one face for the whole formula,
+/// because a `MATH` table is a property of a face rather than of a theme role -- the
+/// constants that place every bar and script come from it, so the choice decides how
+/// a formula looks more than any size or weight does. `Cambria Math` is the face the
+/// platform ships with real math tables; the fallback is asked for its own.
+fn math_face(theme: &Theme) -> FaceRequest {
+    let names = &theme.fonts.math;
+    FaceRequest {
+        family: names[0].clone(),
+        cjk_family: names[0].clone(),
+        fallback: vec![names[1].clone()],
+        weight: 400,
+        italic: false,
+        ..Default::default()
+    }
+}
+
+/// The face a formula's prose is set from when a store has to set the formula on its
+/// own, without a block to borrow the surrounding style from: a body paragraph's,
+/// which is what a formula in running text stands beside.
+fn prose_face(theme: &Theme) -> FaceRequest {
+    let mut styles = Vec::new();
+    let id = intern(&mut styles, &theme.fonts.fallback, theme.resolve(BlockKind::Paragraph, InlineStyle::EMPTY));
+    styles[id.0 as usize].face.clone()
+}
+
 /// Intern an inline object's style: the box the line has to make room for, and what
 /// draws inside it.
 ///
@@ -10867,20 +10920,11 @@ impl<'a> Objects<'a> {
                 // One face for the whole formula's *structure*, because a `MATH` table is
                 // a property of a face rather than of a theme role: the constants that
                 // place every bar and script come from it, so the choice decides how a
-                // formula looks more than any size or weight does. `Cambria Math` is the
-                // face the platform ships with real math tables; the fallback is asked
-                // for its own. Text the symbol face cannot carry -- a `\text{其中}` in a
+                // formula looks more than any size or weight does (see [`math_face`]).
+                // Text the symbol face cannot carry -- a `\text{其中}` in a
                 // Chinese document -- goes back to the block's prose face, which is the
                 // one thing the math face has no hope of supplying.
-                let names = &theme.fonts.math;
-                let req = FaceRequest {
-                    family: names[0].clone(),
-                    cjk_family: names[0].clone(),
-                    fallback: vec![names[1].clone()],
-                    weight: 400,
-                    italic: false,
-                    ..Default::default()
-                };
+                let req = math_face(theme);
                 let index = self.math.intern(font, &req, &prose.face, source, size, *display)?;
                 let box_ = self.math.get(index)?.object;
                 Some(intern_object(styles, ObjectSource::Math(index), color, box_))
@@ -14696,6 +14740,51 @@ mod tests {
         let mut objects = Objects::new(None, None, &mut math);
         let page = build_ops(&mut font, &Theme::default(), &centered, 700.0, DPI, &mut objects, None);
         assert!(page.wide_regions.is_empty(), "a grid the window holds whole registered a region");
+    }
+
+    /// A worker layout interns its formulas into the worker's own store, which dies
+    /// with the job; what reaches the window is the key a region carries. The key
+    /// has to find the formula in the setting store, and to set it again in one that
+    /// never saw it -- the state a window's store is in when an async layout's page
+    /// arrives and a reader clicks a formula.
+    #[test]
+    fn a_formula_key_sets_the_formula_again_in_a_store_that_never_saw_it() {
+        let Ok(mut font) = FontEngine::new() else { return };
+        if !font.probe() {
+            return;
+        }
+        let doc = Document::parse("$$g(a)=\\frac{x^{2}}{e^{x}}a+\\frac{x-1}{e^{x}}+e$$\n");
+        let mut math = crate::math::MathStore::new();
+        let mut objects = Objects::new(None, None, &mut math);
+        let page = build_ops(&mut font, &Theme::default(), &doc, 700.0, DPI, &mut objects, None);
+        let keys: Vec<_> = page.wide_regions.iter().filter_map(|r| match &r.kind {
+            WideKind::Formula(key) => Some(key.clone()),
+            _ => None,
+        }).collect();
+        assert!(!keys.is_empty(), "a display formula registered no region");
+        for key in &keys {
+            assert!(math.find(key).is_some(), "the setting store could not find its own key");
+        }
+        // The window's store, after an async layout: nothing in it. The key sets
+        // the formula again, into the same box the page was set from.
+        let mut fresh = crate::math::MathStore::new();
+        assert_eq!(fresh.find(&keys[0]), None);
+        let theme = Theme::default();
+        let i = fresh
+            .intern(
+                &font,
+                &math_face(&theme),
+                &prose_face(&theme),
+                &keys[0].source,
+                keys[0].size as f32 / 64.0,
+                keys[0].display,
+            )
+            .expect("a key the store never saw still sets");
+        let set = fresh.get(i).unwrap();
+        let from_page = math.find(&keys[0]).and_then(|j| math.get(j)).unwrap();
+        assert_eq!(set.key(), from_page.key());
+        assert_eq!(set.object, from_page.object, "the box a fresh store sets drifted from the page's");
+        assert_eq!(set.parts.len(), from_page.parts.len());
     }
 
     /// A layout hands its finish to the window whatever its last batch carried.

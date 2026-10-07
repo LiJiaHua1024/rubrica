@@ -396,6 +396,8 @@ impl Document {
         let rewritten = tex_delimiters(source);
         let original = source;
         let source = rewritten.as_deref().unwrap_or(source);
+        let relaxed = relax_list_interrupts(source);
+        let source = relaxed.as_deref().unwrap_or(source);
         let opts = Options::ENABLE_STRIKETHROUGH
             | Options::ENABLE_TASKLISTS
             | Options::ENABLE_TABLES
@@ -604,8 +606,146 @@ fn tex_inline(line: &str) -> String {
     out
 }
 
+/// The blank lines the list-interrupt leniency inserts, or `None` when the source
+/// needs none.
+///
+/// CommonMark lets a list interrupt a paragraph only when its first marker is `1.`,
+/// which is what keeps "…windows in my house is / 14.  The number of doors is 6."
+/// one sentence. Notes written the way a chat model writes them lean on the other
+/// reading: every numbered point starts its own line, with no blank line anywhere
+/// between the blocks, and point 3 onward melts into the paragraph before it -- on
+/// these pages as much as on GitHub's, because the rule is the spec's. So a marker
+/// at the head of a line is read the way its author read it: as a new point, with
+/// the paragraph ended above it. A blank line is inserted before such a line, which
+/// is the only edit the pass makes; everything else -- fences, display equations,
+/// a list already running -- is exactly the shape whose reading must not change.
+///
+/// Whether the marker really opens a point is a judgement the source leaves open,
+/// and the pass settles it heuristically, by [`ends_sentence`]: a paragraph that
+/// finished its thought gives way to the point beneath it, while a line still in
+/// mid-sentence keeps its wrap -- which is what saves the very sentence the strict
+/// rule exists for, "…windows in my house is" ending nowhere near a full stop. A
+/// bullet item above counts as finished too: a marker line is not prose a wrap can
+/// run through.
+///
+/// A line is a point when it carries an ordered marker with a text after it: one to
+/// nine digits, a `.` or a `)`, and the space a non-empty item needs. The insert
+/// waits on the line before: blank means the paragraph is already over and the
+/// marker needs no help, and a numbered line means the marker goes on with a list
+/// it already belongs to -- a blank line dropped into a running list would loosen
+/// every item it had.
+fn relax_list_interrupts(src: &str) -> Option<String> {
+    let mut out = String::new();
+    // The character and run length of a code fence that is still open -- the same
+    // judgement [`tex_delimiters`] makes, and for the same reason: the lines inside
+    // a fence are somebody's text, not the parser's to rearrange.
+    let mut fence: Option<(char, usize)> = None;
+    // Whether a `$$` display equation is still open across lines. TeX delimiters
+    // have already been rewritten, so `\[ … \]` is read here too.
+    let mut display = false;
+    // The line before, as the interruption test reads it: blank, an ordered point
+    // (whose list the marker would go on with), a bullet item, or its text.
+    let mut prev_blank = true;
+    let mut prev_ordered = false;
+    let mut prev_bullet = false;
+    let mut prev_text = "";
+    let mut changed = false;
+    for line in src.split_inclusive('\n') {
+        let body = line.trim_end_matches(['\n', '\r']);
+        let text = body.trim_start();
+        let indent = body.len() - text.len();
+        // A blockquote's markers sit above whatever the line carries, exactly as
+        // [`tex_delimiters`] takes them off before its own tests.
+        let mut quoted = text;
+        while let Some(rest) = quoted.strip_prefix('>') {
+            quoted = rest.strip_prefix([' ', '\t']).unwrap_or(rest);
+        }
+        let first = quoted.chars().next();
+        let run = quoted.chars().take_while(|c| Some(*c) == first).count();
+        let is_fence_marker = indent < 4 && matches!(first, Some('`') | Some('~')) && run >= 3;
+        let ends_fence = fence.is_some_and(|(c, n)| {
+            is_fence_marker
+                && first == Some(c)
+                && run >= n
+                && quoted.trim_end_matches([' ', '\t']).chars().all(|x| x == c)
+        });
+        let in_fence = fence.is_some() || indent >= 4;
+        if !in_fence
+            && !display
+            && !prev_blank
+            && !prev_ordered
+            && numbered_item(quoted)
+            && (prev_bullet || ends_sentence(prev_text))
+        {
+            out.push('\n');
+            changed = true;
+        }
+        // The state this line leaves behind, for the line after it.
+        if ends_fence {
+            fence = None;
+        } else if is_fence_marker && fence.is_none() {
+            fence = Some((first.unwrap(), run));
+        }
+        if !in_fence && indent < 4 {
+            if display {
+                if quoted.contains("$$") {
+                    display = false;
+                }
+            } else if quoted.starts_with("$$") && !quoted[2..].contains("$$") {
+                display = true;
+            }
+        }
+        out.push_str(line);
+        let blank = body.trim().is_empty();
+        prev_blank = blank;
+        prev_ordered = !blank && numbered_item(quoted);
+        prev_bullet = !blank && bullet_item(quoted);
+        prev_text = quoted;
+    }
+    changed.then_some(out)
+}
+
+/// Whether a line, its indent and quote markers already off, is an ordered list
+/// marker with a text after it: one to nine digits, a `.` or a `)`, and the space
+/// a non-empty item needs. A bare `3.` is an empty item, and a sentence a wrap
+/// left starting `3.` deserves to stay a sentence.
+fn numbered_item(text: &str) -> bool {
+    let digits = text.chars().take_while(|c| c.is_ascii_digit()).count();
+    digits > 0
+        && digits <= 9
+        && matches!(text.as_bytes().get(digits), Some(b'.' | b')'))
+        && matches!(text.as_bytes().get(digits + 1), Some(b' ' | b'\t'))
+}
+
+/// Whether a line, its indent and quote markers already off, is a bullet item:
+/// one of the three markers, then a space or the end of the line.
+fn bullet_item(text: &str) -> bool {
+    matches!(text.as_bytes().first(), Some(b'-' | b'+' | b'*'))
+        && matches!(text.as_bytes().get(1), None | Some(b' ' | b'\t'))
+}
+
+/// Whether a line ends like a finished thought, reading past the closing quotes
+/// and brackets a sentence may go out wearing. This is the whole of the list
+/// leniency's discipline: a marker under a finished line is a new point, a marker
+/// under a half-finished line is a sentence a wrap left behind. The colon counts
+/// as finished because it is what a list is usually introduced with.
+fn ends_sentence(line: &str) -> bool {
+    let mut chars = line.trim_end().chars().rev();
+    let last = loop {
+        match chars.next() {
+            // The quotes and brackets a sentence may close inside of: what the
+            // sentence itself ends with is the character under them.
+            Some(')' | ']' | '}' | '"' | '\'' | '）' | '」' | '』' | '”' | '’' | '】' | '》' | '〉') => continue,
+            Some(c) => break c,
+            None => return false,
+        }
+    };
+    matches!(last, '。' | '！' | '？' | '…' | '；' | '：' | ':' | '.' | '!' | '?')
+}
+
 /// Sparse offsets for the only source edits made before parsing: TeX delimiter
-/// replacement and indentation removed from standalone display delimiters.
+/// replacement and indentation removed from standalone display delimiters, and
+/// the blank line [`relax_list_interrupts`] inserts before an ordered marker.
 fn rewrite_origins(original: &str, rewritten: &str, base: usize) -> Vec<(usize, usize)> {
     let mut points = vec![(0, base)];
     let (mut from, mut to) = (0, 0);
@@ -625,6 +765,16 @@ fn rewrite_origins(original: &str, rewritten: &str, base: usize) -> Vec<(usize, 
         let tail = &original[from..];
         if rewritten.as_bytes()[to] == b'$' && (tail.starts_with("\\(") || tail.starts_with("\\)")) {
             from += 2; to += 1;
+        } else if rewritten.as_bytes()[to] == b'\n'
+            // A blank line [`relax_list_interrupts`] inserted: the rewritten text
+            // gained one newline the original never had, straight after a line's
+            // own terminator. The pass never touches a blank line the original
+            // already had, so a doubled newline in the rewritten text and a
+            // single one here is that insert and nothing else.
+            && to > 0
+            && rewritten.as_bytes()[to - 1] == b'\n'
+        {
+            to += 1;
         } else {
             let trimmed = tail.trim_start_matches([' ', '\t']);
             let skipped = tail.len() - trimmed.len();
@@ -1898,5 +2048,105 @@ mod source_span_tests {
         let spent = started.elapsed();
         assert!(spent.as_secs_f64() < 1.0, "16 000 styled lines took {spent:?}");
         assert_eq!(spans, folded(&source));
+    }
+
+    /// The leniency's whole contract: a blank line goes before a numbered point a
+    /// paragraph would swallow -- and only where the paragraph above finished its
+    /// thought -- and nowhere else: not into a running list, not into a fence, not
+    /// into a display equation, not before a sentence a wrap left starting `3.`.
+    #[test]
+    fn the_list_leniency_inserts_only_where_a_paragraph_swallows_a_point() {
+        // The shape the notes arrive in: no blank line anywhere.
+        assert_eq!(
+            relax_list_interrupts("到此为止。\n3. **新的一点:** 继续\n"),
+            Some("到此为止。\n\n3. **新的一点:** 继续\n".into())
+        );
+        // The heuristic's own gate: the sentence the strict rule exists for ends
+        // mid-thought, and its wrap keeps its wrap.
+        assert_eq!(
+            relax_list_interrupts("The number of windows in my house is\n14.  The number of doors is 6.\n"),
+            None
+        );
+        // Sentence-final punctuation under closing brackets rides along.
+        assert_eq!(
+            relax_list_interrupts("（注：此句已完。）\n5. 甲\n"),
+            Some("（注：此句已完。）\n\n5. 甲\n".into())
+        );
+        // A lead-in colon is what a list is introduced with.
+        assert_eq!(
+            relax_list_interrupts("具体步骤如下：\n3. 甲\n"),
+            Some("具体步骤如下：\n\n3. 甲\n".into())
+        );
+        // A comma is mid-thought in either script.
+        assert_eq!(relax_list_interrupts("首先，看这里，\n3. 甲\n"), None);
+        // A list already running: a blank would loosen every item it has.
+        assert_eq!(relax_list_interrupts("1. 甲\n2. 乙\n3. 丙\n"), None);
+        // The paragraph is already over.
+        assert_eq!(relax_list_interrupts("到此为止。\n\n3. 甲\n"), None);
+        // A bullet item is not prose a wrap runs through; the point under it opens.
+        assert_eq!(relax_list_interrupts("- 甲\n3. 乙\n"), Some("- 甲\n\n3. 乙\n".into()));
+        // A `)` marks a point too.
+        assert_eq!(
+            relax_list_interrupts("到此为止。\n2) 乙\n"),
+            Some("到此为止。\n\n2) 乙\n".into())
+        );
+        // No space after the marker is no marker: prose a wrap left there.
+        assert_eq!(relax_list_interrupts("到此为止。\n3.四\n"), None);
+        // Inside a fence the lines are somebody's text, not the parser's.
+        assert_eq!(relax_list_interrupts("到此为止。\n```\n3. 甲\n```\n"), None);
+        // Inside a display equation the same.
+        assert_eq!(relax_list_interrupts("$$\n3. 甲\n$$\n"), None);
+        // Indented code is not prose either.
+        assert_eq!(relax_list_interrupts("到此为止。\n    3. 甲\n"), None);
+        // A quoted paragraph ends at the blank, and the quoted point follows.
+        assert_eq!(
+            relax_list_interrupts("> 到此为止。\n> 3. 甲\n"),
+            Some("> 到此为止。\n\n> 3. 甲\n".into())
+        );
+        // The first line of a file was never swallowed by anything.
+        assert_eq!(relax_list_interrupts("3. 甲\n"), None);
+    }
+
+    /// The sentence the strict rule exists for, read whole: a wrap left `14.` at
+    /// the head of a line, and the line before it ends mid-sentence -- so the
+    /// heuristic keeps it one paragraph, exactly where CommonMark does.
+    #[test]
+    fn a_wrap_that_starts_with_a_number_stays_a_sentence() {
+        let doc = Document::parse(
+            "The number of windows in my house is\n14.  The number of doors is 6.\n",
+        );
+        assert_eq!(doc.blocks.len(), 1, "a wrapped sentence split into blocks");
+        assert!(doc.blocks[0].text.contains("14."), "{:?}", doc.blocks[0].text);
+        assert!(doc.blocks[0].list.is_none());
+    }
+
+    /// A numbered point on its own line, with no blank line above it, becomes the
+    /// block its author wrote: where CommonMark's "only `1.` interrupts" rule melts
+    /// point 3 into the paragraph before it, this reader starts the list there.
+    #[test]
+    fn a_numbered_point_after_a_paragraph_opens_its_own_block() {
+        let source = "到此为止。\n3. **新的一点:** 继续\n";
+        let doc = Document::parse(source);
+        assert_eq!(doc.blocks.len(), 2, "the point stayed in the paragraph before it");
+        assert_eq!(doc.blocks[0].kind, BlockKind::Paragraph);
+        assert!(
+            !doc.blocks[0].text.contains("3."),
+            "the marker melted into the paragraph: {:?}",
+            doc.blocks[0].text
+        );
+        assert_eq!(
+            doc.blocks[1].list.map(|l| (l.ordered, l.index)),
+            Some((true, Some(3))),
+            "the point is the item numbered 3"
+        );
+        assert!(doc.blocks[1].text.contains("新的一点"), "{:?}", doc.blocks[1].text);
+        // The block's text came out of the rewritten source one blank line longer
+        // than the file: its spans still name the file's own bytes.
+        let at = doc.blocks[1].sources.first().map(|s| s.source).expect("spans keep sources");
+        assert!(source[at..].starts_with("新"), "a span names the wrong byte of the file: {at}");
+        // And `1.` interrupted paragraphs before the leniency, unchanged.
+        let one = Document::parse("到此为止。\n1. 第一点\n");
+        assert_eq!(one.blocks.len(), 2);
+        assert_eq!(one.blocks[1].list.map(|l| (l.ordered, l.index)), Some((true, Some(1))));
     }
 }

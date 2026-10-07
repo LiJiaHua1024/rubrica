@@ -98,6 +98,14 @@ and column, images, links and footnotes, strikethrough, autolinks, raw HTML kept
 YAML front matter dropped as metadata, and `\(...\)`, `\[...\]` and `$...$` formulas.
 Definition lists (`Term` over a line starting `: `) are read as terms and definitions.
 
+One deliberate leave from CommonMark, settled heuristically: an ordered marker (`3.` or
+`3)`) at the head of a line starts its own item even without a blank line above it --
+but only when the line above finished its thought, meaning sentence punctuation with
+any closing quotes or brackets riding on it, or a lead-in colon. A line still in
+mid-sentence keeps its wrap, which is what saves the hard-wrapped English sentence the
+strict rule exists for. Fences, display equations and a list already running are read
+exactly as the spec reads them.
+
 Math covers fractions and roots, scripts and limits, big operators with stacked
 sub-superscripts, matrices and cases and `aligned`, `\hline` and column rulings,
 `\over`/`\choose`/`\atop`/`\brace`/`\brack`/`\above`, extensible brackets and braces,
