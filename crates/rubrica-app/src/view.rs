@@ -11448,6 +11448,14 @@ fn pdf_rgb(c: Rgb) -> PdfColor {
 }
 
 #[cfg(feature = "pdf")]
+fn pdf_filled_rect(x: f32, y: f32, width: f32, height: f32) -> PdfRect {
+    PdfRect {
+        mode: Some(printpdf::PaintMode::Fill),
+        ..PdfRect::from_xywh(printpdf::Pt(x), printpdf::Pt(y), printpdf::Pt(width), printpdf::Pt(height))
+    }
+}
+
+#[cfg(feature = "pdf")]
 fn pdf_color(role: ColorRole, dark: bool) -> PdfColor {
     pdf_rgb(Palette::of(dark).ink(role))
 }
@@ -11692,12 +11700,7 @@ fn write_pdf(
         let mut ops = vec![
             PdfOp::SetFillColor { col: pdf_rgb(palette.bg) },
             PdfOp::DrawRectangle {
-                rectangle: PdfRect::from_xywh(
-                    printpdf::Pt(0.0),
-                    printpdf::Pt(0.0),
-                    printpdf::Pt(width),
-                    printpdf::Pt(height),
-                ),
+                rectangle: pdf_filled_rect(0.0, 0.0, width, height),
             },
         ];
         let mut source_ops = Vec::new();
@@ -11807,12 +11810,7 @@ fn write_pdf(
                     let clipped1 = y1.min(content_height);
                     ops.push(PdfOp::SetFillColor { col: pdf_color(*color, dark) });
                     ops.push(PdfOp::DrawRectangle {
-                        rectangle: PdfRect::from_xywh(
-                            printpdf::Pt(*x),
-                            printpdf::Pt(height - clipped1),
-                            printpdf::Pt(*w),
-                            printpdf::Pt(clipped1 - clipped0),
-                        ),
+                        rectangle: pdf_filled_rect(*x, height - clipped1, *w, clipped1 - clipped0),
                     });
                 }
                 Op::Line { x0, y0, x1, y1, thickness, color } => {
