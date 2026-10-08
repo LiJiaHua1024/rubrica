@@ -7670,7 +7670,7 @@ fn layout_block(
 
     // The paragraph under measurement, opened so that each word's width is looked
     // up by the paragraph's address instead of by hashing the whole of it.
-    font.begin_paragraph(text);
+    let _paragraph = font.begin_paragraph(text);
     let (para, plan) = typeset_hyphenated(
         text,
         &spacing,

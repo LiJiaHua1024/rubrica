@@ -133,7 +133,20 @@ pub struct FontEngine {
     /// as long as its words are measured, so an equal address and length can only be
     /// the paragraph itself. Any other text -- a label, a marker, a table cell -- has
     /// an address of its own and goes to the cache.
-    paragraph: RefCell<Option<OpenParagraph>>,
+    paragraph: Rc<RefCell<Option<OpenParagraph>>>,
+}
+
+/// Keeps the paragraph text alive and immutable for the address-based fast path.
+#[must_use]
+pub struct ParagraphGuard<'a> {
+    paragraph: Rc<RefCell<Option<OpenParagraph>>>,
+    _text: &'a str,
+}
+
+impl Drop for ParagraphGuard<'_> {
+    fn drop(&mut self) {
+        self.paragraph.borrow_mut().take();
+    }
 }
 
 /// The paragraph [`FontEngine::begin_paragraph`] opened.
@@ -260,7 +273,7 @@ impl FontEngine {
                 resolved: RefCell::new(HashMap::new()),
                 shaped: RefCell::new(LayeredMap::default()),
                 analyzed: RefCell::new(LayeredMap::default()),
-                paragraph: RefCell::new(None),
+                paragraph: Rc::new(RefCell::new(None)),
                 strikeout: RefCell::new(HashMap::new()),
                 font_files: RefCell::new(HashMap::new()),
                 styles: RefCell::new(Vec::new()),
@@ -502,10 +515,12 @@ impl FontEngine {
     /// Open a paragraph for measurement: its words are asked of [`Self::shape_runs`]
     /// with the paragraph's own text, and the calls this saves are what keep a long
     /// paragraph from costing its own length once per word.
-    pub fn begin_paragraph(&self, text: &str) {
+    pub fn begin_paragraph<'a>(&self, text: &'a str) -> ParagraphGuard<'a> {
+        self.paragraph.borrow_mut().take();
         let runs = self.itemization(text);
         *self.paragraph.borrow_mut() =
             Some(OpenParagraph { owner: (text.as_ptr(), text.len()), runs });
+        ParagraphGuard { paragraph: self.paragraph.clone(), _text: text }
     }
 
     /// Shape `text[range]`, starting a new run wherever the face must change.
@@ -1218,6 +1233,22 @@ mod tests {
         }
     }
 
+    #[test]
+    fn a_reused_paragraph_buffer_is_analysed_as_its_current_text() {
+        let engine = FontEngine::new().unwrap();
+        assert!(engine.probe());
+        let mut text = String::from("aא");
+        let pointer = text.as_ptr();
+        {
+            let _paragraph = engine.begin_paragraph(&text);
+            assert!(covers_text(&engine.shape_runs(&text, 0..text.len(), &installed_request(), 13.5, 0.0), &text));
+        }
+        text.replace_range(.., "中");
+        assert_eq!(pointer, text.as_ptr());
+        let _paragraph = engine.begin_paragraph(&text);
+        assert!(covers_text(&engine.shape_runs(&text, 0..text.len(), &installed_request(), 13.5, 0.0), &text));
+    }
+
     /// A variation selector is a modifier, not a character: it asks for another form of
     /// the glyph before it and draws nothing of its own, so no face has to have one.
     /// Read as an ordinary character it is one nothing owns, and the piece it landed in
@@ -1314,4 +1345,3 @@ mod tests {
             "and it should be drawn as .notdef boxes, not silently substituted");
     }
 }
-
