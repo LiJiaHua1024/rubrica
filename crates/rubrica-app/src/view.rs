@@ -1040,6 +1040,8 @@ pub enum Join {
 /// can be drawn in two pieces while still being one word to select.
 pub struct SelLine {
     pub source: Option<std::ops::Range<usize>>,
+    /// Sparse mapping from this line's displayed UTF-8 bytes to the original source.
+    pub source_map: Vec<rubrica_doc::SourceSpan>,
     /// Top edge and height, in the same device independent pixels as [`Hot`] and
     /// measured from the top of the document.
     pub y: f32,
@@ -6235,9 +6237,12 @@ impl View {
     fn caret_source(&self) -> Option<usize> {
         let caret = self.caret?;
         let line = self.sel_index.get(caret.line)?;
-        let start = line.source.as_ref()?.start;
         let prefix = line.chars.iter().take(caret.ch).map(|c| c.len_utf8()).sum::<usize>();
-        Some(start + prefix)
+        rubrica_doc::source_at(&line.source_map, prefix).or_else(|| {
+            line.source.as_ref().map(|range| {
+                range.start + if line.source_map.is_empty() { prefix } else { 0 }
+            })
+        })
     }
 
     fn restore_source(&mut self, byte: usize) {
@@ -7581,7 +7586,7 @@ fn mark_line(
     segs.sort_by_key(|s| s.0.start);
     let first = segs.first()?;
     let mut l = SelLine {
-        source: None,
+        source_map: Vec::new(), source: None,
         y: top * k, h: h * k, join,
         chars: Vec::new(), copies: Vec::new(), xs: Vec::new(), ends: Vec::new(),
     };
@@ -7630,15 +7635,19 @@ fn copy_objects(line: &mut SelLine, text: &str, start: usize,
     }
 }
 
-fn source_line(line: &mut SelLine, text: &str, start: usize, sources: &[rubrica_doc::SourceSpan], shift: usize) {
-    let mut positions = text[start..].char_indices().take(line.chars.len()).filter_map(|(at, c)| {
-        let byte = (start + at).checked_sub(shift)?;
-        rubrica_doc::source_at(sources, byte).map(|source| source..source + c.len_utf8())
-    });
-    if let Some(first) = positions.next() {
-        let end = positions.last().map_or(first.end, |last| last.end);
-        line.source = Some(first.start..end.max(first.end));
-    }
+fn source_line(line: &mut SelLine, _text: &str, start: usize, sources: &[rubrica_doc::SourceSpan], shift: usize) {
+    let end = start + line.chars.iter().map(|c| c.len_utf8()).sum::<usize>();
+    let first = sources.partition_point(|span| span.range.end + shift <= start);
+    line.source_map = sources[first..].iter()
+        .take_while(|span| span.range.start + shift < end)
+        .map(|span| {
+            let begin = span.range.start + shift;
+            let lo = begin.max(start);
+            let hi = (span.range.end + shift).min(end);
+            rubrica_doc::SourceSpan { range: lo - start..hi - start, source: span.source + lo - begin }
+        }).collect();
+    line.source = line.source_map.first().zip(line.source_map.last())
+        .map(|(first, last)| first.source..last.source + last.range.len());
 }
 
 /// Typeset one block into the display list and return the new document y.
@@ -13130,7 +13139,7 @@ mod tests {
     #[test]
     fn pdf_page_starts_break_at_lines_and_keep_a_heading_with_following_text() {
         let line = |y, h| SelLine {
-            source: None,
+            source_map: Vec::new(), source: None,
             y,
             h,
             join: Join::None,
@@ -13171,7 +13180,7 @@ mod tests {
     #[test]
     fn a_heading_a_page_already_starts_on_never_eats_the_lines_under_it() {
         let line = |y, h| SelLine {
-            source: None,
+            source_map: Vec::new(), source: None,
             y,
             h,
             join: Join::None,
@@ -13221,7 +13230,7 @@ mod tests {
     #[test]
     fn live_page_starts_convert_display_pixels_to_points() {
         let line = |y, h| SelLine {
-            source: None,
+            source_map: Vec::new(), source: None,
             y,
             h,
             join: Join::None,
@@ -13276,7 +13285,7 @@ mod tests {
         // every line that fits and the next one starts where the first line that will
         // not fit stands, so the last line a page owns ends on the page's own floor.
         let line = |y: f32| SelLine {
-            source: None,
+            source_map: Vec::new(), source: None,
             y,
             h: 30.0,
             join: Join::None,
@@ -13536,11 +13545,25 @@ mod tests {
 
     /// A laid-out line to drag over: monospace, one `CHAR` wide per boundary, so the
     /// arithmetic a test writes is the arithmetic it checks.
+    #[test]
+    fn displayed_line_maps_markup_and_utf8_back_to_source() {
+        let source = "before **粗体** [link](target) after";
+        let doc = Document::parse(source);
+        let block = &doc.blocks[0];
+        let mut line = sel_line(&block.text, 0.0, Join::None);
+        source_line(&mut line, &block.text, 0, &block.sources, 0);
+        for word in ["粗体", "link", "after"] {
+            let byte = block.text.find(word).unwrap();
+            assert_eq!(rubrica_doc::source_at(&line.source_map, byte), source.find(word));
+        }
+        assert_eq!(rubrica_doc::source_at(&line.source_map, block.text.len()), Some(source.len()));
+    }
+
     fn sel_line(text: &str, y: f32, join: Join) -> SelLine {
         let chars: Vec<char> = text.chars().collect();
         let xs: Vec<_> = (0..=chars.len()).map(|i| i as f32 * CHAR).collect();
         let ends = xs[1..].to_vec();
-        SelLine { source: None, y, h: CHAR * 1.5, join, chars, copies: Vec::new(), xs, ends }
+        SelLine { source_map: Vec::new(), source: None, y, h: CHAR * 1.5, join, chars, copies: Vec::new(), xs, ends }
     }
 
     /// A line whose character at `squeezed_at` was given no width by the break that
@@ -13551,7 +13574,7 @@ mod tests {
             .map(|i| (i - (i > squeezed_at) as usize) as f32 * CHAR)
             .collect();
         let ends = xs[1..].to_vec();
-        SelLine { source: None, y, h: CHAR * 1.5, join: Join::None, chars, copies: Vec::new(), xs, ends }
+        SelLine { source_map: Vec::new(), source: None, y, h: CHAR * 1.5, join: Join::None, chars, copies: Vec::new(), xs, ends }
     }
 
     #[test]
@@ -13592,7 +13615,7 @@ mod tests {
     #[test]
     fn a_page_list_always_has_the_first_page_in_it() {
         let line = |y, h| SelLine {
-            source: None,
+            source_map: Vec::new(), source: None,
             y,
             h,
             join: Join::None,
@@ -15166,7 +15189,7 @@ mod bidi_tests {
         for n in 0..200 {
             let len = 3 + n % 7;
             sel.push(SelLine {
-                source: None,
+                source_map: Vec::new(), source: None,
                 y,
                 h: 20.0,
                 join: Join::None,

@@ -126,7 +126,7 @@ mod tests {
     fn line(text: &str, y: f32, join: Join) -> SelLine {
         let chars: Vec<char> = text.chars().collect();
         SelLine {
-            source: None,
+            source_map: Vec::new(), source: None,
             y,
             h: CHAR * 1.5,
             join,
