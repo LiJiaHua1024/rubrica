@@ -11616,6 +11616,23 @@ fn card_band(window_top: f32, window_height: f32, up: Pt) -> (Pt, Pt) {
 }
 
 #[cfg(feature = "pdf")]
+fn clip_pdf_line(x0: f32, y0: f32, x1: f32, y1: f32, top: f32, height: f32) -> Option<[(f32, f32); 2]> {
+    let a = y0 - top;
+    let dy = y1 - y0;
+    if dy == 0.0 {
+        return (a >= 0.0 && a < height).then_some([(x0, a), (x1, a)]);
+    }
+    let t0 = -a / dy;
+    let t1 = (height - a) / dy;
+    let lo = t0.min(t1).max(0.0);
+    let hi = t0.max(t1).min(1.0);
+    (lo < hi).then_some([
+        (x0 + (x1 - x0) * lo, a + dy * lo),
+        (x0 + (x1 - x0) * hi, a + dy * hi),
+    ])
+}
+
+#[cfg(feature = "pdf")]
 fn pdf_page_starts(page: &Page, page_height: Pt) -> Vec<Pt> {
     reader_page_starts(&page.sel, &page.anchor_tops, page.height, page_height, 1.0)
 }
@@ -11877,24 +11894,14 @@ fn write_pdf(
                     });
                 }
                 Op::Line { x0, y0, x1, y1, thickness, color } => {
-                    let a = *y0 - top;
-                    let b = *y1 - top;
-                    if (a < 0.0 && b < 0.0) || (a >= content_height && b >= content_height) {
-                        continue;
-                    }
-                    let (a, b) = if a <= b { (a, b) } else { (b, a) };
-                    let clipped0 = a.max(0.0);
-                    let clipped1 = b.min(content_height);
-                    if clipped1 <= clipped0 {
-                        continue;
-                    }
+                    let Some([(ax, ay), (bx, by)]) = clip_pdf_line(*x0, *y0, *x1, *y1, top, content_height) else { continue };
                     ops.push(PdfOp::SetOutlineColor { col: pdf_color(*color, dark) });
                     ops.push(PdfOp::SetOutlineThickness { pt: printpdf::Pt(*thickness) });
                     ops.push(PdfOp::DrawLine {
                         line: printpdf::Line {
                             points: vec![
-                                printpdf::LinePoint { p: pdf_point(*x0, height - clipped0), bezier: false },
-                                printpdf::LinePoint { p: pdf_point(*x1, height - clipped1), bezier: false },
+                                printpdf::LinePoint { p: pdf_point(ax, height - ay), bezier: false },
+                                printpdf::LinePoint { p: pdf_point(bx, height - by), bezier: false },
                             ],
                             is_closed: false,
                         },
@@ -12697,6 +12704,14 @@ pub fn build_in_chunks(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(feature = "pdf")]
+    #[test]
+    fn pdf_line_clipping_preserves_horizontal_and_descending_segments() {
+        assert_eq!(clip_pdf_line(1.0, 20.0, 40.0, 20.0, 10.0, 30.0), Some([(1.0, 10.0), (40.0, 10.0)]));
+        assert_eq!(clip_pdf_line(0.0, 60.0, 60.0, 0.0, 10.0, 30.0), Some([(20.0, 30.0), (50.0, 0.0)]));
+        assert!(clip_pdf_line(0.0, 0.0, 60.0, 0.0, 10.0, 30.0).is_none());
+    }
 
     #[test]
     fn a_tall_image_gets_contiguous_pages_through_its_middle() {
