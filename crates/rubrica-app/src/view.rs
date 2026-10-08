@@ -1619,6 +1619,7 @@ pub struct View {
     /// layout has lines to point it at. A worker layout answers in batches, so the
     /// place cannot be stood in until the layout that owns it is finished.
     pending_anchor: Option<usize>,
+    pending_heading: Option<usize>,
     /// The page, shared with any layout worker currently building it. Replaced whole
     /// rather than edited, which is what makes sharing it safe.
     doc: Arc<Document>,
@@ -2030,6 +2031,8 @@ type StatusLabelCache = ((String, f32), Option<IDWriteTextLayout>, f32, f32, Vec
 /// only the wrapping has to be built again. The store grows with the tabs the reader
 /// keeps open, which is the reader's own choice, and shrinks with each tab they close.
 struct TabPage {
+    pending_anchor: Option<usize>,
+    pending_heading: Option<usize>,
     /// The layout inputs the page's ops were built under. An epoch that differs from
     /// the view's means the window's width, DPI, size or face moved while this page
     /// slept, and the wrapping -- not the text -- is rebuilt before it is shown.
@@ -2072,6 +2075,8 @@ impl TabPage {
     /// contents are overwritten before anything reads them.
     fn empty() -> Self {
         TabPage {
+            pending_anchor: None,
+            pending_heading: None,
             epoch: 0,
             layout_dpi: 96.0,
             source: String::new(),
@@ -3159,6 +3164,7 @@ pub fn run(path: Option<PathBuf>, extra: Vec<PathBuf>) -> Result<()> {
         profile: "Default".to_string(),
         started: false,
         pending_anchor: None,
+        pending_heading: None,
         doc: Arc::new(Document::source("")),
         source: String::new(),
         source_view: false,
@@ -5564,7 +5570,11 @@ impl View {
                     self.load_document(&target.path, hwnd);
                 }
                 if let Some(at) = target.fragment.as_deref().and_then(|f| heading_index(&self.doc, f)) {
-                    if let Some(top) = self.anchor_tops.get(at) {
+                    if self.layout_job.is_some() {
+                        self.pending_anchor = None;
+                        self.pending_heading = Some(at);
+                        if same { self.history.leave(from.clone()); }
+                    } else if let Some(top) = self.anchor_tops.get(at) {
                         self.scroll = if self.reading_mode == ReadingMode::Stack {
                             *top
                         } else {
@@ -6573,6 +6583,8 @@ impl View {
         self.sel_version += 1;
         self.hotspots.clear();
         self.wide_regions.clear();
+        self.anchor_tops.clear();
+        self.note_tops.clear();
         self.page_starts.clear();
         self.selection = None;
         self.press_caret = None;
@@ -6813,8 +6825,17 @@ impl View {
     /// in. A start-up remembers the place before there are any lines, and the layout
     /// that owns the page -- a worker's, in batches -- is what makes the place real.
     fn take_pending_anchor(&mut self) {
+        if self.layout_job.is_some() { return; }
         if let Some(anchor) = self.pending_anchor.take() {
             self.restore_to(anchor);
+        }
+        if let Some(at) = self.pending_heading.take() {
+            if let Some(top) = self.anchor_tops.get(at) {
+                self.scroll = if self.reading_mode == ReadingMode::Stack { *top }
+                    else { (*top - self.theme.base).max(0.0) };
+                self.snap_to_page();
+                self.remember_reading();
+            }
         }
     }
 
@@ -8737,6 +8758,8 @@ impl View {
         // is about to be a different one: the same number in another document is a
         // different note, and a bubble carried across would be describing neither.
         self.close_note_bubble();
+        std::mem::swap(&mut page.pending_anchor, &mut self.pending_anchor);
+        std::mem::swap(&mut page.pending_heading, &mut self.pending_heading);
         std::mem::swap(&mut page.source, &mut self.source);
         std::mem::swap(&mut page.doc, &mut self.doc);
         std::mem::swap(&mut page.counts, &mut self.counts);
@@ -9194,6 +9217,7 @@ impl View {
         // document's remembered offset over to this one, which lands the reader in
         // whatever character happens to sit at the same index in different prose.
         self.pending_anchor = None;
+        self.pending_heading = None;
         // A global choice, read afresh rather than inherited from whatever window
         // started: this is the one route to a document that a start-up never takes, and
         // a line-break rule changed in the Settings app since the last launch belongs
