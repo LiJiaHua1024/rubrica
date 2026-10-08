@@ -9126,11 +9126,13 @@ impl View {
         });
     }
 
-    fn read_current(&self) -> std::io::Result<reading::Decoded> {
+    fn read_current(&mut self) -> std::io::Result<reading::Decoded> {
         let path = self.path.as_deref().ok_or_else(|| std::io::Error::new(std::io::ErrorKind::NotFound, "no document path"))?;
         if self.lazy_text {
-            let index = self.chapter_index.as_ref().ok_or_else(|| std::io::Error::new(std::io::ErrorKind::InvalidData, "missing TXT chapter index"))?;
-            reading::read_chapter_source(path, index, self.chapter, self.encoding)
+            let (index, chapter, decoded) = reading::reread_chapter_source(path, self.chapter, self.encoding)?;
+            self.chapter_index = Some(index);
+            self.chapter = chapter;
+            Ok(decoded)
         } else {
             reading::read(path, self.encoding)
         }

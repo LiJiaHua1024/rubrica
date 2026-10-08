@@ -157,6 +157,18 @@ pub fn read_chapter_source(
     read_range(path, index.range(chapter), encoding)
 }
 
+/// A refresh must index the current file before using any of its byte ranges.
+pub fn reread_chapter_source(
+    path: &Path,
+    chapter: usize,
+    encoding: Encoding,
+) -> io::Result<(ChapterIndex, usize, Decoded)> {
+    let index = scan_chapters(path, encoding, true)?;
+    let chapter = chapter.min(index.chapters().len().saturating_sub(1));
+    let decoded = read_chapter_source(path, &index, chapter, encoding)?;
+    Ok((index, chapter, decoded))
+}
+
 pub fn read_chapter(
     path: &Path,
     index: &ChapterIndex,
@@ -487,6 +499,20 @@ mod tests {
         assert_eq!(readable(&(1024..2048), 1024), None, "nothing is behind the end of the file");
         // The last byte of the file is still a range the file can fill.
         assert_eq!(readable(&(1023..1024), 1024), Some(1));
+    }
+
+    #[test]
+    fn a_shortened_book_is_reindexed_before_its_chapter_is_read() {
+        let path = std::env::temp_dir().join(format!("rubrica-reindexed-{}.txt", std::process::id()));
+        std::fs::write(&path, "Chapter 1\nold first\n\nChapter 2\nold second\n").unwrap();
+        let old = scan_chapters(&path, Encoding::Utf8, true).unwrap();
+        assert_eq!(old.chapters().len(), 2);
+        std::fs::write(&path, "Chapter 1\nnew\n").unwrap();
+        let (index, chapter, decoded) = reread_chapter_source(&path, 1, Encoding::Utf8).unwrap();
+        assert_eq!(index.chapters().len(), 1);
+        assert_eq!(chapter, 0);
+        assert_eq!(decoded.text, "Chapter 1\nnew\n");
+        std::fs::remove_file(path).unwrap();
     }
 
     /// And end to end: a book indexed and then truncated under the reader's feet fails
