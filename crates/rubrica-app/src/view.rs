@@ -11756,22 +11756,6 @@ fn write_pdf(
     let mut missing_font_faces = Vec::new();
     let mut images: HashMap<PathBuf, (printpdf::XObjectId, usize, usize)> = HashMap::new();
     let palette = Palette::of(dark);
-    // The part of a figure that reaches past the bottom of the page it was placed on,
-    // waiting for the page below to draw it at zero. A rule and a filled box are
-    // clipped instead, because clipping them loses nothing -- a rule is a rule -- but
-    // a figure is not: cut at the band edge the bottom of the picture is simply gone,
-    // and the viewer cutting the rest off at the MediaBox is not a smaller loss, it is
-    // the same one. The remainder is a figure of its own, so the page that takes it
-    // measures it against its own band like any other, and a figure taller than two
-    // pages keeps handing what is left down.
-    let mut carry: Vec<Vec<Op>> = vec![Vec::new(); page_starts.len()];
-    // Which of the document's figures have already handed their bottom to the page
-    // below. The figure itself is not drawn again once it has: its top is off the top
-    // of every page from there on, and what the page below draws in its place covers
-    // exactly the strip the figure would have shown there, so drawing both would put
-    // the same band of picture on two pages.
-    let mut handed_down: Vec<bool> = vec![false; page.ops.len()];
-
     for (page_index, top) in page_starts.iter().copied().enumerate() {
         let content_height = page_starts
             .get(page_index + 1)
@@ -11845,22 +11829,6 @@ fn write_pdf(
             ops.push(PdfOp::EndMarkedContent);
             ops.push(PdfOp::EndTextSection);
         }
-        // What the page below inherited, first. It is kept in the document's own
-        // coordinates rather than this page's, so that the shift a repeated header or
-        // a continued footnote reserves on the page that takes it applies to the
-        // figure the way it applies to everything else laid out there.
-        source_ops.extend(
-            std::mem::take(&mut carry[page_index])
-                .iter()
-                .map(|op| translate_pdf_op(op, content_shift)),
-        );
-        // The document's own ops come after the header, the footnote and the carried
-        // remainder, so the first `from_page` slots are none of those. The band test
-        // below drops some of the rest too, so a slot does not name the op's place in
-        // `page.ops` either -- `page_slots` is that answer, in push order, and the
-        // image arm needs it to say which figure it has just handed down.
-        let from_page = source_ops.len();
-        let mut page_slots: Vec<usize> = Vec::new();
         // The band test runs before the clone, not after. A page walks the whole
         // document's op list to find the slice of it that is its own, and a deep clone
         // of every op in that list -- four Vecs, two Strings and a COM AddRef each --
@@ -11868,17 +11836,13 @@ fn write_pdf(
         // hundred thousand lines spent minutes in the clone alone. The test is the one
         // the drawing arms make below, lifted out so the two cannot disagree, and it
         // is stated in the pre-shift frame, which is what `top - content_shift` is.
-        for (index, op) in page.ops.iter().enumerate() {
-            if handed_down[index] {
-                continue;
-            }
+        for op in &page.ops {
             if !op_intersects_band(op, top - content_shift, content_height) {
                 continue;
             }
             source_ops.push(translate_pdf_op(op, content_shift));
-            page_slots.push(index);
         }
-        for (slot, op) in source_ops.iter().enumerate() {
+        for op in &source_ops {
             match op {
                 Op::Rect { x, y, w, h, color } => {
                     let y0 = *y - top;
@@ -11912,41 +11876,7 @@ fn write_pdf(
                     if *w <= 0.0 || *h <= 0.0 || local_y >= content_height {
                         continue;
                     }
-                    // A figure whose top stands above this page was drawn by the page it
-                    // starts on, which handed its bottom down here. What it would show
-                    // between the top of this band and the bottom of it is exactly what
-                    // that remainder shows, so drawing it again would put the same band
-                    // of picture on two pages.
-                    if local_y < 0.0 && slot >= from_page {
-                        continue;
-                    }
                     if local_y + *h <= 0.0 {
-                        continue;
-                    }
-                    // The part of the figure the band reaches is shown from the
-                    // figure's own top -- a crop and not a squash, since the width is
-                    // scaled the same way -- and what hangs past the bottom becomes a
-                    // figure of its own, placed at the band edge, which the page below
-                    // treats as it treats any other and hands down again in turn. A
-                    // figure taller than the page is therefore cut into as many pieces
-                    // as it takes rather than being cut off once.
-                    let spill = (local_y + *h - content_height).max(0.0);
-                    if spill > 0.0 {
-                        if let Some(next) = carry.get_mut(page_index + 1) {
-                            next.push(Op::Image {
-                                path: path.clone(),
-                                x: *x,
-                                y: *y + (content_height - local_y) - content_shift,
-                                w: *w,
-                                h: spill,
-                            });
-                        }
-                        if slot >= from_page {
-                            handed_down[page_slots[slot - from_page]] = true;
-                        }
-                    }
-                    let visible = (*h - spill).min(content_height - local_y.max(0.0));
-                    if visible <= 0.0 {
                         continue;
                     }
                     let (id, pixel_w, pixel_h) = if let Some(hit) = images.get(path) {
@@ -11961,14 +11891,25 @@ fn write_pdf(
                     };
                     let transform = XObjectTransform {
                         translate_x: Some(printpdf::Pt(*x)),
-                        translate_y: Some(printpdf::Pt(height - local_y - visible)),
+                        translate_y: Some(printpdf::Pt(height - local_y - *h)),
                         scale_x: Some(*w / pixel_w.max(1) as f32),
-                        scale_y: Some(visible / pixel_h.max(1) as f32),
+                        scale_y: Some(*h / pixel_h.max(1) as f32),
                         dpi: Some(72.0),
                         no_auto_scale: false,
                         ..Default::default()
                     };
+                    // Keep the original scale and source position on every page;
+                    // the clipping path selects the strip this page actually owns.
+                    ops.push(PdfOp::SaveGraphicsState);
+                    ops.push(PdfOp::DrawRectangle {
+                        rectangle: PdfRect {
+                            mode: Some(printpdf::PaintMode::Clip),
+                            ..PdfRect::from_xywh(printpdf::Pt(*x), printpdf::Pt(height - content_height),
+                                printpdf::Pt(*w), printpdf::Pt(content_height))
+                        },
+                    });
                     ops.push(PdfOp::UseXobject { id, transform });
+                    ops.push(PdfOp::RestoreGraphicsState);
                 }
                 Op::Runs(runs) => {
                     for run in runs {
