@@ -11895,7 +11895,7 @@ fn write_pdf(
                         scale_x: Some(*w / pixel_w.max(1) as f32),
                         scale_y: Some(visible / pixel_h.max(1) as f32),
                         dpi: Some(72.0),
-                        no_auto_scale: true,
+                        no_auto_scale: false,
                         ..Default::default()
                     };
                     ops.push(PdfOp::UseXobject { id, transform });
