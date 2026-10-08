@@ -492,13 +492,19 @@ fn tex_delimiters(src: &str) -> Option<String> {
         return None;
     }
     let mut out = String::with_capacity(src.len());
+    let code: Vec<_> = Parser::new(src).into_offset_iter()
+        .filter_map(|(event, range)| matches!(event, Event::Code(_)).then_some(range)).collect();
     // The character and run length of a code fence that is still open.
     let mut fence: Option<(char, usize)> = None;
     // Whether a `\[` has been rewritten, so a `\]` is only rewritten for the `\[`
     // it closes. An equation opening with no close, or a stray close, is prose: a
     // lone `$$` would be printed as one.
     let mut display_open = false;
-    for line in src.split_inclusive('\n') {
+    for (offset, line) in src.split_inclusive('\n').scan(0usize, |offset, line| {
+        let start = *offset;
+        *offset += line.len();
+        Some((start, line))
+    }) {
         let body = line.trim_end_matches(['\n', '\r']);
         let text = body.trim_start();
         let indent = body.len() - text.len();
@@ -512,7 +518,9 @@ fn tex_delimiters(src: &str) -> Option<String> {
         }
         let first = quoted.chars().next();
         let run = quoted.chars().take_while(|c| Some(*c) == first).count();
-        let marker = indent < 4 && matches!(first, Some('`') | Some('~')) && run >= 3;
+        let in_code = |byte| code.iter().any(|range| range.contains(&byte));
+        let marker = indent < 4 && matches!(first, Some('`') | Some('~')) && run >= 3
+            && !in_code(offset + body.len() - quoted.len());
         // A closing fence may trail whitespace, as CommonMark allows; anything
         // else after the run -- another fence, words -- leaves it open.
         let ends_fence = fence.is_some_and(|(c, n)| {
@@ -534,7 +542,7 @@ fn tex_delimiters(src: &str) -> Option<String> {
         // it. The trailing blanks CommonMark lets a closing line keep go too, since
         // `\[   ` is the same delimiter as `\[`.
         let bare = quoted.trim_end_matches([' ', '\t']);
-        let display = !plain && match bare {
+        let display = !plain && !in_code(offset + body.len() - quoted.len()) && match bare {
             "\\[" => {
                 display_open = true;
                 true
@@ -556,7 +564,7 @@ fn tex_delimiters(src: &str) -> Option<String> {
         } else if plain {
             out.push_str(body);
         } else {
-            out.push_str(&tex_inline(body));
+            out.push_str(&tex_inline(body, offset, &code));
         }
         out.push_str(&line[body.len()..]);
     }
@@ -565,35 +573,26 @@ fn tex_delimiters(src: &str) -> Option<String> {
 
 /// `\(x\)` to `$x$` across one line of prose, leaving anything inside a code span as
 /// its author typed it.
-fn tex_inline(line: &str) -> String {
+fn tex_inline(line: &str, offset: usize, code: &[std::ops::Range<usize>]) -> String {
     let b = line.as_bytes();
     let mut out = String::with_capacity(line.len());
     let mut i = 0;
-    // Length of the backtick run a code span opened with, which is the only run long
-    // enough to close it.
-    let mut span = 0usize;
     while i < b.len() {
+        let at = code.partition_point(|range| range.end <= offset + i);
+        if let Some(range) = code.get(at).filter(|range| range.start <= offset + i) {
+            let end = (range.end - offset).min(line.len());
+            out.push_str(&line[i..end]);
+            i = end;
+            continue;
+        }
         match b[i] {
-            b'`' => {
-                let mut n = 0;
-                while i + n < b.len() && b[i + n] == b'`' {
-                    n += 1;
-                }
-                if span == 0 {
-                    span = n;
-                } else if span == n {
-                    span = 0;
-                }
-                out.push_str(&line[i..i + n]);
-                i += n;
-            }
             // Two backslashes are one literal one, and it does not escape what comes
             // after: `\\(` is a backslash and a bracket, not a delimiter.
             b'\\' if b.get(i + 1) == Some(&b'\\') => {
                 out.push_str("\\\\");
                 i += 2;
             }
-            b'\\' if span == 0 && matches!(b.get(i + 1), Some(b'(' | b')')) => {
+            b'\\' if matches!(b.get(i + 1), Some(b'(' | b')')) => {
                 out.push('$');
                 i += 2;
             }

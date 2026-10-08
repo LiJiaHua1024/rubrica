@@ -1169,6 +1169,19 @@ fn a_code_blocks_source_spans_stop_where_its_text_does() {
 // --- emphasis ---------------------------------------------------------------
 
 #[test]
+fn multiline_code_spans_keep_tex_delimiters_and_prose_still_rewrites() {
+    for source in ["`start\n\\(x\\)\nend` \\(y\\)", "``start `\n\\[\n\\(x\\)\n\\]\nend`` \\(y\\)"] {
+        let doc = Document::parse(source);
+        let block = &doc.blocks[0];
+        let code = block.spans.iter().find(|s| s.style.contains(InlineStyle::CODE)).unwrap();
+        assert!(block.text[code.range.clone()].contains(r"\(x\)"));
+        assert_eq!(block.objects.len(), 1, "only prose becomes math: {block:?}");
+    }
+    let doc = Document::parse("an unmatched ` tick\n\\(y\\)");
+    assert_eq!(doc.blocks[0].objects.len(), 1);
+}
+
+#[test]
 fn escaped_cjk_emphasis_delimiters_remain_literal_in_all_bodies() {
     for source in [r"\*“字面”\*", r"\*\*“字面”\*\*", r"\*“字面”*", "---\ntitle: test\n---\n\\*“字面”\\*"] {
         let doc = Document::parse(source);
