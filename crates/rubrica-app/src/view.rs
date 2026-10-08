@@ -11252,7 +11252,7 @@ pub(crate) fn export_png(
     let doc = if source_view {
         Document::source(source)
     } else if plain {
-        rubrica_doc::plain::parse(source, text_options)
+        reading::parse_plain(source, input_path, text_options)
     } else {
         Document::parse_with(source, rubrica_doc::ParseOptions { keep_line_breaks })
     };
@@ -11458,7 +11458,7 @@ pub fn export_pdf(
     let doc = if source_view {
         Document::source(source)
     } else if plain {
-        rubrica_doc::plain::parse(source, text_options)
+        reading::parse_plain(source, input_path, text_options)
     } else {
         Document::parse_with(source, rubrica_doc::ParseOptions { keep_line_breaks })
     };

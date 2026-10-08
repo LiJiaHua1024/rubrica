@@ -1605,7 +1605,7 @@ impl Peek {
         let doc = if prefs.source {
             rubrica_doc::Document::source(&decoded.text)
         } else if plain {
-            rubrica_doc::plain::parse(&decoded.text, prefs.text)
+            reading::parse_plain(&decoded.text, Some(path), prefs.text)
         } else {
             rubrica_doc::Document::parse_with(
                 &decoded.text,

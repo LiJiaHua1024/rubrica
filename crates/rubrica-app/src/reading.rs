@@ -320,6 +320,11 @@ pub fn text_options_for(path: Option<&Path>, stored: TextOptions) -> TextOptions
     }
 }
 
+/// All plain-text entry points use the same file-specific paragraph rules.
+pub fn parse_plain(source: &str, path: Option<&Path>, options: TextOptions) -> rubrica_doc::Document {
+    rubrica_doc::plain::parse(source, text_options_for(path, options))
+}
+
 pub fn is_plain(path: Option<&Path>) -> bool {
     path.and_then(Path::extension).and_then(|s| s.to_str())
         .is_some_and(|e| e.eq_ignore_ascii_case("txt") || e.eq_ignore_ascii_case("log"))
@@ -503,6 +508,18 @@ mod tests {
         // A rule the reader picked themselves is not overridden.
         let picked = TextOptions { paragraphs: ParagraphRule::BlankLines, chapters: true };
         assert_eq!(text_options_for(Some(log), picked), picked);
+    }
+
+    #[test]
+    fn plain_log_exports_and_previews_keep_records_on_separate_lines() {
+        let source = "record 1\n\nrecord 2\nrecord 3\n";
+        let log = parse_plain(source, Some(Path::new("events.log")), TextOptions::default());
+        assert_eq!(log.blocks.iter().map(|block| block.text.as_str()).collect::<Vec<_>>(),
+            vec!["record 1", "record 2", "record 3"]);
+        let book = parse_plain(source, Some(Path::new("book.txt")), TextOptions::default());
+        assert_eq!(book.blocks.len(), 2);
+        let picked = TextOptions { paragraphs: ParagraphRule::BlankLines, chapters: false };
+        assert_eq!(parse_plain(source, Some(Path::new("events.log")), picked).blocks.len(), 2);
     }
 
     #[test]
