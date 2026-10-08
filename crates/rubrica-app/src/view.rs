@@ -6375,6 +6375,10 @@ impl View {
     /// that is no longer that long. A place the new layout has no line for leaves the top
     /// alone: a document that has shrunk since the reader left it is not theirs any more.
     fn restore_to(&mut self, anchor: usize) {
+        if self.layout_job.is_some() {
+            self.pending_anchor = Some(anchor);
+            return;
+        }
         let k = scale_of(self.dpi);
         if let Some(scroll) = scroll_for_anchor(&self.sel_index, anchor, k) {
             self.scroll = scroll;
