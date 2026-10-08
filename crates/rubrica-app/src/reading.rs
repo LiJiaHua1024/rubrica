@@ -2,7 +2,7 @@
 
 use std::io::{self, BufRead, BufReader, Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
-use rubrica_doc::plain::{Chapter, ChapterIndex, ParagraphRule, TextOptions, is_chapter};
+use rubrica_doc::plain::{Chapter, ChapterIndex as TextChapterIndex, ParagraphRule, TextOptions, is_chapter};
 use windows::Win32::Globalization::{MultiByteToWideChar, MB_ERR_INVALID_CHARS, MULTI_BYTE_TO_WIDE_CHAR_FLAGS};
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -35,6 +35,25 @@ pub struct Decoded {
     pub text: String,
     pub encoding: Encoding,
     pub guessed: bool,
+}
+
+/// Byte ranges and the single file encoding established while scanning them.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ChapterIndex {
+    source: TextChapterIndex,
+    encoding: Encoding,
+    guessed: bool,
+}
+
+impl ChapterIndex {
+    pub fn new(source: &str, detect: bool) -> Self {
+        Self { source: TextChapterIndex::new(source, detect), encoding: Encoding::Utf8, guessed: false }
+    }
+}
+
+impl std::ops::Deref for ChapterIndex {
+    type Target = TextChapterIndex;
+    fn deref(&self) -> &Self::Target { &self.source }
 }
 
 /// Above this size a plain UTF-8 book may be indexed and read by chapter instead of
@@ -72,10 +91,13 @@ pub fn can_window_text(path: &Path, requested: Encoding) -> bool {
 /// starts.
 pub fn scan_chapters(path: &Path, requested: Encoding, detect: bool) -> io::Result<ChapterIndex> {
     if matches!(requested, Encoding::Auto | Encoding::Utf8) {
-        if let Ok(index) = ChapterIndex::from_path(path, detect) {
-            return Ok(index);
+        if let Ok(index) = TextChapterIndex::from_path(path, detect) {
+            return Ok(ChapterIndex { source: index, encoding: Encoding::Utf8, guessed: false });
         }
     }
+    // A failed whole-file UTF-8 validation resolves Automatic once for the book.
+    // A UTF-8-looking line in a legacy book must not select another encoding.
+    let encoding = if requested == Encoding::Auto { Encoding::Gb18030 } else { requested };
     let file = std::fs::File::open(path)?;
     let length = file.metadata()?.len() as usize;
     let mut reader = BufReader::new(file);
@@ -89,7 +111,7 @@ pub fn scan_chapters(path: &Path, requested: Encoding, detect: bool) -> io::Resu
         let mut line = Vec::new();
         let read = reader.read_until(b'\n', &mut line)?;
         if read == 0 { break; }
-        let mut decoded = decode(&line, requested)?;
+        let mut decoded = decode(&line, encoding)?;
         if first {
             if let Some(stripped) = decoded.text.strip_prefix('\u{feff}') {
                 decoded.text = stripped.to_string();
@@ -116,7 +138,11 @@ pub fn scan_chapters(path: &Path, requested: Encoding, detect: bool) -> io::Resu
     } else if let Some(last) = chapters.last_mut() {
         last.range.end = length;
     }
-    Ok(ChapterIndex::from_parts_with_offsets(chapters, decoded_starts, blank_separated))
+    Ok(ChapterIndex {
+        source: TextChapterIndex::from_parts_with_offsets(chapters, decoded_starts, blank_separated),
+        encoding,
+        guessed: requested == Encoding::Auto && encoding == Encoding::Gb18030,
+    })
 }
 
 /// How many bytes of `range` a file of `len` bytes still has behind it, or `None` when
@@ -154,7 +180,10 @@ pub fn read_chapter_source(
     chapter: usize,
     encoding: Encoding,
 ) -> io::Result<Decoded> {
-    read_range(path, index.range(chapter), encoding)
+    let resolved = if encoding == Encoding::Auto { index.encoding } else { encoding };
+    let mut decoded = read_range(path, index.range(chapter), resolved)?;
+    decoded.guessed = encoding == Encoding::Auto && index.guessed;
+    Ok(decoded)
 }
 
 /// A refresh must index the current file before using any of its byte ranges.
@@ -512,6 +541,23 @@ mod tests {
         assert_eq!(index.chapters().len(), 1);
         assert_eq!(chapter, 0);
         assert_eq!(decoded.text, "Chapter 1\nnew\n");
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn automatic_chapters_share_the_whole_books_encoding_and_offsets() {
+        let path = std::env::temp_dir().join(format!("rubrica-auto-chapters-{}.txt", std::process::id()));
+        let bytes = b"Chapter 1\n\xc2\xa9\nChapter 2\n\xd6\xd0\n";
+        std::fs::write(&path, bytes).unwrap();
+        let whole = read(&path, Encoding::Auto).unwrap();
+        let index = scan_chapters(&path, Encoding::Auto, true).unwrap();
+        for chapter in 0..2 {
+            let decoded = read_chapter_source(&path, &index, chapter, Encoding::Auto).unwrap();
+            assert_eq!(decoded.encoding, whole.encoding);
+            assert!(decoded.guessed);
+            assert!(whole.text[index.decoded_start(chapter)..].starts_with(&decoded.text));
+        }
+        assert_eq!(index.decoded_start(1), whole.text.find("Chapter 2").unwrap());
         std::fs::remove_file(path).unwrap();
     }
 

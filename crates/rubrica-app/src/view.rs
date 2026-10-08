@@ -104,8 +104,8 @@ use windows::Win32::UI::WindowsAndMessaging::{
 use windows_numerics::{Matrix3x2, Vector2};
 
 use crate::clipboard;
-use crate::reading::{self, Encoding};
-use rubrica_doc::plain::{ChapterIndex, ParagraphRule, TextOptions};
+use crate::reading::{self, ChapterIndex, Encoding};
+use rubrica_doc::plain::{ParagraphRule, TextOptions};
 use crate::find::Needle;
 use crate::font::{cjk_char, FaceRequest, FontEngine, GlyphRun, ObjectBox, Style as RunStyle};
 use crate::hyphen::Hyphenator;
