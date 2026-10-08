@@ -317,14 +317,14 @@ impl Block {
     /// the text it already was. Running earlier would be worse: the cut would
     /// clip the style off the tail of it, and the emphasis would end silently at
     /// the definition's first line.
-    fn relax_emphasis(&mut self) {
+    fn relax_emphasis(&mut self, original: &str) {
         if self.kind != BlockKind::Code {
-            emphasis::relax(&mut self.body());
+            emphasis::relax(&mut self.body(), original);
         }
         // A table keeps its prose in cells rather than in `text`, so the block
         // itself is the one kind here whose reading lives somewhere else.
         for cell in self.table.iter_mut().flat_map(|t| t.head.iter_mut().chain(t.rows.iter_mut().flatten())) {
-            emphasis::relax(&mut cell.body());
+            emphasis::relax(&mut cell.body(), original);
         }
     }
 }
@@ -383,6 +383,7 @@ impl Document {
     }
 
     pub fn parse_with(source: &str, options: ParseOptions) -> Document {
+        let original_source = source;
         let original_len = source.len();
         // Front matter is the author's metadata for the tool that wrote the file, and
         // nothing of it is prose: shown as itself it arrives as a rule, a paragraph of
@@ -403,7 +404,7 @@ impl Document {
             | Options::ENABLE_TABLES
             | Options::ENABLE_MATH
             | Options::ENABLE_FOOTNOTES;
-        let mut st = Builder { options, input: source, origins: rewrite_origins(original, source, base), ..Builder::default() };
+        let mut st = Builder { options, input: source, original: original_source, origins: rewrite_origins(original, source, base), ..Builder::default() };
         for (ev, range) in Parser::new_ext(source, opts).into_offset_iter() {
             st.event_range = range;
             st.event(ev);
@@ -871,6 +872,7 @@ struct Draft {
 #[derive(Default)]
 struct Builder<'a> {
     input: &'a str,
+    original: &'a str,
     origins: Vec<(usize, usize)>,
     event_range: std::ops::Range<usize>,
     options: ParseOptions,
@@ -1449,7 +1451,7 @@ impl Builder<'_> {
                 // reading order, so they leave `blocks` here rather than being
                 // filtered out of it later.
                 for mut b in split_definitions(b, breaks) {
-                    b.relax_emphasis();
+                    b.relax_emphasis(self.original);
                     if !worth_setting(&b) {
                         continue;
                     }

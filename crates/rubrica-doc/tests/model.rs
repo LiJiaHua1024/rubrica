@@ -1169,6 +1169,21 @@ fn a_code_blocks_source_spans_stop_where_its_text_does() {
 // --- emphasis ---------------------------------------------------------------
 
 #[test]
+fn escaped_cjk_emphasis_delimiters_remain_literal_in_all_bodies() {
+    for source in [r"\*“字面”\*", r"\*\*“字面”\*\*", r"\*“字面”*", "---\ntitle: test\n---\n\\*“字面”\\*"] {
+        let doc = Document::parse(source);
+        let block = &doc.blocks[0];
+        assert!(block.text.contains('*'), "{source}: {:?}", block.text);
+        assert!(!block.spans.iter().any(|s| s.style.contains(InlineStyle::EMPHASIS) || s.style.contains(InlineStyle::STRONG)));
+    }
+    let doc = Document::parse("| Header |\n| --- |\n| \\*“字面”\\* |\n\nNote[^n].\n\n[^n]: \\*“字面”\\*");
+    assert_eq!(doc.blocks[0].table.as_ref().unwrap().rows[0][0].text, "*“字面”*");
+    assert_eq!(doc.footnotes[0].blocks[0].text, "*“字面”*");
+    let doc = Document::parse(r"\\**“粗体”**");
+    assert!(doc.blocks[0].spans.iter().any(|s| s.style.contains(InlineStyle::STRONG)));
+}
+
+#[test]
 fn nested_matching_emphasis_restores_its_outer_style() {
     for (source, style) in [
         ("*outer *inner* tail* plain", InlineStyle::EMPHASIS),

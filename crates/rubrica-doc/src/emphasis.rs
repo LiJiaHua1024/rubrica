@@ -49,7 +49,7 @@ struct Run {
 /// span over text that still spells `**` would print the asterisks anyway: a
 /// delimiter the parser consumed is gone from [`crate::Block::text`], and one it
 /// refuses has to be treated the same way to read the same way.
-pub(crate) fn relax(t: &mut Text<'_>) {
+pub(crate) fn relax(t: &mut Text<'_>, original: &str) {
     if !t.text.contains('*') {
         return;
     }
@@ -57,7 +57,13 @@ pub(crate) fn relax(t: &mut Text<'_>) {
         t.spans.iter().filter(|s| s.style.contains(InlineStyle::CODE)).map(|s| s.range.clone()).collect();
     let link: Vec<Range<usize>> =
         t.spans.iter().filter(|s| s.style.contains(InlineStyle::LINK)).map(|s| s.range.clone()).collect();
-    let runs: Vec<Run> = runs(t.text).into_iter().filter(|r| !inside_code(&code, r)).collect();
+    let runs: Vec<Run> = runs(t.text).into_iter().filter(|r| {
+        !inside_code(&code, r) && !r.range.clone().any(|byte| {
+            let Some(at) = crate::source_at(t.sources, byte) else { return false };
+            original.as_bytes().get(at) == Some(&b'*')
+                && original.as_bytes()[..at].iter().rev().take_while(|&&b| b == b'\\').count() % 2 == 1
+        })
+    }).collect();
     let mut stack: Vec<usize> = Vec::new();
     let mut pairs: Vec<(Range<usize>, Range<usize>, InlineStyle)> = Vec::new();
     for (i, r) in runs.iter().enumerate() {
