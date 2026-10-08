@@ -9345,7 +9345,10 @@ impl View {
         } else if self.path.is_some() {
             // The built-in sample, which is a page the reader can leave and be asked back
             // to but has no file to read again.
-            self.set_page(crate::sample::DOCUMENT.to_string(), None, hwnd);
+            let Some(id) = self.workspace.tabs.items().iter()
+                .find(|tab| tab.document == DocumentRef::Sample).map(|tab| tab.id)
+                else { return false };
+            if !self.switch_to_tab(id, hwnd) { return false; }
         }
         self.scroll = there.scroll;
         self.snap_to_page();
