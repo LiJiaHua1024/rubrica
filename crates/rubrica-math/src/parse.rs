@@ -617,6 +617,9 @@ impl<'a> Parser<'a> {
 
     /// One group, or the single character or command that follows.
     fn argument(&mut self) -> Node {
+        while self.peek().is_some_and(|b| b.is_ascii_whitespace()) {
+            self.bump();
+        }
         if self.depth >= Self::MAX_DEPTH {
             // The cap is reached mid-command-chain (`\frac\frac\frac...` recurses
             // through here without ever entering a group). One argument-shaped
@@ -772,13 +775,12 @@ impl<'a> Parser<'a> {
         (String::from_utf8_lossy(&self.src[start..self.at]).into_owned(), end)
     }
 
-    /// The letters of the control sequence at the cursor, and the one space TeX
-    /// consumes after it.
+    /// The letters of the control sequence and the whitespace TeX consumes after it.
     fn skip_command_name(&mut self) {
         while self.peek().is_some_and(|c| c.is_ascii_alphabetic()) {
             self.bump();
         }
-        if self.peek() == Some(b' ') {
+        while self.peek().is_some_and(|b| b.is_ascii_whitespace()) {
             self.bump();
         }
     }
@@ -838,8 +840,8 @@ impl<'a> Parser<'a> {
             self.bump();
         }
         let name = std::str::from_utf8(&self.src[start..self.at]).ok()?.to_string();
-        // Consume one space after a named command, as TeX does.
-        if self.peek() == Some(b' ') {
+        // Whitespace after a named command separates it from its arguments.
+        while self.peek().is_some_and(|b| b.is_ascii_whitespace()) {
             self.bump();
         }
         Some(self.named(&name))
@@ -2823,6 +2825,19 @@ mod tests {
         // left the reader inside the glyph: the next read could not decode, and the
         // rest of the formula was dropped rather than shown.
         assert_eq!(of("\\frac{1}{2}\\α + 1"), "((frac 1 2) α + 1)");
+    }
+
+    #[test]
+    fn arguments_skip_external_whitespace_but_text_groups_preserve_it() {
+        for (spaced, compact) in [
+            ("\\frac {a} {b}", "\\frac{a}{b}"),
+            ("x^ {2}", "x^{2}"),
+            ("\\frac\n\t{a}\n\t{b}", "\\frac{a}{b}"),
+            ("\\sqrt  {x}", "\\sqrt{x}"),
+            ("\\text  { a b }", "\\text{ a b }"),
+        ] {
+            assert_eq!(of(spaced), of(compact), "{spaced}");
+        }
     }
 
     #[test]
