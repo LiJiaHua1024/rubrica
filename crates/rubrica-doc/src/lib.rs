@@ -881,6 +881,7 @@ struct Builder<'a> {
     /// the only trace of the line each `: ` actually began on.
     breaks: Vec<usize>,
     inline: InlineStyle,
+    inline_stack: Vec<InlineStyle>,
     quote_depth: u8,
     /// One entry per open list, holding its info and the next item number.
     lists: Vec<(ListInfo, u64)>,
@@ -1165,11 +1166,11 @@ impl Builder<'_> {
                     }
                 }
             }
-            Tag::Emphasis => self.inline.insert(InlineStyle::EMPHASIS),
-            Tag::Strong => self.inline.insert(InlineStyle::STRONG),
-            Tag::Strikethrough => self.inline.insert(InlineStyle::STRIKETHROUGH),
+            Tag::Emphasis => self.begin_inline(InlineStyle::EMPHASIS),
+            Tag::Strong => self.begin_inline(InlineStyle::STRONG),
+            Tag::Strikethrough => self.begin_inline(InlineStyle::STRIKETHROUGH),
             Tag::Link { dest_url, .. } => {
-                self.inline.insert(InlineStyle::LINK);
+                self.begin_inline(InlineStyle::LINK);
                 // The first destination wins: CommonMark cannot nest anchors, but a
                 // malformed document can reach here with a link inside a link, and one
                 // run of text can only be clicked into one place.
@@ -1204,6 +1205,15 @@ impl Builder<'_> {
             }
             _ => {}
         }
+    }
+
+    fn begin_inline(&mut self, style: InlineStyle) {
+        self.inline_stack.push(self.inline);
+        self.inline.insert(style);
+    }
+
+    fn end_inline(&mut self) {
+        self.inline = self.inline_stack.pop().unwrap_or(InlineStyle::EMPTY);
     }
 
     fn end(&mut self, tag: TagEnd) {
@@ -1254,11 +1264,9 @@ impl Builder<'_> {
             TagEnd::List(_) => {
                 self.lists.pop();
             }
-            TagEnd::Emphasis => self.inline.remove(InlineStyle::EMPHASIS),
-            TagEnd::Strong => self.inline.remove(InlineStyle::STRONG),
-            TagEnd::Strikethrough => self.inline.remove(InlineStyle::STRIKETHROUGH),
+            TagEnd::Emphasis | TagEnd::Strong | TagEnd::Strikethrough => self.end_inline(),
             TagEnd::Link => {
-                self.inline.remove(InlineStyle::LINK);
+                self.end_inline();
                 self.link = None;
             }
             TagEnd::Image => {

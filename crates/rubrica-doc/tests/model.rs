@@ -1169,6 +1169,22 @@ fn a_code_blocks_source_spans_stop_where_its_text_does() {
 // --- emphasis ---------------------------------------------------------------
 
 #[test]
+fn nested_matching_emphasis_restores_its_outer_style() {
+    for (source, style) in [
+        ("*outer *inner* tail* plain", InlineStyle::EMPHASIS),
+        ("**outer **inner** tail** plain", InlineStyle::STRONG),
+        ("~~outer ~~inner~~ tail~~ plain", InlineStyle::STRIKETHROUGH),
+    ] {
+        let doc = Document::parse(source);
+        let block = &doc.blocks[0];
+        let tail = block.text.find("tail").unwrap();
+        assert!(block.spans.iter().any(|span| span.range.contains(&tail) && span.style.contains(style)), "{source}: {:?}", block.spans);
+        let plain = block.text.find("plain").unwrap();
+        assert!(!block.spans.iter().any(|span| span.range.contains(&plain) && span.style.contains(style)));
+    }
+}
+
+#[test]
 fn emphasis_never_pairs_across_a_code_span_or_a_link() {
     // The delimiters stood on either side of a code span, so the pair styled the
     // code as bold -- which the module's own rule says cannot happen -- and, across
