@@ -930,6 +930,19 @@ impl FontEngine {
         )
     }
 
+    /// Visible horizontal edges, excluding the glyph's empty side bearings.
+    pub(crate) fn glyph_horizontal_ink(&self, face: usize, glyph: u16, size: Pt)
+        -> Option<(Pt, Pt)>
+    {
+        let (face_obj, metrics) = self.faces.borrow().get(face)
+            .map(|f| (f.face.clone(), f.metrics))?;
+        let mut m = [DWRITE_GLYPH_METRICS::default()];
+        unsafe { face_obj.GetDesignGlyphMetrics(&glyph, 1, m.as_mut_ptr(), false) }.ok()?;
+        let scale = size / metrics.designUnitsPerEm.max(1) as f32;
+        Some((m[0].leftSideBearing as f32 * scale,
+            (m[0].advanceWidth as f32 - m[0].rightSideBearing as f32) * scale))
+    }
+
     /// Sanity probe used at startup and by tests: can we shape anything at all.
     pub fn probe(&self) -> bool {
         let req = FaceRequest {

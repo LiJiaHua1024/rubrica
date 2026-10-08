@@ -17,6 +17,7 @@
 pub mod layout;
 pub mod parse;
 pub mod table;
+mod chemistry;
 
 pub use layout::{layout, Extents, Formula, MathMeasure, Running, Shape, Stacked};
 pub use parse::{parse, Limits, Node, Parser};
@@ -213,6 +214,177 @@ mod tests {
     /// asserting; this only keeps the printing of a failure legible.
     fn near(got: f32, want: f32, what: &str) {
         assert!((got - want).abs() < 0.001, "{what}: {got}, wanted {want}");
+    }
+
+    #[test]
+    fn reaction_conditions_are_centred_above_and_below_a_growing_arrow() {
+        for table in [true, false] {
+            let mut m = Mock { table, asked: Vec::new(), widened: Vec::new() };
+            let f = set(r"A \xrightarrow[\text{高压}]{\text{催化剂及加热}} B", 10.0, false, &mut m);
+            let r = runs(&f);
+            let top = r.iter().find(|s| s.0 == "催化剂及加热").unwrap();
+            let bottom = r.iter().find(|s| s.0 == "高压").unwrap();
+            assert!(top.2 < 0.0 && bottom.2 > 0.0);
+            assert!(top.3 < 10.0 && bottom.3 < 10.0);
+            near(top.1 + 0.25 * top.3 * 6.0, bottom.1 + 0.25 * bottom.3 * 2.0,
+                "conditions share the arrow's centre");
+            assert!(f.ascent >= -top.2 + 0.7 * top.3);
+            assert!(f.descent >= bottom.2 + 0.2 * bottom.3);
+            assert!(m.widened.iter().any(|(c, w)| *c == '→' && *w >= 36.6));
+            assert!(r.iter().all(|s| !s.0.contains("xrightarrow")));
+        }
+    }
+
+    #[test]
+    fn reaction_arrows_use_horizontal_font_constructions_when_available() {
+        struct ArrowFace;
+        impl MathMeasure for ArrowFace {
+            fn measure(&mut self, text: &str, size: f32) -> Extents {
+                Extents { advance: text.chars().count() as f32 * size / 2.0,
+                    ascent: size * 0.7, descent: size * 0.2, italic: 0.0 }
+            }
+            fn constant(&mut self, _: usize, _: f32) -> Option<f32> { None }
+            fn percent(&mut self, _: usize, fallback: f32) -> f32 { fallback }
+            fn stretch(&mut self, _: char, _: f32, _: f32) -> Option<Vec<Stacked>> { None }
+            fn widen(&mut self, _: char, _: f32, width: f32) -> Option<Vec<Running>> {
+                Some(vec![Running { index: 42, x: 0.0, width: width + 4.0,
+                    ascent: 6.0, descent: 2.0 }])
+            }
+        }
+        let f = set(r"\xrightarrow{xy}", 10.0, false, &mut ArrowFace);
+        near(f.width, 36.0, "reserve the variant's actual width");
+        let r = runs(&f);
+        near(r[0].1 + 0.25 * r[0].3 * 2.0, 18.0, "centre the label on the variant");
+        assert!(f.shapes.iter().any(|s| matches!(s, Shape::Glyph { index: 42, .. })));
+    }
+
+    #[test]
+    fn equilibrium_rows_align_visible_tips_and_tails_despite_unequal_side_bearings() {
+        struct BearingFace(Mock);
+        impl MathMeasure for BearingFace {
+            fn measure(&mut self, text: &str, size: f32) -> Extents {
+                self.0.measure(text, size)
+            }
+            fn horizontal_ink(&mut self, ch: char, size: f32) -> (f32, f32) {
+                if matches!(ch, '⇀' | '⇁') { (0.06 * size, 0.43 * size) }
+                else { (0.09 * size, 0.46 * size) }
+            }
+            fn constant(&mut self, index: usize, size: f32) -> Option<f32> {
+                self.0.constant(index, size)
+            }
+            fn percent(&mut self, index: usize, fallback: f32) -> f32 {
+                self.0.percent(index, fallback)
+            }
+            fn stretch(&mut self, ch: char, size: f32, height: f32) -> Option<Vec<Stacked>> {
+                self.0.stretch(ch, size, height)
+            }
+            fn widen(&mut self, ch: char, size: f32, width: f32) -> Option<Vec<Running>> {
+                self.0.widened.push((ch, width));
+                Some(vec![Running { index: 42, x: 0.0, width, ascent: size, descent: size }])
+            }
+        }
+        for display in [false, true] {
+            for src in [r"\xrightleftharpoons{}", r"\xleftrightharpoons{}",
+                r"\xrightleftharpoons[高温、高压]{催化剂}",
+                r"\xleftrightharpoons[高温、高压]{催化剂}"] {
+                let mut face = BearingFace(Mock::bare());
+                let f = set(src, 10.0, display, &mut face);
+                let shafts = frame(&f);
+                assert_eq!(shafts.len(), 2);
+                assert!(face.0.widened.is_empty(), "composite glyphs may have staggered ends");
+                for (text, x, y, size) in runs(&f).into_iter().filter(|r|
+                    matches!(r.0.as_str(), "⇀" | "⇁" | "↼" | "↽")) {
+                    let (lo, hi) = face.horizontal_ink(text.chars().next().unwrap(), size);
+                    let (sx, _, sw, _) = shafts.iter().find(|s|
+                        s.1 < -2.5 && y < 0.0 || s.1 > -2.5 && y > 0.0).unwrap();
+                    near((x + lo).min(*sx), 0.0, "both rows start at the visible left edge");
+                    near((x + hi).max(sx + sw), f.width, "both rows end at the visible right edge");
+                }
+                for label in ["催化剂", "高温、高压"] {
+                    if let Some((text, x, _, size)) = runs(&f).into_iter().find(|r| r.0 == label) {
+                        near(x + text.chars().count() as f32 * size / 4.0, f.width / 2.0,
+                            "conditions remain centred on the aligned pair");
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn chemistry_keeps_elements_upright_and_places_counts_charges_and_states() {
+        let f = set(r"\ce{2NH4+ + SO4^2- -> (NH4)2SO4(aq)}", 10.0, false, &mut Mock::bare());
+        let raw: Vec<_> = f.shapes.iter().filter_map(|s| match s {
+            Shape::Run { text, y, size, .. } => Some((text.as_str(), *y, *size)), _ => None,
+        }).collect();
+        assert!(raw.iter().any(|s| s.0 == "NH" && s.1 == 0.0 && s.2 == 10.0));
+        assert!(raw.iter().any(|s| s.0 == "4" && s.1 > 0.0 && s.2 < 10.0));
+        assert!(raw.iter().any(|s| s.0 == "+" && s.1 < 0.0));
+        assert!(raw.iter().any(|s| s.0 == "2" && s.1 < 0.0));
+        assert!(raw.iter().any(|s| s.0 == "aq" && s.1 == 0.0));
+        assert!(raw.iter().all(|s| plain(s.0) == s.0), "elements must stay roman");
+        let f = set(r"\mathrm{SO_4^{2-}}", 10.0, false, &mut Mock::bare());
+        let r = runs(&f);
+        assert!(r.iter().any(|s| s.0 == "SO" && s.2 == 0.0));
+        assert!(r.iter().any(|s| s.0 == "4" && s.2 > 0.0));
+        assert!(r.iter().any(|s| s.0 == "2" && s.2 < 0.0));
+    }
+
+    #[test]
+    fn chemistry_supports_equilibrium_hydrates_bonds_gas_and_precipitate() {
+        for src in [
+            r"\ce{N2 + 3H2 <=>[\text{催化剂}][\Delta] 2NH3}",
+            r"\ce{CuSO4 * 5H2O ->[\Delta] CuSO4 + 5H2O}",
+            r"\ce{Ag+ + Cl- -> AgCl v}",
+            r"\ce{Zn + 2H+ -> Zn^2+ + H2 ^}",
+            r"\ce{H-Cl -> H+ + Cl-}",
+        ] {
+            let f = set(src, 10.0, false, &mut Mock::bare());
+            assert!(runs(&f).iter().all(|s| !s.0.contains('\\')), "unparsed command in {src}");
+        }
+        let f = set(r"\ce{CaCO3 ->[\Delta] CaO + CO2 ^ + CaCO3 v}", 10.0, false, &mut Mock::bare());
+        let r = runs(&f);
+        assert!(r.iter().any(|s| s.0 == "↑"));
+        assert!(r.iter().any(|s| s.0 == "↓"));
+        let f = set(r"N_2 + 3H_2 \rightleftharpoons 2NH_3", 10.0, false, &mut Mock::bare());
+        assert!(runs(&f).iter().any(|s| s.0 == "⇀"));
+        for (src, bond) in [(r"\ce{H-Cl}", "−"), (r"\ce{O=O}", "="), (r"\ce{N#N}", "≡")] {
+            let f = set(src, 10.0, false, &mut Mock::bare());
+            near(f.width, if bond == "−" { 20.0 } else { 15.0 },
+                "bonds add no operator spacing");
+            assert!(runs(&f).iter().any(|s| s.0 == bond));
+        }
+    }
+
+    #[test]
+    fn malformed_and_nested_chemistry_and_arrow_arguments_remain_bounded() {
+        for src in [r"\ce{Fe(OH)3 ->[点燃", r"\xrightarrow[{]}]{\Delta}",
+            r"\ce{SO4^}", r"\xrightarrow[下方", r"\ce{\text{溶液 2}}"] {
+            set(src, 10.0, false, &mut Mock::bare());
+        }
+        let src = format!("{}H2O{}", r"\ce{".repeat(200), "}".repeat(200));
+        set(&src, 10.0, false, &mut Mock::bare());
+    }
+
+    #[test]
+    fn ordinary_tex_reactions_share_chemical_lettering_and_arrow_proportions() {
+        for src in [r"2Na + Cl_2 \xrightarrow{点燃} 2NaCl",
+            r"N_2 + 3H_2 \rightleftharpoons 2NH_3", r"2Na + S = Na_2S"] {
+            assert!(crate::chemistry::is_reaction(src));
+            let f = set(src, 10.0, false, &mut Mock::bare());
+            assert!(f.shapes.iter().all(|s| match s {
+                Shape::Run { text, .. } => plain(text) == *text, _ => true,
+            }), "chemical elements must use upright letters: {src}");
+        }
+        for src in [r"x+y=z", r"A \xrightarrow{条件} B", r"\frac{Na}{Cl}=x",
+            r"\mathbb{R}=C", r"f(x)=N_2", r"H+O=P"] {
+            assert!(!crate::chemistry::is_reaction(src), "misclassified math: {src}");
+        }
+        for display in [true, false] {
+            let f = set(r"\xrightarrow{\Delta}", 10.0, display, &mut Mock::bare());
+            assert!(f.width >= 32.0, "even a short condition needs a full reaction arrow");
+        }
+        let f = set(r"\ce{N2 + 3H2 ⇌ 2NH3}", 10.0, false, &mut Mock::bare());
+        assert!(runs(&f).iter().any(|s| s.0 == "⇀"));
     }
 
     #[test]

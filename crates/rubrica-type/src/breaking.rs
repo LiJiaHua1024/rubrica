@@ -60,6 +60,9 @@ pub struct BreakOptions {
     /// A line earns this only when its final content is one or more closing marks;
     /// opening punctuation and prose at a line end receive nothing.
     pub hanging_punctuation: Pt,
+    /// Beyond this multiple of the real glue's stretch, leave a short line at
+    /// natural width. Emergency stretch is a solver allowance, not visible glue.
+    pub max_stretch_ratio: Pt,
     /// Items a single piece may span before the paragraph is broken at an
     /// ordinary break opportunity between two already-legal pieces.
     ///
@@ -92,6 +95,7 @@ impl BreakOptions {
             ragged: false,
             tight_box: false,
             hanging_punctuation: 0.0,
+            max_stretch_ratio: 3.0,
             // ~16K characters of Latin prose, or ~32K items of Han: far past any
             // paragraph a document writes by hand, and small enough that one solver
             // run over a piece stays in the milliseconds.
@@ -346,8 +350,12 @@ fn score(
     // ragged block -- where lines live between half a measure and all of it -- had
     // no reason to fill its measure at all. The solver took whichever of the
     // equally cheap breaks it met first, which is the loosest one.
-    let mut adj = (100.0 * f64::from(ratio).powi(3)).min(10_000.0) + 100.0;
-    if bad >= 10000 {
+    // The reported badness is capped like TeX's, but underfull demerits must
+    // distinguish a slightly loose line from one with several ems between words.
+    // Otherwise the final pass assigns both the same cost and keeps the first.
+    // Stay below RESCUED so an overfull rescue can never beat ordinary breaks.
+    let mut adj = (100.0 * f64::from(ratio).powi(3)).min(10_000_000.0) + 100.0;
+    if bad >= 10000 && delta < 0.0 {
         adj = 100_000.0;
     }
     // Fitness classes may not jump the ladder two rungs at a time: TeX charges
@@ -751,7 +759,10 @@ fn solve(
             fitness: ed.fitness,
             forced: matches!(items[ed.item], Item::Penalty { forced: true, .. }),
             first: n == 0 && first_line,
-            ragged: opts.ragged,
+            ragged: opts.ragged || (ed.stretch < INFINITY / 2.0
+                && ed.width < opts.target(n == 0 && first_line)
+                && opts.target(n == 0 && first_line) - ed.width
+                    > ed.stretch * opts.max_stretch_ratio),
             hyphen: match items[ed.item] {
                 Item::Penalty { hyphen, .. } => hyphen,
                 _ => None,

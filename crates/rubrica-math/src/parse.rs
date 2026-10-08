@@ -16,6 +16,8 @@
 pub enum Node {
     /// A run of characters set at the current style: identifiers, digits, operators.
     Atom(String),
+    /// A chemical bond has no relation spacing, even when written as `=` or `≡`.
+    Bond(String),
     Row(Vec<Node>),
     Frac {
         num: Box<Node>,
@@ -98,6 +100,12 @@ pub enum Node {
         base: Box<Node>,
         label: Box<Node>,
         side: BarSide,
+    },
+    /// A reaction arrow grown to fit its script-sized conditions.
+    Arrow {
+        glyph: char,
+        above: Option<Box<Node>>,
+        below: Option<Box<Node>>,
     },
     /// `\boxed`, `\fbox`: the body inside a rectangle.
     Boxed { body: Box<Node> },
@@ -254,6 +262,8 @@ pub struct Parser<'a> {
     /// is being read: `\mathbb{R^n}` reaches the `n`, `\mathbb{R}^n` does not. `None`
     /// is the state a formula is read in, where a written letter is math italic.
     alphabet: Option<Alphabet>,
+    /// Explicit mhchem or a recognisable element-based reaction in ordinary TeX.
+    chemical: bool,
     /// Whether the node just collected is a run of written letters, which is the only
     /// thing a following written letter joins. A command's own text is not: welding
     /// `\sin` onto the `x` after it would set the operator's name as a variable.
@@ -329,7 +339,11 @@ enum Ctx {
 
 /// Parse a whole formula, the entry point callers use.
 pub fn parse(src: &str) -> Node {
-    Parser::new(src).formula()
+    if crate::chemistry::is_reaction(src) {
+        Parser::chemical(src, 0)
+    } else {
+        Parser::new(src).formula()
+    }
 }
 
 impl<'a> Parser<'a> {
@@ -337,13 +351,14 @@ impl<'a> Parser<'a> {
     /// no business being a hundred levels deep -- TeX's own macros bottom out long
     /// before -- and past this point the reader loses the arrangement, not the
     /// mathematics, rather than the process losing the stack.
-    const MAX_DEPTH: usize = 100;
+    pub(crate) const MAX_DEPTH: usize = 100;
 
     pub fn new(s: &'a str) -> Parser<'a> {
         Parser {
             src: s.as_bytes(),
             at: 0,
             alphabet: None,
+            chemical: false,
             welding: false,
             infix: None,
             hline: false,
@@ -491,6 +506,10 @@ impl<'a> Parser<'a> {
                         continue;
                     };
                     let text = self.letter(ch);
+                    if self.chemical && matches!(ch, '→' | '←' | '↔' | '⇌' | '⇋') {
+                        self.push(&mut out, Node::Arrow { glyph: ch, above: None, below: None });
+                        continue;
+                    }
                     if ch.is_alphabetic() && self.welding {
                         if let Some(Node::Atom(s)) = out.last_mut() {
                             s.push_str(&text);
@@ -1026,7 +1045,8 @@ impl<'a> Parser<'a> {
             // Upright words: read as written, spaces and all, because a formula's
             // `\text{as } x` loses a word when the space is treated as a separator.
             "text" | "textrm" | "mbox" => Node::Atom(self.text_argument()),
-            "mathrm" | "operatorname" => Node::Atom(self.text_argument()),
+            "operatorname" => Node::Atom(self.text_argument()),
+            "mathrm" => self.alphabetized(Alphabet::Roman),
             // Invisible in TeX, and the worst thing a reader can do with them is print
             // them: `\label{eq:one}` at the end of every displayed formula would put
             // `label(𝑒𝑞:𝑜𝑛𝑒)` on the page, which is why emitting nothing is the fix
@@ -1115,6 +1135,20 @@ impl<'a> Parser<'a> {
             // same box here; which side the label goes is the only difference that shows.
             "overset" | "stackrel" => self.stack(BarSide::Over),
             "underset" => self.stack(BarSide::Under),
+            "xrightarrow" => self.arrow('→'),
+            "xleftarrow" => self.arrow('←'),
+            "xleftrightarrow" => self.arrow('↔'),
+            "xRightarrow" => self.arrow('⇒'),
+            "xLeftarrow" => self.arrow('⇐'),
+            "xLeftrightarrow" => self.arrow('⇔'),
+            "xrightleftharpoons" => self.arrow('⇌'),
+            "xleftrightharpoons" => self.arrow('⇋'),
+            "ce" => self.chemistry_argument(),
+            "bond" => Node::Bond(match self.text_argument().as_str() {
+                "#" => "≡".into(),
+                "-" => "−".into(),
+                other => other.into(),
+            }),
             "boxed" | "fbox" => Node::Boxed { body: Box::new(self.argument()) },
             // The one grid written as an argument rather than as an environment:
             // `\sum_{\substack{i<j\\k\neq l}}` puts two lines under an operator's limit,
@@ -1186,6 +1220,65 @@ impl<'a> Parser<'a> {
         let label = self.argument();
         let base = self.argument();
         Node::Stack { base: Box::new(base), label: Box::new(label), side }
+    }
+
+    fn arrow(&mut self, glyph: char) -> Node {
+        let below = self.optional_argument().map(Box::new);
+        let above = Some(Box::new(self.argument()));
+        Node::Arrow { glyph, above, below }
+    }
+
+    /// Square brackets are optional arguments only here; nested braces protect a
+    /// written closing bracket in a condition. Parse through the existing depth cap.
+    fn optional_argument(&mut self) -> Option<Node> {
+        while self.peek().is_some_and(|b| b.is_ascii_whitespace()) {
+            self.bump();
+        }
+        if self.peek() != Some(b'[') {
+            return None;
+        }
+        self.bump();
+        let start = self.at;
+        let mut braces = 0usize;
+        let mut brackets = 1usize;
+        while let Some(c) = self.peek() {
+            match c {
+                b'\\' => { self.bump(); let _ = self.take_char(); continue; }
+                b'{' => braces += 1,
+                b'}' => braces = braces.saturating_sub(1),
+                b'[' if braces == 0 => brackets += 1,
+                b']' if braces == 0 => {
+                    brackets -= 1;
+                    if brackets == 0 { break; }
+                }
+                _ => {}
+            }
+            let _ = self.take_char();
+        }
+        let end = self.at;
+        if self.peek() == Some(b']') { self.bump(); }
+        let mut child = Parser::new(std::str::from_utf8(&self.src[start..end]).unwrap_or(""));
+        child.alphabet = self.alphabet;
+        child.chemical = self.chemical;
+        child.depth = self.depth + 1;
+        Some(child.formula())
+    }
+
+    fn chemistry_argument(&mut self) -> Node {
+        if self.peek() != Some(b'{') {
+            return self.argument();
+        }
+        self.bump();
+        let source = self.skip_group();
+        crate::chemistry::parse(&source, self.depth + 1)
+    }
+
+    pub(crate) fn chemical(source: &'a str, depth: usize) -> Node {
+        let mut parser = Parser::new(source);
+        parser.alphabet = Some(Alphabet::Roman);
+        parser.chemical = true;
+        parser.depth = depth;
+        parser.formula()
     }
 
     /// A style switch, which emits nothing itself: the run being collected wraps itself
@@ -1497,6 +1590,8 @@ impl<'a> Parser<'a> {
             return Node::BigOp { op, limits, sub: None, sup: None };
         }
         match symbol(name) {
+            Some(s) if self.chemical && matches!(s, "→" | "←" | "↔" | "⇌" | "⇋") =>
+                Node::Arrow { glyph: s.chars().next().unwrap(), above: None, below: None },
             Some(s) => Node::Atom(s.to_string()),
             // Unknown: show what was written rather than swallow it.
             None => Node::Atom(format!("\\{name}")),
@@ -1591,6 +1686,7 @@ impl<'a> Parser<'a> {
 /// by the same run path -- with the face itself chosen by the platform's font fallback.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Alphabet {
+    Roman,
     Bold,
     Italic,
     BoldItalic,
@@ -1614,6 +1710,7 @@ impl Alphabet {
     fn bases(self) -> (u32, u32, Option<u32>) {
         use Alphabet::*;
         match self {
+            Roman => (b'A' as u32, b'a' as u32, Some(b'0' as u32)),
             Bold => (0x1D400, 0x1D41A, Some(0x1D7CE)),
             Italic => (0x1D434, 0x1D44E, None),
             BoldItalic => (0x1D468, 0x1D482, None),
@@ -1769,6 +1866,12 @@ fn symbol(name: &str) -> Option<&'static str> {
         "to" | "rightarrow" => "→",
         "leftarrow" => "←",
         "leftrightarrow" => "↔",
+        "rightleftharpoons" => "⇌",
+        "leftrightharpoons" => "⇋",
+        "rightharpoonup" => "⇀",
+        "rightharpoondown" => "⇁",
+        "leftharpoonup" => "↼",
+        "leftharpoondown" => "↽",
         "Rightarrow" => "⇒",
         "Leftarrow" => "⇐",
         "Leftrightarrow" => "⇔",
@@ -2028,6 +2131,7 @@ mod tests {
     fn sexp(n: &Node) -> String {
         match n {
             Node::Atom(s) => s.clone(),
+            Node::Bond(s) => format!("(bond {s})"),
             Node::Row(v) if v.is_empty() => String::new(),
             // A row of one is just that one: `{x}` and `x` must not look different.
             Node::Row(v) if v.len() == 1 => sexp(&v[0]),
@@ -2075,6 +2179,9 @@ mod tests {
             Node::Big { delim, step, role } => format!("(big {step} {role:?} {delim:?})"),
             Node::Stack { base, label, side } =>
                 format!("(stack {side:?} {} {})", sexp(base), sexp(label)),
+            Node::Arrow { glyph, above, below } => format!("(arrow {glyph} {} {})",
+                above.as_ref().map_or_else(|| "-".into(), |n| sexp(n)),
+                below.as_ref().map_or_else(|| "-".into(), |n| sexp(n))),
             Node::Boxed { body } => format!("(boxed {})", sexp(body)),
             Node::Styled { body, style } => format!("(style {style:?} {})", sexp(body)),
             Node::Space(mu) => format!("(space {mu})"),

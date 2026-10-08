@@ -1014,6 +1014,29 @@ fn an_object_too_wide_for_the_measure_still_reports_a_line() {
 }
 
 #[test]
+fn an_inline_formula_does_not_spread_a_short_cjk_line_across_the_column() {
+    let text = "• 与卤素及硫：钠在氯气中剧烈燃烧，生成大量白烟（\u{fffc}）；而当钠与硫粉混合研磨时，机械能跨越了活化能壁垒，瞬间发生爆炸性的电子转移。";
+    let spacing = Spacing::for_size(SIZE);
+    for width in [130.0, 180.0, 240.0, 360.0] {
+        let mut m = ObjectMeasure { object_at: text.find('\u{fffc}'), box_: (width, 12.0, 3.0) };
+        let opts = BreakOptions::new(360.0);
+        let (para, plan) = typeset(text, &spacing, StyleId(0), &[], &opts, &mut m);
+        assert_eq!(plan.lines.iter().map(|l| text_of(&para, text, l)).collect::<String>(),
+            text.replace(' ', ""), "all text and the formula must survive");
+        for line in &plan.lines {
+            let placed = place(&para, line);
+            if line.natural < line.target && !line.is_ragged() {
+                assert!(line.target - line.natural <= line.stretch * opts.max_stretch_ratio);
+            }
+            if line.ragged {
+                assert!((line_width(&placed) - line.natural).abs() < 0.01,
+                    "a short line must retain natural spacing");
+            }
+        }
+    }
+}
+
+#[test]
 fn text_nodes_still_report_zero_extent() {
     // The line box for ordinary prose comes from the fonts; a non-zero default here
     // would silently override it.
@@ -1504,4 +1527,3 @@ fn a_piece_with_no_soft_items_still_splits_and_terminates() {
         .sum();
     assert_eq!(total, src.len(), "the run survived the split whole");
 }
-

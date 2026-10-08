@@ -114,6 +114,17 @@ wide accents, `\overset`/`\underset`/`\stackrel`/`\boxed`, the lettering styles
 `\mathtt`, `\text`), and the TeX style switches `\displaystyle`, `\textstyle`,
 `\scriptstyle` and `\scriptscriptstyle`.
 
+Chemical equations support extensible reaction arrows such as
+`\xrightarrow[below]{above}` and `\xrightleftharpoons[below]{above}`, equilibrium
+symbols, gas/precipitate arrows and scripted ions. A common subset of mhchem's
+`\ce{...}` notation sets elements upright and handles coefficients, automatic
+subscripts, charges (`SO4^2-`, `NH4+`), states, isotopes, bonds, hydrates and labelled
+reactions (`\ce{N2 + 3H2 <=>[催化剂][高温、高压] 2NH3}`). It does not implement the
+complete mhchem language. See `fixtures/chemistry.md` for examples.
+Ordinary TeX reactions whose identifiers can be recognised as chemical elements
+also use upright lettering and longer reaction arrows. Arrow conditions are centred
+at a readable size; arrows grow to leave room on both sides of their labels.
+
 ## Reading features
 
 Selection by mouse and keyboard with clipboard copy, a caret that follows the pointer,

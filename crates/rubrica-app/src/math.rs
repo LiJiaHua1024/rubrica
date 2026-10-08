@@ -304,6 +304,25 @@ impl<'a> Adapter<'a> {
 }
 
 impl MathMeasure for Adapter<'_> {
+    fn horizontal_ink(&mut self, ch: char, size: Pt) -> (Pt, Pt) {
+        let text = ch.to_string();
+        let runs = self.font.shape_runs(&text, 0..text.len(), self.shaped_as(&text), size, 0.0);
+        let mut at = 0.0;
+        let mut left = f32::INFINITY;
+        let mut right = f32::NEG_INFINITY;
+        for run in runs {
+            for (i, glyph) in run.glyphs.iter().enumerate() {
+                if let Some((lo, hi)) = self.font.glyph_horizontal_ink(run.face, *glyph, size) {
+                    let origin = at + run.offsets[i].advanceOffset;
+                    left = left.min(origin + lo);
+                    right = right.max(origin + hi);
+                }
+                at += run.advances[i];
+            }
+        }
+        if left.is_finite() && right.is_finite() { (left, right) } else { (0.0, at) }
+    }
+
     fn measure(&mut self, text: &str, size: Pt) -> Extents {
         // The advance comes from the shaper, so the width the line breaks on is the
         // width the painter draws. The ink comes from the glyph outlines instead,

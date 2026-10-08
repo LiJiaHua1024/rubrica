@@ -104,6 +104,12 @@ pub trait MathMeasure {
     /// Measure `text` at `size`, including its trailing italic correction.
     fn measure(&mut self, text: &str, size: Pt) -> Extents;
 
+    /// Visible left/right edges of one glyph, relative to its shaping origin.
+    /// Side bearings must not stagger a pair of otherwise equal-length arrows.
+    fn horizontal_ink(&mut self, ch: char, size: Pt) -> (Pt, Pt) {
+        (0.0, self.measure(&ch.to_string(), size).advance)
+    }
+
     /// A length constant converted to points at `size`, or `None` if the face has no
     /// `MATH` table for it.
     fn constant(&mut self, index: usize, size: Pt) -> Option<Pt>;
@@ -283,6 +289,7 @@ impl Engine<'_> {
     fn lay_at(&mut self, n: &Node, st: Style) -> (Vec<Shape>, Mb) {
         match n {
             Node::Atom(s) => self.atom(s, st),
+            Node::Bond(s) => self.atom(s, st),
             Node::Row(v) => self.row(v, st),
             Node::Frac { num, den, has_bar, style } =>
                 self.frac(num, den, *has_bar, *style, st),
@@ -298,6 +305,8 @@ impl Engine<'_> {
             Node::Brace { body, side } => self.brace(body, *side, st),
             Node::Big { delim, step, role } => self.big(*delim, *step, *role, st),
             Node::Stack { base, label, side } => self.stack(base, label, *side, st),
+            Node::Arrow { glyph, above, below } =>
+                self.arrow(*glyph, above.as_deref(), below.as_deref(), st),
             Node::Boxed { body } => self.boxed(body, st),
             Node::Array { rows, columns, kind, delimiters, rules, col_rules } => self.array(
                 rows,
@@ -1023,6 +1032,98 @@ impl Engine<'_> {
         self.stacked(b_shapes, bb, below, above, st)
     }
 
+    fn arrow(&mut self, glyph: char, above: Option<&Node>, below: Option<&Node>, st: Style)
+        -> (Vec<Shape>, Mb)
+    {
+        // Reaction conditions must remain readable beside CJK prose. Font script
+        // sizes can be only 70% of the body; use a slightly larger label here.
+        let script = Style { size: self.script_size(st, 1).max(0.82 * st.size),
+            display: false, cramped: true };
+        let top = above.map(|n| self.lay(n, script)).filter(|(s, _)| !s.is_empty());
+        let bottom = below.map(|n| self.lay(n, script)).filter(|(s, _)| !s.is_empty());
+        let label_width = top.iter().chain(bottom.iter()).map(|(_, b)| b.ink_width())
+            .fold(0.0f32, Pt::max);
+        // A reaction arrow needs a visible shaft on both sides of its condition,
+        // even for a lone Delta. Keep the head at its natural font size.
+        let mut width = (label_width + 1.2 * st.size).max(3.2 * st.size);
+        let axis = self.c(constant::AXIS_HEIGHT, st.size, FALLBACK_AXIS);
+        let mut out = Vec::new();
+        let mut ascent = axis;
+        let mut descent = 0.0f32;
+        if matches!(glyph, '⇌' | '⇋') {
+            // A composite equilibrium glyph can have staggered ends by design.
+            // Build its two rows independently and align their *visible* tips and
+            // tails to the same 0..width interval, including font side bearings.
+            let (upper, lower) = if glyph == '⇌' { ('⇀', '↽') } else { ('↼', '⇁') };
+            let rule = self.c(constant::FRACTION_RULE_THICKNESS, st.size, FALLBACK_RULE);
+            for (ch, right, offset) in [(upper, glyph == '⇌', -0.12 * st.size),
+                (lower, glyph == '⇋', 0.12 * st.size)] {
+                let e = self.ext(&ch.to_string(), st.size);
+                let (left, end) = self.m.horizontal_ink(ch, st.size);
+                let head = (end - left).clamp(0.1 * st.size, width / 2.0);
+                let x = if right { width - end } else { -left };
+                out.push(Shape::Run { text: ch.to_string(), x, y: offset, size: st.size });
+                out.push(Shape::Rule {
+                    x: if right { 0.0 } else { head / 2.0 },
+                    y: -axis + offset - rule / 2.0,
+                    width: width - head / 2.0,
+                    thickness: rule,
+                });
+                ascent = ascent.max(e.ascent - offset);
+                descent = descent.max(e.descent + offset);
+            }
+        } else if let Some(parts) = self.m.widen(glyph, st.size, width).filter(|p|
+            p.iter().map(|s| s.x + s.width).fold(0.0f32, Pt::max) >= width) {
+            let actual = parts.iter().map(|p| p.x + p.width).fold(0.0f32, Pt::max);
+            width = width.max(actual);
+            let centre = (width - actual) / 2.0;
+            for p in parts {
+                out.push(Shape::Glyph { index: p.index, x: centre + p.x, y: 0.0, size: st.size });
+                ascent = ascent.max(p.ascent);
+                descent = descent.max(p.descent);
+            }
+        } else {
+            // Keep the arrowhead at the face's own size; extend its shaft with a
+            // rule. Scaling a whole arrow would also enlarge its head and labels.
+            let e = self.ext(&glyph.to_string(), st.size);
+            let head = e.advance.min(width / 2.0);
+            let rule = self.c(constant::FRACTION_RULE_THICKNESS, st.size, FALLBACK_RULE);
+            let double = matches!(glyph, '⇒' | '⇐' | '⇔');
+            let paired = double;
+            for offset in if paired { vec![-0.12 * st.size, 0.12 * st.size] } else { vec![0.0] } {
+                out.push(Shape::Rule { x: head / 2.0, y: -axis + offset - rule / 2.0,
+                    width: width - head, thickness: rule });
+            }
+            let mut ends = Vec::new();
+            match glyph {
+                '←' => ends.push(('←', false, 0.0)),
+                '↔' => { ends.push(('←', false, 0.0)); ends.push(('→', true, 0.0)); }
+                '⇐' => ends.push(('⇐', false, 0.0)),
+                '⇔' => { ends.push(('⇐', false, 0.0)); ends.push(('⇒', true, 0.0)); }
+                _ => ends.push((glyph, true, 0.0)),
+            }
+            for (ch, right, y) in ends {
+                let ext = self.ext(&ch.to_string(), st.size);
+                let x = if right { width - ext.advance } else { 0.0 };
+                out.push(Shape::Run { text: ch.to_string(), x: x.max(0.0), y, size: st.size });
+                ascent = ascent.max(ext.ascent - y);
+                descent = descent.max(ext.descent + y);
+            }
+        }
+        let gap = self.c(constant::UPPER_LIMIT_GAP_MIN, st.size, 0.15).max(0.1 * st.size);
+        if let Some((s, b)) = top {
+            let y = -(ascent + gap + b.descent);
+            translate(&s, (width - b.ink_width()) / 2.0, y, &mut out);
+            ascent = ascent.max(b.ascent - y);
+        }
+        if let Some((s, b)) = bottom {
+            let y = descent + gap + b.ascent;
+            translate(&s, (width - b.ink_width()) / 2.0, y, &mut out);
+            descent = descent.max(b.descent + y);
+        }
+        (out, Mb { width, ascent, descent, italic: 0.0, align_x: width / 2.0 })
+    }
+
     /// Limits above and below an already-laid-out base, centred on its width. The base
     /// comes in as shapes because both of this file's callers have one: a big operator
     /// measures its own glyph, while a stacked label keeps whatever its base turned out
@@ -1323,6 +1424,7 @@ fn source_of(n: &Node) -> String {
         match step {
             Step::Text(t) => out.push_str(&t),
             Step::Node(Node::Atom(s)) => out.push_str(s),
+            Step::Node(Node::Bond(s)) => out.push_str(s),
             Step::Node(Node::Row(v)) => work.extend(v.iter().rev().map(Step::Node)),
             Step::Node(Node::Frac { num, den, .. }) => {
                 work.push(Step::Text("}".into()));
@@ -1436,6 +1538,11 @@ fn source_of(n: &Node) -> String {
                     .into(),
                 ));
             }
+            Step::Node(Node::Arrow { glyph, above, below }) => {
+                if let Some(n) = below { work.push(Step::Node(n)); }
+                if let Some(n) = above { work.push(Step::Node(n)); }
+                work.push(Step::Text(glyph.to_string()));
+            }
             Step::Node(Node::Boxed { body }) => {
                 work.push(Step::Text("}".into()));
                 work.push(Step::Node(body));
@@ -1532,6 +1639,12 @@ fn is_rel(ch: char) -> bool {
             | '\u{2192}'
             | '\u{2190}'
             | '\u{2194}'
+            | '\u{21cc}'
+            | '\u{21cb}'
+            | '\u{21c0}'
+            | '\u{21c1}'
+            | '\u{21bc}'
+            | '\u{21bd}'
             | '\u{21d2}'
             | '\u{21d0}'
             | '\u{21d4}'
@@ -1630,6 +1743,7 @@ impl Class {
             // A stacked label is spaced as its base is, because that is what TeX's
             // forced `\limits` on it means: `\overset{a}{=} b` reads as a relation.
             Node::Stack { base, .. } => Class::of(sole(base)),
+            Node::Arrow { .. } => Class::Rel,
             _ => Class::Ord,
         }
     }
@@ -1683,4 +1797,3 @@ fn column_gap(kind: ArrayKind, j: usize, size: Pt) -> Pt {
         _ => base,
     }
 }
-
