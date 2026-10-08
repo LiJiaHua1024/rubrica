@@ -3,6 +3,9 @@
 /dist/
 *.pdb
 
+# Local audit and debug artifacts.
+/audit/
+
 # Agent and editor state, local to whoever's working on this.
 .qoder/
 .idea/
