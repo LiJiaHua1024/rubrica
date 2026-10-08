@@ -3926,7 +3926,8 @@ impl View {
         // whatever arrives afterwards.
         self.stamp = path.as_deref().and_then(stamp_of);
         self.keep_line_breaks = crate::settings::keep_line_breaks();
-        let preferences = path.as_deref().map(crate::settings::document).unwrap_or_default();
+        let mut preferences = path.as_deref().map(crate::settings::document).unwrap_or_default();
+        preferences.text = reading::text_options_for(path.as_deref(), preferences.text);
         let profile = crate::profiles::selected(preferences.plain.unwrap_or_else(|| reading::is_plain(path.as_deref())));
         if profile != "Default" { crate::profiles::load(&profile).apply(&mut self.theme); }
         self.profile = profile;
