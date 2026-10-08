@@ -4034,7 +4034,8 @@ impl View {
                 } else {
                     index.window(&source, 0, preferences.text)
                 }
-        } else { Document::parse_with(&source, rubrica_doc::ParseOptions {
+        } else if plain { rubrica_doc::plain::parse(&source, preferences.text) }
+        else { Document::parse_with(&source, rubrica_doc::ParseOptions {
             keep_line_breaks: preferences.line_breaks.unwrap_or(self.keep_line_breaks),
         }) };
         trace("page-ready");
