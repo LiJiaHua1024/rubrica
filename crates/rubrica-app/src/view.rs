@@ -1784,11 +1784,12 @@ pub struct View {
     client_w: f32,
     client_h: f32,
     dpi: f32,
-    /// Window movement and interactive resizing share a modal loop. A move leaves these
-    /// alone; a resize records its first visible anchor and reflows once when the loop ends.
+    /// Interactive resizing reuses the current wrapping and reflows once on release.
+    /// A cheap horizontal preview keeps the visible ink inside the changing viewport.
     size_move_active: bool,
     resize_pending: bool,
     resize_anchor: Option<usize>,
+    resize_preview: Option<ResizePreview>,
     path: Option<PathBuf>,
     /// Documents named on the command line alongside the first. They are opened as
     /// tabs after the window is answering for the reader, which is the only order in
@@ -3119,13 +3120,33 @@ fn held(vk: VIRTUAL_KEY) -> bool {
     unsafe { (GetKeyState(vk.0 as i32) as u16 & 0x8000) != 0 }
 }
 
-/// Stand the reader's window up.
+fn layout_needs_worker(doc: &Document) -> bool {
+    doc.blocks.len() > View::LAYOUT_ASYNC_BLOCKS
+        || doc.blocks.iter().any(|block| block.text.len() > View::LAYOUT_ASYNC_BLOCK_BYTES)
+}
+
+/// Geometry of the page being reused during a modal resize. Captured once;
+/// subsequent pointer steps only change the paint and hit-test translation.
+#[derive(Clone, Copy, Debug)]
+struct ResizePreview {
+    width: f32,
+    left: f32,
+    inset: f32,
+}
+
+impl ResizePreview {
+    fn shift(self, client_width: f32) -> f32 {
+        ((client_width - self.width) * 0.5).max(self.inset - self.left)
+    }
+}
+
+/// Build the reader state before creating its window.
 ///
 /// The window comes first and the page second, and not by preference: a double-click
 /// is answered with a frame milliseconds after the process starts, while the
 /// document's settings, read, parse and layout all run afterwards against a window
 /// that is already there.
-pub fn run(path: Option<PathBuf>, extra: Vec<PathBuf>) -> Result<()> {
+fn new_view(path: Option<PathBuf>, extra: Vec<PathBuf>) -> Result<(Box<View>, crate::settings::Settings)> {
     // Must happen before the first window exists, or the process is already
     // bitmap-scaled and text on a secondary high-density monitor is soft.
     unsafe {
@@ -3168,7 +3189,7 @@ pub fn run(path: Option<PathBuf>, extra: Vec<PathBuf>) -> Result<()> {
     let lang_choice = crate::settings::language();
     let lang = lang_choice.unwrap_or_else(Language::system_language);
 
-    let mut view = Box::new(View {
+    let view = Box::new(View {
         d2d,
         target: None,
         hwnd_target: None,
@@ -3253,6 +3274,7 @@ pub fn run(path: Option<PathBuf>, extra: Vec<PathBuf>) -> Result<()> {
         size_move_active: false,
         resize_pending: false,
         resize_anchor: None,
+        resize_preview: None,
         path,
         extra,
         pending_open: Vec::new(),
@@ -3286,6 +3308,11 @@ pub fn run(path: Option<PathBuf>, extra: Vec<PathBuf>) -> Result<()> {
         cap_press_brush: None,
     });
 
+    Ok((view, saved))
+}
+
+pub fn run(path: Option<PathBuf>, extra: Vec<PathBuf>) -> Result<()> {
+    let (mut view, saved) = new_view(path, extra)?;
     const CLASS: &str = "Rubrica.Main";
     unsafe {
         let hinst = GetModuleHandleW(None)?;
@@ -3301,7 +3328,7 @@ pub fn run(path: Option<PathBuf>, extra: Vec<PathBuf>) -> Result<()> {
             // the embedded one is the same artwork Explorer shows for the executable.
             hIcon: crate::icon::large(),
             hIconSm: crate::icon::small(),
-            hCursor: arrow,
+            hCursor: view.arrow,
             // Null on purpose: the render target covers every client pixel, and a
             // system background brush flashes white while a corner is dragged.
             hbrBackground: HBRUSH::default(),
@@ -3905,6 +3932,80 @@ unsafe fn edit_find_key(hwnd: HWND, vk: u32) -> Option<LRESULT> {
 }
 
 impl View {
+    fn capture_resize_preview(&self) -> ResizePreview {
+        let width = (self.client_w - self.content_dx()).max(1.0);
+        let top = if self.reading_mode == ReadingMode::Stack && self.layout_job.is_none() {
+            self.page_start(self.current_page_index()).unwrap_or(0.0) * scale_of(self.dpi)
+        } else {
+            scroll_dip(self.scroll, self.dpi) + TOPBAR_H
+        };
+        let bottom = top + (self.content_bottom() - TOPBAR_H).max(1.0);
+        let band = visible_band(&self.ops, &self.ops_reach, top, bottom, self.ops_sorted);
+        let mut left = f32::INFINITY;
+        let mut right = f32::NEG_INFINITY;
+        for op in &self.ops[band] {
+            if op_bottom(op) < top || op_top(op) > bottom { continue; }
+            let mut include = |x: f32, end: f32, y: f32| {
+                let shift = self.shift_at(x, y);
+                left = left.min(x + shift);
+                right = right.max(end + shift);
+            };
+            match op {
+                Op::Runs(runs) => for run in runs {
+                    include(run.x, run.x + run.advances.iter().sum::<f32>(), run.baseline);
+                },
+                Op::Rect { x, y, w, .. } | Op::Image { x, y, w, .. } => include(*x, x + w, *y),
+                Op::Line { x0, y0, x1, .. } => include(x0.min(*x1), x0.max(*x1), *y0),
+            }
+        }
+        if !left.is_finite() { left = 0.0; right = width; }
+        ResizePreview {
+            // An overflowing table can be wider than its original viewport. Account
+            // for its actual reach when widening rather than keeping a bare gutter.
+            width: width.max(left + right),
+            left,
+            inset: (self.theme.base * MARGIN_EM * 0.25 * scale_of(self.dpi)).min(left),
+        }
+    }
+
+    fn resize_page_shift(&self) -> f32 {
+        self.resize_preview.map_or(0.0, |preview| {
+            preview.shift((self.client_w - self.content_dx()).max(1.0))
+        })
+    }
+
+    unsafe fn finish_resize(&mut self, hwnd: HWND) {
+        self.size_move_active = false;
+        self.resize_preview = None;
+        if self.resize_pending {
+            let anchor = self.resize_anchor.take();
+            self.resize_pending = false;
+            self.layout_epoch += 1;
+            self.relayout_from_anchor(anchor);
+            self.layout_find();
+            let _ = InvalidateRect(Some(hwnd), None, false);
+        }
+    }
+
+    unsafe fn resize_for_dpi(&mut self, hwnd: HWND, rect: &RECT, new_dpi: f32) {
+        // Compare against the old client geometry in the nested WM_SIZE. The
+        // suggested window rect must not be installed as cached client dimensions.
+        let _ = SetWindowPos(
+            hwnd, Some(HWND_TOP), rect.left, rect.top,
+            rect.right - rect.left, rect.bottom - rect.top,
+            SWP_NOZORDER | SWP_NOACTIVATE,
+        );
+        // A DPI change can keep the same pixel size and send no WM_SIZE at all.
+        // If a nested message already applied it, this avoids a second layout.
+        if self.dpi != new_dpi {
+            let mut client = RECT::default();
+            if GetClientRect(hwnd, &mut client).is_ok() {
+                let size = LPARAM(((client.bottom as isize) << 16) | client.right as isize);
+                self.on_message(hwnd, WM_SIZE, WPARAM(0), size);
+            }
+        }
+    }
+
     /// Read the page, and everything about it the window was created without: the
     /// reader's settings for this document, the text, the parse, and the layout that
     /// follows. The window is already showing and answering while this runs, and the
@@ -4298,7 +4399,6 @@ impl View {
                 LRESULT(HTCLIENT as isize)
             }
             WM_SIZE => {
-                let anchor = anchor_at(&self.sel_index, self.scroll, scale_of(self.dpi));
                 let w = (lp.0 & 0xFFFF) as u32;
                 let h = ((lp.0 >> 16) & 0xFFFF) as u32;
                 let new_zoomed = IsZoomed(hwnd).as_bool();
@@ -4320,6 +4420,12 @@ impl View {
                     }
                     return LRESULT(0);
                 }
+                let anchor = if self.resize_pending { self.resize_anchor } else {
+                    self.pending_anchor.or_else(|| anchor_at(&self.sel_index, self.scroll, scale_of(self.dpi)))
+                };
+                if self.size_move_active && !dpi_changed && !self.resize_pending {
+                    self.resize_preview = Some(self.capture_resize_preview());
+                }
                 self.client_w = new_w;
                 self.client_h = new_h;
                 if size_changed {
@@ -4328,20 +4434,31 @@ impl View {
                     }
                 }
                 self.dpi = new_dpi;
-                if self.size_move_active {
+                if self.size_move_active && !dpi_changed {
                     // A resize sends WM_SIZE for every pointer step. Keep the current
                     // page visible while the user is still dragging, then build the
                     // final wrapping once in WM_EXITSIZEMOVE.
                     if !self.resize_pending {
                         self.resize_anchor = anchor;
+                        // The old-width job can no longer contribute to the page.
+                        // Stop its work now, retaining its marker so a partial stack
+                        // keeps painting as a scroll until the final reflow.
+                        if let Some(job) = &self.layout_job {
+                            job.cancel.store(true, Ordering::Relaxed);
+                        }
                     }
                     self.resize_pending = true;
                 } else {
+                    self.resize_pending = false;
+                    self.resize_anchor = None;
+                    self.resize_preview = None;
                     // A new width is a new wrapping, for every tab and not only this one.
                     self.layout_epoch += 1;
                     self.relayout_from_anchor(anchor);
-                    self.layout_find();
                 }
+                // The edit is a child window, not part of the deferred display list.
+                // It must fit the live search panel throughout the drag.
+                self.layout_find();
                 let _ = InvalidateRect(Some(hwnd), None, false);
                 LRESULT(0)
             }
@@ -4354,44 +4471,21 @@ impl View {
                 // somewhere: it closes a drag and a resize alike. Written as it happens
                 // rather than on the way out, because a reader who moves the window and then
                 // loses the machine to a power cut has still moved it.
-                self.size_move_active = false;
-                if self.resize_pending {
-                    let anchor = self.resize_anchor.take();
-                    self.resize_pending = false;
-                    self.layout_epoch += 1;
-                    self.relayout_from_anchor(anchor);
-                    self.layout_find();
-                    let _ = InvalidateRect(Some(hwnd), None, false);
-                }
+                self.finish_resize(hwnd);
                 record_geometry(hwnd);
                 DefWindowProcW(hwnd, msg, wp, lp)
             }
             WM_DPICHANGED => {
-                // No relayout of its own, and that is the whole point of the arm.
-                // `SetWindowPos` below is a synchronous message send: it lays the page out
-                // by way of a nested `WM_SIZE` before it returns. Outside an interactive
-                // move that message reflows the page; during one it records the final
-                // anchor and leaves the reflow to `WM_EXITSIZEMOVE`. Doing it again here
-                // doubled the work: a heavy page started a worker job that the duplicate
-                // cancelled almost at once, leaving the page blank longer than the crossing.
+                // SetWindowPos normally sends WM_SIZE synchronously. That handler
+                // applies the new client geometry and DPI; only fall back to it when
+                // no nested message did so, rather than starting the same layout twice.
                 let new_dpi = GetDpiForWindow(hwnd).max(96) as f32;
                 let r = &*(lp.0 as *const RECT);
                 // The target is made at `TARGET_DPI` and stays there: `new_dpi` is the
                 // window's scale, which the display list and the layout have already
                 // been built against, and handing it to `SetDpi` would multiply every
                 // coordinate in the window by it a second time. See `TARGET_DPI`.
-                self.client_w = (r.right - r.left).max(1) as f32;
-                self.client_h = (r.bottom - r.top).max(1) as f32;
-                let _ = SetWindowPos(
-                    hwnd,
-                    Some(HWND_TOP),
-                    r.left,
-                    r.top,
-                    r.right - r.left,
-                    r.bottom - r.top,
-                    SWP_NOZORDER | SWP_NOACTIVATE,
-                );
-                self.dpi = new_dpi;
+                self.resize_for_dpi(hwnd, r, new_dpi);
                 // Filed again straight away: a window that has just crossed into another
                 // scale is standing at a frame in the new monitor's pixels, and the number
                 // remembered before the crossing is one that cannot be restored to anywhere
@@ -5248,12 +5342,12 @@ impl View {
                 return None;
             }
             let page_w = (self.client_w - self.content_dx()).max(1.0);
-            let tx = layout.left - (page_w - layout.width) * 0.5;
+            let tx = layout.left - (page_w - layout.width) * 0.5 + self.resize_page_shift();
             let start = self.page_start(index).unwrap_or(0.0);
             Some((x - tx, y + start * scale_of(self.dpi) - layout.top))
         } else {
             if y < TOPBAR_H || y >= self.content_bottom() || x < self.content_dx() { return None; }
-            Some((x - self.content_dx(), document_y(y, self.scroll, self.dpi)))
+            Some((x - self.content_dx() - self.resize_page_shift(), document_y(y, self.scroll, self.dpi)))
         }
     }
 
@@ -5268,14 +5362,14 @@ impl View {
             if self.page_transition.is_some() { return None; }
             let layout = self.page_stack_layout();
             let page_w = (self.client_w - self.content_dx()).max(1.0);
-            let tx = layout.left - (page_w - layout.width) * 0.5;
+            let tx = layout.left - (page_w - layout.width) * 0.5 + self.resize_page_shift();
             let start = self.page_start(self.current_page_index()).unwrap_or(0.0);
             let (cx, cy) = (x + tx, y - start * scale_of(self.dpi) + layout.top);
             let inside = cx >= layout.left && cx <= layout.left + layout.width && cy >= layout.top;
             inside.then_some((cx, cy))
         } else {
             let cy = y - scroll_dip(self.scroll, self.dpi);
-            (cy >= TOPBAR_H).then_some((x + self.content_dx(), cy))
+            (cy >= TOPBAR_H).then_some((x + self.content_dx() + self.resize_page_shift(), cy))
         }
     }
 
@@ -6668,6 +6762,9 @@ impl View {
     /// the page when the layout is done. `epoch` mismatches are a layout the window
     /// abandoned; their batches are dropped on the floor.
     fn layout_messages(&mut self) {
+        // The preview, its anchor and its hit-test index describe one immutable
+        // wrapping. Batches for its old width are discarded by the final reflow.
+        if self.resize_pending { return; }
         loop {
             let Some(result) = self.layout_job.as_ref().map(|job| job.receiver.try_recv()) else {
                 break;
@@ -6790,6 +6887,9 @@ impl View {
         // before its page does, and the messages that arrive in between must find a
         // layout of nothing rather than a layout of the wrong page.
         if !self.started { return; }
+        self.resize_pending = false;
+        self.resize_anchor = None;
+        self.resize_preview = None;
         self.page_transition = None;
         // The image decoder rides along with the first layout rather than the window's
         // creation: by the time a page is laid out the frame is already up, and a
@@ -6813,8 +6913,7 @@ impl View {
         // A worker takes the layout when there is a lot of it -- many blocks, or a
         // few blocks so large they cost as much as many: a log folded into one
         // paragraph by Markdown is one block and hundreds of kilobytes of work.
-        let heavy = self.doc.blocks.len() > Self::LAYOUT_ASYNC_BLOCKS
-            || self.doc.blocks.iter().any(|b| b.text.len() > Self::LAYOUT_ASYNC_BLOCK_BYTES);
+        let heavy = layout_needs_worker(&self.doc);
         if heavy {
             let page_w = (self.client_w - self.content_dx()).max(1.0);
             self.begin_layout_job(page_w);
@@ -9499,7 +9598,8 @@ impl View {
                 return;
             }
             let content_dx = self.content_dx();
-            target.SetTransform(&Matrix3x2::translation(content_dx, 0.0));
+            let page_dx = content_dx + self.resize_page_shift();
+            target.SetTransform(&Matrix3x2::translation(page_dx, 0.0));
             // The display list is measured from the top of the document, so the whole of
             // it is lifted by the scroll here and nowhere else: a wheel tick costs one
             // subtraction at paint time rather than a relayout of the page, which is the
@@ -9522,11 +9622,14 @@ impl View {
                 self.ops_sorted,
                 true,
             );
+            target.SetTransform(&Matrix3x2::translation(content_dx, 0.0));
             self.draw_preview(&target);
+            target.SetTransform(&Matrix3x2::translation(page_dx, 0.0));
             // Search marks, selection bands, and the caret all belong to the page that
             // is currently in front. Their line indexes stay global, so snapping to a
             // new page never changes what a selection means.
             self.draw_page_overlays(&target, up, top, bottom);
+            target.SetTransform(&Matrix3x2::translation(content_dx, 0.0));
             // The thumb is drawn from its geometry rather than as an op, because an op
             // would mean relaying out the document on every wheel tick. It is the only
             // sign the reader has that the edge of the window can be gripped.
@@ -9687,7 +9790,7 @@ impl View {
         }
 
         let page_w = (self.client_w - self.content_dx()).max(1.0);
-        let tx = layout.left - (page_w - layout.width) * 0.5;
+        let tx = layout.left - (page_w - layout.width) * 0.5 + self.resize_page_shift();
         target.SetTransform(&Matrix3x2::translation(tx, 0.0));
         let up = start * scale_of(self.dpi) - top;
         let content_height = self.page_content_height(index);
@@ -10350,7 +10453,6 @@ fn layout_table(
     let Out { ops, hots, sel, hyphens, wide, table_headers, table_spans, note_spans: _, math_texts } = out;
     let Ctx { theme, styles, client_pt, k, math, wide_limit, .. } = *ctx;
     let Blk { left: block_left, column, .. } = *blk;
-    let mut left = block_left;
     let size = theme.base;
     let mut spacing = Spacing::for_size(size);
     spacing.keep_korean_words = theme.keep_korean_words;
@@ -10436,23 +10538,24 @@ fn layout_table(
 
     let natural_total: Pt = widths.iter().sum();
     let mut total = natural_total;
-    if total > column {
-        if total <= wide_limit {
-            // A table that is wider than the measure but still fits the window may use
-            // the empty margin rather than shrinking its words. The visible reading
-            // column stays the same; the extra width is a pannable region below.
-            left -= (total - column) * 0.5;
-        } else {
-            // A column's floor is its own content's, never less than the one a short
-            // word needs: a squeezed grid is still a grid of whole words.
-            let floors: Vec<Pt> = fragments
-                .iter()
-                .map(|f| (size * CELL_MIN_EM + pad * 2.0).max(*f))
-                .collect();
-            squeeze_grid(&mut widths, &floors, column);
-            total = widths.iter().sum();
-        }
+    if total > column && total > wide_limit {
+        // A column's floor is its own content's, never less than the one a short
+        // word needs: a squeezed grid is still a grid of whole words.
+        let floors: Vec<Pt> = fragments
+            .iter()
+            .map(|f| (size * CELL_MIN_EM + pad * 2.0).max(*f))
+            .collect();
+        squeeze_grid(&mut widths, &floors, column);
+        total = widths.iter().sum();
     }
+
+    // Centre the actual grid width, including the width left by unbreakable-word
+    // floors after squeezing. Keep an overflowing grid's first column reachable.
+    let left = if total > column {
+        (block_left - (total - column) * 0.5).max((size * MARGIN_EM * 0.25).min(block_left))
+    } else {
+        block_left
+    };
 
     let mut paint_row = |cells: &[PreparedCell], top: Pt, head: bool, ops: &mut Vec<Op>, hots: &mut Vec<Hot>, sel: &mut Vec<SelLine>| -> Pt {
         // Measure every cell first: the row is as tall as its tallest cell.
@@ -12740,6 +12843,254 @@ pub fn build_in_chunks(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    struct ResizeView(Box<View>);
+
+    impl ResizeView {
+        fn new(source: &str) -> Self {
+            let (mut view, _) = new_view(None, Vec::new()).expect("reader state");
+            view.theme = Theme::default();
+            assert!(view.font.probe());
+            unsafe {
+                // A hidden native window provides real D2D and EDIT geometry without
+                // reading a document, restoring a session or writing reader settings.
+                let hwnd = CreateWindowExW(Default::default(), w!("STATIC"), w!("Resize test"),
+                    windows::Win32::UI::WindowsAndMessaging::WS_POPUP,
+                    0, 0, 1800, 900, None, None, None, None).expect("test window");
+                view.attach(hwnd);
+            }
+            view.doc = Arc::new(Document::parse(source));
+            view.started = true;
+            view.relayout();
+            Self(view)
+        }
+
+        fn resize(&mut self, width: u32, height: u32) {
+            unsafe {
+                self.0.on_message(self.0.hwnd, WM_SIZE, WPARAM(0),
+                    LPARAM(((height as isize) << 16) | width as isize));
+            }
+        }
+    }
+
+    impl Drop for ResizeView {
+        fn drop(&mut self) {
+            if let Some(job) = self.0.layout_job.take() {
+                job.cancel.store(true, Ordering::Relaxed);
+            }
+            unsafe {
+                self.0.drop_edit_font();
+                let _ = DestroyWindow(self.0.hwnd);
+            }
+        }
+    }
+
+    #[test]
+    fn medium_markdown_resizes_reuse_the_page_until_the_drag_finishes() {
+        let paragraph = "中文和 English 混排，改变窗口宽度应保持阅读位置。 A paragraph with enough words to exercise global line breaking and repeated measurements instead of a short label. ";
+        let source = format!("## Section\n\n{}\n\n$$\\frac{{a+b}}{{c+d}}$$\n\n", paragraph.repeat(6)).repeat(48);
+        let mut window = ResizeView::new(&source);
+        assert!(!layout_needs_worker(&window.0.doc), "this must cover a document below the old worker threshold");
+        window.0.scroll = 500.0;
+        let anchor = anchor_at(&window.0.sel_index, window.0.scroll, scale_of(window.0.dpi));
+        let epoch = window.0.layout_epoch;
+        let version = window.0.sel_version;
+        window.0.size_move_active = true;
+        let started = std::time::Instant::now();
+        for step in 0..32 {
+            window.resize(900 + step * 24, 900);
+        }
+        eprintln!("32 medium Markdown resize messages: {:?}", started.elapsed());
+        assert_eq!(window.0.layout_epoch, epoch, "a pointer step must not typeset the document");
+        assert_eq!(window.0.sel_version, version, "the cached selection geometry must stay in place");
+        assert_eq!(window.0.resize_anchor, anchor);
+        unsafe { window.0.finish_resize(window.0.hwnd); }
+        assert_eq!(window.0.layout_epoch, epoch + 1);
+        assert_eq!(anchor_at(&window.0.sel_index, window.0.scroll, scale_of(window.0.dpi)), anchor);
+    }
+
+    #[test]
+    fn small_pages_defer_reflow_and_ignore_unchanged_or_zero_sizes() {
+        let mut window = ResizeView::new(&"A paragraph with enough words to wrap. ".repeat(100));
+        let epoch = window.0.layout_epoch;
+        let height = window.0.content_h;
+        window.0.size_move_active = true;
+        window.resize(700, 900);
+        assert_eq!(window.0.layout_epoch, epoch);
+        assert!(window.0.resize_pending);
+        let preview = window.0.resize_preview.unwrap();
+        assert!(preview.left + window.0.resize_page_shift() >= preview.inset);
+        window.resize(1800, 900);
+        assert_eq!(window.0.resize_page_shift(), 0.0, "returning to the original width must undo the preview translation");
+        window.resize(700, 900);
+        window.resize(700, 900);
+        window.resize(0, 0);
+        assert_eq!(window.0.layout_epoch, epoch);
+        assert_eq!(window.0.content_h, height, "dragging must reuse the old wrapping");
+        assert_eq!((window.0.client_w, window.0.client_h), (700.0, 900.0));
+        assert_eq!(unsafe { window.0.hwnd_target.as_ref().unwrap().GetPixelSize() }.width, 700);
+        unsafe { window.0.finish_resize(window.0.hwnd); }
+        assert_eq!(window.0.layout_epoch, epoch + 1, "the completed drag must reflow once");
+        assert!(window.0.content_h > height, "the final width must wrap the paragraph anew");
+        assert!(window.0.resize_preview.is_none());
+        window.0.size_move_active = true;
+        unsafe { window.0.finish_resize(window.0.hwnd); }
+        assert_eq!(window.0.layout_epoch, epoch + 1, "a move without a resize must not reflow");
+        window.resize(1800, 900);
+        assert_eq!(window.0.layout_epoch, epoch + 2, "a nonmodal resize must apply its wrapping immediately");
+        assert!(!window.0.resize_pending);
+    }
+
+    #[test]
+    fn resize_previews_keep_wide_tables_and_hit_testing_aligned_in_both_reading_modes() {
+        let cell = "`mathItalicsCorrectionInfoOffset` `extendedShapeCoverageOffset`";
+        let row = [cell; 4].join(" | ");
+        let source = format!("| A | B | C | D |\n| --- | --- | --- | --- |\n| {row} |\n\n[Link after the table](https://example.invalid/)\n");
+        let mut window = ResizeView::new(&source);
+        for mode in [ReadingMode::Scroll, ReadingMode::Stack] {
+            for tree in [false, true] {
+                window.0.reading_mode = mode;
+                window.0.tree_visible = tree;
+                window.0.tree_width = 240.0;
+                window.resize(700, 900);
+                window.0.relayout();
+                let (left, right) = window.0.ops.iter().filter_map(|op| match op {
+                    Op::Line { x0, x1, y0, y1, .. } if x0 == x1 && y1 > y0 => Some(*x0),
+                    _ => None,
+                }).fold((f32::INFINITY, f32::NEG_INFINITY), |(lo, hi), x| (lo.min(x), hi.max(x)));
+                window.0.size_move_active = true;
+                window.resize(700, 1000);
+                assert_eq!(window.0.resize_page_shift(), 0.0, "a height-only resize must not slide the page");
+                window.resize(1800, 1000);
+                let shift = window.0.resize_page_shift();
+                let width = window.0.client_w - window.0.content_dx();
+                assert!(left + shift > 0.0 && right + shift < width, "the widened preview must expose both table edges");
+                assert!((left + shift - (width - right - shift)).abs() < 1.0, "the preview must not recreate the large left gutter");
+                let line = &window.0.sel_index[0];
+                let x = (line.xs[0] + line.ends[0]) * 0.5;
+                let y = line.y + line.h * 0.5;
+                let expected = caret_at(&window.0.sel_index, x, y);
+                let (cx, cy) = window.0.client_point(x, y).expect("visible table cell");
+                assert_eq!(window.0.caret_under(cx, cy), expected, "selection must follow the preview");
+                let (hot_index, hot) = window.0.hotspots.iter().enumerate()
+                    .find(|(_, hot)| matches!(hot.kind, HotKind::Url(_))).expect("link hotspot");
+                let x = hot.x + hot.w * 0.5;
+                let y = hot.y + hot.h * 0.5;
+                let (cx, cy) = window.0.client_point(x, y).expect("visible link");
+                assert_eq!(window.0.hot_at(cx, cy), Some(hot_index), "links must follow the preview");
+                window.0.paint();
+                assert!(window.0.target.is_some(), "painting the transformed preview must preserve the render target");
+                unsafe { window.0.finish_resize(window.0.hwnd); }
+                assert!(window.0.resize_preview.is_none());
+            }
+        }
+    }
+
+    #[test]
+    fn a_deferred_heavy_resize_still_positions_the_search_edit_immediately() {
+        let mut window = ResizeView::new(&"Paragraph.\n\n".repeat(View::LAYOUT_ASYNC_BLOCKS + 1));
+        unsafe { window.0.open_find(window.0.hwnd); }
+        // Hold a completed old-width job in the queue while the preview is live.
+        // No timing or worker scheduling assumption is needed to exercise the race.
+        let (sender, receiver) = std::sync::mpsc::channel();
+        let job = window.0.layout_job.as_mut().unwrap();
+        job.receiver = receiver;
+        let cancel = job.cancel.clone();
+        sender.send(LayoutMessage::Finished { epoch: job.epoch, finals: LayoutFinals {
+            height: 12345.0, column: 100.0, left: 20.0,
+            note_tops: Vec::new(), anchor_tops: Vec::new(), hyphens: HyphenCount::default(),
+        } }).unwrap();
+        window.0.pending_anchor = Some(10);
+        let height = window.0.content_h;
+        let version = window.0.sel_version;
+        let epoch = window.0.layout_epoch;
+        window.0.size_move_active = true;
+        for width in [700, 1800] {
+            window.resize(width, 900);
+            window.0.layout_messages();
+            assert!(window.0.resize_pending);
+            assert_eq!(window.0.layout_epoch, epoch, "heavy pages must not restart a worker for each step");
+            assert_eq!(window.0.content_h, height, "old-width batches must not change the frozen preview");
+            assert_eq!(window.0.sel_version, version);
+            assert_eq!(window.0.resize_anchor, Some(10), "keep the pending reading anchor even with a partial layout");
+            assert!(cancel.load(Ordering::Relaxed), "do not keep typesetting the abandoned width during the drag");
+            let mut rect = RECT::default();
+            unsafe { windows::Win32::UI::WindowsAndMessaging::GetWindowRect(window.0.edit.unwrap(), &mut rect).unwrap(); }
+            assert_eq!(rect.right - rect.left, find_edit(width as f32).2);
+        }
+        unsafe { window.0.finish_resize(window.0.hwnd); }
+        assert_eq!(window.0.layout_epoch, epoch + 1, "a heavy resize reflows once at its final width");
+        assert!(!window.0.resize_pending);
+        assert!(window.0.layout_job.is_some());
+        assert!(cancel.load(Ordering::Relaxed), "release must cancel the old-width run");
+        assert_eq!(window.0.pending_anchor, Some(10));
+    }
+
+    #[test]
+    fn dpi_changes_without_a_nested_size_update_reflow_once_and_resize_the_target() {
+        let mut window = ResizeView::new("A paragraph at the old monitor scale.");
+        let dpi = window.0.dpi;
+        // Simulate arriving from a different scale while the native test window is
+        // already at its destination DPI. STATIC does not route nested WM_SIZE to View.
+        window.0.dpi = dpi * 1.5;
+        window.0.size_move_active = true;
+        window.0.resize_pending = true;
+        let epoch = window.0.layout_epoch;
+        let rect = RECT { left: 0, top: 0, right: 1800, bottom: 900 };
+        unsafe { window.0.resize_for_dpi(window.0.hwnd, &rect, dpi); }
+        assert_eq!(window.0.dpi, dpi);
+        assert_eq!(window.0.layout_epoch, epoch + 1);
+        assert!(!window.0.resize_pending, "a monitor-scale change must not leave old-scale geometry live");
+        unsafe { window.0.resize_for_dpi(window.0.hwnd, &rect, dpi); }
+        assert_eq!(window.0.layout_epoch, epoch + 1);
+
+        window.0.dpi = dpi * 1.5;
+        let larger = RECT { right: 2000, ..rect };
+        unsafe { window.0.resize_for_dpi(window.0.hwnd, &larger, dpi); }
+        assert_eq!(window.0.client_w, 2000.0);
+        assert_eq!(unsafe { window.0.hwnd_target.as_ref().unwrap().GetPixelSize() }.width, 2000);
+    }
+
+    #[test]
+    fn squeezed_wide_tables_use_both_margins_after_a_narrow_wide_resize() {
+        let mut font = FontEngine::new().expect("DirectWrite");
+        assert!(font.probe(), "a usable font is required for the resize regression");
+        let cell = "`mathItalicsCorrectionInfoOffset` `extendedShapeCoverageOffset`";
+        let row = [cell; 4].join(" | ");
+        let doc = Document::parse(&format!(
+            "Before the table.\n\n| A | B | C | D |\n| --- | --- | --- | --- |\n| {row} |\n\nAfter the table.\n"
+        ));
+        let mut math = MathStore::new();
+        let mut objects = Objects::new(None, None, &mut math);
+        for width in [1800.0, 700.0, 1800.0] {
+            let page = build_ops(&mut font, &Theme::default(), &doc, width, 96.0, &mut objects, None);
+            let (left, right) = page.ops.iter().filter_map(|op| match op {
+                Op::Line { x0, x1, y0, y1, .. } if x0 == x1 && y1 > y0 => Some(*x0),
+                _ => None,
+            }).fold((f32::INFINITY, f32::NEG_INFINITY), |(lo, hi), x| (lo.min(x), hi.max(x)));
+            let table_width = right - left;
+            // Selection coordinates must move with the painted grid, including
+            // distinct cells sharing a row's y coordinate.
+            for (index, line) in page.sel.iter().enumerate() {
+                if line.chars.is_empty() { continue; }
+                let x = (line.xs[0] + line.ends[0]) * 0.5;
+                assert_eq!(caret_at(&page.sel, x, line.y + line.h * 0.5).line, index);
+            }
+            assert!(table_width > page.column * scale_of(96.0), "the table must exceed the prose measure");
+            assert!(left >= 0.0, "the first column must stay reachable");
+            if width == 1800.0 {
+                assert!(table_width < width, "the squeezed table should fit this viewport: {table_width}");
+                assert!((left - (width - right)).abs() < 1.0, "unequal margins: {left}..{right} in {width}");
+                assert!(page.wide_regions.is_empty(), "a table that fits should not need panning");
+            } else {
+                assert!(!page.wide_regions.is_empty(), "the narrow viewport must allow panning");
+                assert!(left < 30.0, "overflow must not waste the left margin: {left}");
+                for region in &page.wide_regions {
+                    assert!((region.content_w - region.w - (right - width)).abs() < 1.0);
+                }
+            }
+        }
+    }
 
     #[cfg(feature = "pdf")]
     #[test]
