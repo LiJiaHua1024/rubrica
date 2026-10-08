@@ -1620,6 +1620,7 @@ pub struct View {
     /// place cannot be stood in until the layout that owns it is finished.
     pending_anchor: Option<usize>,
     pending_heading: Option<usize>,
+    pending_source: Option<usize>,
     /// The page, shared with any layout worker currently building it. Replaced whole
     /// rather than edited, which is what makes sharing it safe.
     doc: Arc<Document>,
@@ -2033,6 +2034,7 @@ type StatusLabelCache = ((String, f32), Option<IDWriteTextLayout>, f32, f32, Vec
 struct TabPage {
     pending_anchor: Option<usize>,
     pending_heading: Option<usize>,
+    pending_source: Option<usize>,
     parsed_line_breaks: bool,
     /// The layout inputs the page's ops were built under. An epoch that differs from
     /// the view's means the window's width, DPI, size or face moved while this page
@@ -2078,6 +2080,7 @@ impl TabPage {
         TabPage {
             pending_anchor: None,
             pending_heading: None,
+            pending_source: None,
             parsed_line_breaks: false,
             epoch: 0,
             layout_dpi: 96.0,
@@ -3167,6 +3170,7 @@ pub fn run(path: Option<PathBuf>, extra: Vec<PathBuf>) -> Result<()> {
         started: false,
         pending_anchor: None,
         pending_heading: None,
+        pending_source: None,
         doc: Arc::new(Document::source("")),
         source: String::new(),
         source_view: false,
@@ -6137,6 +6141,7 @@ impl View {
         // here and on every other tab that now has to be wrapped again when shown.
         self.layout_epoch += 1;
         self.reset_chapter_cache();
+        let source = self.source_anchor();
         let plain = self.plain_override.unwrap_or_else(|| reading::is_plain(self.path.as_deref()));
         if self.lazy_text
             && (self.source_view || !plain || !self.text_options.chapters || self.chapter_index.is_none())
@@ -6154,7 +6159,6 @@ impl View {
                 }
             }
         }
-        let source = self.source_anchor();
         let profile = crate::profiles::selected(self.plain_override.unwrap_or_else(|| reading::is_plain(self.path.as_deref())));
         if profile != self.profile {
             crate::profiles::load(&profile).apply(&mut self.theme);
@@ -6215,13 +6219,13 @@ impl View {
 
     fn source_anchor(&self) -> Option<usize> {
         if self.scroll == 0.0 {
-            if self.source_view {
-                return Some(0);
-            }
             if self.lazy_text {
                 return Some(self.chapter_index.as_ref()
                     .map(|index| index.decoded_start(self.chapter))
                     .unwrap_or(0));
+            }
+            if self.source_view {
+                return Some(0);
             }
         }
         self.sel_index.iter().find(|line| line.y + line.h > self.scroll * scale_of(self.dpi))
@@ -6237,6 +6241,10 @@ impl View {
     }
 
     fn restore_source(&mut self, byte: usize) {
+        if self.layout_job.is_some() {
+            self.pending_source = Some(byte);
+            return;
+        }
         if let Some(scroll) = scroll_for_source(&self.sel_index, byte, scale_of(self.dpi)) { self.scroll = scroll; }
         self.snap_to_page();
     }
@@ -6832,6 +6840,9 @@ impl View {
         if self.layout_job.is_some() { return; }
         if let Some(anchor) = self.pending_anchor.take() {
             self.restore_to(anchor);
+        }
+        if let Some(source) = self.pending_source.take() {
+            self.restore_source(source);
         }
         if let Some(at) = self.pending_heading.take() {
             if let Some(top) = self.anchor_tops.get(at) {
@@ -8765,6 +8776,7 @@ impl View {
         self.close_note_bubble();
         std::mem::swap(&mut page.pending_anchor, &mut self.pending_anchor);
         std::mem::swap(&mut page.pending_heading, &mut self.pending_heading);
+        std::mem::swap(&mut page.pending_source, &mut self.pending_source);
         std::mem::swap(&mut page.source, &mut self.source);
         std::mem::swap(&mut page.doc, &mut self.doc);
         std::mem::swap(&mut page.counts, &mut self.counts);
@@ -9228,6 +9240,7 @@ impl View {
         // whatever character happens to sit at the same index in different prose.
         self.pending_anchor = None;
         self.pending_heading = None;
+        self.pending_source = None;
         // A global choice, read afresh rather than inherited from whatever window
         // started: this is the one route to a document that a start-up never takes, and
         // a line-break rule changed in the Settings app since the last launch belongs
