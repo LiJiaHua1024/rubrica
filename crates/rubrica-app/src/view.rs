@@ -83,7 +83,7 @@ use windows::Win32::UI::Controls::Dialogs::{
 };
 use windows::Win32::UI::Shell::{DragAcceptFiles, DragFinish, DragQueryFileW, ShellExecuteW, HDROP};
 use windows::Win32::UI::WindowsAndMessaging::{
-    AppendMenuW, WM_APP, CS_DBLCLKS, CS_HREDRAW, CS_VREDRAW, CREATESTRUCTW, CreatePopupMenu,
+    AppendMenuW, WM_APP, CS_DBLCLKS, CREATESTRUCTW, CreatePopupMenu,
     CreateWindowExW, DefWindowProcW, DestroyMenu, DestroyWindow, DispatchMessageW,
     GWLP_USERDATA, GetCaretBlinkTime, GetClientRect, GetCursorPos, GetSystemMetrics, GetWindowLongPtrW, GetMessageW, GetWindowPlacement,
     HCURSOR, HMENU, HWND_TOP, HTCLIENT, HTCAPTION, HTBOTTOM, HTBOTTOMLEFT, HTBOTTOMRIGHT, HTLEFT, HTRIGHT,
@@ -93,7 +93,8 @@ use windows::Win32::UI::WindowsAndMessaging::{
     SW_MAXIMIZE, SW_MINIMIZE, SW_SHOWNORMAL, SetTimer,
     SetWindowLongPtrW, SetWindowPos, ShowWindow, SW_SHOWMAXIMIZED, SW_RESTORE, TPM_RETURNCMD,
     SWP_FRAMECHANGED, SWP_NOMOVE, SWP_NOSIZE, TPM_RIGHTBUTTON, TrackPopupMenuEx, PeekMessageW, PM_REMOVE, TranslateMessage, WM_CONTEXTMENU, WM_NULL, WNDCLASSEXW,
-    WM_DESTROY, WM_NCDESTROY, WM_DPICHANGED, WM_ERASEBKGND, WM_EXITSIZEMOVE, WM_KEYDOWN, WM_MOUSEWHEEL,
+    WM_DESTROY, WM_NCDESTROY, WM_DPICHANGED, WM_ERASEBKGND, WM_ENTERSIZEMOVE, WM_EXITSIZEMOVE,
+    WM_KEYDOWN, WM_MOUSEWHEEL,
     WM_CAPTURECHANGED, WM_CLOSE, WM_NCCALCSIZE, WM_NCCREATE, WM_NCHITTEST, WM_PAINT, WM_SETCURSOR, WM_SIZE, WM_TIMER, WS_EX_APPWINDOW, WS_OVERLAPPEDWINDOW,
     SWP_NOACTIVATE, SWP_NOZORDER, WM_COPYDATA, WM_DROPFILES, WM_LBUTTONDOWN, WM_LBUTTONDBLCLK, WM_LBUTTONUP,
     WM_MBUTTONDOWN, WM_MOUSEMOVE, WM_SYSKEYDOWN, CallWindowProcW, EN_CHANGE, ES_AUTOHSCROLL, GetParent,
@@ -1783,6 +1784,11 @@ pub struct View {
     client_w: f32,
     client_h: f32,
     dpi: f32,
+    /// Window movement and interactive resizing share a modal loop. A move leaves these
+    /// alone; a resize records its first visible anchor and reflows once when the loop ends.
+    size_move_active: bool,
+    resize_pending: bool,
+    resize_anchor: Option<usize>,
     path: Option<PathBuf>,
     /// Documents named on the command line alongside the first. They are opened as
     /// tabs after the window is answering for the reader, which is the only order in
@@ -3244,6 +3250,9 @@ pub fn run(path: Option<PathBuf>, extra: Vec<PathBuf>) -> Result<()> {
         client_w: 1.0,
         client_h: 1.0,
         dpi: 96.0,
+        size_move_active: false,
+        resize_pending: false,
+        resize_anchor: None,
         path,
         extra,
         pending_open: Vec::new(),
@@ -3283,7 +3292,9 @@ pub fn run(path: Option<PathBuf>, extra: Vec<PathBuf>) -> Result<()> {
         let wide = utf16(CLASS);
         let wc = WNDCLASSEXW {
             cbSize: std::mem::size_of::<WNDCLASSEXW>() as u32,
-            style: CS_HREDRAW | CS_VREDRAW | CS_DBLCLKS,
+            // WM_SIZE invalidates and repaints explicitly. The H/V redraw class styles
+            // force additional full-client paints during interactive resizing.
+            style: CS_DBLCLKS,
             lpfnWndProc: Some(wnd_proc),
             hInstance: hinst.into(),
             // The caption, the taskbar button and Alt-Tab all read the class's icon;
@@ -3745,11 +3756,11 @@ unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM)
             DefWindowProcW(hwnd, msg, wp, lp)
         }
         WM_ERASEBKGND => {
-            // The window is answered before its page is: until the render target paints
-            // for the first time, this is what the reader is looking at. Filling it with
-            // the palette's own paper keeps a start-up from flashing the system's idea
-            // of a background at them, and costs a rectangle.
-            if let Some(v) = view {
+            // Direct2D clears and paints the whole client area in WM_PAINT. Erasing it
+            // with GDI first exposes a second, differently presented frame on every
+            // move or resize. Keep the startup fallback only until the render target is
+            // attached; after that, the Direct2D frame is the only background paint.
+            if let Some(v) = view.filter(|v| v.target.is_none()) {
                 let brush = unsafe { CreateSolidBrush(colorref(v.palette.bg)) };
                 let mut r = RECT::default();
                 unsafe {
@@ -4290,18 +4301,52 @@ impl View {
                 let anchor = anchor_at(&self.sel_index, self.scroll, scale_of(self.dpi));
                 let w = (lp.0 & 0xFFFF) as u32;
                 let h = ((lp.0 >> 16) & 0xFFFF) as u32;
-                self.client_w = w.max(1) as f32;
-                self.client_h = h.max(1) as f32;
-                self.zoomed = IsZoomed(hwnd).as_bool();
-                if let Some(t) = &self.hwnd_target {
-                    let _ = t.Resize(&D2D_SIZE_U { width: w.max(1), height: h.max(1) });
+                let new_zoomed = IsZoomed(hwnd).as_bool();
+                let zoom_changed = self.zoomed != new_zoomed;
+                self.zoomed = new_zoomed;
+                if w == 0 || h == 0 {
+                    if zoom_changed {
+                        let _ = InvalidateRect(Some(hwnd), None, false);
+                    }
+                    return LRESULT(0);
                 }
-                self.dpi = GetDpiForWindow(hwnd).max(96) as f32;
-                // A new width is a new wrapping, for every tab and not only this one.
-                self.layout_epoch += 1;
-                self.relayout_from_anchor(anchor);
-                self.layout_find();
+                let (new_w, new_h) = (w.max(1) as f32, h.max(1) as f32);
+                let new_dpi = GetDpiForWindow(hwnd).max(96) as f32;
+                let size_changed = self.client_w != new_w || self.client_h != new_h;
+                let dpi_changed = self.dpi != new_dpi;
+                if !size_changed && !dpi_changed {
+                    if zoom_changed {
+                        let _ = InvalidateRect(Some(hwnd), None, false);
+                    }
+                    return LRESULT(0);
+                }
+                self.client_w = new_w;
+                self.client_h = new_h;
+                if size_changed {
+                    if let Some(t) = &self.hwnd_target {
+                        let _ = t.Resize(&D2D_SIZE_U { width: w, height: h });
+                    }
+                }
+                self.dpi = new_dpi;
+                if self.size_move_active {
+                    // A resize sends WM_SIZE for every pointer step. Keep the current
+                    // page visible while the user is still dragging, then build the
+                    // final wrapping once in WM_EXITSIZEMOVE.
+                    if !self.resize_pending {
+                        self.resize_anchor = anchor;
+                    }
+                    self.resize_pending = true;
+                } else {
+                    // A new width is a new wrapping, for every tab and not only this one.
+                    self.layout_epoch += 1;
+                    self.relayout_from_anchor(anchor);
+                    self.layout_find();
+                }
                 let _ = InvalidateRect(Some(hwnd), None, false);
+                LRESULT(0)
+            }
+            WM_ENTERSIZEMOVE => {
+                self.size_move_active = true;
                 LRESULT(0)
             }
             WM_EXITSIZEMOVE => {
@@ -4309,19 +4354,26 @@ impl View {
                 // somewhere: it closes a drag and a resize alike. Written as it happens
                 // rather than on the way out, because a reader who moves the window and then
                 // loses the machine to a power cut has still moved it.
+                self.size_move_active = false;
+                if self.resize_pending {
+                    let anchor = self.resize_anchor.take();
+                    self.resize_pending = false;
+                    self.layout_epoch += 1;
+                    self.relayout_from_anchor(anchor);
+                    self.layout_find();
+                    let _ = InvalidateRect(Some(hwnd), None, false);
+                }
                 record_geometry(hwnd);
                 DefWindowProcW(hwnd, msg, wp, lp)
             }
             WM_DPICHANGED => {
                 // No relayout of its own, and that is the whole point of the arm.
                 // `SetWindowPos` below is a synchronous message send: it lays the page out
-                // by way of a nested `WM_SIZE` before it returns, and that `WM_SIZE`
-                // already takes the anchor, bumps the epoch and re-asks the page and the
-                // find box for their geometry. Doing it again here doubled the work --
-                // a heavy document started a worker job that the duplicate cancelled a
-                // millisecond later, so a crossing between monitors emptied the page and
-                // left the reader watching a blank window for twice as long as the
-                // crossing took.
+                // by way of a nested `WM_SIZE` before it returns. Outside an interactive
+                // move that message reflows the page; during one it records the final
+                // anchor and leaves the reflow to `WM_EXITSIZEMOVE`. Doing it again here
+                // doubled the work: a heavy page started a worker job that the duplicate
+                // cancelled almost at once, leaving the page blank longer than the crossing.
                 let new_dpi = GetDpiForWindow(hwnd).max(96) as f32;
                 let r = &*(lp.0 as *const RECT);
                 // The target is made at `TARGET_DPI` and stays there: `new_dpi` is the
