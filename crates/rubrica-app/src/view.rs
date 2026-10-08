@@ -11574,6 +11574,19 @@ fn reader_page_starts(sel: &[SelLine], anchors: &[Pt], height: Pt, page_height: 
             continue;
         }
         let previous = *starts.last().unwrap_or(&0.0);
+        if height > page_height + 0.01 {
+            if y > previous + 0.01 {
+                starts.push(y);
+            }
+            limit = *starts.last().unwrap() + page_height;
+            while limit < y + height - 0.01 {
+                let next = limit;
+                starts.push(next);
+                limit = next + page_height;
+                if limit <= next { break; }
+            }
+            continue;
+        }
         if y <= previous + 0.01 {
             continue;
         }
@@ -12623,6 +12636,20 @@ pub fn build_in_chunks(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_tall_image_gets_contiguous_pages_through_its_middle() {
+        for y in [0.0, 10.0] {
+            let mut image = sel_line("image", y, Join::None);
+            image.h = 300.0;
+            let tail = sel_line("after", 330.0, Join::Blank);
+            let starts = reader_page_starts(&[image, tail], &[], 360.0, 120.0, 1.0);
+            assert!(starts.windows(2).all(|pair| pair[1] - pair[0] <= 120.01), "{starts:?}");
+            for point in [10.0, 129.0, 200.0, 309.0, 340.0] {
+                assert!(starts.iter().any(|top| *top <= point && point < *top + 120.0));
+            }
+        }
+    }
 
     const DPI: f32 = 96.0;
 
