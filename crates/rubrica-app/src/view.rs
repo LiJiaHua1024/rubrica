@@ -11634,7 +11634,24 @@ fn clip_pdf_line(x0: f32, y0: f32, x1: f32, y1: f32, top: f32, height: f32) -> O
 
 #[cfg(feature = "pdf")]
 fn pdf_page_starts(page: &Page, page_height: Pt) -> Vec<Pt> {
-    reader_page_starts(&page.sel, &page.anchor_tops, page.height, page_height, 1.0)
+    page_starts_with_overhead(&page.sel, &page.anchor_tops, page.height, page_height, 1.0,
+        |top| pdf_continuation_height(page, top, page_height))
+}
+
+#[cfg(feature = "pdf")]
+fn pdf_continuation_height(page: &Page, top: Pt, height: Pt) -> Pt {
+    let mut used = 0.0;
+    for span in &page.table_spans {
+        if span.y < top && span.y + span.height > top {
+            if let Some(header) = page.table_headers.get(span.header) {
+                if used + header.height < height { used += header.height; }
+            }
+        }
+    }
+    for note in &page.note_spans {
+        if note.y < top && note.y + note.height > top && used + 18.0 < height { used += 18.0; }
+    }
+    used
 }
 
 /// Line-safe page starts shared by the PDF writer and the on-screen page stack.
@@ -11643,18 +11660,27 @@ fn pdf_page_starts(page: &Page, page_height: Pt) -> Vec<Pt> {
 /// heights and heading anchors are points. `scale` is the one conversion between those
 /// two spaces; passing `1.0` keeps the PDF path at its 72dpi coordinate system.
 fn reader_page_starts(sel: &[SelLine], anchors: &[Pt], height: Pt, page_height: Pt, scale: Pt) -> Vec<Pt> {
+    page_starts_with_overhead(sel, anchors, height, page_height, scale, |_| 0.0)
+}
+
+fn page_starts_with_overhead(sel: &[SelLine], anchors: &[Pt], height: Pt, page_height: Pt, scale: Pt,
+    overhead: impl Fn(Pt) -> Pt) -> Vec<Pt>
+{
     if !page_height.is_finite() || page_height <= 0.0 || !scale.is_finite() || scale <= 0.0 {
         return vec![0.0];
     }
+    let capacity = |top| (page_height - overhead(top)).max(page_height.min(1.0)).min(page_height);
     if sel.is_empty() {
         let mut starts = vec![0.0];
-        while *starts.last().unwrap_or(&0.0) + page_height < height {
-            starts.push(starts.last().copied().unwrap_or(0.0) + page_height);
+        while *starts.last().unwrap() + capacity(*starts.last().unwrap()) < height {
+            let next = *starts.last().unwrap() + capacity(*starts.last().unwrap());
+            if next <= *starts.last().unwrap() { break; }
+            starts.push(next);
         }
         return starts;
     }
     let mut starts = vec![0.0];
-    let mut limit = page_height;
+    let mut limit = capacity(0.0);
     for line in sel {
         let y = line.y / scale;
         let height = line.h / scale;
@@ -11662,15 +11688,15 @@ fn reader_page_starts(sel: &[SelLine], anchors: &[Pt], height: Pt, page_height: 
             continue;
         }
         let previous = *starts.last().unwrap_or(&0.0);
-        if height > page_height + 0.01 {
+        if height > capacity(y) + 0.01 {
             if y > previous + 0.01 {
                 starts.push(y);
             }
-            limit = *starts.last().unwrap() + page_height;
+            limit = *starts.last().unwrap() + capacity(*starts.last().unwrap());
             while limit < y + height - 0.01 {
                 let next = limit;
                 starts.push(next);
-                limit = next + page_height;
+                limit = next + capacity(next);
                 if limit <= next { break; }
             }
             continue;
@@ -11696,7 +11722,7 @@ fn reader_page_starts(sel: &[SelLine], anchors: &[Pt], height: Pt, page_height: 
         let start = heading.filter(|top| *top > previous + 0.01).unwrap_or(y);
         if start > previous + 0.01 {
             starts.push(start);
-            limit = start + page_height;
+            limit = start + capacity(start);
         }
     }
     starts
@@ -11757,10 +11783,10 @@ fn write_pdf(
     let mut images: HashMap<PathBuf, (printpdf::XObjectId, usize, usize)> = HashMap::new();
     let palette = Palette::of(dark);
     for (page_index, top) in page_starts.iter().copied().enumerate() {
-        let content_height = page_starts
+        let body_height = page_starts
             .get(page_index + 1)
-            .map(|next| (next - top).min(height))
-            .unwrap_or(height);
+            .map(|next| next - top)
+            .unwrap_or(height - pdf_continuation_height(page, top, height));
         let mut ops = vec![
             PdfOp::SetFillColor { col: pdf_rgb(palette.bg) },
             PdfOp::DrawRectangle {
@@ -11772,6 +11798,7 @@ fn write_pdf(
         for span in &page.table_spans {
             if span.y < top && span.y + span.height > top {
                 if let Some(header) = page.table_headers.get(span.header) {
+                    if content_shift + header.height >= height { continue; }
                     let dy = top - header.y;
                     source_ops.extend(header.ops.iter().map(|op| translate_pdf_op(op, dy)));
                     content_shift += header.height;
@@ -11779,7 +11806,7 @@ fn write_pdf(
             }
         }
         for note in &page.note_spans {
-            if note.y < top && note.y + note.height > top {
+            if note.y < top && note.y + note.height > top && content_shift + 18.0 < height {
                 let marker = format!("Footnote {} (continued)", note.number);
                 let marker_y = content_shift + 12.0;
                 ops.push(PdfOp::SetFillColor { col: pdf_color(ColorRole::Muted, dark) });
@@ -11796,10 +11823,12 @@ fn write_pdf(
                 content_shift += 18.0;
             }
         }
+        let content_height = (body_height + content_shift).min(height);
         for text in &page.math_texts {
             let local_y = text.y + content_shift - top;
             let local_top = local_y - text.h;
-            if local_y <= 0.0 || local_top >= content_height || text.w <= 0.0 {
+            if text.y <= top || text.y - text.h >= top + body_height
+                || local_y <= 0.0 || local_top >= content_height || text.w <= 0.0 {
                 continue;
             }
             let face = pdf_text_face(font, text.face_index, &text.source);
@@ -11835,14 +11864,26 @@ fn write_pdf(
         // only to drop all but one page's worth is what made export quadratic: a
         // hundred thousand lines spent minutes in the clone alone. The test is the one
         // the drawing arms make below, lifted out so the two cannot disagree, and it
-        // is stated in the pre-shift frame, which is what `top - content_shift` is.
+        // is stated in the original document coordinates. Header space is reserved
+        // by pagination rather than borrowed from the preceding page's content.
+        let from_page = source_ops.len();
         for op in &page.ops {
-            if !op_intersects_band(op, top - content_shift, content_height) {
+            if !op_intersects_band(op, top, body_height) {
                 continue;
             }
             source_ops.push(translate_pdf_op(op, content_shift));
         }
-        for op in &source_ops {
+        for (slot, op) in source_ops.iter().enumerate() {
+            if slot == from_page {
+                ops.push(PdfOp::SaveGraphicsState);
+                ops.push(PdfOp::DrawRectangle {
+                    rectangle: PdfRect {
+                        mode: Some(printpdf::PaintMode::Clip),
+                        ..PdfRect::from_xywh(printpdf::Pt(0.0), printpdf::Pt(height - content_height),
+                            printpdf::Pt(width), printpdf::Pt(content_height - content_shift))
+                    },
+                });
+            }
             match op {
                 Op::Rect { x, y, w, h, color } => {
                     let y0 = *y - top;
@@ -11981,14 +12022,16 @@ fn write_pdf(
                 }
             }
         }
+        if source_ops.len() > from_page { ops.push(PdfOp::RestoreGraphicsState); }
         for hot in &page.hotspots {
+            if hot.y + hot.h <= top || hot.y >= top + body_height { continue; }
             let HotKind::Url(url) = &hot.kind else { continue };
             let local_y = hot.y + content_shift - top;
             let local_bottom = local_y + hot.h;
             if local_bottom <= 0.0 || local_y >= content_height || hot.w <= 0.0 || hot.h <= 0.0 {
                 continue;
             }
-            let clipped_top = local_y.max(0.0);
+            let clipped_top = local_y.max(content_shift);
             let clipped_bottom = local_bottom.min(content_height);
             let link = PdfLinkAnnotation::new(
                 PdfRect::from_xywh(
@@ -12652,6 +12695,23 @@ mod tests {
         assert_eq!(clip_pdf_line(1.0, 20.0, 40.0, 20.0, 10.0, 30.0), Some([(1.0, 10.0), (40.0, 10.0)]));
         assert_eq!(clip_pdf_line(0.0, 60.0, 60.0, 0.0, 10.0, 30.0), Some([(20.0, 30.0), (50.0, 0.0)]));
         assert!(clip_pdf_line(0.0, 0.0, 60.0, 0.0, 10.0, 30.0).is_none());
+    }
+
+    #[test]
+    fn page_starts_reserve_continuation_space_without_repeating_lines() {
+        let lines: Vec<_> = (0..15).map(|i| {
+            let mut line = sel_line("row", i as f32 * 20.0, Join::None);
+            line.h = 20.0;
+            line
+        }).collect();
+        let overhead = |top| if top > 0.0 { 20.0 } else { 0.0 };
+        let starts = page_starts_with_overhead(&lines, &[], 300.0, 80.0, 1.0, overhead);
+        assert_eq!(starts, [0.0, 80.0, 140.0, 200.0, 260.0]);
+        for line in &lines {
+            let containing = starts.iter().filter(|&&top| top <= line.y && line.y + line.h <= top + 80.0 - overhead(top)).count();
+            assert_eq!(containing, 1, "row at {}: {starts:?}", line.y);
+        }
+        assert_eq!(page_starts_with_overhead(&[], &[], 200.0, 80.0, 1.0, overhead), [0.0, 80.0, 140.0]);
     }
 
     #[test]
