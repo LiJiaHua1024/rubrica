@@ -2033,6 +2033,7 @@ type StatusLabelCache = ((String, f32), Option<IDWriteTextLayout>, f32, f32, Vec
 struct TabPage {
     pending_anchor: Option<usize>,
     pending_heading: Option<usize>,
+    parsed_line_breaks: bool,
     /// The layout inputs the page's ops were built under. An epoch that differs from
     /// the view's means the window's width, DPI, size or face moved while this page
     /// slept, and the wrapping -- not the text -- is rebuilt before it is shown.
@@ -2077,6 +2078,7 @@ impl TabPage {
         TabPage {
             pending_anchor: None,
             pending_heading: None,
+            parsed_line_breaks: false,
             epoch: 0,
             layout_dpi: 96.0,
             source: String::new(),
@@ -8754,6 +8756,7 @@ impl View {
     fn take_page(&mut self, page: &mut TabPage) {
         page.epoch = self.layout_epoch;
         page.layout_dpi = self.dpi;
+        page.parsed_line_breaks = self.line_break_override.unwrap_or(self.keep_line_breaks);
         // A note belongs to the page it was read from, and the page under the pointer
         // is about to be a different one: the same number in another document is a
         // different note, and a bubble carried across would be describing neither.
@@ -8841,7 +8844,8 @@ impl View {
         match self.pages.remove(&id) {
             Some(mut page) => {
                 let warm = page.epoch == self.layout_epoch;
-                let anchor = (!warm)
+                let parse_changed = page.parsed_line_breaks != page.line_break_override.unwrap_or(self.keep_line_breaks);
+                let anchor = (!warm || parse_changed)
                     .then(|| anchor_at(&page.sel_index, page.scroll, scale_of(page.layout_dpi)))
                     .flatten();
                 // The profile comes with the page: its wrapping was built under the
@@ -8851,7 +8855,11 @@ impl View {
                     self.profile = page.profile.clone();
                 }
                 self.give_page(&mut page);
-                if !warm {
+                if parse_changed {
+                    let doc = self.parse_source();
+                    self.set_doc(doc);
+                }
+                if !warm || parse_changed {
                     // The text and the parse are kept; only the wrapping is rebuilt.
                     self.relayout_from_anchor(anchor);
                 }
