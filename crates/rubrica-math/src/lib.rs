@@ -1575,4 +1575,28 @@ mod tests {
         let sizes: Vec<f32> = runs(&f).into_iter().map(|(_, _, _, s)| s).collect();
         assert_eq!(sizes, vec![10.0, 3.75, 3.75]);
     }
+
+    /// A single-headed arrow fills its box edge to edge: the shaft starts at the
+    /// box's left edge and meets the head's ink, so the arrow is centred in its own
+    /// box and the conditions above and below line up with it. The shaft used to
+    /// begin half a head in from the tail -- the geometry a double-headed arrow
+    /// wants -- which left the gap beside the tail half a head wider than the gap
+    /// at the point and pushed the labels off the arrow's own centre.
+    #[test]
+    fn a_single_headed_arrow_fills_its_box_edge_to_edge() {
+        let f = set(r"\xrightarrow{xy}", 10.0, false, &mut Mock::mathy());
+        let (sx, sw) = f
+            .shapes
+            .iter()
+            .find_map(|s| match s {
+                Shape::Rule { x, width, .. } => Some((*x, *width)),
+                _ => None,
+            })
+            .expect("the arrow's shaft");
+        let (hx, _, _) = one(&f, "→");
+        near(sx, 0.0, "the shaft starts at the box's left edge");
+        near(sw, f.width - 5.0, "and runs to where the head's ink begins");
+        near(hx, f.width - 5.0, "the head's ink ends at the box's right edge");
+    }
+
 }

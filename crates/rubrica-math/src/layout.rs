@@ -1182,15 +1182,9 @@ impl Engine<'_> {
         } else {
             // Keep the arrowhead at the face's own size; extend its shaft with a
             // rule. Scaling a whole arrow would also enlarge its head and labels.
-            let e = self.ext(&glyph.to_string(), st.size);
-            let head = e.advance.min(width / 2.0);
             let rule = self.c(constant::FRACTION_RULE_THICKNESS, st.size, FALLBACK_RULE);
             let double = matches!(glyph, '⇒' | '⇐' | '⇔');
             let paired = double;
-            for offset in if paired { vec![-0.12 * st.size, 0.12 * st.size] } else { vec![0.0] } {
-                out.push(Shape::Rule { x: head / 2.0, y: -axis + offset - rule / 2.0,
-                    width: width - head, thickness: rule });
-            }
             let mut ends = Vec::new();
             match glyph {
                 '←' => ends.push(('←', false, 0.0)),
@@ -1199,12 +1193,35 @@ impl Engine<'_> {
                 '⇔' => { ends.push(('⇐', false, 0.0)); ends.push(('⇒', true, 0.0)); }
                 _ => ends.push((glyph, true, 0.0)),
             }
+            // Each head is placed by where its *ink* sits, so the arrow fills its
+            // box edge to edge and the shaft meets the head exactly. Placed by
+            // advance instead, the shaft still began half a head in from the tail
+            // -- the geometry a double-headed arrow wants -- and a single-headed
+            // one sat right of centre in its own box: the gap beside its tail was
+            // half a head wider than the gap at its point, and the conditions
+            // above and below were centred on the box rather than on the arrow.
+            let mut shaft_from = 0.0;
+            let mut shaft_to = width;
             for (ch, right, y) in ends {
                 let ext = self.ext(&ch.to_string(), st.size);
-                let x = if right { width - ext.advance } else { 0.0 };
-                out.push(Shape::Run { text: ch.to_string(), x: x.max(0.0), y, size: st.size });
+                let (lo, hi) = self.m.horizontal_ink(ch, st.size);
+                let x = if right { width - hi } else { -lo };
+                out.push(Shape::Run { text: ch.to_string(), x, y, size: st.size });
                 ascent = ascent.max(ext.ascent - y);
                 descent = descent.max(ext.descent + y);
+                if right {
+                    shaft_to = width - (hi - lo);
+                } else {
+                    shaft_from = hi - lo;
+                }
+            }
+            for offset in if paired { vec![-0.12 * st.size, 0.12 * st.size] } else { vec![0.0] } {
+                out.push(Shape::Rule {
+                    x: shaft_from,
+                    y: -axis + offset - rule / 2.0,
+                    width: (shaft_to - shaft_from).max(0.0),
+                    thickness: rule,
+                });
             }
         }
         let gap = self.c(constant::UPPER_LIMIT_GAP_MIN, st.size, 0.15).max(0.1 * st.size);
