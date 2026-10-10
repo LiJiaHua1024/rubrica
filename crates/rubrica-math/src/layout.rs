@@ -1092,15 +1092,46 @@ impl Engine<'_> {
         } else {
             0.0
         };
-        let k = if min_h > 0.0 && e.height() < min_h { min_h / e.height().max(0.01) } else { 1.0 };
-        let ob = Mb {
-            width: e.advance * k,
-            ascent: e.ascent * k,
-            descent: e.descent * k,
-            italic: e.italic * k,
-            align_x: e.advance * k / 2.0,
+        // The way a face says "big" is a taller drawing of the same glyph, not the
+        // same drawing scaled: scaling a summation sign takes its strokes up with
+        // it and reads as a bolder character rather than a larger one, while the
+        // face's own 1.129 and 1.91 em drawings go unused. A face with nothing to
+        // grow falls back to the scale, which is all the constant can ask of it.
+        let single = (op.chars().count() == 1).then(|| op.chars().next().unwrap());
+        let grown = (min_h > 0.0 && e.height() < min_h)
+            .then(|| single.and_then(|ch| self.m.stretch(ch, st.size, min_h)))
+            .flatten()
+            .filter(|parts| !parts.is_empty());
+        let (a_shapes, ob) = match grown {
+            Some(_) => {
+                // Grown and centred on the axis the way a sub-formula's pair is,
+                // because a display operator stands on the axis with its limits.
+                let axis = self.c(constant::AXIS_HEIGHT, st.size, FALLBACK_AXIS);
+                let mut shapes = Vec::new();
+                let (w, up, down) = self.delimiter(
+                    single.unwrap(),
+                    st.size,
+                    min_h / 2.0 + axis,
+                    min_h / 2.0 - axis,
+                    0.0,
+                    &mut shapes,
+                );
+                (shapes, Mb { width: w, ascent: up, descent: down, italic: 0.0, align_x: w / 2.0 })
+            }
+            None => {
+                let k =
+                    if min_h > 0.0 && e.height() < min_h { min_h / e.height().max(0.01) } else { 1.0 };
+                let ob = Mb {
+                    width: e.advance * k,
+                    ascent: e.ascent * k,
+                    descent: e.descent * k,
+                    italic: e.italic * k,
+                    align_x: e.advance * k / 2.0,
+                };
+                let (shapes, _) = self.atom(op, Style { size: st.size * k, ..st });
+                (shapes, ob)
+            }
         };
-        let (a_shapes, _) = self.atom(op, Style { size: st.size * k, ..st });
         self.stacked(a_shapes, ob, sub, sup, st)
     }
 

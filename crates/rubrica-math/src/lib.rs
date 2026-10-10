@@ -72,14 +72,24 @@ mod tests {
         /// coarse variant step hands back the next drawing up. Zero is a face whose
         /// assemblies come out exactly as asked.
         over: f32,
+        /// Whether `stretch` also carries the large operators, the way Cambria
+        /// Math carries taller drawings of the summation sign and the integral.
+        grows_ops: bool,
     }
 
     impl Mock {
         fn mathy() -> Mock {
-            Mock { table: true, asked: Vec::new(), widened: Vec::new(), piece: 0.4, over: 0.0 }
+            Mock {
+                table: true,
+                asked: Vec::new(),
+                widened: Vec::new(),
+                piece: 0.4,
+                over: 0.0,
+                grows_ops: false,
+            }
         }
         fn bare() -> Mock {
-            Mock { table: false, asked: Vec::new(), widened: Vec::new(), piece: 0.4, over: 0.0 }
+            Mock { table: false, asked: Vec::new(), widened: Vec::new(), piece: 0.4, over: 0.0, grows_ops: false }
         }
         /// A face whose wider drawing reaches further than the base it covers, which
         /// is what a coarse variant step gives a real font.
@@ -152,8 +162,11 @@ mod tests {
 
         fn stretch(&mut self, ch: char, size: f32, height: f32) -> Option<Vec<Stacked>> {
             self.asked.push((ch, height));
-            // Only the shapes a math face really carries: brackets and the radical.
-            if !matches!(ch, '(' | ')' | '[' | ']' | '\u{221a}') {
+            // Only the shapes a math face really carries: brackets and the radical,
+            // and the large operators when the face grows those too.
+            let grows = matches!(ch, '(' | ')' | '[' | ']' | '\u{221a}')
+                || (self.grows_ops && ch == '\u{2211}');
+            if !grows {
                 return None;
             }
             Some(vec![
@@ -259,7 +272,7 @@ mod tests {
     #[test]
     fn reaction_conditions_are_centred_above_and_below_a_growing_arrow() {
         for table in [true, false] {
-            let mut m = Mock { table, asked: Vec::new(), widened: Vec::new(), piece: 0.4, over: 0.0 };
+            let mut m = Mock { table, asked: Vec::new(), widened: Vec::new(), piece: 0.4, over: 0.0, grows_ops: false };
             let f = set(r"A \xrightarrow[\text{高压}]{\text{催化剂及加热}} B", 10.0, false, &mut m);
             let r = runs(&f);
             let top = r.iter().find(|s| s.0 == "催化剂及加热").unwrap();
@@ -1619,6 +1632,38 @@ mod tests {
             let f = set(src, 10.0, false, &mut Mock::mathy());
             near(f.width, 15.0 + 2.0 * (5.0 / 18.0) * 10.0, "{src} takes a thick muskip");
         }
+    }
+
+    /// A display operator grows by the face's own taller drawing, not by scaling
+    /// the one it has: a scaled summation sign takes its strokes up with it and
+    /// reads as a bolder character rather than a larger one, while the face's own
+    /// 1.129 and 1.91 em drawings go unused. The grown operator stands on the
+    /// axis with its limits, the way a sub-formula's pair does.
+    #[test]
+    fn a_display_operator_grows_by_the_faces_own_drawing() {
+        let mut m = Mock { grows_ops: true, ..Mock::mathy() };
+        let f = set(r"\sum_{i}^{n}", 10.0, true, &mut m);
+        let g = grown(&f);
+        assert_eq!(g.len(), 2, "the assembled operator rather than a scaled one");
+        assert!(
+            runs(&f).iter().all(|s| s.0 != "\u{2211}"),
+            "the natural glyph was scaled instead of grown"
+        );
+        // Centred on the axis -- 0.4 em in this face.
+        let centre = ((g[0].2 - 2.0) + (g[1].2 + 1.0)) / 2.0;
+        near(centre, -4.0, "the operator's ink centre");
+        // And the box pays for the drawing's own height, not the request's.
+        assert!(f.ascent >= -(g[1].2 - 2.0) - 0.001, "the box stops short of the operator");
+    }
+
+    /// A face with nothing to grow still has to say something at the size the
+    /// constant asks for, and the scale is what it has: the operator grows and
+    /// its limits stack above and below it as before.
+    #[test]
+    fn a_display_operator_with_no_variant_is_scaled() {
+        let f = set(r"\sum_{i}^{n}", 10.0, true, &mut Mock::mathy());
+        let (_, _, _, size) = runs(&f).into_iter().find(|(t, ..)| *t == "\u{2211}").unwrap();
+        assert!(size > 10.0, "the operator was not grown at all: {size}");
     }
 
 }
