@@ -1406,6 +1406,11 @@ struct Peek {
     theme: Theme,
     page: Option<crate::view::Page>,
     title: Vec<crate::view::PaintRun>,
+    /// How wide the whole file name would have been, and how much of it the bar
+    /// has room for. The second is where the hint is measured back from, so a
+    /// long name cannot run under it.
+    title_width: f32,
+    title_end: f32,
     hint: Vec<crate::view::PaintRun>,
     /// The glyph that puts the preview away, and the box that finds it. A preview
     /// whose hooks the system has taken away, and a user who simply wants the
@@ -1473,6 +1478,8 @@ impl Peek {
                 theme: Theme::default(),
                 page: None,
                 title: Vec::new(),
+                title_width: 0.0,
+                title_end: 0.0,
                 hint: Vec::new(),
                 close: Vec::new(),
                 close_box: RECT::default(),
@@ -1762,16 +1769,28 @@ impl Peek {
         let size = self.theme.base * 0.95;
         let runs = font.shape_runs(&name, 0..name.len(), &req, size, 0.0);
         let pad = BAR_PAD * k;
+        let widths: Vec<f32> = runs.iter().map(|r| r.width() * k).collect();
         let mut at = pad;
         let baseline = BAR_H / 2.0 + size * k * 0.35;
-        for r in &runs {
+        self.title_width = widths.iter().sum::<f32>();
+        // The name stops one gap short of the close glyph's own target, which is
+        // a square the height of the bar centred on the glyph: a long file name
+        // would otherwise run under it, and the glyph is the only way out of the
+        // preview that is not the keyboard.
+        for (r, width) in runs.iter().zip(&widths) {
+            if at + *width > client_w - pad - BAR_H {
+                break;
+            }
             if let Some(mut run) = paint_run(font, r, 0.0, 0.0, k, ColorRole::Text, None) {
                 run.x = at;
                 run.baseline = baseline;
-                at += r.width() * k;
+                at += *width;
                 self.title.push(run);
             }
         }
+        // Where the name actually ends, which is what the hint is measured back
+        // from rather than the bar's left edge.
+        self.title_end = at;
         let small = self.theme.base * 0.72;
         // The close glyph takes the right end of the bar first, and the hint is
         // measured backwards from whatever is left of it.
@@ -1802,7 +1821,7 @@ impl Peek {
         let runs = font.shape_runs(hint, 0..hint.len(), &req, small, 0.0);
         for r in runs.iter().rev() {
             let width = r.width() * k;
-            if right - width < at + pad {
+            if right - width < self.title_end + pad {
                 break;
             }
             if let Some(mut run) = paint_run(font, r, 0.0, 0.0, k, ColorRole::Muted, None) {
