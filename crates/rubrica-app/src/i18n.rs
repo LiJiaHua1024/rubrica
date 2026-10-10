@@ -130,6 +130,8 @@ pub enum Key {
     FindNoMatch,
     FindOneMatch,
     /// A footnote carried over onto the page below it, with the number in place of {n}.
+    /// Only the PDF writer says it, and that is built on request.
+    #[cfg_attr(not(feature = "pdf"), allow(dead_code))]
     FootnoteContinued,
 
     MenuBack,
