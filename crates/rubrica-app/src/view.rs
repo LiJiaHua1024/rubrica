@@ -9622,6 +9622,11 @@ impl View {
                 self.ops_sorted,
                 true,
             );
+            // The preview and the note bubble are laid out in window coordinates
+            // -- a bubble hangs beside the mark that opened it wherever the page put
+            // it -- so they are drawn before the content translation is applied,
+            // exactly as the page-stack branch above does.
+            target.SetTransform(&Matrix3x2::identity());
             target.SetTransform(&Matrix3x2::translation(content_dx, 0.0));
             self.draw_preview(&target);
             target.SetTransform(&Matrix3x2::translation(page_dx, 0.0));
@@ -9629,7 +9634,7 @@ impl View {
             // is currently in front. Their line indexes stay global, so snapping to a
             // new page never changes what a selection means.
             self.draw_page_overlays(&target, up, top, bottom);
-            target.SetTransform(&Matrix3x2::translation(content_dx, 0.0));
+            target.SetTransform(&Matrix3x2::identity());
             // The thumb is drawn from its geometry rather than as an op, because an op
             // would mean relaying out the document on every wheel tick. It is the only
             // sign the reader has that the edge of the window can be gripped.
