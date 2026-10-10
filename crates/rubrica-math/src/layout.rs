@@ -1753,6 +1753,11 @@ fn is_rel(ch: char) -> bool {
         ch,
         '=' | '<'
             | '>'
+            // The two relation bars are TeX's relations, not binary operators:
+            // `a \mid b` and `a \parallel b` take the thick muskip a relation
+            // gets, and set as binary they came up a muskip short of it.
+            | '\u{2223}'
+            | '\u{2225}'
             | '\u{2264}'
             | '\u{2265}'
             | '\u{2260}'
@@ -1833,8 +1838,6 @@ fn is_bin(ch: char) -> bool {
             | '\u{2227}'
             | '\u{2228}'
             | '\u{2216}'
-            | '\u{2223}'
-            | '\u{2225}'
     )
 }
 

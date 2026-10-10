@@ -1609,4 +1609,16 @@ mod tests {
         near(f.width, 15.0 + 2.0 * (5.0 / 18.0) * 10.0, "a thick muskip on both sides");
     }
 
+    /// `\mid` and `\parallel` are relations in TeX, not binary operators: they
+    /// take the thick muskip a relation gets. Set as binary they came up a
+    /// muskip short, and the two bars disagreed with `\bigm|` -- the same mark
+    /// the writer sized by hand.
+    #[test]
+    fn the_relation_bars_take_a_relations_room() {
+        for src in [r"a \mid b", r"a \parallel b"] {
+            let f = set(src, 10.0, false, &mut Mock::mathy());
+            near(f.width, 15.0 + 2.0 * (5.0 / 18.0) * 10.0, "{src} takes a thick muskip");
+        }
+    }
+
 }
