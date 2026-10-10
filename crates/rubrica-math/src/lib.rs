@@ -1549,4 +1549,30 @@ mod tests {
             -(top - 2.0) - f.ascent
         );
     }
+
+    /// A script inside a script takes the second percentage, not the first one
+    /// twice: the level travels with the style, so `x^{a^{b}}` sets its inner `b`
+    /// at the scriptscript size rather than the square of the script one -- a
+    /// quarter again too big, close enough to the outer script to read as the
+    /// same size and to collide with it.
+    #[test]
+    fn a_script_inside_a_script_takes_the_second_percentage() {
+        let f = set(r"x^{a^{b}}", 10.0, false, &mut Mock::mathy());
+        let sizes: Vec<(String, f32)> =
+            runs(&f).into_iter().map(|(t, _, _, s)| (t, s)).collect();
+        assert_eq!(
+            sizes,
+            vec![("x".to_string(), 10.0), ("a".to_string(), 7.5), ("b".to_string(), 3.75)]
+        );
+    }
+
+    /// A fraction inside a script has scriptscript halves, the way TeX sets them:
+    /// the halves are one step down from the fraction, and the fraction is already
+    /// one step down from the sentence.
+    #[test]
+    fn a_fraction_inside_a_script_has_scriptscript_halves() {
+        let f = set(r"x^{\frac{a}{b}}", 10.0, false, &mut Mock::mathy());
+        let sizes: Vec<f32> = runs(&f).into_iter().map(|(_, _, _, s)| s).collect();
+        assert_eq!(sizes, vec![10.0, 3.75, 3.75]);
+    }
 }

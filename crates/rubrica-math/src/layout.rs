@@ -143,6 +143,12 @@ struct Style {
     size: Pt,
     display: bool,
     cramped: bool,
+    /// How many script steps down this style already is: 0 for the formula's own,
+    /// 1 for a superscript's contents, 2 for a script inside that. The level, not
+    /// the size, is what says how much further a construct inside it shrinks -- a
+    /// fraction in a script has scriptscript halves, and a script inside a script
+    /// is at the second percentage rather than the first one twice.
+    level: u8,
 }
 
 /// Ratios used when the face reports nothing. The two script percentages are the
@@ -235,7 +241,7 @@ impl Mb {
 /// Lay `node` out at `size`, as a display or an inline formula.
 pub fn layout(node: &Node, size: Pt, display: bool, m: &mut dyn MathMeasure) -> Formula {
     let mut e = Engine { m, depth: 0 };
-    let (shapes, b) = e.lay(node, Style { size, display, cramped: false });
+    let (shapes, b) = e.lay(node, Style { size, display, cramped: false, level: 0 });
     Formula { shapes, width: b.width, ascent: b.ascent, descent: b.descent }
 }
 
@@ -263,14 +269,30 @@ impl Engine<'_> {
 
     /// Script sizes are composed, so a second-level script is always smaller than the
     /// first no matter what the two percentages happen to be.
-    fn script_size(&mut self, st: Style, level: u8) -> Pt {
+    /// The size `steps` script steps below `st`.
+    ///
+    /// Each step reads the next percentage, and nothing below scriptscript shrinks
+    /// further, so this is the one place the two percentages are read. Composed from
+    /// the style's own level rather than from an absolute one: a script inside a
+    /// script is at the second percentage, not the first one twice, and a fraction
+    /// inside a script has scriptscript halves.
+    fn script_size_from(&mut self, st: Style, steps: u8) -> Pt {
         let one = self.m.percent(constant::SCRIPT_PERCENT_SCALE_DOWN, FALLBACK_SCRIPT_PERCENT);
-        if level <= 1 {
-            return st.size * one;
+        let two = self.m.percent(
+            constant::SCRIPT_SCRIPT_PERCENT_SCALE_DOWN,
+            FALLBACK_SCRIPT_SCRIPT_PERCENT,
+        );
+        let mut size = st.size;
+        let mut level = st.level;
+        for _ in 0..steps {
+            size = match level {
+                0 => size * one,
+                1 => size * two,
+                _ => size,
+            };
+            level += 1;
         }
-        let two =
-            self.m.percent(constant::SCRIPT_SCRIPT_PERCENT_SCALE_DOWN, FALLBACK_SCRIPT_SCRIPT_PERCENT);
-        st.size * one * two
+        size
     }
 
     /// Every construct below reaches its body through here, so the depth is counted
@@ -331,8 +353,16 @@ impl Engine<'_> {
                 match style {
                     MathStyle::Display => s.display = true,
                     MathStyle::Text => s.display = false,
-                    MathStyle::Script => s.size = self.script_size(st, 1),
-                    MathStyle::ScriptScript => s.size = self.script_size(st, 2),
+                    // The level travels with the size, so a script written inside
+                    // the switched body knows how far down it already is.
+                    MathStyle::Script => {
+                        s.size = self.script_size_from(st, 1);
+                        s.level = st.level + 1;
+                    }
+                    MathStyle::ScriptScript => {
+                        s.size = self.script_size_from(st, 2);
+                        s.level = st.level + 2;
+                    }
                 }
                 self.lay(body, s)
             }
@@ -401,7 +431,7 @@ impl Engine<'_> {
         // a forced one changes.
         let mut base = st;
         if forced == FracStyle::Text {
-            base.size = self.script_size(st, 1);
+            base.size = self.script_size_from(st, 1);
         }
         let st = Style {
             display: match forced {
@@ -412,8 +442,20 @@ impl Engine<'_> {
             ..base
         };
         // Both halves lose the display style and are cramped: a numerator is set in
-        // text style even inside a display formula.
-        let inner = Style { display: false, cramped: true, ..st };
+        // text style even inside a display formula. A fraction already inside a
+        // script sets its halves one step further down -- `x^{\frac ab}` is a
+        // scriptscript fraction -- and the level travels with them so a fraction
+        // inside *that* one still knows where it is.
+        let inner = if st.level >= 1 {
+            Style {
+                size: self.script_size_from(st, 1),
+                level: st.level + 1,
+                display: false,
+                cramped: true,
+            }
+        } else {
+            Style { display: false, cramped: true, ..st }
+        };
         let (snum, n_b) = self.lay(num, inner);
         let (sden, d_b) = self.lay(den, inner);
 
@@ -571,10 +613,12 @@ impl Engine<'_> {
     ) -> (Vec<Shape>, Mb) {
         let Rulings { rows: row_rules, columns: col_rules } = rules;
         // Cells are dependent material, so text style and cramped exactly as a
-        // fraction's halves are. `smallmatrix` is the one that is also a script size.
+        // fraction's halves are. `smallmatrix` is the one that is also a script size
+        // -- one step down from wherever the grid already is.
         let mut inner = Style { display: false, cramped: st.cramped, ..st };
         if kind == ArrayKind::SmallMatrix {
-            inner.size = self.script_size(st, 1);
+            inner.size = self.script_size_from(st, 1);
+            inner.level = st.level + 1;
         }
         let cols = columns.len().max(1);
         let mut laid: Vec<Vec<(Vec<Shape>, Mb)>> = Vec::with_capacity(rows.len());
@@ -717,7 +761,14 @@ impl Engine<'_> {
         st: Style,
     ) -> (Vec<Shape>, Mb) {
         let (sbase, bb) = self.lay(base, st);
-        let level1 = Style { size: self.script_size(st, 1), display: false, cramped: true };
+        // One script step down from wherever this already is: a script inside a
+        // script is at the second percentage, not the first one twice over.
+        let level1 = Style {
+            size: self.script_size_from(st, 1),
+            level: st.level + 1,
+            display: false,
+            cramped: true,
+        };
         let sup_box = sup.map(|n| self.lay(n, level1));
         let sub_box = sub.map(|n| self.lay(n, level1));
         if sup_box.is_none() && sub_box.is_none() {
@@ -818,8 +869,14 @@ impl Engine<'_> {
         let extra = self.c(constant::RADICAL_EXTRA_ASCENDER, st.size, FALLBACK_RULE);
 
         // The degree, if any, sits outside the hook: `kernBeforeDegree` in front of
-        // it, the negative `kernAfterDegree` pulling the sign back over it.
-        let level2 = Style { size: self.script_size(st, 2), display: false, cramped: true };
+        // it, the negative `kernAfterDegree` pulling the sign back over it. Two
+        // script steps down from wherever this already is.
+        let level2 = Style {
+            size: self.script_size_from(st, 2),
+            level: st.level + 2,
+            display: false,
+            cramped: true,
+        };
         let deg = degree.map(|d| self.lay(d, level2));
         let (before, after) = if deg.is_some() {
             (
@@ -1073,8 +1130,12 @@ impl Engine<'_> {
     {
         // Reaction conditions must remain readable beside CJK prose. Font script
         // sizes can be only 70% of the body; use a slightly larger label here.
-        let script = Style { size: self.script_size(st, 1).max(0.82 * st.size),
-            display: false, cramped: true };
+        let script = Style {
+            size: self.script_size_from(st, 1).max(0.82 * st.size),
+            level: st.level + 1,
+            display: false,
+            cramped: true,
+        };
         let top = above.map(|n| self.lay(n, script)).filter(|(s, _)| !s.is_empty());
         let bottom = below.map(|n| self.lay(n, script)).filter(|(s, _)| !s.is_empty());
         let label_width = top.iter().chain(bottom.iter()).map(|(_, b)| b.ink_width())
@@ -1172,7 +1233,12 @@ impl Engine<'_> {
         sup: Option<&Node>,
         st: Style,
     ) -> (Vec<Shape>, Mb) {
-        let level1 = Style { size: self.script_size(st, 1), display: false, cramped: true };
+        let level1 = Style {
+            size: self.script_size_from(st, 1),
+            level: st.level + 1,
+            display: false,
+            cramped: true,
+        };
         let sup_box = sup.map(|n| self.lay(n, level1));
         let sub_box = sub.map(|n| self.lay(n, level1));
         let mut out = Vec::new();
