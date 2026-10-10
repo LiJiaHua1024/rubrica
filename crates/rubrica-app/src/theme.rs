@@ -499,10 +499,15 @@ impl Theme {
         }
         let color = if inline.contains(InlineStyle::DELIMITER) {
             ColorRole::Muted
+        } else if role == Role::Mono {
+            // Code keeps its own ink even inside a link: a link is the promise of
+            // somewhere to go, and its colour on a monospaced word read as a
+            // third thing -- mono face in the link's accent -- where the code's
+            // own ink is the stronger statement. The link's underline still says
+            // where it leads.
+            ColorRole::Code
         } else if inline.contains(InlineStyle::LINK) {
             ColorRole::Accent
-        } else if role == Role::Mono {
-            ColorRole::Code
         } else if matches!(kind, BlockKind::Heading(_)) {
             ColorRole::Text
         } else if inline.contains(InlineStyle::STRIKETHROUGH) {
@@ -638,6 +643,13 @@ mod tests {
         assert_eq!(
             t.resolve(BlockKind::Paragraph, InlineStyle::CODE).family,
             t.fonts.family(Role::Mono, false)
+        );
+        // And code inside a link keeps the code's ink rather than borrowing the
+        // link's: a monospaced word in the accent colour read as a third thing,
+        // where the code's own colour is the stronger statement.
+        assert_eq!(
+            t.resolve(BlockKind::Paragraph, InlineStyle::CODE | InlineStyle::LINK).color,
+            ColorRole::Code
         );
     }
 
