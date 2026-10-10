@@ -8522,7 +8522,13 @@ impl View {
     fn tree_at(&self, x: f32, y: f32) -> Option<usize> {
         if !self.tree_visible || x >= self.tree_width || y < TOPBAR_H { return None; }
         let row = ((y - TOPBAR_H - 6.0) / TREE_ROW_H).floor();
-        (row >= 0.0).then_some(row as usize).filter(|row| *row < self.tree.len())
+        // Only a row the panel has drawn is a row a click can hit. The surface is
+        // clipped to the viewport, so a list longer than the window is cut off
+        // without the rows behind it going anywhere -- and a click in the empty
+        // space below the last drawn row used to open a document that is not on
+        // the screen at all.
+        let rows = ((self.content_bottom() - TOPBAR_H - 6.0) / TREE_ROW_H).ceil();
+        (row >= 0.0).then_some(row as usize).filter(|row| *row < self.tree.len() && *row < rows as usize)
     }
 
     unsafe fn draw_tree_panel(&mut self, target: &ID2D1RenderTarget) {
