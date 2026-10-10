@@ -129,6 +129,8 @@ pub enum Key {
     FindCue,
     FindNoMatch,
     FindOneMatch,
+    /// A footnote carried over onto the page below it, with the number in place of {n}.
+    FootnoteContinued,
 
     MenuBack,
     MenuForward,
@@ -281,6 +283,7 @@ fn translate_en(key: Key) -> &'static str {
         Key::FindCue => "Find in document",
         Key::FindNoMatch => "no match",
         Key::FindOneMatch => "1 match",
+        Key::FootnoteContinued => "Footnote {n} (continued)",
 
         Key::MenuBack => "Back",
         Key::MenuForward => "Forward",
@@ -417,6 +420,7 @@ fn translate_zh_cn(key: Key) -> &'static str {
         Key::FindCue => "在文档中查找",
         Key::FindNoMatch => "无匹配项",
         Key::FindOneMatch => "1 个匹配项",
+        Key::FootnoteContinued => "第 {n} 条注释（续）",
 
         Key::MenuBack => "后退",
         Key::MenuForward => "前进",
@@ -553,6 +557,7 @@ fn translate_zh_tw(key: Key) -> &'static str {
         Key::FindCue => "在文件中尋找",
         Key::FindNoMatch => "無相符項目",
         Key::FindOneMatch => "1 個相符項目",
+        Key::FootnoteContinued => "第 {n} 則註解（繼）",
 
         Key::MenuBack => "返回",
         Key::MenuForward => "前進",
@@ -689,6 +694,7 @@ fn translate_ja(key: Key) -> &'static str {
         Key::FindCue => "ドキュメント内を検索",
         Key::FindNoMatch => "一致なし",
         Key::FindOneMatch => "1 件一致",
+        Key::FootnoteContinued => "注 {n}（続き）",
 
         Key::MenuBack => "戻る",
         Key::MenuForward => "進む",
@@ -825,6 +831,7 @@ fn translate_ko(key: Key) -> &'static str {
         Key::FindCue => "문서에서 찾기",
         Key::FindNoMatch => "일치 항목 없음",
         Key::FindOneMatch => "1개 일치",
+        Key::FootnoteContinued => "각주 {n}(계속)",
 
         Key::MenuBack => "뒤로",
         Key::MenuForward => "앞으로",
@@ -961,6 +968,7 @@ fn translate_fr(key: Key) -> &'static str {
         Key::FindCue => "Rechercher dans le document",
         Key::FindNoMatch => "aucune correspondance",
         Key::FindOneMatch => "1 correspondance",
+        Key::FootnoteContinued => "Note {n} (suite)",
 
         Key::MenuBack => "Précédent",
         Key::MenuForward => "Suivant",
@@ -1097,6 +1105,7 @@ fn translate_de(key: Key) -> &'static str {
         Key::FindCue => "Im Dokument suchen",
         Key::FindNoMatch => "keine Treffer",
         Key::FindOneMatch => "1 Treffer",
+        Key::FootnoteContinued => "Fußnote {n} (fortgesetzt)",
 
         Key::MenuBack => "Zurück",
         Key::MenuForward => "Vorwärts",
@@ -1233,6 +1242,7 @@ fn translate_es(key: Key) -> &'static str {
         Key::FindCue => "Buscar en el documento",
         Key::FindNoMatch => "sin coincidencias",
         Key::FindOneMatch => "1 coincidencia",
+        Key::FootnoteContinued => "Nota {n} (continuación)",
 
         Key::MenuBack => "Atrás",
         Key::MenuForward => "Adelante",
@@ -1369,6 +1379,7 @@ fn translate_ru(key: Key) -> &'static str {
         Key::FindCue => "Найти в документе",
         Key::FindNoMatch => "нет совпадений",
         Key::FindOneMatch => "1 совпадение",
+        Key::FootnoteContinued => "Сноска {n} (продолжение)",
 
         Key::MenuBack => "Назад",
         Key::MenuForward => "Вперед",
@@ -1505,6 +1516,7 @@ fn translate_it(key: Key) -> &'static str {
         Key::FindCue => "Trova nel documento",
         Key::FindNoMatch => "nessuna corrispondenza",
         Key::FindOneMatch => "1 corrispondenza",
+        Key::FootnoteContinued => "Nota {n} (continua)",
 
         Key::MenuBack => "Indietro",
         Key::MenuForward => "Avanti",
@@ -1641,6 +1653,7 @@ fn translate_pt(key: Key) -> &'static str {
         Key::FindCue => "Localizar no documento",
         Key::FindNoMatch => "nenhuma correspondência",
         Key::FindOneMatch => "1 correspondência",
+        Key::FootnoteContinued => "Nota {n} (continuação)",
 
         Key::MenuBack => "Voltar",
         Key::MenuForward => "Avançar",

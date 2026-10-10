@@ -12022,7 +12022,13 @@ fn write_pdf(
         }
         for note in &page.note_spans {
             if note.y < top && note.y + note.height > top && content_shift + 18.0 < height {
-                let marker = format!("Footnote {} (continued)", note.number);
+                // A note carried onto the page below it is labelled in the
+                // reader's own language, the way everything else the app writes is.
+                let marker = crate::i18n::t(
+                    crate::settings::current_language(),
+                    crate::i18n::Key::FootnoteContinued,
+                )
+                .replace("{n}", &note.number.to_string());
                 let marker_y = content_shift + 12.0;
                 ops.push(PdfOp::SetFillColor { col: pdf_color(ColorRole::Muted, dark) });
                 ops.push(PdfOp::SetFont {
