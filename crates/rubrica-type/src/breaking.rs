@@ -299,6 +299,7 @@ fn score(
     allowance: Pt,
     tolerance: i32,
     prev_fit: u8,
+    penalty: i32,
     opts: &BreakOptions,
 ) -> Option<(i32, u8, f64)> {
     // Hanging punctuation is an allowance, not a reason to stretch every short line.
@@ -354,7 +355,16 @@ fn score(
     // distinguish a slightly loose line from one with several ems between words.
     // Otherwise the final pass assigns both the same cost and keeps the first.
     // Stay below RESCUED so an overfull rescue can never beat ordinary breaks.
-    let mut adj = (100.0 * f64::from(ratio).powi(3)).min(10_000_000.0) + 100.0;
+    //
+    // The break's own penalty rides inside the square with the line penalty, the
+    // way TeX's `(l + b)^2` reads `l` as `\linepenalty` plus whatever the break
+    // itself costs: a discretionary break pays `\hyphenpenalty`, so a paragraph
+    // that can be set without hyphens is set without them. Written into the item
+    // and never read, every dictionary point was free and a narrow measure came
+    // out hyphen-dense.
+    let mut adj = (100.0 * f64::from(ratio).powi(3)).min(10_000_000.0)
+        + 100.0
+        + f64::from(penalty.max(0));
     if bad >= 10000 && delta < 0.0 {
         adj = 100_000.0;
     }
@@ -576,6 +586,12 @@ fn solve(
         let mut best: Option<(f64, usize)> = None;
         let mut next_active: Vec<usize> = Vec::with_capacity(active.len() + 1);
         let mut stop = false;
+        // The penalty this break itself carries -- a discretionary break pays
+        // `\hyphenpenalty`, a forced one pays nothing. The same for every edge.
+        let bp = match items[k] {
+            Item::Penalty { forced: false, penalty, .. } => penalty,
+            _ => 0,
+        };
         // The overfull line that overflows least, kept in case refusing it -- and
         // everything else -- leaves the active list with nothing in it.
         let mut rescue: Option<(f64, usize)> = None;
@@ -629,6 +645,7 @@ fn solve(
                 hang,
                 tolerance,
                 ed.fitness,
+                bp,
                 opts,
             ) else {
                 // Rejected because the line is too short; every remaining active
@@ -685,6 +702,7 @@ fn solve(
                     hang,
                     i32::MAX,
                     ed.fitness,
+                    bp,
                     opts,
                 )
                 .unwrap_or((10000, 3, 0.0));
@@ -713,6 +731,7 @@ fn solve(
             hang,
             tolerance,
             ed.fitness,
+            bp,
             opts,
         )
         .expect("the edge chosen above scored legal, rescue included");

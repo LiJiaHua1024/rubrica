@@ -794,3 +794,51 @@ fn break_opportunities(text: &str, spacing: &Spacing) -> Vec<(usize, bool)> {
                 && text[at..].chars().next().is_some_and(hangul)))
         .collect()
 }
+
+#[cfg(test)]
+mod hyphen_penalty {
+    use super::*;
+    use crate::breaking::{break_paragraph, BreakOptions};
+
+    /// One word with one dictionary point inside it, set at the given penalty in
+    /// a measure that holds the first half of the word.
+    fn plan_for(penalty: i32) -> crate::Plan {
+        let src = "extraordinary";
+        let spacing = Spacing::for_size(16.0);
+        let mut measure = MonospaceMeasure { size: 16.0, factor: 0.5 };
+        let breaks = break_opportunities(src, &spacing);
+        let opts = BuildOptions {
+            spacing: &spacing,
+            style_of: StyleId(0),
+            spans: &[],
+            hyphens: &[8],
+            hyphen_penalty: penalty,
+            hyphen_width: 0.0,
+        };
+        let para = build(src, &breaks, &opts, &mut measure);
+        break_paragraph(&para, &BreakOptions::new(4.0 * 16.0))
+    }
+
+    /// The penalty the break item carries is the one the solver pays. Free, the
+    /// dictionary point is taken and the word divides; charged more than hanging
+    /// the word whole costs, the same break is refused and the word is set as one
+    /// overfull line instead. Written into the item and never read, every
+    /// dictionary point used to be free and a narrow measure came out
+    /// hyphen-dense.
+    #[test]
+    fn a_hyphen_break_pays_its_penalty() {
+        let free = plan_for(0);
+        assert!(
+            free.lines.iter().any(|l| l.hyphen.is_some()),
+            "a free dictionary point was not taken: {} line(s)",
+            free.lines.len()
+        );
+        let dear = plan_for(1_000_000_000);
+        assert!(
+            dear.lines.iter().all(|l| l.hyphen.is_none()),
+            "an unaffordable break was taken anyway: {} line(s)",
+            dear.lines.len()
+        );
+        assert!(dear.lines[0].is_overfull(), "the hang should still be reported as one");
+    }
+}
