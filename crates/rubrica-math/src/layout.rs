@@ -56,6 +56,12 @@ pub struct Stacked {
     /// baseline, which is the part's own descent plus its offset in the assembly.
     pub baseline_up: Pt,
     pub width: Pt,
+    /// The part's own ink around its baseline. A grown shape is free to be taller
+    /// than the height it was asked for -- a coarse variant step hands back the
+    /// next drawing up -- and the caller cannot borrow these from the natural
+    /// glyph: the overhang has to be paid for in the line's height.
+    pub ascent: Pt,
+    pub descent: Pt,
 }
 
 /// One glyph of a shape grown *sideways*, as the wide accents and braces are.
@@ -838,8 +844,16 @@ impl Engine<'_> {
         let mut sign_w: Pt = 0.0;
 
         let natural = self.ext("\u{221a}", st.size);
+        // How tall the sign's own ink stands above the radical's bottom edge, which
+        // is also the height the degree's raise is a percentage of. The assembly is
+        // free to be taller than the height it was asked for -- the step between
+        // drawings is the face's -- and a sign that overhangs the bar is ink the
+        // line has to make room for.
+        let mut sign_ink = natural.ascent + natural.descent;
         match self.m.stretch('\u{221a}', st.size, sign_h) {
             Some(parts) => {
+                let top = parts.iter().map(|p| p.baseline_up + p.ascent).fold(0.0, f32::max);
+                sign_ink = top;
                 for p in &parts {
                     sign_w = sign_w.max(p.width);
                     out.push(Shape::Glyph {
@@ -851,6 +865,7 @@ impl Engine<'_> {
                         size: st.size,
                     });
                 }
+                ascent = ascent.max(top - descent);
             }
             None => {
                 // Nothing stretchable: the design-size sign, which is right for a
@@ -872,9 +887,10 @@ impl Engine<'_> {
         let width = body_x + bb.ink_width();
 
         if let Some((sd, db)) = deg {
-            // A percentage of the radical sign's own height.
+            // A percentage of the radical sign's own height -- the height of the ink
+            // actually drawn, which is what the face grew it to.
             let pct = self.m.percent(constant::RADICAL_DEGREE_BOTTOM_RAISE_PERCENT, 0.6);
-            translate(&sd, before, -sign_h * pct - db.descent, &mut out);
+            translate(&sd, before, -sign_ink * pct - db.descent, &mut out);
         }
         (
             out,
@@ -906,7 +922,14 @@ impl Engine<'_> {
         // looks centred rather than sitting on the baseline.
         let tall = min > 0.0 && bb.height() >= min;
         let (up, down) = if tall {
-            (bb.height() / 2.0 + axis, bb.height() / 2.0 - axis)
+            // The pair is centred on the axis, but never shorter than the body's own
+            // ink: a top-heavy body asks for a symmetric extent that stops short of
+            // its ascent, and the bracket then covers the middle of the grid and
+            // misses its top.
+            (
+                bb.ascent.max(bb.height() / 2.0 + axis),
+                bb.descent.max(bb.height() / 2.0 - axis),
+            )
         } else {
             (bb.ascent, bb.descent)
         };
@@ -956,14 +979,27 @@ impl Engine<'_> {
         let want = up + down;
         let natural = self.ext(&ch.to_string(), size);
         if let Some(parts) = self.m.stretch(ch, size, want) {
-            // Each part's baseline is its offset up from the assembly's bottom edge,
-            // and that bottom edge sits `down` below the formula's baseline.
+            if parts.is_empty() {
+                return (natural.advance, up, down);
+            }
+            // The assembly's own ink, measured from the bottom edge the table laid
+            // the parts against. A variant or a built shape is free to be taller
+            // than what was asked for -- the step between drawings is the face's,
+            // not the request's -- and the overhang is ink the line must pay for.
+            let top = parts.iter().map(|p| p.baseline_up + p.ascent).reduce(f32::max).unwrap_or(0.0);
+            let foot =
+                parts.iter().map(|p| p.baseline_up - p.descent).reduce(f32::min).unwrap_or(0.0);
+            // Centre that ink on what was asked for -- the axis, for a sub-formula's
+            // pair -- rather than hanging the whole assembly off the requested
+            // bottom edge, which ran the overhang off the top of the line and left
+            // the body poking out below a bracket that stopped short of it.
+            let edge = (down - up) / 2.0 + (top + foot) / 2.0;
             let mut w = natural.advance;
             for p in &parts {
                 w = w.max(p.width);
-                out.push(Shape::Glyph { index: p.index, x, y: down - p.baseline_up, size });
+                out.push(Shape::Glyph { index: p.index, x, y: edge - p.baseline_up, size });
             }
-            return (w, up, down);
+            return (w, top - edge, edge - foot);
         }
         out.push(Shape::Run { text: ch.to_string(), x, y: 0.0, size });
         (natural.advance, natural.ascent, natural.descent)

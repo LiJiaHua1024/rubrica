@@ -68,19 +68,27 @@ mod tests {
         /// Width of each piece the wider hat or brace is assembled from, in ems.
         /// The face's own drawing decides how far past the base a mark reaches.
         piece: f32,
+        /// How far past the requested height a grown shape reaches, in points: a
+        /// coarse variant step hands back the next drawing up. Zero is a face whose
+        /// assemblies come out exactly as asked.
+        over: f32,
     }
 
     impl Mock {
         fn mathy() -> Mock {
-            Mock { table: true, asked: Vec::new(), widened: Vec::new(), piece: 0.4 }
+            Mock { table: true, asked: Vec::new(), widened: Vec::new(), piece: 0.4, over: 0.0 }
         }
         fn bare() -> Mock {
-            Mock { table: false, asked: Vec::new(), widened: Vec::new(), piece: 0.4 }
+            Mock { table: false, asked: Vec::new(), widened: Vec::new(), piece: 0.4, over: 0.0 }
         }
         /// A face whose wider drawing reaches further than the base it covers, which
         /// is what a coarse variant step gives a real font.
         fn overwide() -> Mock {
             Mock { piece: 0.9, ..Mock::mathy() }
+        }
+        /// A face whose grown shapes come out past the height they were asked for.
+        fn overshoot() -> Mock {
+            Mock { over: 5.0, ..Mock::mathy() }
         }
     }
 
@@ -149,8 +157,20 @@ mod tests {
                 return None;
             }
             Some(vec![
-                Stacked { index: 11, baseline_up: 0.2 * height, width: 0.4 * size },
-                Stacked { index: 12, baseline_up: 0.8 * height, width: 0.4 * size },
+                Stacked {
+                    index: 11,
+                    baseline_up: 0.2 * height + self.over,
+                    width: 0.4 * size,
+                    ascent: 0.2 * size,
+                    descent: 0.1 * size,
+                },
+                Stacked {
+                    index: 12,
+                    baseline_up: 0.8 * height + self.over,
+                    width: 0.4 * size,
+                    ascent: 0.2 * size,
+                    descent: 0.1 * size,
+                },
             ])
         }
 
@@ -239,7 +259,7 @@ mod tests {
     #[test]
     fn reaction_conditions_are_centred_above_and_below_a_growing_arrow() {
         for table in [true, false] {
-            let mut m = Mock { table, asked: Vec::new(), widened: Vec::new(), piece: 0.4 };
+            let mut m = Mock { table, asked: Vec::new(), widened: Vec::new(), piece: 0.4, over: 0.0 };
             let f = set(r"A \xrightarrow[\text{高压}]{\text{催化剂及加热}} B", 10.0, false, &mut m);
             let r = runs(&f);
             let top = r.iter().find(|s| s.0 == "催化剂及加热").unwrap();
@@ -1478,5 +1498,55 @@ mod tests {
         let g = grown(&b);
         near(g[0].1, -4.0, "the brace is centred the same way");
         near(b.width, 18.0, "and its box reserves the ink it actually draws");
+    }
+
+    /// The ink a grown shape actually draws, as the box that contains it. The parts
+    /// carry their own extents, and a shape that overshoots the height it was asked
+    /// for is ink the line has to pay for.
+    fn ink_of(f: &Formula) -> (f32, f32) {
+        f.shapes
+            .iter()
+            .filter_map(|s| match s {
+                Shape::Glyph { y, .. } => Some(*y),
+                _ => None,
+            })
+            .fold((f32::INFINITY, f32::NEG_INFINITY), |(lo, hi), y| (lo.min(y), hi.max(y)))
+    }
+
+    /// A coarse variant step hands back a drawing taller than the height it was
+    /// asked for. Hung off the requested bottom edge, the overhang ran off the top
+    /// of the line while the box still reported the request -- the bracket struck
+    /// through the line above, and the denominator poked out below a bracket that
+    /// stopped short of it. Centred on the axis and reported as it stands, the
+    /// overhang is split between the two sides and the line makes room for it.
+    #[test]
+    fn a_delimiter_taller_than_its_request_is_centred_and_paid_for() {
+        let f = set(r"\left(\frac{x}{y}\right)", 10.0, true, &mut Mock::overshoot());
+        let (top, bottom) = ink_of(&f);
+        // The parts' own ink: two tenths of an em above each baseline, one below.
+        assert!(
+            f.ascent >= -(top - 2.0) - 0.001,
+            "the box stops {:.1}pt short of the delimiter's ink",
+            -(top - 2.0) - f.ascent
+        );
+        assert!(f.descent >= bottom + 1.0 - 0.001, "and below it");
+        // Centred on the axis -- 0.4 em in this face -- rather than hung off the
+        // bottom of the request.
+        let centre = ((top - 2.0) + (bottom + 1.0)) / 2.0;
+        near(centre, -4.0, "the delimiter's ink centre");
+    }
+
+    /// The radical sign is asked to cover the bar, and a face whose drawing comes
+    /// back past that has its overhang reserved: the hook used to run above the
+    /// box the line made room for and strike into the line above.
+    #[test]
+    fn a_radical_sign_past_the_bar_is_paid_for() {
+        let f = set(r"\sqrt{\frac{x}{y}}", 10.0, false, &mut Mock::overshoot());
+        let (top, _) = ink_of(&f);
+        assert!(
+            f.ascent >= -(top - 2.0) - 0.001,
+            "the box stops {:.1}pt short of the sign's ink",
+            -(top - 2.0) - f.ascent
+        );
     }
 }

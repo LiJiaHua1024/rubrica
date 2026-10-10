@@ -397,7 +397,7 @@ impl MathMeasure for Adapter<'_> {
                 // table says where pieces join and never where a piece's baseline
                 // sits, so this is the reading that keeps the connectors meeting.
                 let baseline_up = p.offset as f32 * s + (band - (up + down)) / 2.0 + down;
-                Stacked { index: p.glyph, baseline_up, width: advance }
+                Stacked { index: p.glyph, baseline_up, width: advance, ascent: up, descent: down }
             })
             .collect();
         Some(out)
