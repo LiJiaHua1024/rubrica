@@ -8,7 +8,7 @@
 //! same table the line breaker uses, so the two never drift apart.
 
 use crate::{Block, BlockKind, Document};
-use rubrica_type::classify::Role;
+use rubrica_type::classify::{self, Role};
 
 /// What a status bar can say about the text it is showing.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -84,6 +84,14 @@ impl TextCounts {
                 continue;
             }
             if Role::of(ch) == Role::Cjk {
+                // Punctuation shares the CJK role -- the glue that keeps two
+                // ideographs apart is what keeps a comma off a line's start --
+                // but a comma is not a word, and counting it as one inflated
+                // every Chinese book's word count by its punctuation.
+                if classify::is_cjk_punct(ch) {
+                    in_word = false;
+                    continue;
+                }
                 self.cjk_characters += 1;
                 self.words += 1;
                 in_word = false;
@@ -137,6 +145,18 @@ mod tests {
         assert_eq!(c.cjk_characters, 5);
         assert_eq!(c.latin_words, 1);
         assert_eq!(c.words, 6);
+    }
+
+    /// Full-width punctuation shares the CJK role -- the glue that keeps two
+    /// ideographs apart is what keeps a comma off a line's start -- but a comma
+    /// is not a word. Counted as one, every Chinese book's word count carried its
+    /// punctuation with it.
+    #[test]
+    fn cjk_punctuation_is_acharacter_but_not_a_word() {
+        let c = counts("中文，测试。");
+        assert_eq!(c.cjk_characters, 4, "the four ideographs");
+        assert_eq!(c.words, 4, "and not the two commas as well");
+        assert_eq!(c.characters, 6, "the punctuation is still ink on the page");
     }
 
     #[test]
