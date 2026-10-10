@@ -1222,15 +1222,20 @@ impl Engine<'_> {
                 // The box still reports the natural mark's height: a face's wider hat is
                 // its flatter one, so reserving the taller of the two can only ever make
                 // the line a little roomy above, never clip the ink.
+                //
+                // The centring may run negative -- a coarse variant step hands back a
+                // drawing wider than the base -- and that is where the mark belongs:
+                // overhanging both sides, not clamped flush left. The caller shifts the
+                // whole formula past a negative edge, so nothing is lost off the origin.
                 let drawn = parts.last().map(|p| p.x + p.width).unwrap_or(sa.advance);
-                let at = ((bb.width - drawn) / 2.0).max(0.0);
+                let at = (bb.width - drawn) / 2.0;
                 for p in parts {
                     out.push(Shape::Glyph { index: p.index, x: at + p.x, y, size: st.size });
                 }
             }
             None => out.push(Shape::Run {
                 text: glyph,
-                x: ((bb.width - sa.advance) / 2.0).max(0.0),
+                x: (bb.width - sa.advance) / 2.0,
                 y,
                 size: st.size,
             }),
@@ -1312,7 +1317,10 @@ impl Engine<'_> {
         let deep = parts.iter().map(|p| p.descent).fold(0.0f32, f32::max);
         let mut out = Vec::new();
         translate(&sb, 0.0, 0.0, &mut out);
-        let at = ((bb.width - ink) / 2.0).max(0.0);
+        // Centred on the body even when the assembly reaches past it: the overhang
+        // belongs on both sides. The caller shifts the whole formula past a negative
+        // edge, so a mark that starts left of the origin loses nothing.
+        let at = (bb.width - ink) / 2.0;
         match side {
             // The bottom edge of the brace -- its baseline less its own descent -- is
             // what stands `gap` above the body, not its baseline.

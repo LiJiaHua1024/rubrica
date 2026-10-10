@@ -65,14 +65,22 @@ mod tests {
         /// grown by, and a test needs to tell a face with none from a base that never
         /// needed one.
         widened: Vec<(char, f32)>,
+        /// Width of each piece the wider hat or brace is assembled from, in ems.
+        /// The face's own drawing decides how far past the base a mark reaches.
+        piece: f32,
     }
 
     impl Mock {
         fn mathy() -> Mock {
-            Mock { table: true, asked: Vec::new(), widened: Vec::new() }
+            Mock { table: true, asked: Vec::new(), widened: Vec::new(), piece: 0.4 }
         }
         fn bare() -> Mock {
-            Mock { table: false, asked: Vec::new(), widened: Vec::new() }
+            Mock { table: false, asked: Vec::new(), widened: Vec::new(), piece: 0.4 }
+        }
+        /// A face whose wider drawing reaches further than the base it covers, which
+        /// is what a coarse variant step gives a real font.
+        fn overwide() -> Mock {
+            Mock { piece: 0.9, ..Mock::mathy() }
         }
     }
 
@@ -155,8 +163,20 @@ mod tests {
                 return None;
             }
             Some(vec![
-                Running { index: 21, x: 0.0, width: 0.4 * size, ascent: 0.2 * size, descent: 0.1 * size },
-                Running { index: 22, x: 0.4 * size, width: 0.4 * size, ascent: 0.2 * size, descent: 0.1 * size },
+                Running {
+                    index: 21,
+                    x: 0.0,
+                    width: self.piece * size,
+                    ascent: 0.2 * size,
+                    descent: 0.1 * size,
+                },
+                Running {
+                    index: 22,
+                    x: self.piece * size,
+                    width: self.piece * size,
+                    ascent: 0.2 * size,
+                    descent: 0.1 * size,
+                },
             ])
         }
     }
@@ -219,7 +239,7 @@ mod tests {
     #[test]
     fn reaction_conditions_are_centred_above_and_below_a_growing_arrow() {
         for table in [true, false] {
-            let mut m = Mock { table, asked: Vec::new(), widened: Vec::new() };
+            let mut m = Mock { table, asked: Vec::new(), widened: Vec::new(), piece: 0.4 };
             let f = set(r"A \xrightarrow[\text{高压}]{\text{催化剂及加热}} B", 10.0, false, &mut m);
             let r = runs(&f);
             let top = r.iter().find(|s| s.0 == "催化剂及加热").unwrap();
@@ -1436,5 +1456,27 @@ mod tests {
             }),
             "\\begin{a & b\\\\c\\\\d & e\\end{}"
         );
+    }
+
+    /// A coarse variant step hands back a drawing wider than the base it covers.
+    /// The mark belongs centred on the base, overhanging both sides -- clamped
+    /// flush left it sat against the base's left edge and reached a whole piece
+    /// past its right, and the formula's origin moved out from under the text.
+    #[test]
+    fn a_mark_wider_than_its_base_stays_centred_on_it() {
+        let mut m = Mock::overwide();
+        // Two half-em letters, one em of assembled mark: half a piece past each edge.
+        let f = set("\\widehat{ab}", 10.0, false, &mut m);
+        let g = grown(&f);
+        assert_eq!(g.len(), 2, "the assembled mark rather than the natural one");
+        near(g[0].1, -4.0, "the mark starts half a piece left of the base");
+        near(g[1].1, 5.0, "and reaches half a piece past its right edge");
+        near(f.width, 10.0, "the box still measures the base it sits on");
+
+        let mut m = Mock::overwide();
+        let b = set("\\overbrace{ab}", 10.0, false, &mut m);
+        let g = grown(&b);
+        near(g[0].1, -4.0, "the brace is centred the same way");
+        near(b.width, 18.0, "and its box reserves the ink it actually draws");
     }
 }
