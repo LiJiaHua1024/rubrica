@@ -66,7 +66,7 @@ use windows::Win32::UI::HiDpi::{
     DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2, GetDpiForWindow, SetProcessDpiAwarenessContext,
 };
 use windows::Win32::UI::Input::KeyboardAndMouse::{
-    GetKeyState, ReleaseCapture, SetCapture, SetFocus, VK_CONTROL, VK_O, VK_UP,
+    GetKeyState, ReleaseCapture, SetCapture, SetFocus, VK_CONTROL, VK_LBUTTON, VK_O, VK_UP,
     TrackMouseEvent, TME_LEAVE, TRACKMOUSEEVENT,
 };
 use windows::Win32::System::SystemInformation::GetTickCount;
@@ -4930,6 +4930,7 @@ impl View {
                 }
                 if self.tree_visible && (x - self.tree_width).abs() <= 6.0 {
                     self.tree_dragging = true;
+                    let _ = SetCapture(hwnd);
                     return LRESULT(0);
                 }
                 if let Some(index) = self.tree_at(x, y) {
@@ -5080,7 +5081,7 @@ impl View {
                 // left the page owes the page no note either. This one is a question
                 // rather than an answer, so it repaints only when the note changes.
                 self.hover_note(x, y, hwnd);
-                if self.tree_dragging {
+                if self.tree_dragging && held(VK_LBUTTON) {
                     self.tree_width = x.clamp(TREE_MIN_W, TREE_MAX_W);
                     self.layout_epoch += 1;
                     self.relayout_keeping_anchor();
