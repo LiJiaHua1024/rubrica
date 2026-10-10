@@ -373,14 +373,23 @@ fn score(
     // `lousy`; the whole ladder at once pays `awful` and `nasty` together. Holding
     // a class costs nothing -- two loose lines in a row are not themselves a fault
     // -- and a one-rung step is free, as in TeX.
+    //
+    // The charge is a flat addition, not another term inside the square. TeX adds
+    // `\adjdemerits` after squaring, and the pruning bound
+    // `minimum_demerits + |adj_demerits|` only holds if it enters linearly: a
+    // squared jump was worth four times a perfect line, so two loose lines one
+    // class apart cost the solver nothing to alternate between, and the page
+    // showed it as a line that was tight beside one that was loose.
     let jump = fit.abs_diff(prev_fit);
-    if jump > 1 {
-        adj += match jump {
+    let flat = if jump > 1 {
+        match jump {
             2 => f64::from(opts.lousy_demerits),
             _ => f64::from(opts.awful_demerits.saturating_add(opts.nasty_demerits)),
-        };
-    }
-    Some((bad, fit, (adj.max(0.0) / 100.0).powi(2)))
+        }
+    } else {
+        0.0
+    };
+    Some((bad, fit, (adj.max(0.0) / 100.0).powi(2) + flat))
 }
 
 /// Cut an over-long piece at break opportunities until every piece is within
@@ -880,4 +889,28 @@ fn desperate(
         start = b;
     }
     out
+}
+
+#[cfg(test)]
+mod demerits {
+    use super::*;
+
+    /// The fitness-class charge is a flat addition, not another term inside the
+    /// square: TeX adds `\adjdemerits` after squaring, and its pruning bound --
+    /// `minimum_demerits + |adj_demerits|` -- only holds if the charge enters
+    /// linearly. Squared, a two-rung jump was worth four times a perfect line,
+    /// which is nothing, and the page showed the alternation as a tight line
+    /// beside a loose one.
+    #[test]
+    fn a_fitness_jump_is_charged_flat_not_squared() {
+        let opts = BreakOptions::new(100.0);
+        let held = score(100.0, 10.0, 0.0, 100.0, 0.0, 10_000, 0, 0, &opts)
+            .expect("a perfect line is legal")
+            .2;
+        let jumped = score(100.0, 10.0, 0.0, 100.0, 0.0, 10_000, 2, 0, &opts)
+            .expect("a perfect line is legal whatever came before")
+            .2;
+        assert_eq!(held, 1.0, "a perfect line costs the line penalty alone");
+        assert_eq!(jumped, held + f64::from(opts.lousy_demerits));
+    }
 }
