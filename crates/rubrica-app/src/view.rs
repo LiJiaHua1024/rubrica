@@ -9890,9 +9890,9 @@ impl View {
         let layout = self.page_stack_layout();
         let label = format!("{} / {}", index + 1, self.page_count());
         let label_rect = D2D_RECT_F {
-            left: layout.left + layout.width * 0.5 - 42.0,
+            left: layout.left + layout.width * 0.5 - PAGE_BUTTON_W - 6.0,
             top: layout.top + layout.height - PAGE_FOOTER_H + 5.0,
-            right: layout.left + layout.width * 0.5 + 42.0,
+            right: layout.left + layout.width * 0.5 + PAGE_BUTTON_W + 6.0,
             bottom: layout.top + layout.height - 4.0,
         };
         let text = utf16(&label);
