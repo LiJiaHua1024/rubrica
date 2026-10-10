@@ -791,20 +791,28 @@ impl Engine<'_> {
             FALLBACK_SUP_SHIFT,
         );
         let drop_max = self.c(constant::SUPERSCRIPT_BASELINE_DROP_MAX, st.size, 0.30);
-        let bottom_min = if sub_box.is_some() {
-            self.c(constant::SUPERSCRIPT_BOTTOM_MAX_WITH_SUBSCRIPT, st.size, 0.32)
-        } else {
-            self.c(constant::SUPERSCRIPT_BOTTOM_MIN, st.size, 0.11)
-        };
+        // Two different constants for the two questions the superscript's bottom
+        // answers. Alone, it has a floor -- how high above the baseline it has to
+        // sit. Beside a subscript it has a ceiling instead: how high the gap
+        // adjustment below may lift it. The name says which is which, and reading
+        // the ceiling as a floor lifted every exponent past the height the face
+        // asked for.
+        let bottom_min = self.c(constant::SUPERSCRIPT_BOTTOM_MIN, st.size, 0.11);
+        let bottom_max =
+            self.c(constant::SUPERSCRIPT_BOTTOM_MAX_WITH_SUBSCRIPT, st.size, 0.32);
         let shift_down = self.c(constant::SUBSCRIPT_SHIFT_DOWN, st.size, FALLBACK_SUB_SHIFT);
         let top_max = self.c(constant::SUBSCRIPT_TOP_MAX, st.size, 0.32);
         let base_drop_min = self.c(constant::SUBSCRIPT_BASELINE_DROP_MIN, st.size, 0.02);
 
         let mut u = 0.0;
         if let Some((_, sb)) = sup_box.as_ref() {
-            // u - sup.descent >= bottom_min, and u >= base.ascent - drop_max: a tall
-            // base such as a parenthesised fraction drags its exponent up with it.
-            u = shift_up.max(bb.ascent - drop_max).max(bottom_min + sb.descent);
+            // u >= base.ascent - drop_max: a tall base such as a parenthesised
+            // fraction drags its exponent up with it. With no subscript the
+            // superscript's bottom also has its floor.
+            u = shift_up.max(bb.ascent - drop_max);
+            if sub_box.is_none() {
+                u = u.max(bottom_min + sb.descent);
+            }
         }
         let mut d = 0.0;
         if let Some((_, sb)) = sub_box.as_ref() {
@@ -817,6 +825,13 @@ impl Engine<'_> {
                 } else {
                     self.rules(4.0, st.size)
                 };
+                // The shortfall is made up by lifting the superscript first, as far
+                // as its bottom may rise past the baseline; whatever is left of the
+                // gap moves the subscript down. Charged to the subscript alone, a
+                // tall subscript pushed the exponent's clearance the whole way.
+                let shortfall = (gap + sb.ascent + pb.descent - (d + u)).max(0.0);
+                let room = (bottom_max + pb.descent - u).max(0.0);
+                u += shortfall.min(room);
                 d = d.max(gap + sb.ascent + pb.descent - u);
             }
         }
