@@ -284,18 +284,29 @@ fn parse_range(
     let mut offset = 0usize;
     for raw in source[range.clone()].split_inclusive('\n') {
         let line_start = source_base + offset;
-        let content_start = source_base + offset + raw.len() - raw.trim_start().len();
+        // ASCII whitespace and the newline are the air between words and come off
+        // both ends -- but U+3000 stays: it is a glyph the author wrote, a
+        // full-width indent, and peeling it as whitespace set every line of a
+        // Chinese novel flush left with the indent deleted from the measure.
+        let content_start = line_start + raw.len()
+            - raw.trim_start_matches(['\r', '\n', ' ', '\t']).len();
+        // Where the words themselves begin, past the indent as well: a chapter
+        // title is trimmed of it, because an indent on a heading is the book's
+        // paragraph convention and not part of a title.
+        let title_start = line_start + raw.len() - raw.trim_start().len();
         offset += raw.len();
-        let line = raw.trim();
-        if line.is_empty() {
+        let line = raw.trim_matches(['\r', '\n', ' ', '\t']);
+        // A line of nothing but space is a break between paragraphs, whatever
+        // width the space is.
+        if line.trim().is_empty() {
             flush(&mut paragraph, &mut sources, &mut blocks);
             continue;
         }
         if options.chapters && is_chapter(line) {
             flush(&mut paragraph, &mut sources, &mut blocks);
-            let mut block = Block::literal(BlockKind::Heading(1), line.into());
+            let mut block = Block::literal(BlockKind::Heading(1), line.trim().into());
             if let Some(first) = block.sources.first_mut() {
-                first.source = content_start;
+                first.source = title_start;
             }
             blocks.push(block);
         } else {
@@ -348,9 +359,28 @@ mod tests {
         assert_eq!(doc.blocks.iter().filter(|b| matches!(b.kind, BlockKind::Heading(_))).count(), 3);
     }
 
+    /// The full-width space is a glyph the author wrote -- a first-line indent --
+    /// and not whitespace to be peeled: trimmed as one, every line of a Chinese
+    /// novel came out flush left with the indent deleted from the measure. A
+    /// chapter line keeps the indent out of its title, because there it is the
+    /// book's paragraph convention rather than part of the words.
     #[test]
-    fn a_chapter_window_keeps_global_source_positions() {
-        let src = "前言\n开头\n\n第一章\n正文\n换行\n\n第二章\n结尾";
+    fn an_ideographic_indent_survives_the_line_break() {
+        let src = "　第一章 开始\n　这是缩进段落。";
+        let doc = parse(src, TextOptions { paragraphs: ParagraphRule::Lines, chapters: true });
+        assert_eq!(doc.blocks[0].text, "第一章 开始", "the title is trimmed of the indent");
+        assert_eq!(
+            doc.blocks[1].text,
+            "　这是缩进段落。",
+            "the body keeps the indent the author wrote"
+        );
+        // And the source offset still points at the line's own first byte, indent
+        // included, so a caret on the indent lands on the indent.
+        assert_eq!(doc.blocks[1].sources[0].source, src.find('这').unwrap() - 3);
+    }
+
+    #[test]
+    fn a_chapter_window_keeps_global_source_positions() {        let src = "前言\n开头\n\n第一章\n正文\n换行\n\n第二章\n结尾";
         let index = ChapterIndex::new(src, true);
         assert_eq!(index.chapters().len(), 3);
         let chapter = index.chapters()[1].clone();
