@@ -7282,9 +7282,13 @@ impl View {
         let runs = self.font.shape_runs(&text, 0..text.len(), &req, size, 0.02);
         let width: f32 = runs.iter().map(|r| r.width() * k).sum();
         let (px, py, pw, ph) = find_panel((self.client_w - self.content_dx()).max(1.0));
-        // End against the bar's own right edge, so a count that grows from two figures to
-        // five does not walk under the box.
-        let mut at = px + pw - FIND_PAD - width;
+        // The count is set against the bar's right edge, but never so far left that
+        // it runs under the box: the room reserved for it is a guess at how wide a
+        // count can be, and a long one in a wide count of hits would otherwise have
+        // its first figures hidden behind the control, which is a child window and
+        // is painted after its parent.
+        let floor = px + FIND_PAD + (pw - 2.0 * FIND_PAD - FIND_COUNT).max(48.0) + FIND_PAD;
+        let mut at = (px + pw - FIND_PAD - width).max(floor);
         let baseline = py + ph / 2.0 + size * k * 0.35;
         let mut label = Vec::new();
         for r in &runs {
