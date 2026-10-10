@@ -1265,3 +1265,21 @@ fn two_objects_left_adjacent_stay_two_objects() {
         );
     }
 }
+
+#[test]
+fn a_multiline_code_span_maps_its_words_back_into_the_source() {
+    // A code span that ran across a line break comes back with the break folded
+    // to a space, so the text the reader sees is not a substring of the source
+    // and a plain search found nothing: every character's offset fell back to
+    // the span's own start, and a caret on the span's second line landed on its
+    // first backtick.
+    let src = "see `start\nend` here\n";
+    let b = &Document::parse(src).blocks[0];
+    assert_eq!(b.text, "see start end here");
+    let at = b.text.find("end").expect("the folded span's second line");
+    assert_eq!(
+        rubrica_doc::source_at(&b.sources, at),
+        src.find("end"),
+        "the second line maps back to its own bytes"
+    );
+}

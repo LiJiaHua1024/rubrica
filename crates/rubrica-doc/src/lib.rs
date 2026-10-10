@@ -858,6 +858,50 @@ fn bare_line(line: &str) -> &str {
     line.trim_end_matches(['\r', '\n', ' ', '\t'])
 }
 
+/// Where `text` sits inside `raw`, letting a run of whitespace in one stand for a
+/// run of whitespace in the other.
+///
+/// CommonMark folds the line breaks of a multi-line code span into single spaces,
+/// so the text the reader sees is not a substring of the source it was written
+/// in. A plain search then finds nothing and every character's source offset
+/// falls back to the span's start -- a caret on the second line of such a span
+/// lands on its first backtick, and a search for the span's words highlights the
+/// wrong bytes.
+fn find_folded(raw: &str, text: &str) -> Option<usize> {
+    if text.is_empty() {
+        return Some(0);
+    }
+    (0..raw.len()).find(|&at| folded_at(raw, text, at))
+}
+
+/// Whether `text` matches `raw` from `at`, whitespace runs answering for each
+/// other.
+fn folded_at(raw: &str, text: &str, at: usize) -> bool {
+    let raw = raw.as_bytes();
+    let text = text.as_bytes();
+    let mut i = at;
+    let mut t = 0;
+    while t < text.len() {
+        if i >= raw.len() {
+            return false;
+        }
+        if raw[i] == text[t] {
+            i += 1;
+            t += 1;
+        } else if text[t].is_ascii_whitespace() && raw[i].is_ascii_whitespace() {
+            while i < raw.len() && raw[i].is_ascii_whitespace() {
+                i += 1;
+            }
+            while t < text.len() && text[t].is_ascii_whitespace() {
+                t += 1;
+            }
+        } else {
+            return false;
+        }
+    }
+    true
+}
+
 /// A definition being collected, before its number is known.
 #[derive(Clone, Debug)]
 struct Draft {
@@ -929,7 +973,17 @@ struct Builder<'a> {
 impl Builder<'_> {
     fn sources(&self, text: &str, start: usize) -> Vec<SourceSpan> {
         let raw = &self.input[self.event_range.clone()];
-        let exact = raw.find(text).map(|at| self.event_range.start + at);
+        // Where the words sit in the source. A plain search answers for anything
+        // the parser hands over verbatim; a code span that ran across a line
+        // break comes back with the break folded to a space, so the text the
+        // reader sees is not a substring of the source and the search has to let
+        // a run of whitespace stand for a run of whitespace. Failing that, the
+        // span's own start is the honest answer -- every character of a
+        // synthesized text maps to the byte it was written at.
+        let exact = raw
+            .find(text)
+            .or_else(|| find_folded(raw, text))
+            .map(|at| self.event_range.start + at);
         let mut spans: Vec<SourceSpan> = Vec::new();
         for (at, c) in text.char_indices() {
             let source = original_at(&self.origins, exact.map_or(self.event_range.start, |base| base + at));
