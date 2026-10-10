@@ -1824,6 +1824,11 @@ pub struct View {
     history: History,
     /// Set while the pointer is dragging the scroll thumb.
     dragging: bool,
+    /// How far down the thumb the pointer took hold of it, in points from its top.
+    /// Kept so a drag carries its grip: centre the thumb on the cursor instead and
+    /// the first tick of the drag moves the document by however far off-centre the
+    /// grab was.
+    thumb_grab: f32,
     /// Horizontal offset currently applied to the wide region under the pointer.
     wide_offset: f32,
     /// The wide region currently being panned or previewed.
@@ -3293,6 +3298,7 @@ fn new_view(path: Option<PathBuf>, extra: Vec<PathBuf>) -> Result<(Box<View>, cr
         stamp: None,
         history: History::default(),
         dragging: false,
+        thumb_grab: 0.0,
         wide_offset: 0.0,
         wide_active: None,
         press_at: None,
@@ -4969,6 +4975,9 @@ impl View {
                 self.pressed = None;
                 if self.thumb_hit(x, y) {
                     self.dragging = true;
+                    if let Some((_, ty, _, th)) = self.thumb_rect() {
+                        self.thumb_grab = (y - TOPBAR_H - ty).clamp(0.0, th);
+                    }
                     self.scroll_to_thumb(y);
                 } else if let Some(i) = self.hot_at(x, y) {
                     self.pressed = Some(i);
@@ -8919,8 +8928,11 @@ impl View {
         let view = (self.content_bottom() - TOPBAR_H).max(1.0);
         let max_scroll = max_scroll_of(self.content_h, self.theme.base, view / scale_of(self.dpi));
         let room = (view - th).max(1.0);
-        let centre = (pointer_y - TOPBAR_H - th * 0.5).clamp(0.0, room);
-        self.scroll = centre / room * max_scroll;
+        // Where the thumb's top goes: the pointer, less how far down the thumb it
+        // took hold. A drag that centres the thumb on the cursor instead moves the
+        // document by the whole distance the grab was off-centre on its first tick.
+        let at = (pointer_y - TOPBAR_H - self.thumb_grab).clamp(0.0, room);
+        self.scroll = at / room * max_scroll;
     }
 
     /// Open every dropped file, each as its own tab, in the order the drop named them;
