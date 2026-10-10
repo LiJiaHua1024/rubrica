@@ -10907,13 +10907,6 @@ fn layout_table(
         thickness: rule * k,
         color: ColorRole::Muted,
     });
-    let header_end = ops.len();
-    let mut header_ops = ops[header_start..header_end].to_vec();
-    if let Some(Op::Rect { h, .. }) = header_ops.first_mut() {
-        *h = head_h * k;
-    }
-    let header_index = table_headers.len();
-    table_headers.push(TableHeaderFragment { y: grid_top, height: head_h, ops: header_ops });
     // The grid's vertical rules, placed here rather than after the rows. The boundaries
     // are the widths themselves rather than `grid_w` divided up: a cell is laid out at
     // its column's measured width, and a rule between two other numbers would sit on
@@ -10926,6 +10919,7 @@ fn layout_table(
     // reading order and never recovers from it. Their height is the grid's, which the
     // rows have only just told, so it is filled in below; their top is the header's
     // bottom, which is where the rows begin and what the op before them says too.
+    let mut row_bottoms: Vec<f32> = Vec::with_capacity(t.rows.len());
     let vrules_at = ops.len();
     let mut edge = left;
     for i in 0..=widths.len() {
@@ -10942,7 +10936,9 @@ fn layout_table(
         });
     }
     for r in &t.rows {
-        y += paint_row(r, y, false, ops, hots, sel);
+        let row_h = paint_row(r, y, false, ops, hots, sel);
+        y += row_h;
+        row_bottoms.push(y);
         // A cell that wraps has no other ending. Without a rule under each row, the
         // second line of one cell reads as the first line of the cell below it -- which
         // is exactly the failure a grid of narrow columns produces on every row, and the
@@ -10962,6 +10958,24 @@ fn layout_table(
             *y1 = y * k;
         }
     }
+    // The header a continuation page redraws: the panel, the two rules, the
+    // header's own words, and the vertical rules' segment down to the first row
+    // -- without which a redrawn header arrives as a bar that ended, its columns
+    // missing. The rules are in the list from `vrules_at`, so the fragment is
+    // cut here rather than before them, and the segment is clipped to the first
+    // row's own bottom because the originals reach the grid's foot.
+    let first_bottom = t.rows.first().map_or(y, |_| row_bottoms[0]);
+    let mut header_ops = ops[header_start..vrules_at + widths.len() + 1].to_vec();
+    for op in header_ops.iter_mut().skip(vrules_at - header_start) {
+        if let Op::Line { y1, .. } = op {
+            *y1 = first_bottom * k;
+        }
+    }
+    if let Some(Op::Rect { h, .. }) = header_ops.first_mut() {
+        *h = head_h * k;
+    }
+    let header_index = table_headers.len();
+    table_headers.push(TableHeaderFragment { y: grid_top, height: head_h, ops: header_ops });
     // The header panel is drawn before its text, so its height can only be filled
     // in once the first row has been measured.
     if let Some(Op::Rect { h, .. }) = ops.get_mut(panel) {
