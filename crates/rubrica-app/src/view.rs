@@ -2469,10 +2469,15 @@ fn find_panel(client_w: f32) -> (f32, f32, f32, f32) {
 /// is placed in physical pixels, which is a different coordinate system even where the
 /// two are the same size; `position_edit` is where they are turned into one another,
 /// and it is the only place that is allowed to multiply anything.
-fn find_edit(client_w: f32) -> (i32, i32, i32, i32) {
+fn find_edit(client_w: f32, line: Pt) -> (i32, i32, i32, i32) {
     let (x, y, w, h) = find_panel(client_w);
     let box_w = (w - 2.0 * FIND_PAD - FIND_COUNT).max(48.0);
-    let box_h = (h - 2.0 * FIND_PAD).max(12.0);
+    // Tall enough for the line the monitor has scaled the words to, plus a
+    // little air above and below it. The words are `line` tall on a 96 dpi
+    // screen and proportionally taller on one that has been scaled -- the same
+    // factor `shape_find_label` puts on the count beside the box, so the two
+    // stay one sentence instead of one shrinking against the other.
+    let box_h = (line + 2.0 * FIND_PAD).max(h - 2.0 * FIND_PAD).max(12.0);
     (
         (x + FIND_PAD) as i32,
         (y + FIND_PAD) as i32,
@@ -7081,7 +7086,8 @@ impl View {
         if let Some(font) = self.edit_font {
             let _ = SendMessageW(edit, WM_SETFONT, Some(WPARAM(font.0 as usize)), Some(LPARAM(1)));
         }
-        let (x, y, w, h) = find_edit((self.client_w - self.content_dx()).max(1.0));
+        let line = self.theme.base * FIND_TEXT * scale_of(self.dpi);
+        let (x, y, w, h) = find_edit((self.client_w - self.content_dx()).max(1.0), line);
         // The bar and the box are drawn in the render target's unit, and the window
         // manager places a child in pixels of its own -- two coordinate systems, and
         // this the one place that turns the first into the second. It is a conversion
@@ -7115,13 +7121,12 @@ impl View {
         // only way to ask for a size that matches the text beside it. Weight 400 is
         // regular; the character set is left to the system, so a reader whose locale is
         // not Latin gets a face that can hold their own words.
-        // A point is 4/3 of a pixel whatever the monitor says, because a pixel is a
-        // 1/96 inch and a point is a 1/72 inch. Letting the dpi into this instead makes
-        // the box's letters half again as tall as the count beside them on any screen
-        // scaled past 100%, and a reader types into a box too small to show it in.
-        // `FIND_TEXT` is the count's own scale (`shape_find_label`): a query and the
-        // number of what it found are one sentence, and two sizes say they are not.
-        let height = -((self.theme.base * FIND_TEXT * 4.0 / 3.0).round() as i32);
+        // A point is 4/3 of a pixel at 96 dpi, and `scale_of` says what the monitor
+        // has made of it since. The count beside the box is scaled by the same
+        // factor -- `shape_find_label` reads this size through it -- so a query and
+        // the number of what it found are one sentence at every scale, instead of
+        // one that shrinks against the other as the display scales.
+        let height = -((self.theme.base * FIND_TEXT * scale_of(self.dpi)).round() as i32);
         let font = CreateFontW(
             height,
             0,
@@ -7240,7 +7245,8 @@ impl View {
         // Stroking the path instead would put a half-unit on each side of it, which on
         // a bar this small reads as a smudge rather than an edge.
         if let Some(frame) = self.frame_brush.clone() {
-            let (ex, ey, ew, eh) = find_edit(panel_w);
+            let line = self.theme.base * FIND_TEXT * scale_of(self.dpi);
+            let (ex, ey, ew, eh) = find_edit(panel_w, line);
             let r = D2D_RECT_F {
                 left: ex as f32 - 1.0,
                 top: ey as f32 - 1.0,
@@ -13033,7 +13039,7 @@ mod tests {
             assert!(cancel.load(Ordering::Relaxed), "do not keep typesetting the abandoned width during the drag");
             let mut rect = RECT::default();
             unsafe { windows::Win32::UI::WindowsAndMessaging::GetWindowRect(window.0.edit.unwrap(), &mut rect).unwrap(); }
-            assert_eq!(rect.right - rect.left, find_edit(width as f32).2);
+            assert_eq!(rect.right - rect.left, find_edit(width as f32, Theme::DESIGN_BASE * FIND_TEXT * 4.0 / 3.0).2);
         }
         unsafe { window.0.finish_resize(window.0.hwnd); }
         assert_eq!(window.0.layout_epoch, epoch + 1, "a heavy resize reflows once at its final width");
@@ -13462,7 +13468,7 @@ mod tests {
                 // number already in pixels, so it is asked about here too.
                 for dx in [0.0, 200.0] {
                     let (px, py, pw, ph) = find_panel(w);
-                    let (ex, ey, ew, eh) = find_edit(w);
+                    let (ex, ey, ew, eh) = find_edit(w, Theme::DESIGN_BASE * FIND_TEXT * 4.0 / 3.0);
                     // Drawn: the box `draw_find` frames, which it fills a pixel proud of
                     // on every side so what shows is a line of exactly one unit.
                     let (fl, ft, fr, fb) = (ex as f32 - 1.0, ey as f32 - 1.0, (ex + ew) as f32 + 1.0, (ey + eh) as f32 + 1.0);
@@ -13831,7 +13837,7 @@ mod tests {
         assert!(!in_find_panel(tx + track / 2.0, py + ph / 2.0, 1080.0), "and the grip is still a press");
         // The box sits inside the panel, with the count's room left at its right -- in
         // the panel's own units, which are the only ones the two of them share.
-        let (ex, ey, ew, eh) = find_edit(1080.0);
+        let (ex, ey, ew, eh) = find_edit(1080.0, Theme::DESIGN_BASE * FIND_TEXT * 4.0 / 3.0);
         assert!(ex as f32 >= px - 1.0, "the box left the bar: {ex}");
         assert!((ex + ew) as f32 <= (px + pw - FIND_COUNT) + 1.0, "the box took the count's room");
         assert!(ey as f32 >= py - 1.0 && (ey + eh) as f32 <= (py + ph) + 1.0);
@@ -13848,7 +13854,7 @@ mod tests {
     fn the_box_lands_inside_the_window_the_manager_will_place_it_in() {
         let k = unit_px(window_target_properties().dpiX);
         for w in [640.0, 1080.0, 1920.0] {
-            let (ex, ey, ew, eh) = find_edit(w);
+            let (ex, ey, ew, eh) = find_edit(w, Theme::DESIGN_BASE * FIND_TEXT * 4.0 / 3.0);
             assert!((ex as f32 + ew as f32) * k <= w + 1.0, "the box went over the edge at {w}px");
             assert!(
                 (ey as f32 + eh as f32) * k <= FIND_TOP + FIND_H + 1.0,
@@ -13862,7 +13868,7 @@ mod tests {
         for w in [180.0, 320.0, 1080.0] {
             let (px, _, pw, _) = find_panel(w);
             assert!(px >= 0.0 && px + pw <= w, "the bar left the window at {w}px: {px}+{pw}");
-            let (ex, _, ew, _) = find_edit(w);
+            let (ex, _, ew, _) = find_edit(w, Theme::DESIGN_BASE * FIND_TEXT * 4.0 / 3.0);
             assert!(ew > 40, "and left nothing to type into at {w}px");
             assert!((ex + ew) as f32 <= w + 1.0, "the box went over the edge at {w}px");
         }
@@ -13874,7 +13880,7 @@ mod tests {
     /// starts reading as somewhere a thing has been typed.
     #[test]
     fn the_box_is_taller_than_the_line_it_holds() {
-        let (_, _, _, eh) = find_edit(1080.0);
+        let (_, _, _, eh) = find_edit(1080.0, Theme::DESIGN_BASE * FIND_TEXT * 4.0 / 3.0);
         let line = Theme::DESIGN_BASE * FIND_TEXT * 4.0 / 3.0;
         assert!(eh as f32 >= line + 6.0, "the box is {eh}px for a {line:.1}px line");
     }
