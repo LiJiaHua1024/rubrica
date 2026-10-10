@@ -12625,12 +12625,6 @@ pub fn build_in_chunks(
     // whatever the last layout left behind, or against nothing. Each window installs
     // the whole table again as it grows; this one is here so that a table always
     // exists, not so that the first window has one.
-    // A table is installed before anything is typeset against one, and a document whose
-    // blocks are all in a window that has not come round yet -- a file that is nothing
-    // but a footnote definition has none at all -- would otherwise be set against
-    // whatever the last layout left behind, or against nothing. Each window installs
-    // the whole table again as it grows; this one is here so that a table always
-    // exists, not so that the first window has one.
     font.begin_layout(
         styles
             .iter()
