@@ -1878,6 +1878,15 @@ impl Class {
             // forced `\limits` on it means: `\overset{a}{=} b` reads as a relation.
             Node::Stack { base, .. } => Class::of(sole(base)),
             Node::Arrow { .. } => Class::Rel,
+            // A hand-sized delimiter keeps the class its role names: `\bigm|` is the
+            // relation the writer typed it as, not the ordinary atom the fallback
+            // would make it -- `a \bigm| b` set with no air at all between the three.
+            Node::Big { role, .. } => match role {
+                BigRole::Open => Class::Open,
+                BigRole::Close => Class::Close,
+                BigRole::Rel => Class::Rel,
+                BigRole::Ord => Class::Ord,
+            },
             _ => Class::Ord,
         }
     }

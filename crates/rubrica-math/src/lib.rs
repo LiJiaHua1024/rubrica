@@ -1599,4 +1599,14 @@ mod tests {
         near(hx, f.width - 5.0, "the head's ink ends at the box's right edge");
     }
 
+    /// A hand-sized delimiter keeps the class its role names: `\bigm|` is the
+    /// relation the writer typed it as. Read as the ordinary atom the fallback
+    /// made it, `a \bigm| b` set as `a∣b` -- no air at all between the three,
+    /// where TeX gives a relation its thick muskip on both sides.
+    #[test]
+    fn a_hand_sized_relation_delimiter_gets_the_relations_air() {
+        let f = set(r"a \bigm| b", 10.0, false, &mut Mock::mathy());
+        near(f.width, 15.0 + 2.0 * (5.0 / 18.0) * 10.0, "a thick muskip on both sides");
+    }
+
 }
