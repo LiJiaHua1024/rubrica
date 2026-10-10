@@ -63,7 +63,7 @@ use windows::Win32::System::Com::{
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::System::Registry::{RRF_RT_DWORD, RegGetValueW, HKEY_CURRENT_USER};
 use windows::Win32::UI::HiDpi::{
-    DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2, GetDpiForWindow, SetProcessDpiAwarenessContext,
+    DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2, GetDpiForWindow, GetSystemMetricsForDpi, SetProcessDpiAwarenessContext,
 };
 use windows::Win32::UI::Input::KeyboardAndMouse::{
     GetKeyState, ReleaseCapture, SetCapture, SetFocus, VK_CONTROL, VK_LBUTTON, VK_O, VK_UP,
@@ -3865,8 +3865,14 @@ unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM)
         // the page's first and last letters would sit off the monitor's edge.
         WM_NCCALCSIZE => {
             if wp.0 != 0 && IsZoomed(hwnd).as_bool() {
-                let frame =
-                    GetSystemMetrics(SM_CXSIZEFRAME) + GetSystemMetrics(SM_CXPADDEDBORDER);
+                // Measured for this window's monitor rather than the primary one:
+                // a maximised window on a display scaled past 100% has a frame a
+                // different number of pixels wide from the one the system reports
+                // for the desktop, and the wrong number leaves the page's first
+                // and last letters either off the edge or short of it.
+                let dpi = GetDpiForWindow(hwnd);
+                let frame = GetSystemMetricsForDpi(SM_CXSIZEFRAME, dpi)
+                    + GetSystemMetricsForDpi(SM_CXPADDEDBORDER, dpi);
                 let r = &mut *(lp.0 as *mut RECT);
                 r.left += frame;
                 r.top += frame;
