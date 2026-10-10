@@ -379,7 +379,7 @@ impl Palette {
                 // highlight that stayed below it would read as text that had gone off.
                 keyword: Rgb { r: 0.78, g: 0.61, b: 0.94 },
                 string: Rgb { r: 0.87, g: 0.69, b: 0.51 },
-                comment: Rgb { r: 0.52, g: 0.58, b: 0.55 },
+                comment: Rgb { r: 0.62, g: 0.66, b: 0.62 },
                 number: Rgb { r: 0.55, g: 0.79, b: 0.75 },
                 ty: Rgb { r: 0.62, g: 0.80, b: 0.58 },
                 // The strip is darker than the page, the resting pill lighter than the
@@ -394,7 +394,7 @@ impl Palette {
                 dark,
                 bg: Rgb { r: 0.977, g: 0.974, b: 0.966 },
                 text: Rgb { r: 0.13, g: 0.135, b: 0.15 },
-                muted: Rgb { r: 0.42, g: 0.44, b: 0.47 },
+                muted: Rgb { r: 0.36, g: 0.38, b: 0.41 },
                 accent: Rgb { r: 0.12, g: 0.35, b: 0.66 },
                 code_bg: Rgb { r: 0.937, g: 0.935, b: 0.928 },
                 page_surface: Rgb { r: 0.995, g: 0.992, b: 0.982 },
@@ -404,7 +404,7 @@ impl Palette {
                 // never pass for one another at a glance.
                 keyword: Rgb { r: 0.45, g: 0.20, b: 0.55 },
                 string: Rgb { r: 0.56, g: 0.28, b: 0.13 },
-                comment: Rgb { r: 0.40, g: 0.46, b: 0.42 },
+                comment: Rgb { r: 0.32, g: 0.38, b: 0.34 },
                 number: Rgb { r: 0.09, g: 0.40, b: 0.44 },
                 ty: Rgb { r: 0.16, g: 0.40, b: 0.22 },
                 // The same relationship the night palette has, the other way up: a strip
@@ -15957,5 +15957,67 @@ mod document_interaction_tests {
         // has a place to go.
         assert_eq!(bubble_cut(&[200.0], 120.0, 12.0), (0, Some(108.0)));
         assert_eq!(bubble_cut(&[], 120.0, 12.0), (0, None));
+    }
+
+    /// Every ink the window draws is drawn on a surface of its own palette, and a
+    /// reader has to be able to read it there. The WCAG AA bar for body text is
+    /// 4.5:1; the inks that only have to be found -- a scrollbar thumb -- are not
+    /// measured here, but words are.
+    #[test]
+    fn every_ink_clears_the_contrast_bar_on_the_surface_it_is_drawn_on() {
+        fn luminance(c: &Rgb) -> f64 {
+            let one = |v: f64| {
+                if v <= 0.03928 { v / 12.92 } else { ((v + 0.055) / 1.055).powf(2.4) }
+            };
+            0.2126 * one(f64::from(c.r)) + 0.7152 * one(f64::from(c.g))
+                + 0.0722 * one(f64::from(c.b))
+        }
+        fn ratio(a: &Rgb, b: &Rgb) -> f64 {
+            let (hi, lo) = {
+                let (x, y) = (luminance(a), luminance(b));
+                if x > y { (x, y) } else { (y, x) }
+            };
+            (hi + 0.05) / (lo + 0.05)
+        }
+        for palette in [Palette::of(false), Palette::of(true)] {
+            let which = if palette.dark { "night" } else { "day" };
+            // Words on the page.
+            assert!(
+                ratio(&palette.text, &palette.bg) >= 4.5,
+                "{which} page text {:.2}",
+                ratio(&palette.text, &palette.bg),
+            );
+            // The status bar, the top bar and the find bar are muted ink on the
+            // strip; the scrollbar thumb is drawn in the same one.
+            assert!(
+                ratio(&palette.muted, &palette.tab_strip) >= 4.5,
+                "{which} bar text {:.2}",
+                ratio(&palette.muted, &palette.tab_strip),
+            );
+            // A comment is ink a reader has to read, on the panel behind it.
+            assert!(
+                ratio(&palette.comment, &palette.code_bg) >= 4.5,
+                "{which} code comment {:.2}",
+                ratio(&palette.comment, &palette.code_bg),
+            );
+            // And the four code inks, each against the panel and against the page.
+            for (name, ink) in [
+                ("keyword", &palette.keyword),
+                ("string", &palette.string),
+                ("number", &palette.number),
+                ("type", &palette.ty),
+            ] {
+                assert!(
+                    ratio(ink, &palette.code_bg) >= 4.5,
+                    "{which} {name} {:.2}",
+                    ratio(ink, &palette.code_bg),
+                );
+                assert!(
+                    ratio(ink, &palette.bg) >= 4.5,
+                    "{which} {name} on the page {:.2}",
+                    ratio(ink, &palette.bg),
+                );
+            }
+        }
     }
 }
