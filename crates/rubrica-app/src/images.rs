@@ -172,8 +172,11 @@ impl ImageStore {
     /// The size is read from the header, which costs nothing, while the decode asks the
     /// device for `w * h * 4` bytes whatever the file weighs on disk -- and a flat
     /// 20 000 x 20 000 PNG is a hundred kilobytes of file asking for 1.6 GB of texture.
-    /// A figure past the cap degrades to its alt text, which is a thing a reader can
-    /// still read.
+    /// A figure past the cap is left out of the page rather than degraded to its alt
+    /// text: a block's text and its span offsets are built before any of this runs, so
+    /// swapping words in for a placeholder would move every later offset with it. The
+    /// caller reports the figure once and leaves the placeholder to read as the prose
+    /// around it.
     fn size_of(frame: &IWICBitmapFrameDecode) -> Option<(u32, u32)> {
         let (mut w, mut h) = (0u32, 0u32);
         unsafe { frame.GetSize(&mut w, &mut h).ok()? };
