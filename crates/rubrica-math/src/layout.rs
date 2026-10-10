@@ -283,14 +283,12 @@ impl Engine<'_> {
             FALLBACK_SCRIPT_SCRIPT_PERCENT,
         );
         let mut size = st.size;
-        let mut level = st.level;
-        for _ in 0..steps {
+        for level in st.level..st.level.saturating_add(steps) {
             size = match level {
                 0 => size * one,
                 1 => size * two,
                 _ => size,
             };
-            level += 1;
         }
         size
     }
