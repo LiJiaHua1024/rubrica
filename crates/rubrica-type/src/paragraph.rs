@@ -32,6 +32,11 @@ pub struct Node {
     pub text: Range<usize>,
     pub style: StyleId,
     pub advance: Pt,
+    /// The width this box measured before punctuation compression shortened it.
+    /// Equal to `advance` for every box but a mark that gave up its blank side,
+    /// and read back where the glyph's own extent is what matters -- hanging
+    /// punctuation, whose ink was never scaled down with the advance.
+    pub natural: Pt,
     /// Role of the first code point. It is the right-hand side of the recipe at the
     /// boundary *before* this box; the left-hand side of the boundary after it is read
     /// from the box's last character, which a quoted pair can make a different script
@@ -553,6 +558,7 @@ pub fn build(
                 text: range,
                 style,
                 advance: natural * (1.0 - compression),
+                natural,
                 role,
                 punctuation,
                 ascent,
@@ -586,6 +592,7 @@ pub fn build(
                 text: seg.end..seg.end,
                 style,
                 advance: opts.hyphen_width,
+                natural: opts.hyphen_width,
                 role: Role::Western,
                 punctuation: None,
                 ascent: 0.0,

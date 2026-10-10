@@ -23,12 +23,28 @@ pub struct Placed {
     pub bidi_level: u8,
 }
 
+/// The width a line is set to.
+///
+/// A closing mark that passes the measure may hang into the margin, but the
+/// allowance is not room to stretch into: set at `target + hang` the line grew
+/// past its own natural width, the slack went out into the joins, and the mark
+/// was pushed further past the measure by the very budget meant to excuse it.
+/// The line is therefore set at its natural width whenever that is what the
+/// allowance admits.
+fn set_width(line: &Line) -> Pt {
+    if line.natural > line.target {
+        (line.target + line.hang).min(line.natural)
+    } else {
+        line.target
+    }
+}
+
 /// Lay out one line at its target width. Ragged lines get natural widths -- unless
 /// their natural width is already past the measure, which no amount of stretch
 /// licence covers.
 pub fn place(para: &Paragraph, line: &Line) -> Vec<Placed> {
     let items = &para.items;
-    let target = if line.natural > line.target { line.target + line.hang } else { line.target };
+    let target = set_width(line);
     let delta = f64::from(target) - f64::from(line.natural);
     // Infinite stretch makes *leftover* space free -- that is what keeps a final line
     // ragged -- but it absorbs no ink. A line whose own width already passes the
@@ -175,7 +191,7 @@ impl<'a> LinePlacer<'a> {
             slot_levels.push(level);
         }
         let width: Pt = slots.iter().map(|s| s.w).sum();
-        let target = if line.natural > line.target { line.target + line.hang } else { line.target };
+        let target = set_width(line);
         // A right-to-left paragraph is aligned at its right edge, so a line wider
         // than its measure overflows to the *left* -- into the cell's own padding,
         // where a heading of the right-to-left world belongs. Clamping at zero sent

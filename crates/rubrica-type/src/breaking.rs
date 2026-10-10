@@ -273,21 +273,31 @@ fn hanging_width(para: &Paragraph, items: &[Item], line: Range<usize>, allowance
     if allowance <= 0.0 {
         return 0.0;
     }
+    // The mark's advance was shortened by the blank side it gave up, but the ink
+    // was not scaled with it: the glyph is drawn at its own extent, so what may
+    // pass the measure is the width the box measured before the compression.
+    // Reading the compressed advance let a theme that both compresses and hangs
+    // excuse less overflow than the mark it was excusing.
     let mut total = 0.0;
     for item in line.rev() {
         match items[item] {
+            // `\parfillskip`, and the glue before a hard break, stay inside the
+            // line's range: they are what makes the line ragged, not its edge.
+            // The walk used to stop at them, so the final line never received an
+            // allowance even when it ended in a closing mark.
+            Item::Glue { stretch, .. } if stretch >= INFINITY / 2.0 => {}
             Item::Box { node } => {
                 let node = para.node(node);
                 if node.punctuation != Some(crate::classify::PunctuationKind::Closing) {
                     break;
                 }
-                total += node.advance;
+                total += f64::from(node.natural);
             }
             Item::Glue { breakable: false, .. } => {}
             _ => break,
         }
     }
-    total.min(allowance)
+    total.min(f64::from(allowance)) as Pt
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -303,8 +313,16 @@ fn score(
     opts: &BreakOptions,
 ) -> Option<(i32, u8, f64)> {
     // Hanging punctuation is an allowance, not a reason to stretch every short line.
-    // It only enlarges the target when the line would otherwise be overfull.
-    let effective_target = if natural > target { target + allowance } else { target };
+    // It only enlarges the target when the line would otherwise be overfull -- and
+    // never past the line's own natural width: the allowance exists to excuse a
+    // closing mark that passes the measure, not to invite the line to grow into
+    // air that then has to be distributed, mark pushed further out by the very
+    // budget meant to excuse it.
+    let effective_target = if natural > target {
+        (target + allowance).min(natural)
+    } else {
+        target
+    };
     let delta = f64::from(effective_target) - f64::from(natural);
     let st = f64::from(stretch);
     // In a tight box shrinking is not a way out of an overfull line, so the solver

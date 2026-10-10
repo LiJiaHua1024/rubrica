@@ -1539,3 +1539,58 @@ fn a_blank_line_is_one_line_not_two() {
     let lines: Vec<String> = plan.lines.iter().map(|l| text_of(&para, src, l)).collect();
     assert_eq!(lines, vec!["a".to_string(), String::new(), "b".to_string()]);
 }
+
+#[test]
+fn a_hanging_line_is_set_at_its_natural_width() {
+    // The allowance excuses a closing mark that passes the measure; it is not
+    // room to stretch into. Set at target + hang, the line grew past its own
+    // natural width, the slack went out into the ideograph joins, and the mark
+    // was pushed further past the measure by the very budget meant to excuse it.
+    let text = "甲乙。丙丁";
+    let spacing = Spacing::for_size(SIZE);
+    let mut measure = MonospaceMeasure { size: SIZE, factor: 0.5 };
+    let mut options = BreakOptions::new(1.25 * SIZE);
+    options.hanging_punctuation = 0.5 * SIZE;
+    let (para, plan) = typeset(text, &spacing, StyleId(0), &[], &options, &mut measure);
+    let first = &plan.lines[0];
+    assert!(first.hang > 0.0, "the closing mark received no allowance");
+    let width = line_width(&place(&para, first));
+    assert_eq!(width, first.natural, "the hanging line was stretched past its own width");
+    assert!(width <= first.target + first.hang + 0.01, "the line left its allowance behind");
+}
+
+#[test]
+fn a_compressed_mark_hangs_by_the_width_it_measured() {
+    // The mark's advance was shortened by the blank side it gave up, but the ink
+    // was not scaled with it. Read from the compressed advance, a theme that both
+    // compresses and hangs excused less overflow than the mark it was excusing.
+    let text = "甲乙。丙丁";
+    let mut spacing = Spacing::for_size(SIZE);
+    spacing.punctuation_compression = 0.5;
+    let mut measure = MonospaceMeasure { size: SIZE, factor: 0.5 };
+    let mut options = BreakOptions::new(1.0 * SIZE);
+    options.hanging_punctuation = SIZE;
+    let (para, plan) = typeset(text, &spacing, StyleId(0), &[], &options, &mut measure);
+    let first = &plan.lines[0];
+    let first_text = text_of(&para, text, first);
+    assert!(first_text.ends_with('。'), "line did not keep the mark: {first_text:?}");
+    // Half an em measured, a quarter charged: the allowance is the half.
+    assert!((first.hang - 0.5 * SIZE).abs() < 0.01, "allowance was {}", first.hang);
+}
+
+#[test]
+fn a_final_line_hangs_its_closing_mark_too() {
+    // `\parfillskip` stays inside the last line's range, and the walk used to
+    // stop at it: the final line never received an allowance even when it ended
+    // in a closing mark.
+    let text = "甲乙。";
+    let spacing = Spacing::for_size(SIZE);
+    let mut measure = MonospaceMeasure { size: SIZE, factor: 0.5 };
+    let mut options = BreakOptions::new(1.0 * SIZE);
+    options.hanging_punctuation = SIZE;
+    let (para, plan) = typeset(text, &spacing, StyleId(0), &[], &options, &mut measure);
+    let last = plan.lines.last().expect("the paragraph produced a line");
+    assert!(last.hang > 0.0, "the final line received no allowance");
+    let width = line_width(&place(&para, last));
+    assert_eq!(width, last.natural, "the final line was stretched past its own width");
+}
