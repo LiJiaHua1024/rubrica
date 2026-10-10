@@ -117,8 +117,12 @@ fn plain_scan(text: &str, s: &Spec) -> Vec<(Range<usize>, ColorRole)> {
             continue;
         }
         // `@media`, `@override`, `@Controller`: a directive, wherever it stands.
+        // The `#` half belongs to the families that spell directives with one --
+        // `#region`, `#if` -- and not to CSS, where a `#` opens a hex colour or
+        // an id selector and painted `#fff` in the directive's ink beside `#333`
+        // in the ordinary one.
         if s.at_rule
-            && (ch == b'@' || ch == b'#')
+            && (ch == b'@' || (ch == b'#' && s.hash_directive))
             && b.get(i + 1).is_some_and(|c| c.is_ascii_alphabetic())
         {
             let end = word_end(text, i + 1);
@@ -401,6 +405,10 @@ struct Spec {
     preproc: bool,
     /// `@media`, `@override`: an at-sign names a directive.
     at_rule: bool,
+    /// A `#` names a directive too, as the C family's `#region` and `#if` do. Not
+    /// CSS's: there a `#` opens a hex colour or an id selector, and reading it as
+    /// a directive gave one stylesheet two inks for one kind of value.
+    hash_directive: bool,
     /// A capital letter names a type.
     capitals: bool,
     /// `SELECT` is `select`.
@@ -424,6 +432,7 @@ const BASE: Spec = Spec {
     types: &[],
     preproc: false,
     at_rule: false,
+    hash_directive: false,
     capitals: true,
     insensitive: false,
     keys: false,
@@ -647,6 +656,7 @@ const CS: Spec = Spec {
     keywords: KW_CS,
     types: TY_CS,
     at_rule: true,
+    hash_directive: true,
     ..BASE
 };
 
@@ -910,6 +920,27 @@ mod tests {
         assert_eq!(marked("css", "@media (max-width: 600px) { a { color: red } }}").first(), Some(&("@media", ColorRole::Keyword)));
         assert_eq!(marked("css", "@media"), vec![("@media", ColorRole::Keyword)]);
         assert_eq!(marked("java", "@Override"), vec![("@Override", ColorRole::Keyword)]);
+        // The C family spells its directives with a hash as well, and there the
+        // sign is what names one.
+        assert_eq!(marked("cs", "#region Docs").first(), Some(&("#region", ColorRole::Keyword)));
+    }
+
+    /// CSS's hash is not a directive's sign: it opens a hex colour or an id
+    /// selector. Read as a directive, `#fff` came out in the directive's ink
+    /// beside `#333` in the ordinary one -- two colours for one kind of value in
+    /// one stylesheet.
+    #[test]
+    fn a_css_hash_is_a_colour_rather_than_a_directive() {
+        for src in ["a { color: #fff }", "a { color: #abc }", "#head { color: red }"] {
+            let marked = marked("css", src);
+            assert!(
+                marked.iter().all(|(t, c)| !t.starts_with('#') || *c != ColorRole::Keyword),
+                "{src:?} painted a hash as a directive: {marked:?}"
+            );
+        }
+        // The colour keeps its digits either way -- the sign is simply not the
+        // start of a keyword any more.
+        assert_eq!(marked("css", "color: #333").last(), Some(&("333", ColorRole::Number)));
     }
 
     #[test]
