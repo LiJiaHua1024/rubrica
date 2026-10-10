@@ -1195,9 +1195,11 @@ fn a_join_never_gives_back_more_air_than_it_holds() {
 
 #[test]
 fn no_line_hangs_past_the_measure() {
-    // The ideograph join shrinks, so a line wider than the column is not "overfull"
-    // to the solver -- but the painter still has to take that ink back, or the page
-    // hangs into the margin. The final line used to be exempt from both checks.
+    // The inter-script join and the word spaces shrink, so a line wider than the
+    // column is not "overfull" to the solver -- but the painter still has to take
+    // that ink back, or the page hangs into the margin. The final line used to be
+    // exempt from both checks. (The ideograph join itself offers no shrink at
+    // all: two Han characters at natural width already touch.)
     let text = "引擎在 Han 与 Latin 的边界自动插入约四分之一 em 的可调间距，作者不需要手动加空格：使用Rust编写、Direct2D绘制、以及Microsoft YaHei渲染中文。";
     let column = 13.0 * SIZE;
     let (para, plan) = set(text, column);
