@@ -8325,7 +8325,19 @@ impl View {
             })
     }
     fn thumb_rect(&self) -> Option<(f32, f32, f32, f32)> {
-        thumb_rect(self.content_h, self.theme.base, self.client_w, (self.content_bottom() - TOPBAR_H).max(1.0), self.scroll, self.dpi)
+        // The thumb is drawn in window coordinates, so the width it is placed
+        // against is the content area's rather than the client's: with the
+        // workspace tree open, the client runs a tree's width further right
+        // than the edge the thumb has to sit against.
+        let width = (self.client_w - self.content_dx()).max(1.0);
+        thumb_rect(
+            self.content_h,
+            self.theme.base,
+            width,
+            (self.content_bottom() - TOPBAR_H).max(1.0),
+            self.scroll,
+            self.dpi,
+        )
     }
 
     fn tab_title(tab: &Tab) -> String {
