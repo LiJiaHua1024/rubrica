@@ -1245,3 +1245,23 @@ fn emphasis_never_pairs_across_a_code_span_or_a_link() {
     assert_eq!(&b.text[b.actions[0].range.clone()], "\u{7B2C}\u{201C}\u{4E00}\u{201D}\u{7AE0}");
     assert!(b.spans.iter().any(|s| s.style.contains(InlineStyle::STRONG)));
 }
+
+#[test]
+fn two_objects_left_adjacent_stay_two_objects() {
+    // Two figures with nothing between them, in a paragraph that also carries an
+    // emphasis pair the Chinese relaxation has to cut. The spans are merged once
+    // the marks are gone, and an object is found again by its exact range: merged,
+    // the range matched no record at all and both figures were set as their
+    // placeholder character, which no face draws.
+    let src = "\u{9501}\u{6B7B}\u{5728}**\u{201C}\u{7532}\u{201D}**![a](x.png)![b](y.png)\n";
+    let b = &Document::parse(src).blocks[0];
+    assert_eq!(b.objects.len(), 2, "{b:?}");
+    for o in &b.objects {
+        assert!(
+            b.spans.iter().any(|s| s.range == o.range && s.style.contains(InlineStyle::OBJECT)),
+            "no span of its own for the object at {:?}: {:?}",
+            o.range,
+            b.spans.iter().map(|s| (&b.text[s.range.clone()], s.style)).collect::<Vec<_>>()
+        );
+    }
+}

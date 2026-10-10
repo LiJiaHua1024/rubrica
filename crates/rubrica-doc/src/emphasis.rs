@@ -283,14 +283,22 @@ fn shift_range(cuts: &[Range<usize>], range: Range<usize>) -> Range<usize> {
 
 /// Drop empty runs and join neighbours of one style, so the spans keep tiling the
 /// text the way every writer here assumes they do.
+///
+/// Object spans never join. An object is found again by its exact range -- the
+/// renderer looks the range up in the block's object table -- so two objects left
+/// adjacent by a cut have to stay two spans: merged, the range matches no record
+/// and both objects are set as their placeholder character, which no face draws.
 fn merge(spans: Vec<Span>) -> Vec<Span> {
     let mut out: Vec<Span> = Vec::with_capacity(spans.len());
     for s in spans {
         if s.range.start >= s.range.end {
             continue;
         }
+        let joins = !s.style.contains(InlineStyle::OBJECT);
         match out.last_mut() {
-            Some(prev) if prev.style == s.style && prev.range.end == s.range.start => prev.range.end = s.range.end,
+            Some(prev) if joins && prev.style == s.style && prev.range.end == s.range.start => {
+                prev.range.end = s.range.end
+            }
             _ => out.push(s),
         }
     }
