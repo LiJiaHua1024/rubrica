@@ -490,8 +490,13 @@ pub fn build(
         let ws_start = seg.start + lead + core.len();
         let trailing = &text[ws_start..seg.end];
 
+        // Whether the leading run already ended a line: `emit_space` says so from
+        // the run itself, which is the same answer `*mandatory` carries. Only one
+        // of the two may speak, or a whitespace-only segment -- a blank line --
+        // breaks twice and is set as two blank lines.
+        let mut forced = false;
         if !slice[..lead].is_empty() {
-            emit_space(&mut p, &mut prev, &slice[..lead], opts);
+            forced = emit_space(&mut p, &mut prev, &slice[..lead], opts);
         }
 
         if !core.is_empty() {
@@ -559,7 +564,7 @@ pub fn build(
         }
 
         let split_here = hyphen_set.binary_search(&seg.end).is_ok() && trailing.is_empty();
-        if *mandatory {
+        if *mandatory && !forced {
             // `\hfil\break`, which is what a forced break is in TeX: the line ends
             // where the author said so and is then left flush at its natural width.
             // Without the filler the line is justified like any other, and because a
@@ -636,19 +641,21 @@ fn is_stripped(ch: char) -> bool {
 
 /// Emit the item for a run of literal whitespace, and record that the following
 /// box needs no script-recipe glue because this space already separates them.
-fn emit_space(p: &mut Paragraph, prev: &mut Option<char>, ws: &str, opts: &BuildOptions) {
+/// Returns whether this run ended a line, so that a caller holding the same fact
+/// as a flag does not end it a second time.
+fn emit_space(p: &mut Paragraph, prev: &mut Option<char>, ws: &str, opts: &BuildOptions) -> bool {
     // A cut that ends a segment is normally told to be mandatory by UAX #14, and
     // that is what [`build`] acts on; this is the same answer worked out from the
     // run itself, for a caller that hands over a break list without the flag. Every
     // mandatory separator UAX #14 can name, not only `\n`: a CR, a VT, a NEL, a
     // line or paragraph separator is a line the author ended, just spelled
     // differently.
-    if ws.contains(['\n', '\r', '\u{b}', '\u{c}', '\u{85}', '\u{2028}', '\u{2029}']) {
-        // `\hfil\break`, which is what a forced break is in TeX: the line ends where
-        // the author said so and is then left flush at its natural width. Without the
-        // filler the line is justified like any other, and because a Chinese line's
-        // glue is stretchable anywhere, three characters after a hard break would be
-        // spread across the whole column.
+    let forced = if ws.contains(['\n', '\r', '\u{b}', '\u{c}', '\u{85}', '\u{2028}', '\u{2029}']) {
+        // `\hfil\break`, which is what a forced break is in TeX: the line ends
+        // where the author said so and is then left flush at its natural width.
+        // Without the filler the line is justified like any other, and because a
+        // Chinese line's glue is stretchable anywhere, three characters after a
+        // hard break would be spread across the whole column.
         p.items.push(Item::Glue {
             base: 0.0,
             stretch: INFINITY,
@@ -656,6 +663,7 @@ fn emit_space(p: &mut Paragraph, prev: &mut Option<char>, ws: &str, opts: &Build
             breakable: true,
         });
         p.items.push(Item::Penalty { penalty: i32::MIN, forced: true, width: 0.0, hyphen: None });
+        true
     } else {
         let r = opts.spacing.latin_space;
         // One space's recipe, or the run's own length worth of it. Breaking anywhere
@@ -670,8 +678,10 @@ fn emit_space(p: &mut Paragraph, prev: &mut Option<char>, ws: &str, opts: &Build
             shrink: (r.shrink * n).min(r.base * n),
             breakable: true,
         });
-    }
+        false
+    };
     *prev = None;
+    forced
 }
 
 /// A break the source offers where its author wrote nothing: the line may split

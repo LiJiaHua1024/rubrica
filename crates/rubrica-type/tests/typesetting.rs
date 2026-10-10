@@ -1527,3 +1527,15 @@ fn a_piece_with_no_soft_items_still_splits_and_terminates() {
         .sum();
     assert_eq!(total, src.len(), "the run survived the split whole");
 }
+
+#[test]
+fn a_blank_line_is_one_line_not_two() {
+    // A whitespace-only segment between two texts: the run itself says it ends a
+    // line, and UAX #14 says the same of the cut that follows it. The two paths
+    // used to answer the same break twice, so every blank line in a code block
+    // was set as two and the block grew a line of air it never had.
+    let src = "a\n\nb";
+    let (para, plan) = set(src, 8.0 * SIZE);
+    let lines: Vec<String> = plan.lines.iter().map(|l| text_of(&para, src, l)).collect();
+    assert_eq!(lines, vec!["a".to_string(), String::new(), "b".to_string()]);
+}
