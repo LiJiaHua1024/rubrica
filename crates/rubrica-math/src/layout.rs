@@ -1200,7 +1200,14 @@ impl Engine<'_> {
         } else {
             self.c(constant::ACCENT_BASE_HEIGHT, st.size, 0.45)
         };
-        let y = -bb.ascent - (bb.ascent - lift).max(0.0);
+        // The mark's own baseline, lifted by the excess of the base's ink over the
+        // tallest base that needs no lift. A combining accent carries its ink above
+        // its own baseline -- the face draws it so that sitting on the base's
+        // baseline puts the ink just clear of `accentBaseHeight` -- so the lift is
+        // the whole of the adjustment. Charging the base's ascent on top of it as
+        // well set every accent a further full ascent higher: a hat over `x` hung
+        // half an em above the letter, and the formula's line grew to match.
+        let y = -(bb.ascent - lift).max(0.0);
         // The wider drawing is asked for only once the base is actually wider than the
         // natural mark. Over a single letter the two are the same shape, and asking
         // regardless would let a face that happens to have variants swap the design's

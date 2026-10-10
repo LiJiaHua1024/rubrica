@@ -897,8 +897,10 @@ mod tests {
         near(g[1].1, 5.0, "and the second follows it along the base");
         // `flattenedAccentBaseHeight` rather than `accentBaseHeight`: a flattened mark
         // tolerates a taller base before it has to be lifted, so it sits lower here.
-        near(g[0].2, -8.0, "the flattened accent's own baseline");
-        near(f.ascent, 15.0, "the box still clears the natural mark's height");
+        // The lift is the excess alone -- 7 of base over 6 of constant -- because the
+        // mark's own ink already floats a constant above its baseline.
+        near(g[0].2, -1.0, "the flattened accent's own baseline");
+        near(f.ascent, 8.0, "the box still clears the natural mark's height");
     }
 
     #[test]
@@ -908,8 +910,25 @@ mod tests {
         assert!(m.widened.is_empty(), "no wider drawing was ever asked for");
         let (x, y, _) = one(&f, "\u{302}");
         near(x, 2.5, "the natural mark, centred on its base");
-        near(y, -9.5, "and lifted by the smaller of the two constants");
+        // 7 of base over the 4.5 constant, and nothing more: the combining mark's
+        // ink sits that far above its own baseline by the face's own drawing.
+        near(y, -2.5, "and lifted by the smaller of the two constants");
         assert!(grown(&f).is_empty(), "one shaped run, nothing assembled");
+    }
+
+    /// The lift is the base's excess over the constant and nothing else. Charging
+    /// the base's ascent on top of it as well set every accent a further full
+    /// ascent higher -- a hat over a letter hung half an em above it, and the
+    /// formula's line grew to match.
+    #[test]
+    fn an_accent_is_lifted_by_the_excess_alone() {
+        let mut m = Mock::mathy();
+        let f = set("\\hat{x}", 10.0, false, &mut m);
+        let (_, y, _) = one(&f, "\u{302}");
+        // A base whose ink tops out at 0.7em against a 0.45em constant: 0.25em of
+        // lift, not the 0.95em the double charge produced.
+        near(y, -2.5, "the mark's baseline");
+        near(f.ascent, 9.5, "and the box reserves the mark's own height above it");
     }
 
     #[test]
