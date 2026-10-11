@@ -1633,22 +1633,33 @@ fn split_definitions(b: Block, breaks: Vec<usize>) -> Vec<Block> {
             pieces.push(part);
         }
     }
+    // A paragraph every line of which is an empty definition has neither a term nor a
+    // definition to show; it is still the author's text, so it stays a paragraph rather
+    // than vanishing.
+    if pieces.is_empty() {
+        return vec![b];
+    }
     pieces
 }
+
+/// The blanks a line may open with: the indent the author left, and the fold character
+/// a soft break leaves when the reader asked for breaks to be kept.
+const DEFINITION_INDENT: [char; 2] = [' ', '\n'];
 
 /// True for a line that opens with a colon and a space, which is the whole syntax.
 fn opens_a_definition(text: &str, range: &std::ops::Range<usize>) -> bool {
     let body = &text[range.clone()];
-    let t = body.trim_start_matches(' ');
+    let t = body.trim_start_matches(DEFINITION_INDENT);
     t.starts_with(DEFINITION_OPEN) || t == ":"
 }
 
-/// How far into the line the definition's own text begins, past whatever indent the
-/// author left and past the colon.
+/// How far into the line the definition's own text begins: past the indent and past the
+/// colon, and past the space only where the author wrote one -- a bare colon is the
+/// whole of the syntax and has no space to step over.
 fn leading_definition(text: &str, range: &std::ops::Range<usize>) -> usize {
     let body = &text[range.clone()];
-    let indent = body.len() - body.trim_start_matches(' ').len();
-    indent + DEFINITION_OPEN.len()
+    let indent = body.len() - body.trim_start_matches(DEFINITION_INDENT).len();
+    indent + if body[indent..].starts_with(DEFINITION_OPEN) { DEFINITION_OPEN.len() } else { 1 }
 }
 
 /// One line of a folded paragraph, standing on its own: its slice of the text, and
@@ -2337,5 +2348,25 @@ mod source_span_tests {
         let src = "\u{feff}# Hi\n";
         let b = &Document::parse(src).blocks[0];
         assert_eq!(crate::source_at(&b.sources, 0), Some(5));
+    }
+
+    /// A bare colon was read as a definition opener, but `leading_definition` stepped
+    /// past a `: ` the line did not have, so the piece came back empty and the whole
+    /// paragraph went with it.
+    #[test]
+    fn a_bare_colon_line_cannot_make_a_paragraph_vanish() {
+        assert!(!Document::parse(":\n").blocks.is_empty());
+        assert!(!Document::parse(":\n:\n").blocks.is_empty());
+        // And the newline policy must not decide whether a block survives.
+        for src in ["$$:$$\n:\n", "#$$:x$$\n:\n"] {
+            let merged = Document::parse(src);
+            let kept = Document::parse_with(src, ParseOptions { keep_line_breaks: true });
+            assert_eq!(merged.blocks.len(), kept.blocks.len(), "{src}");
+            assert_eq!(
+                merged.blocks.iter().map(|b| b.kind).collect::<Vec<_>>(),
+                kept.blocks.iter().map(|b| b.kind).collect::<Vec<_>>(),
+                "{src}"
+            );
+        }
     }
 }
