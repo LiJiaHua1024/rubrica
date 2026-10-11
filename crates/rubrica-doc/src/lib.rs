@@ -385,6 +385,11 @@ impl Document {
     pub fn parse_with(source: &str, options: ParseOptions) -> Document {
         let original_source = source;
         let original_len = source.len();
+        // A byte-order mark is the encoder's, not the author's: it is not prose, and a
+        // heading written after one is a heading. It comes off before anything else
+        // looks at the source, so `base` -- and every span offset with it -- still
+        // names the file's own bytes.
+        let source = source.strip_prefix('\u{feff}').unwrap_or(source);
         // Front matter is the author's metadata for the tool that wrote the file, and
         // nothing of it is prose: shown as itself it arrives as a rule, a paragraph of
         // `key: value` lines, and another rule, which is the top of every document that
@@ -2316,5 +2321,21 @@ mod source_span_tests {
         let big = t.elapsed().as_secs_f64();
         assert!(big < 8.0 * small.max(0.05), "{big:?} vs {small:?} for 32 000 notes");
         assert!(big < 15.0, "{big:?} for 32 000 notes");
+    }
+
+    /// A byte-order mark is the encoder's, not the author's: a heading written after
+    /// one is a heading, and the outline has to see it.
+    #[test]
+    fn a_byte_order_mark_is_not_prose_and_does_not_hide_the_first_heading() {
+        let doc = Document::parse("\u{feff}# Hi\n\nbody\n");
+        let kinds: Vec<_> = doc.blocks.iter().map(|b| b.kind).collect();
+        assert_eq!(kinds, vec![BlockKind::Heading(1), BlockKind::Paragraph]);
+        assert_eq!(doc.blocks[0].text, "Hi");
+        assert!(Document::parse("\u{feff}").blocks.is_empty());
+        // And the source map still names the file's own bytes: `H` sits after the
+        // three-byte mark and the two bytes of `# `.
+        let src = "\u{feff}# Hi\n";
+        let b = &Document::parse(src).blocks[0];
+        assert_eq!(crate::source_at(&b.sources, 0), Some(5));
     }
 }
