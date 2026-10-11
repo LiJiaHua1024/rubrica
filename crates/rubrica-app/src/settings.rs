@@ -863,8 +863,8 @@ fn take_workspace_path(input: &mut &[u8]) -> Option<std::path::PathBuf> {
     *input = &input[4..];
     let bytes = input.get(..units * 2)?;
     let mut wide = Vec::with_capacity(units);
-    for pair in bytes.chunks_exact(2) {
-        wide.push(u16::from_le_bytes([pair[0], pair[1]]));
+    for pair in bytes.as_chunks::<2>().0 {
+        wide.push(u16::from_le_bytes(*pair));
     }
     *input = &input[units * 2..];
     Some(std::path::PathBuf::from(std::ffi::OsString::from_wide(&wide)))
