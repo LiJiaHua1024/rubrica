@@ -812,45 +812,51 @@ pub fn window() -> Option<Frame> {
 }
 
 const WORKSPACE_KEY: &str = "Workspace";
-const WORKSPACE_MAGIC: &[u8; 4] = b"RWS1";
-
-fn put_workspace_string(out: &mut Vec<u8>, value: &str) -> Option<()> {
-    let bytes = value.as_bytes();
-    let len = u32::try_from(bytes.len()).ok()?;
-    out.extend_from_slice(&len.to_le_bytes());
-    out.extend_from_slice(bytes);
-    Some(())
-}
-
-fn take_workspace_string(input: &mut &[u8]) -> Option<String> {
-    let bytes = take_workspace_bytes(input)?;
-    String::from_utf8(bytes).ok()
-}
-
-fn take_workspace_bytes(input: &mut &[u8]) -> Option<Vec<u8>> {
-    let raw = input.get(..4)?;
-    let len = u32::from_le_bytes(raw.try_into().ok()?) as usize;
-    *input = &input[4..];
-    let bytes = input.get(..len)?;
-    *input = &input[len..];
-    Some(bytes.to_vec())
-}
+const WORKSPACE_MAGIC: &[u8; 4] = b"RWS2";
 
 fn put_workspace_file(out: &mut Vec<u8>, file: &FileRef) -> Option<()> {
     out.extend_from_slice(&file.fingerprint.to_le_bytes());
-    put_workspace_string(out, file.path.to_str()?)
+    put_workspace_path(out, &file.path);
+    Some(())
+}
+
+/// A path as its own UTF-16, length-prefixed: the session is the one thing that has to
+/// survive a name the platform allows and UTF-8 cannot carry, and a path that could not
+/// be written used to take the whole session down with it -- silently, because the
+/// failure is a note on stderr of a GUI process.
+fn put_workspace_path(out: &mut Vec<u8>, path: &std::path::Path) {
+    use std::os::windows::ffi::OsStrExt;
+    let wide: Vec<u16> = path.as_os_str().encode_wide().collect();
+    out.extend_from_slice(&(wide.len() as u32).to_le_bytes());
+    for unit in wide {
+        out.extend_from_slice(&unit.to_le_bytes());
+    }
 }
 
 fn take_workspace_file(input: &mut &[u8]) -> Option<FileRef> {
     let raw = input.get(..8)?;
     let fingerprint = u64::from_le_bytes(raw.try_into().ok()?);
     *input = &input[8..];
-    Some(FileRef::new(PathBuf::from(take_workspace_string(input)?), fingerprint))
+    Some(FileRef::new(take_workspace_path(input)?, fingerprint))
 }
 
-/// Encode the tab/recent session as one versioned blob. Paths are UTF-8 because the
-/// reader could not have opened a non-UTF-8 path on Windows; a path that cannot be encoded
-/// makes the whole save fail rather than leaving a half-restored session.
+fn take_workspace_path(input: &mut &[u8]) -> Option<std::path::PathBuf> {
+    use std::os::windows::ffi::OsStringExt as _;
+    let raw = input.get(..4)?;
+    let units = u32::from_le_bytes(raw.try_into().ok()?) as usize;
+    *input = &input[4..];
+    let bytes = input.get(..units * 2)?;
+    let mut wide = Vec::with_capacity(units);
+    for pair in bytes.chunks_exact(2) {
+        wide.push(u16::from_le_bytes([pair[0], pair[1]]));
+    }
+    *input = &input[units * 2..];
+    Some(std::path::PathBuf::from(std::ffi::OsString::from_wide(&wide)))
+}
+
+/// Encode the tab/recent session as one versioned blob. A path is its own UTF-16,
+/// length-prefixed, because a reader can have opened a name UTF-8 cannot carry and the
+/// session is the one thing that must survive it.
 pub fn encode_workspace(snapshot: &WorkspaceSnapshot) -> Option<Vec<u8>> {
     let mut out = WORKSPACE_MAGIC.to_vec();
     out.extend_from_slice(&(snapshot.session.tabs.len() as u32).to_le_bytes());
