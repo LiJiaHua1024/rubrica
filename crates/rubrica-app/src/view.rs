@@ -8972,12 +8972,22 @@ impl View {
         let mut buf = [0u16; 1024];
         for index in 0..count {
             let written = DragQueryFileW(h, index, Some(&mut buf)) as usize;
-            let path = String::from_utf16_lossy(&buf[..written]);
-            let path = path.trim_end_matches(char::from(0)).to_string();
+            let path = Self::dropped_path(&buf, written);
             self.load_document(std::path::Path::new(&path), hwnd);
         }
         DragFinish(h);
         let _ = InvalidateRect(Some(hwnd), None, false);
+    }
+
+    /// The path a drop carries, out of the buffer the shell wrote it into.
+    ///
+    /// The count the shell reports is clamped to the buffer, because a path longer
+    /// than the buffer is a path the shell may report as the length it needed rather
+    /// than the length it wrote -- and slicing past the end of a fixed array is not a
+    /// thing `panic = "abort"` lets a reader survive.
+    fn dropped_path(buf: &[u16], written: usize) -> String {
+        let written = written.min(buf.len());
+        String::from_utf16_lossy(&buf[..written]).trim_end_matches(char::from(0)).to_string()
     }
 
     /// The place the reader is standing: this page, at this offset down it.
@@ -16086,5 +16096,24 @@ mod document_interaction_tests {
                 );
             }
         }
+    }
+
+    /// A drop's path is read out of the buffer the shell wrote it into, and the count
+    /// the shell reports is clamped to it: a path longer than the buffer used to be
+    /// sliced past the end of the array.
+    #[test]
+    fn a_dropped_path_is_clamped_to_the_buffer_it_was_written_into() {
+        let mut buf = [0u16; 8];
+        let text: Vec<u16> = "a-longer-path-than-the-buffer".encode_utf16().collect();
+        buf[..4].copy_from_slice(&text[..4]);
+        // Within the buffer, the count is the count.
+        assert_eq!(View::dropped_path(&buf, 4), "a-lo");
+        // Past it, the buffer is the bound -- not a slice into freed stack.
+        assert_eq!(View::dropped_path(&buf, 9_999), "a-lo");
+        assert_eq!(View::dropped_path(&buf, 0), "");
+        // A nought the shell left behind is not part of the name.
+        let mut with_null = [0u16; 8];
+        with_null[..2].copy_from_slice(&[b'a' as u16, b'b' as u16]);
+        assert_eq!(View::dropped_path(&with_null, 3), "ab");
     }
 }
