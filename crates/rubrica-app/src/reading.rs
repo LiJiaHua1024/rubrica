@@ -90,6 +90,16 @@ pub fn can_window_text(path: &Path, requested: Encoding) -> bool {
 /// time, so a large book never has to exist as one giant `String` merely to find chapter
 /// starts.
 pub fn scan_chapters(path: &Path, requested: Encoding, detect: bool) -> io::Result<ChapterIndex> {
+    // Lines are split on the byte `\n`, which is half of a UTF-16 newline: a windowed
+    // UTF-16 book would have its chapters cut in the middle of every line ending and
+    // its text full of noughts. `can_window_text` keeps this unreachable today; the
+    // guard is here because the function is public and the day it is asked is not.
+    if matches!(requested, Encoding::Utf16Le | Encoding::Utf16Be) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "chapter windowing requires a byte-oriented encoding",
+        ));
+    }
     if matches!(requested, Encoding::Auto | Encoding::Utf8) {
         if let Ok(index) = TextChapterIndex::from_path(path, detect) {
             return Ok(ChapterIndex { source: index, encoding: Encoding::Utf8, guessed: false });
