@@ -483,6 +483,13 @@ impl<'a> Parser<'a> {
                                 stored = Some(kind);
                                 above = Some(std::mem::take(&mut out));
                             }
+                        } else {
+                            // A nested list has already left a second infix on the
+                            // parser: this group is split, so it is nobody's. Taking it
+                            // would make the next command in the run the numerator of
+                            // a fraction whose denominator is empty, with a rule under
+                            // nothing at all.
+                            self.infix = None;
                         }
                     }
                 }
@@ -2990,5 +2997,25 @@ mod tests {
             "(style Display (style Display (a (style Display b) c)))"
         );
         assert_eq!(of("\\displaystyle a"), "(style Display a)");
+    }
+
+    /// A second infix in one group used to stay on the parser and reach the next
+    /// command in the run, which then became the numerator of a fraction with an
+    /// empty denominator -- and the page carried a rule with nothing under it.
+    #[test]
+    fn a_second_infix_in_one_group_does_not_reach_the_next_command() {
+        let got = of("{a \\over b \\over c}\\alpha");
+        assert_eq!(got.matches("frac").count(), 1, "{got}");
+        assert!(got.contains('α'), "the command after the group survives: {got}");
+        let got = of("\\frac{{a \\over b \\over c}}{2}");
+        assert_eq!(got.matches("frac").count(), 2, "{got}");
+        // The first split stands: a fraction of a fraction, with the discarded
+        // second infix leaving `b` and `c` to read as one run.
+        assert!(got.starts_with("(frac (frac a "), "{got}");
+        assert!(got.ends_with(" 2)"), "{got}");
+        // One infix in a group splits it, as it always did.
+        assert_eq!(of("{a \\over b}"), "(frac a b)");
+        // And a group followed by ordinary text was never affected.
+        assert_eq!(of("{a \\over b \\over c} x").matches("frac").count(), 1);
     }
 }
