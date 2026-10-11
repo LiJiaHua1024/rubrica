@@ -989,7 +989,16 @@ impl<'a> Parser<'a> {
                     body: Box::new(body),
                     degree: degree
                         .filter(|d| !d.is_empty())
-                        .map(|d| Box::new(Node::Atom(d))),
+                        .map(|d| {
+                            // The degree is a formula like any other: a name written in
+                            // it is the symbol it spells, not the letters with a
+                            // backslash still in front of them.
+                            let mut child = Parser::new(&d);
+                            child.alphabet = self.alphabet;
+                            child.chemical = self.chemical;
+                            child.depth = self.depth + 1;
+                            Box::new(child.formula())
+                        }),
                 }
             }
             "left" => {
@@ -2961,7 +2970,7 @@ mod tests {
         assert_eq!(of("\\sqrt[x^2 + 1"), "((sup (sqrt x) 2) + 1)");
         // A `[` of the degree's own is a bracket, so the closer is the one that
         // matches the opening one rather than the first `]` after it.
-        assert_eq!(of("\\sqrt[[3]]{x}"), "(sqrt [3] x)");
+        assert_eq!(of("\\sqrt[[3]]{x}"), "(sqrt ([ 3 ]) x)");
     }
 
     #[test]
@@ -3017,5 +3026,15 @@ mod tests {
         assert_eq!(of("{a \\over b}"), "(frac a b)");
         // And a group followed by ordinary text was never affected.
         assert_eq!(of("{a \\over b \\over c} x").matches("frac").count(), 1);
+    }
+
+    /// The degree is read as the formula it is: a name in it is the symbol it spells,
+    /// which used to reach the page as the letters with the backslash still on them.
+    #[test]
+    fn a_degree_holding_a_name_is_the_symbol_it_spells() {
+        assert_eq!(of("\\sqrt[\\alpha]{x}"), "(sqrt α x)");
+        assert_eq!(of("\\sqrt[\\frac{1}{2}]{x}"), "(sqrt (frac 1 2) x)");
+        // The readings that were already text are unchanged in what they show.
+        assert_eq!(of("\\sqrt[3]{x}"), "(sqrt 3 x)");
     }
 }
