@@ -2026,7 +2026,13 @@ fn resolve_entities(word: &str) -> String {
         let after = &rest[at + 1..];
         // Without its terminator a reference is the character an author typed and nothing
         // else, so it is emitted and the scan moves past it rather than looking again.
-        let Some(end) = after.find(';') else {
+        // The name is short -- the longest HTML entity name is 31 characters and a
+        // numeric one at most 10 -- so the search is bounded: looking for a `;` further
+        // away rescans the whole tail once per `&`, which is quadratic on a long run of
+        // bare ampersands.
+        const MAX_NAME: usize = 40;
+        let end = after.as_bytes().iter().take(MAX_NAME).position(|&b| b == b';');
+        let Some(end) = end else {
             out.push('&');
             rest = after;
             continue;
@@ -2235,5 +2241,25 @@ mod source_span_tests {
         assert!(doc.blocks[0].objects.is_empty());
         // Two spaces and a tab reach column four too.
         assert_eq!(Document::parse("  \t\\[\n").blocks[0].text, "\\[");
+    }
+
+    /// A long run of bare ampersands used to be rescanned once per `&`: 256 KB took
+    /// about two seconds and grew with the square of the run.
+    #[test]
+    fn a_long_run_of_bare_ampersands_is_resolved_in_one_pass() {
+        let src = |n: usize| format!("<div>\n{}\n</div>\n", "&".repeat(n));
+        assert_eq!(Document::parse(&src(256_000)).blocks[0].text.len(), 256_000);
+        // Time both sizes: a linear scan grows by four from 256 KB to 1 MB while the
+        // old quadratic one grew by sixteen, so the ratio tells them apart on any
+        // machine; the ceiling only guards against a linear scan with an absurd
+        // constant.
+        let t0 = std::time::Instant::now();
+        let _ = Document::parse(&src(256_000));
+        let small = t0.elapsed().as_secs_f64();
+        let t = std::time::Instant::now();
+        let _ = Document::parse(&src(1_024_000));
+        let big = t.elapsed().as_secs_f64();
+        assert!(big < 8.0 * small.max(0.05), "{big:?} vs {small:?} for 1 MB of ampersands");
+        assert!(big < 10.0, "{big:?} for 1 MB of ampersands");
     }
 }
