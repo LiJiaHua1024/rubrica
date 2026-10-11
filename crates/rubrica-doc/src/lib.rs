@@ -507,7 +507,7 @@ fn tex_delimiters(src: &str) -> Option<String> {
     }) {
         let body = line.trim_end_matches(['\n', '\r']);
         let text = body.trim_start();
-        let indent = body.len() - text.len();
+        let indent = indent_columns(&body[..body.len() - text.len()]);
         // A blockquote's markers sit above whatever the line carries: a quoted
         // fence is still a fence, and its `>` comes off before the character
         // test, or LaTeX inside quoted code is rewritten to `$` and shown as
@@ -653,7 +653,7 @@ fn relax_list_interrupts(src: &str) -> Option<String> {
     for line in src.split_inclusive('\n') {
         let body = line.trim_end_matches(['\n', '\r']);
         let text = body.trim_start();
-        let indent = body.len() - text.len();
+        let indent = indent_columns(&body[..body.len() - text.len()]);
         // A blockquote's markers sit above whatever the line carries, exactly as
         // [`tex_delimiters`] takes them off before its own tests.
         let mut quoted = text;
@@ -2004,6 +2004,13 @@ const ENTITIES: [(&str, char); 20] = [
 
 /// One word's character references, resolved. Anything that is not a reference -- a bare
 /// `&` in `A & B`, a name nobody defined -- stays written as the author wrote it.
+/// The columns a line's indent stands for. A tab is four columns to CommonMark, so a
+/// line opened with one is indented code -- and the backslash in it is the author's to
+/// print rather than a delimiter to rewrite.
+fn indent_columns(lead: &str) -> usize {
+    lead.chars().fold(0usize, |n, c| n + if c == '\t' { 4 - (n % 4) } else { 1 })
+}
+
 fn resolve_entities(word: &str) -> String {
     if !word.contains('&') {
         return word.to_string();
@@ -2211,5 +2218,22 @@ mod source_span_tests {
         let one = Document::parse("到此为止。\n1. 第一点\n");
         assert_eq!(one.blocks.len(), 2);
         assert_eq!(one.blocks[1].list.map(|l| (l.ordered, l.index)), Some((true, Some(1))));
+    }
+
+    /// A tab is four columns to CommonMark, so a line opened with one is indented
+    /// code: its backslash is the author's to print, not a delimiter to rewrite.
+    /// Counting the tab as one character read `\t\[` as an inline TeX delimiter and
+    /// printed `$$` where the file had `\[`.
+    #[test]
+    fn a_tab_indented_display_delimiter_is_indented_code_not_an_equation() {
+        let doc = Document::parse("\t\\[\nx\n\t\\]\n");
+        let got: Vec<_> = doc.blocks.iter().map(|b| (b.kind, b.text.as_str())).collect();
+        assert_eq!(got, [(BlockKind::Code, "\\["), (BlockKind::Paragraph, "x ]")]);
+        assert!(doc.blocks.iter().all(|b| b.objects.is_empty()));
+        let doc = Document::parse("\t\\(x\\)\n");
+        assert_eq!(doc.blocks[0].text, "\\(x\\)");
+        assert!(doc.blocks[0].objects.is_empty());
+        // Two spaces and a tab reach column four too.
+        assert_eq!(Document::parse("  \t\\[\n").blocks[0].text, "\\[");
     }
 }
