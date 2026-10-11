@@ -6795,6 +6795,12 @@ impl View {
         // The preview, its anchor and its hit-test index describe one immutable
         // wrapping. Batches for its old width are discarded by the final reflow.
         if self.resize_pending { return; }
+        // Whether a batch landed for the job this window still has. The repaint at the
+        // end is for the page that just gained one; a message that arrived for a job
+        // that is no longer this window's -- a tab switched away from, whose worker
+        // keeps laying out and keeps posting -- has nothing to repaint here, and
+        // redrawing the foreground page for it cost a full window per batch.
+        let mut landed = false;
         loop {
             let Some(result) = self.layout_job.as_ref().map(|job| job.receiver.try_recv()) else {
                 break;
@@ -6830,6 +6836,7 @@ impl View {
             let Some(job) = self.layout_job.as_mut() else { break };
             match message {
                 LayoutMessage::Batch { epoch, chunk } if epoch == job.epoch => {
+                    landed = true;
                     // The first batch is the one the reader has been waiting for: the
                     // window has been open and empty since before the document was read.
                     if job.blocks_done == 0 {
@@ -6901,7 +6908,9 @@ impl View {
                 _ => break,
             }
         }
-        unsafe { let _ = InvalidateRect(Some(self.hwnd), None, false); }
+        if landed {
+            unsafe { let _ = InvalidateRect(Some(self.hwnd), None, false); }
+        }
     }
 
     /// A document bigger than this is laid out on a worker thread: below it the
