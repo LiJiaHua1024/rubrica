@@ -64,7 +64,11 @@ type CachedBitmap = (PathBuf, (u32, u32));
 /// becoming a permanently blank box.
 fn stamp(path: &Path) -> Option<Stamp> {
     let meta = std::fs::metadata(path).ok()?;
-    Some((meta.len(), meta.modified().ok()))
+    // A file whose modification time cannot be read is treated like a missing one:
+    // remembered, it would never change again -- and a figure replaced by another of
+    // the same length would keep the old picture for the rest of the session.
+    let modified = meta.modified().ok()?;
+    Some((meta.len(), Some(modified)))
 }
 
 /// Whether a figure of `w` by `h` pixels is one this reader decodes at all. See
