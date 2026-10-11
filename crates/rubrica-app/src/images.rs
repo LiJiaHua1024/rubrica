@@ -51,7 +51,11 @@ type Stamp = (u64, Option<SystemTime>);
 type CachedSize = (Stamp, Option<(Pt, Pt)>);
 
 /// A bitmap, held against the file it was decoded from and the DPI it was made for.
-type CachedBitmap = (PathBuf, Stamp, (u32, u32));
+///
+/// The file's state is the value rather than part of the key: keyed by it, every
+/// regeneration of a figure left the previous bitmap behind for the rest of the
+/// session -- one per rebuild, each as large as the size cap allows.
+type CachedBitmap = (PathBuf, (u32, u32));
 
 /// The state of the file behind `path`, or `None` when there is no file there at all.
 ///
@@ -87,7 +91,7 @@ pub struct ImageStore {
     /// which means they cannot exist until one does -- and they do not outlive either
     /// the file they came from or the target's DPI, which `WM_DPICHANGED` changes in
     /// place rather than by making a new target.
-    bitmaps: RefCell<HashMap<CachedBitmap, ID2D1Bitmap>>,
+    bitmaps: RefCell<HashMap<CachedBitmap, (Stamp, ID2D1Bitmap)>>,
 }
 
 impl ImageStore {
@@ -136,9 +140,12 @@ impl ImageStore {
     /// alpha composites correctly. Built on first use, then cached against the file it
     /// came from and the target it was made for.
     pub fn bitmap(&self, target: &ID2D1RenderTarget, path: &Path) -> Option<ID2D1Bitmap> {
-        let key = (path.to_path_buf(), stamp(path)?, target_dpi(target));
-        if let Some(hit) = self.bitmaps.borrow().get(&key) {
-            return Some(hit.clone());
+        let key = (path.to_path_buf(), target_dpi(target));
+        let file = stamp(path)?;
+        if let Some((at, hit)) = self.bitmaps.borrow().get(&key) {
+            if *at == file {
+                return Some(hit.clone());
+            }
         }
         let made = (|| {
             let frame = self.first_frame(path)?;
@@ -162,7 +169,7 @@ impl ImageStore {
         // still being written when the document was measured, and a blank figure that
         // stays blank for the rest of the session is a worse answer than asking again.
         if let Some(ref made) = made {
-            self.bitmaps.borrow_mut().insert(key, made.clone());
+            self.bitmaps.borrow_mut().insert(key, (file, made.clone()));
         }
         made
     }
