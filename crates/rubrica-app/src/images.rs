@@ -38,14 +38,20 @@ pub const PX_TO_PT: Pt = 72.0 / 96.0;
 /// image, which no page in a book has a use for.
 const MAX_PIXELS: u64 = 64 * 1024 * 1024;
 
-/// How a file looked when it was last decoded: its length and when it was last written.
+/// How a file looked when it was last decoded: its length, when it was last written,
+/// and a fingerprint of its head.
 ///
 /// A figure is named, not identified. The same `fig.png` is a different picture every
 /// time a build script regenerates it, and the layout worker -- which builds its own
 /// store, and so measures the new file -- would otherwise leave the window painting the
 /// old one inside the new one's box for the rest of the session. `Ctrl`+`R` does not
 /// help, because nothing in it clears the window's store.
-type Stamp = (u64, Option<SystemTime>);
+///
+/// Length and time are the usual answer and they miss one case: a figure replaced by
+/// another of the same length inside one clock tick, which is what a build script
+/// regenerating a screenshot does. The head's fingerprint tells the two apart and
+/// costs four kilobytes of reading.
+type Stamp = (u64, Option<SystemTime>, u64);
 
 /// A natural size, held against the state of the file it was read from.
 type CachedSize = (Stamp, Option<(Pt, Pt)>);
@@ -68,7 +74,22 @@ fn stamp(path: &Path) -> Option<Stamp> {
     // remembered, it would never change again -- and a figure replaced by another of
     // the same length would keep the old picture for the rest of the session.
     let modified = meta.modified().ok()?;
-    Some((meta.len(), Some(modified)))
+    Some((meta.len(), Some(modified), head_fingerprint(path)?))
+}
+
+/// A hash of the first few kilobytes of a file: enough to tell two figures of the same
+/// length apart, and cheap enough to take on every measurement.
+fn head_fingerprint(path: &Path) -> Option<u64> {
+    use std::io::Read;
+    let mut file = std::fs::File::open(path).ok()?;
+    let mut head = [0u8; 4096];
+    let read = file.read(&mut head).ok()?;
+    let mut hash = 0xcbf2_9ce4_8422_2325u64;
+    for byte in &head[..read] {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    Some(hash)
 }
 
 /// Whether a figure of `w` by `h` pixels is one this reader decodes at all. See
