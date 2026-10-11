@@ -4603,7 +4603,16 @@ impl View {
                             self.caret = None;
                             self.selection = None;
                         } else {
-                            PostQuitMessage(0);
+                            // The road the title bar's own close button takes, and
+                            // for the same reason the start-up failure path takes it:
+                            // the window is destroyed while the `Box<View>` behind
+                            // `GWLP_USERDATA` is still alive, `WM_DESTROY` saves the
+                            // reading position and `WM_NCDESTROY` clears the pointer,
+                            // and only then does the message loop end. `PostQuitMessage`
+                            // alone would drop the view with the pointer still naming
+                            // it, and the teardown on the way out of the process would
+                            // deliver `WM_DESTROY` to freed memory.
+                            let _ = unsafe { DestroyWindow(hwnd) };
                         }
                     }
                     // Both of these go through the menu's own command, so the key and the
