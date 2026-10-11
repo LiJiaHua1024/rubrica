@@ -518,7 +518,10 @@ fn tex_delimiters(src: &str) -> Option<String> {
         }
         let first = quoted.chars().next();
         let run = quoted.chars().take_while(|c| Some(*c) == first).count();
-        let in_code = |byte| code.iter().any(|range| range.contains(&byte));
+        let in_code = |byte: usize| {
+            let at = code.partition_point(|range| range.end <= byte);
+            code.get(at).is_some_and(|range| range.start <= byte)
+        };
         let marker = indent < 4 && matches!(first, Some('`') | Some('~')) && run >= 3
             && !in_code(offset + body.len() - quoted.len());
         // A closing fence may trail whitespace, as CommonMark allows; anything
@@ -2261,5 +2264,24 @@ mod source_span_tests {
         let big = t.elapsed().as_secs_f64();
         assert!(big < 8.0 * small.max(0.05), "{big:?} vs {small:?} for 1 MB of ampersands");
         assert!(big < 10.0, "{big:?} for 1 MB of ampersands");
+    }
+
+    /// `in_code` walked every code span the document had, once per line: 32 000 lines
+    /// of `` `c` \(x\) `` cost 378 ms and grew with the square.
+    #[test]
+    fn a_document_of_code_spans_and_tex_delimiters_is_scanned_logarithmically() {
+        let src = |n: usize| format!("{}\n", vec!["`c` \\(x\\)"; n].join("\n"));
+        assert_eq!(Document::parse(&src(32_000)).blocks[0].objects.len(), 32_000);
+        // Time both sizes: the binary search grows with the line count while the old
+        // scan grew with its square, so the ratio tells them apart on any machine;
+        // the ceiling only guards against a scan with an absurd constant.
+        let t0 = std::time::Instant::now();
+        let _ = Document::parse(&src(32_000));
+        let small = t0.elapsed().as_secs_f64();
+        let t = std::time::Instant::now();
+        let _ = Document::parse(&src(128_000));
+        let big = t.elapsed().as_secs_f64();
+        assert!(big < 8.0 * small.max(0.05), "{big:?} vs {small:?} for 128 000 lines");
+        assert!(big < 10.0, "{big:?} for 128 000 lines");
     }
 }
