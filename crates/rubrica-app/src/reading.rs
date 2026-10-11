@@ -96,8 +96,18 @@ pub fn scan_chapters(path: &Path, requested: Encoding, detect: bool) -> io::Resu
         }
     }
     // A failed whole-file UTF-8 validation resolves Automatic once for the book.
-    // A UTF-8-looking line in a legacy book must not select another encoding.
-    let encoding = if requested == Encoding::Auto { Encoding::Gb18030 } else { requested };
+    // A UTF-8-looking line in a legacy book must not select another encoding -- but a
+    // single illegal byte in a Latin book is not a Chinese one either, and guessing
+    // GB18030 for every failure set such a book in noise from end to end. Automatic
+    // gives up here instead, and the caller reads the file whole, which detects the
+    // encoding from its BOM and its bytes and says when it cannot.
+    if requested == Encoding::Auto {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "chapter windowing needs to know the encoding",
+        ));
+    }
+    let encoding = requested;
     let file = std::fs::File::open(path)?;
     let length = file.metadata()?.len() as usize;
     let mut reader = BufReader::new(file);
@@ -562,16 +572,23 @@ mod tests {
     }
 
     #[test]
-    fn automatic_chapters_share_the_whole_books_encoding_and_offsets() {
+    fn automatic_mode_leaves_a_non_utf8_book_to_the_whole_file_read() {
         let path = std::env::temp_dir().join(format!("rubrica-auto-chapters-{}.txt", std::process::id()));
         let bytes = b"Chapter 1\n\xc2\xa9\nChapter 2\n\xd6\xd0\n";
         std::fs::write(&path, bytes).unwrap();
+        // A single illegal byte in a Latin book is not a Chinese one: Automatic gives
+        // up instead of setting the whole book in GB18030 noise, and the caller reads
+        // the file whole, which detects the encoding from its bytes.
+        let error = scan_chapters(&path, Encoding::Auto, true).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
         let whole = read(&path, Encoding::Auto).unwrap();
-        let index = scan_chapters(&path, Encoding::Auto, true).unwrap();
+        assert!(whole.guessed);
+        // An explicitly chosen legacy page still windows, sharing the whole read's
+        // encoding and its offsets into the decoded text.
+        let index = scan_chapters(&path, Encoding::Gb18030, true).unwrap();
         for chapter in 0..2 {
-            let decoded = read_chapter_source(&path, &index, chapter, Encoding::Auto).unwrap();
+            let decoded = read_chapter_source(&path, &index, chapter, Encoding::Gb18030).unwrap();
             assert_eq!(decoded.encoding, whole.encoding);
-            assert!(decoded.guessed);
             assert!(whole.text[index.decoded_start(chapter)..].starts_with(&decoded.text));
         }
         assert_eq!(index.decoded_start(1), whole.text.find("Chapter 2").unwrap());
