@@ -490,7 +490,23 @@ pub fn document(path: &std::path::Path) -> DocumentSettings {
 }
 
 pub fn record_document(path: &std::path::Path, settings: DocumentSettings) {
-    let (sub, raw) = document_key(path);
+    let absolute = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
+    let raw = absolute.to_string_lossy().into_owned();
+    let mut sub = format!("{SUBKEY}\\Documents\\{:016x}", wide_fingerprint(&absolute, 0));
+    // The key is 64 bits of a name an author controls, so a collision is a way to
+    // overwrite another document's record. The path remembered beside the record is
+    // read before the write: a clash moves this document to a salted key rather than
+    // taking the other's place.
+    let mut salt = 0u64;
+    while let Some(batch) = Batch::open(&sub) {
+        match batch.text("Path") {
+            Some(known) if known != raw => {
+                salt += 1;
+                sub = format!("{SUBKEY}\\Documents\\{:016x}", wide_fingerprint(&absolute, salt));
+            }
+            _ => break,
+        }
+    }
     write_text(&sub, "Path", &raw);
     for (name, value) in DOCUMENT_NAMES.iter().zip(settings.words()) { write_word(&sub, name, value); }
 }
