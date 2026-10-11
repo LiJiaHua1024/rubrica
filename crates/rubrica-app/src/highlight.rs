@@ -207,6 +207,12 @@ fn string_end(text: &str, at: usize, quote: u8, escapes: bool, limit: Option<usi
     let mut p = at + 1;
     while p < b.len() {
         if escapes && b[p] == b'\\' {
+            // A line-continuation backslash is not an escape inside a fence: stepping
+            // over the newline after it carried the string into the next line and
+            // swallowed the code there whole.
+            if p + 1 >= b.len() || b[p + 1] == b'\n' {
+                return None;
+            }
             p += 2;
             continue;
         }
@@ -1076,5 +1082,20 @@ mod tests {
         let out = tokens("html", "<a （>中文</a>");
         let text: String = out.iter().map(|(r, _)| &"<a （>中文</a>"[r.start..r.end]).collect();
         assert!(text.contains("<a"), "the tag was still read: {text}");
+    }
+
+    /// A backslash at the end of a line is a continuation in some languages and not in
+    /// a fence: stepping over the newline after it carried an unclosed string into the
+    /// next line and swallowed the code there whole.
+    #[test]
+    fn an_escape_does_not_step_over_a_newline() {
+        let src = "let a = \"oops\\\nlet b = 2;";
+        let out = tokens("rust", src);
+        let text: String = out.iter().map(|(r, _)| &src[r.start..r.end]).collect();
+        assert!(!text.contains("oops\\\nlet b"), "the string crossed the line: {text}");
+        let has_string = out.iter().any(|(r, role)| {
+            matches!(role, ColorRole::String) && src[r.start..r.end].contains("oops")
+        });
+        assert!(!has_string, "an unclosed string is not a string: {out:?}");
     }
 }
