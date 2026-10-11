@@ -947,6 +947,11 @@ struct Builder<'a> {
     pending_item: Option<ListInfo>,
     /// Definitions by label, in the order they were defined.
     notes: Vec<Draft>,
+    /// Where each label sits in `notes`. A citation and a definition both ask for a
+    /// note by label, and `notes` is only ever appended to, so the index is written
+    /// once and read in constant time -- walking the list instead compared every
+    /// label against every note.
+    notes_by_label: std::collections::HashMap<String, usize>,
     /// How many labels have been cited, which is the next number to hand out:
     /// numbers follow first-citation order rather than the order definitions happen
     /// to be parsed in, which pulldown reports last and in its own sequence.
@@ -1134,15 +1139,18 @@ impl Builder<'_> {
     /// before defining it, define the same label twice, or cite one label from two
     /// paragraphs -- and every one of those has to show the same digit.
     fn cite(&mut self, label: &str) -> usize {
-        if let Some(d) = self.notes.iter_mut().find(|d| d.label == label) {
-            if d.number == 0 {
-                self.cited += 1;
-                d.number = self.cited;
+        if let Some(&i) = self.notes_by_label.get(label) {
+            if let Some(d) = self.notes.get_mut(i) {
+                if d.number == 0 {
+                    self.cited += 1;
+                    d.number = self.cited;
+                }
+                return d.number;
             }
-            return d.number;
         }
         self.cited += 1;
         self.notes.push(Draft { label: label.to_string(), number: self.cited, blocks: Vec::new() });
+        self.notes_by_label.insert(label.to_string(), self.notes.len() - 1);
         self.cited
     }
 
@@ -1243,7 +1251,7 @@ impl Builder<'_> {
                 // Definitions are parsed after the whole body, so a cited label is
                 // already here with its number; an uncited one joins now and is
                 // numbered after every citation.
-                let i = match self.notes.iter().position(|d| d.label == label.as_ref()) {
+                let i = match self.notes_by_label.get(label.as_ref()).copied() {
                     Some(i) => i,
                     None => {
                         self.notes.push(Draft {
@@ -1251,7 +1259,9 @@ impl Builder<'_> {
                             number: 0,
                             blocks: Vec::new(),
                         });
-                        self.notes.len() - 1
+                        let i = self.notes.len() - 1;
+                        self.notes_by_label.insert(label.to_string(), i);
+                        i
                     }
                 };
                 // One label defined twice appends to the same note: both texts are
@@ -2283,5 +2293,28 @@ mod source_span_tests {
         let big = t.elapsed().as_secs_f64();
         assert!(big < 8.0 * small.max(0.05), "{big:?} vs {small:?} for 128 000 lines");
         assert!(big < 10.0, "{big:?} for 128 000 lines");
+    }
+
+    /// Each citation and each definition walked the whole note list: 32 000 of them
+    /// cost 3.75 s and grew with the square.
+    #[test]
+    fn many_footnotes_are_numbered_without_rescanning_every_note() {
+        let doc_of = |n: usize| {
+            let cites: String = (0..n).map(|i| format!("x[^{i}]")).collect();
+            let defs: String =
+                (0..n).map(|i| format!("[^{i}]: note {i}")).collect::<Vec<_>>().join("\n\n");
+            Document::parse(&format!("{cites}\n\n{defs}\n"))
+        };
+        assert_eq!(doc_of(32_000).footnotes.len(), 32_000);
+        // Time both sizes: the table grows with the note count while the old scan
+        // grew with its square, so the ratio tells them apart on any machine.
+        let t0 = std::time::Instant::now();
+        let _ = doc_of(8_000);
+        let small = t0.elapsed().as_secs_f64();
+        let t = std::time::Instant::now();
+        let _ = doc_of(32_000);
+        let big = t.elapsed().as_secs_f64();
+        assert!(big < 8.0 * small.max(0.05), "{big:?} vs {small:?} for 32 000 notes");
+        assert!(big < 15.0, "{big:?} for 32 000 notes");
     }
 }
