@@ -31,12 +31,17 @@ pub struct FormulaKey {
     pub source: String,
     pub size: i32,
     pub display: bool,
+    /// The prose face the formula was set in. A `\text{}` run falls back to it when
+    /// the math face has no glyph, so the same source in a bold block is not the same
+    /// formula as in a plain one -- and the pieces that came back the first time are
+    /// not the pieces the second one needs.
+    pub prose: FaceRequest,
 }
 
 /// One formula, prepared: the box the line has to make room for and the pieces to
 /// draw, all relative to the formula's own origin at its left edge and baseline.
 pub struct Entry {
-    key: (String, i32, bool),
+    key: (String, i32, bool, FaceRequest),
     /// Original formula source, used by the PDF accessibility text layer.
     pub source: String,
     pub object: ObjectBox,
@@ -59,7 +64,12 @@ impl Entry {
     /// The key this entry is filed under, for a caller that has to find it again in
     /// some other store than the one that set it.
     pub fn key(&self) -> FormulaKey {
-        FormulaKey { source: self.key.0.clone(), size: self.key.1, display: self.key.2 }
+        FormulaKey {
+            source: self.key.0.clone(),
+            size: self.key.1,
+            display: self.key.2,
+            prose: self.key.3.clone(),
+        }
     }
 }
 
@@ -86,7 +96,12 @@ impl MathStore {
         size: Pt,
         display: bool,
     ) -> Option<usize> {
-        let key = (source.to_string(), (size * 64.0).round() as i32, display);
+        let key = (
+            source.to_string(),
+            (size * 64.0).round() as i32,
+            display,
+            prose.clone(),
+        );
         if let Some(i) = self.entries.iter().position(|e| e.key == key) {
             return Some(i);
         }
@@ -186,9 +201,12 @@ impl MathStore {
 
     /// The index of the entry filed under this key, if there is one.
     pub fn find(&self, key: &FormulaKey) -> Option<usize> {
-        self.entries
-            .iter()
-            .position(|e| e.key.0 == key.source && e.key.1 == key.size && e.key.2 == key.display)
+        self.entries.iter().position(|e| {
+            e.key.0 == key.source
+                && e.key.1 == key.size
+                && e.key.2 == key.display
+                && e.key.3 == key.prose
+        })
     }
 
     /// How many formulas are set, how much of them is shaped rather than drawn, which
@@ -218,7 +236,7 @@ impl MathStore {
     /// glyph id, where a `run` is shaped text.
     pub fn dump(&self, font: &FontEngine) {
         for (i, e) in self.entries.iter().enumerate() {
-            let (source, size, display) = &e.key;
+            let (source, size, display, _) = &e.key;
             println!(
                 "  [{i}] {source:?}  {:.2}pt {}  box {:.1} wide, {:.1}+{:.1} tall",
                 *size as f32 / 64.0,
@@ -444,4 +462,29 @@ fn math_table_bytes(face: &IDWriteFontFace) -> Option<(Vec<u8>, u16)> {
     let mut metrics = DWRITE_FONT_METRICS::default();
     unsafe { face.GetMetrics(&mut metrics) };
     Some((crate::tables::table_bytes(face, b"MATH")?, metrics.designUnitsPerEm))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The same source set in two prose faces is two formulas: a `\text{}` run falls
+    /// back to the prose face when the math face has no glyph for it, so reusing the
+    /// plain one in a bold block set the bold one's words in the plain face.
+    #[test]
+    fn the_same_formula_in_two_prose_faces_is_set_twice() {
+        let Ok(font) = FontEngine::new() else { return };
+        let mut store = MathStore::new();
+        let math = FaceRequest::default();
+        let plain = FaceRequest { family: "Segoe UI".to_string(), ..FaceRequest::default() };
+        let bold = FaceRequest { family: "Segoe UI".to_string(), weight: 700, ..FaceRequest::default() };
+        let a = store.intern(&font, &math, &plain, "\\text{hi}", 13.5, false).expect("set");
+        let b = store.intern(&font, &math, &bold, "\\text{hi}", 13.5, false).expect("set");
+        assert_ne!(a, b, "the same source in two prose faces is two formulas");
+        let c = store.intern(&font, &math, &plain, "\\text{hi}", 13.5, false).expect("set");
+        assert_eq!(a, c, "and the same face hits the same entry");
+        // The key a page carries finds the entry it names.
+        let key = store.get(a).expect("entry").key();
+        assert_eq!(store.find(&key), Some(a));
+    }
 }
