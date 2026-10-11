@@ -61,13 +61,46 @@ pub fn acquire() -> Option<SingleInstance> {
 /// next pass -- so this costs the caller a window procedure, not a document read.
 pub fn forward(paths: &[PathBuf]) -> Option<HWND> {
     let hwnd = reader_window()?;
-    // Null-terminated strings, the whole list closed by a second nought.
+    for payload in batches(paths) {
+        if !send_list(hwnd, &payload) {
+            return None;
+        }
+    }
+    Some(hwnd)
+}
+
+/// The batches a list of paths is sent in, each a whole list of its own: null-
+/// terminated strings closed by a second nought, and none past the cap the reader
+/// answers for. A payload it refuses is a list that opens in a second window, which is
+/// the one thing forwarding exists to prevent.
+fn batches(paths: &[PathBuf]) -> Vec<Vec<u16>> {
+    let mut out: Vec<Vec<u16>> = Vec::new();
     let mut payload: Vec<u16> = Vec::new();
     for path in paths {
+        let before = payload.len();
         payload.extend(path.as_os_str().encode_wide());
         payload.push(0);
+        if (payload.len() + 1) * 2 > MAX_FORWARD as usize {
+            // This path does not fit beside the ones already waiting: they go now, and
+            // the next batch starts with it.
+            payload.truncate(before);
+            if !payload.is_empty() {
+                payload.push(0);
+                out.push(std::mem::take(&mut payload));
+            }
+            payload.extend(path.as_os_str().encode_wide());
+            payload.push(0);
+        }
     }
     payload.push(0);
+    out.push(payload);
+    out
+}
+
+/// One batch, answered for: a reader that refuses it -- a payload past its cap, a
+/// window that went away mid-send -- is reported rather than assumed.
+fn send_list(hwnd: HWND, payload: &[u16]) -> bool {
+    let mut payload = payload.to_vec();
     let mut copy = COPYDATASTRUCT {
         dwData: TAG,
         cbData: (payload.len() * 2) as u32,
@@ -81,7 +114,7 @@ pub fn forward(paths: &[PathBuf]) -> Option<HWND> {
             Some(LPARAM(&mut copy as *mut COPYDATASTRUCT as isize)),
         )
     };
-    (sent.0 != 0).then_some(hwnd)
+    sent.0 != 0
 }
 
 /// The reader's main window, waiting out the moments after a first launch where the
@@ -279,5 +312,35 @@ mod tests {
         assert!(posted(TAG, &wide, u32::MAX).is_none());
         // Another program's mark is not ours, however well it is sized.
         assert!(posted(TAG + 1, &wide, size).is_none());
+    }
+
+    /// A list too big for one payload is sent as several, each a whole list of its own
+    /// and each within the cap the reader answers for: a payload it refuses is a list
+    /// that opens in a second window.
+    #[test]
+    fn a_list_past_the_cap_is_sent_in_batches_each_within_it() {
+        let paths: Vec<PathBuf> = (0..400)
+            .map(|i| PathBuf::from(format!("C:\\books\\{}\\chapter-{i}.md", "section-".repeat(20))))
+            .collect();
+        let sent = super::batches(&paths);
+        assert!(sent.len() >= 2, "400 long paths do not fit one payload");
+        for batch in &sent {
+            assert!(batch.len() * 2 <= MAX_FORWARD as usize, "a batch past the cap");
+        }
+        // Every path arrives exactly once, in the order it was named.
+        let got: Vec<PathBuf> = sent
+            .iter()
+            .flat_map(|b| {
+                b.split(|&u| u == 0)
+                    .filter(|s| !s.is_empty())
+                    .map(|s| PathBuf::from(OsString::from_wide(s)))
+                    .collect::<Vec<_>>()
+            })
+            .collect();
+        assert_eq!(got, paths);
+        // An empty list is still a summons: one payload, holding nothing.
+        let empty = super::batches(&[]);
+        assert_eq!(empty.len(), 1);
+        assert_eq!(empty[0], vec![0]);
     }
 }
