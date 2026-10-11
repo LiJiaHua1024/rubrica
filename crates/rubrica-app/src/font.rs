@@ -208,9 +208,16 @@ impl<K: std::hash::Hash + Eq, V> LayeredMap<K, V> {
     }
 
     /// Offer `key` to the hot generation, retiring the one before it if it is full.
+    ///
+    /// The generation being retired is the *cold* one: the hot map is moved aside and
+    /// kept, so a run the current layout is still asking about survives one more pass
+    /// around the cache. Taking the hot map as the new cold one -- as this did --
+    /// dropped the generation before it whole, which for a book longer than one
+    /// generation happened in the middle of a single layout.
     fn insert(&mut self, key: K, value: V, cap: usize) {
         if self.hot.len() >= cap {
-            self.cold = std::mem::take(&mut self.hot);
+            self.cold.clear();
+            std::mem::swap(&mut self.hot, &mut self.cold);
         }
         self.hot.insert(key, value);
     }
