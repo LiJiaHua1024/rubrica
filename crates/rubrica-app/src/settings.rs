@@ -430,9 +430,23 @@ fn document_key(path: &std::path::Path) -> (String, String) {
     // Retain the exact path beside the hash so a collision never restores another book.
     let absolute = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
     let raw = absolute.to_string_lossy().into_owned();
-    let hash = raw.as_bytes().iter().fold(0xcbf29ce484222325u64,
-        |h, b| (h ^ u64::from(*b)).wrapping_mul(0x100000001b3));
-    (format!("{SUBKEY}\\Documents\\{hash:016x}"), raw)
+    // Hashed from the path's own UTF-16 rather than its lossy UTF-8: two names that
+    // differ only in bytes UTF-8 cannot carry -- an unpaired surrogate, which NTFS
+    // allows -- used to fold into one key and share one book's place and preferences.
+    (format!("{SUBKEY}\\Documents\\{:016x}", wide_fingerprint(&absolute, 0)), raw)
+}
+
+/// The FNV-1a hash of a path's own UTF-16, salted: the lossless spelling of a name, so
+/// no two names a filesystem can hold share a key.
+fn wide_fingerprint(path: &std::path::Path, salt: u64) -> u64 {
+    use std::os::windows::ffi::OsStrExt;
+    let mut hash = 0xcbf29ce484222325u64 ^ salt;
+    for unit in path.as_os_str().encode_wide() {
+        for byte in unit.to_le_bytes() {
+            hash = (hash ^ u64::from(byte)).wrapping_mul(0x100000001b3);
+        }
+    }
+    hash
 }
 
 /// The canonical form of a path, remembered for as long as this process is running.
@@ -1290,5 +1304,20 @@ mod tests {    use super::*;
             z = z.down();
         }
         z
+    }
+
+    /// Two names that differ only in bytes UTF-8 cannot carry are two documents: the
+    /// key is hashed from the path's own UTF-16, so an unpaired surrogate no longer
+    /// shares a subkey -- and with it another book's place and preferences.
+    #[test]
+    fn two_names_utf8_cannot_carry_do_not_share_a_document_key() {
+        use std::os::windows::ffi::OsStringExt as _;
+        let a = std::path::PathBuf::from(std::ffi::OsString::from_wide(
+            &[0x66, 0x6f, 0x6f, 0xD800, 0x2e, 0x6d, 0x64],
+        ));
+        let b = std::path::PathBuf::from(std::ffi::OsString::from_wide(
+            &[0x66, 0x6f, 0x6f, 0xDC00, 0x2e, 0x6d, 0x64],
+        ));
+        assert_ne!(document_key(&a).0, document_key(&b).0);
     }
 }
