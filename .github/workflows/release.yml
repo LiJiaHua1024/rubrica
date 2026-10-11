@@ -1,0 +1,63 @@
+# A tag named v* is a release: this builds the same binary build.yml does and
+# publishes it as a GitHub release, so cutting a release is pushing a tag and
+# nothing else. The notes list every commit since the previous tag.
+name: release
+
+on:
+  push:
+    tags: ['v*']
+
+permissions:
+  contents: write
+
+jobs:
+  windows-x64:
+    runs-on: windows-2025
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          # The notes count the commits since the previous tag, which needs the
+          # tags and the history behind them rather than one commit.
+          fetch-depth: 0
+      - uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de
+        with:
+          toolchain: stable
+          targets: x86_64-pc-windows-msvc
+      - uses: Swatinem/rust-cache@49a0bdc70d2e1b713ca9e2869b211fcce03d3c1c # v2
+        with:
+          key: release-x86_64-pc-windows-msvc
+      - name: Check the tag names the workspace version
+        shell: pwsh
+        run: |
+          $tag = "${{ github.ref_name }}"
+          $version = (Select-String -Path Cargo.toml -Pattern '^version = "(.*)"$').Matches[0].Groups[1].Value
+          if ($tag -ne "v$version") { throw "tag $tag does not match workspace version $version" }
+      - name: Build release binary
+        run: cargo build --package rubrica-app --release --locked --target x86_64-pc-windows-msvc
+      - name: Prepare distribution
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Path dist | Out-Null
+          Copy-Item -LiteralPath target/x86_64-pc-windows-msvc/release/rubrica-app.exe -Destination dist/
+          Copy-Item -LiteralPath README.md, LICENSE-MIT, LICENSE-APACHE -Destination dist/
+          $hash = (Get-FileHash -LiteralPath dist/rubrica-app.exe -Algorithm SHA256).Hash.ToLowerInvariant()
+          "$hash  rubrica-app.exe" | Set-Content -LiteralPath dist/SHA256SUMS -Encoding ascii
+      - name: Write release notes
+        shell: pwsh
+        run: |
+          $prev = git describe --tags --abbrev=0 "HEAD^" 2>$null
+          if ($prev) {
+            $header = "Changes since ${prev}:"
+            $log = git log "$prev..HEAD" --pretty=format:'- %s'
+          } else {
+            $header = "Changes:"
+            $log = git log -20 --pretty=format:'- %s'
+          }
+          @($header, "") + $log | Set-Content -LiteralPath release-notes.md -Encoding utf8NoBOM
+      - name: Publish the release
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release create "${{ github.ref_name }}" --title "Rubrica ${{ github.ref_name }}" --notes-file release-notes.md dist/rubrica-app.exe dist/README.md dist/LICENSE-MIT dist/LICENSE-APACHE dist/SHA256SUMS
