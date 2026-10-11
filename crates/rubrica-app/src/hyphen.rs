@@ -84,14 +84,20 @@ impl Hyphenator {
         if segs.len() < 2 {
             return;
         }
-        let mut consumed = 0usize;
+        let mut at = 0usize;
         for (n, s) in segs.iter().enumerate() {
             let piece = s.trim_end_matches(['-', '\u{AD}']);
-            consumed += piece.len();
+            // Where this syllable sits in the word, found rather than measured: a
+            // word that carries its own hyphen has a segment the dictionary keeps as
+            // it is, and the distance to the next break is where the next syllable
+            // begins rather than the length of this one.
+            let Some(start) = word[at..].find(piece) else { continue };
+            let end = at + start + piece.len();
+            at = end;
             // No break after the final syllable, and never one that would leave a
             // fragment the dictionary's own edge rules already excluded.
             if n + 1 < segs.len() {
-                out.push(base + consumed);
+                out.push(base + end);
             }
         }
     }
@@ -157,5 +163,18 @@ mod tests {
         let pts = h.points("don't hyphenation");
         let shift = "don't ".len();
         assert_eq!(pts, vec![shift + 2, shift + 6, shift + 7], "{pts:?} leaked into the contraction");
+    }
+
+    /// A word that carries its own hyphen has a segment the dictionary keeps as it
+    /// is, so the offsets are found in the word rather than measured from the
+    /// segments' lengths: every one of them lands on a letter, never on the hyphen.
+    #[test]
+    fn a_word_with_its_own_hyphen_keeps_its_offsets() {
+        let h = hy();
+        let word = "state-of-the-art-hyphenation";
+        for p in h.points(word) {
+            assert!(word.as_bytes()[p].is_ascii_alphabetic(), "{p} is not a letter of the word");
+            assert!(p > 0 && p < word.len(), "{p} is not inside the word");
+        }
     }
 }
