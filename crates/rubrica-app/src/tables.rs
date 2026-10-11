@@ -22,7 +22,11 @@ use windows::Win32::Graphics::DirectWrite::IDWriteFontFace;
 
 /// Enough of the file to hold any table directory: a collection header, the offsets of
 /// its faces, and the sfnt header plus records of the face being asked about.
-const HEADER: usize = 4096;
+///
+/// A directory past this head would find no `MATH` table in it, which sets every
+/// formula from the fallback constants without a word -- so it is room for four
+/// thousand records, more than any face ships.
+const HEADER: usize = 64 * 1024;
 
 /// Bytes of `tag` in `face`'s file.
 pub fn table_bytes(face: &IDWriteFontFace, tag: &[u8; 4]) -> Option<Vec<u8>> {
