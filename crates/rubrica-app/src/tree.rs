@@ -29,10 +29,15 @@ fn name(path: &Path) -> String {
     path.file_name().map(|name| name.to_string_lossy().into_owned()).unwrap_or_else(|| path.to_string_lossy().into_owned())
 }
 
+/// How deep a scan may go however what the caller asked for: a directory cycle -- a
+/// junction pointing back up the tree -- would otherwise be walked until the stack
+/// runs out, and a stack overflow is not a thing a reader survives.
+const HARD_MAX_DEPTH: usize = 32;
+
 fn visit(path: &Path, depth: usize, max_depth: usize, out: &mut Vec<Entry>) {
     let kind = if path.is_dir() { EntryKind::Directory } else if is_document(path) { EntryKind::Document } else { return };
     out.push(Entry { path: path.to_path_buf(), name: name(path), depth, kind });
-    if kind != EntryKind::Directory || depth >= max_depth {
+    if kind != EntryKind::Directory || depth >= max_depth.min(HARD_MAX_DEPTH) {
         return;
     }
     let Ok(children) = std::fs::read_dir(path) else { return };
