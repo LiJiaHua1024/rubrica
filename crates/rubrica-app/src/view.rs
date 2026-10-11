@@ -6250,10 +6250,15 @@ impl View {
         self.counts = self.doc.counts();
     }
 
-    fn refresh_chapter_index(&mut self) {
+    fn refresh_chapter_index(&mut self, keep: Option<ChapterIndex>) {
         let plain = self.plain_override.unwrap_or_else(|| reading::is_plain(self.path.as_deref()));
         self.chapter_index = if plain && self.text_options.chapters {
-            if self.lazy_text {
+            // An index handed in is the one the caller has just built -- a windowed
+            // book is opened through a scan, and scanning it again on the way to the
+            // page read the whole file a second time for nothing.
+            if let Some(index) = keep {
+                Some(index)
+            } else if self.lazy_text {
                 self.path.as_deref().and_then(|path| reading::scan_chapters(path, self.encoding, true).ok())
             } else {
                 Some(ChapterIndex::new(&self.source, true))
@@ -6342,7 +6347,7 @@ impl View {
             crate::profiles::load(&profile).apply(&mut self.theme);
             self.profile = profile;
         }
-        self.refresh_chapter_index();
+        self.refresh_chapter_index(None);
         if self.lazy_text && plain && self.text_options.chapters && self.chapter_index.is_none() {
             show_error(hwnd, i18n::t(self.lang, Key::ErrorCannotIndexTxtChapters));
             return;
@@ -9340,7 +9345,7 @@ impl View {
                 if let Ok(source) = reading::read_chapter_source(path, &index, chapter, preferences.encoding) {
                     self.lazy_text = true;
                     let text = source.text.clone();
-                    self.set_page_at(text, Some(path.to_path_buf()), hwnd, chapter);
+                    self.set_page_at(text, Some(path.to_path_buf()), hwnd, chapter, Some(index));
                     self.decoded_encoding = source.encoding;
                     self.encoding_guessed = source.guessed;
                     self.cache_window(chapter, self.source.clone());
@@ -9451,10 +9456,17 @@ impl View {
     /// stepped back to a document of the same name as this one needs to see which is
     /// which.
     fn set_page(&mut self, source: String, path: Option<PathBuf>, hwnd: HWND) {
-        self.set_page_at(source, path, hwnd, 0);
+        self.set_page_at(source, path, hwnd, 0, None);
     }
 
-    fn set_page_at(&mut self, source: String, path: Option<PathBuf>, hwnd: HWND, chapter: usize) {
+    fn set_page_at(
+        &mut self,
+        source: String,
+        path: Option<PathBuf>,
+        hwnd: HWND,
+        chapter: usize,
+        index: Option<ChapterIndex>,
+    ) {
         self.remember_reading();
         self.reset_chapter_cache();
         self.remember_document();
@@ -9496,7 +9508,7 @@ impl View {
             crate::profiles::load(&profile).apply(&mut self.theme);
             self.profile = profile;
         }
-        self.refresh_chapter_index();
+        self.refresh_chapter_index(index);
         self.chapter = self
             .chapter_index
             .as_ref()
