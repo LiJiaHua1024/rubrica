@@ -4,6 +4,18 @@
 
 use crate::parse::{Node, Parser};
 
+/// The arrows ordinary Markdown chemistry is written with, and the command each one
+/// lowers to. The gate that recognises a reaction and the lowering that draws it read
+/// the same list, so a form the reader accepts is a form it can also set.
+const ARROWS: [(&str, &str); 6] = [
+    ("<=>", "xrightleftharpoons"),
+    ("<->", "xleftrightarrow"),
+    ("->", "xrightarrow"),
+    ("<-", "xleftarrow"),
+    ("=>", "xRightarrow"),
+    ("<=", "xLeftarrow"),
+];
+
 /// Ordinary Markdown chemistry often uses TeX without \ce. Require both a
 /// reaction relation and valid element spellings, plus a compound or subscript,
 /// before choosing roman lettering. Unknown identifiers and math commands keep
@@ -13,7 +25,8 @@ pub(crate) fn is_reaction(source: &str) -> bool {
         || source.contains('→')
         || source.contains('⇌')
         || source.contains("arrow")
-        || source.contains("harpoons"))
+        || source.contains("harpoons")
+        || ARROWS.iter().any(|(s, _)| source.contains(s)))
     {
         return false;
     }
@@ -93,6 +106,10 @@ pub(crate) fn is_reaction(source: &str) -> bool {
             atoms += count;
             distinctive |= word.len() > 1;
         } else {
+            // A count written inline is the subscript the author did not write:
+            // `H2` names the same compound as `H_2`, so a digit marks a formula
+            // as chemical exactly like a subscript does.
+            distinctive |= ch.is_ascii_digit();
             at += ch.len_utf8();
         }
     }
@@ -129,16 +146,8 @@ pub(crate) fn parse(source: &str, depth: usize) -> Node {
     let mut in_species = false;
     while at < source.len() {
         let rest = &source[at..];
-        if let Some((arrow, command)) = [
-            ("<=>", "xrightleftharpoons"),
-            ("<->", "xleftrightarrow"),
-            ("->", "xrightarrow"),
-            ("<-", "xleftarrow"),
-            ("=>", "xRightarrow"),
-            ("<=", "xLeftarrow"),
-        ]
-        .into_iter()
-        .find(|(s, _)| rest.starts_with(s))
+        if let Some((arrow, command)) =
+            ARROWS.into_iter().find(|(s, _)| rest.starts_with(s))
         {
             at += arrow.len();
             while source[at..].starts_with(char::is_whitespace) {

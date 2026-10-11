@@ -421,7 +421,8 @@ mod tests {
     #[test]
     fn ordinary_tex_reactions_share_chemical_lettering_and_arrow_proportions() {
         for src in [r"2Na + Cl_2 \xrightarrow{点燃} 2NaCl",
-            r"N_2 + 3H_2 \rightleftharpoons 2NH_3", r"2Na + S = Na_2S"] {
+            r"N_2 + 3H_2 \rightleftharpoons 2NH_3", r"2Na + S = Na_2S",
+            r"2H2 + O2 -> 2H2O", r"N2 + 3H2 <-> 2NH3"] {
             assert!(crate::chemistry::is_reaction(src));
             let f = set(src, 10.0, false, &mut Mock::bare());
             assert!(f.shapes.iter().all(|s| match s {
