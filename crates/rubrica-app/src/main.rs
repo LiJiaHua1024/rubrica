@@ -286,6 +286,7 @@ fn positionals(argv: &[OsString]) -> Vec<PathBuf> {
         "--pdf-width", "--pdf-height",
     ];
     let mut skip_next = false;
+    let mut flags_done = false;
     let mut named = Vec::new();
     for a in argv.iter().skip(1) {
         if skip_next {
@@ -297,10 +298,17 @@ fn positionals(argv: &[OsString]) -> Vec<PathBuf> {
             skip_next = true;
             continue;
         }
-        if text == "report" || text.starts_with("--") {
+        if flags_done {
+            named.push(PathBuf::from(a));
+        } else if text == "--" {
+            // The end of the flags: a document whose name begins with one is still a
+            // document.
+            flags_done = true;
+        } else if text.starts_with("--") {
             continue;
+        } else {
+            named.push(PathBuf::from(a));
         }
-        named.push(PathBuf::from(a));
     }
     named
 }
@@ -394,5 +402,23 @@ mod tests {
             assert!(positive("--dpi", bad).is_err(), "{bad} is not a page size");
             assert!(positive("--width", bad).is_err(), "{bad} is not a page size");
         }
+    }
+
+    /// A document is not a flag: a file called `report` is not a command -- there is no
+    /// such command, the flag is `--report` -- and a name that begins with `--` opens
+    /// after the `--` that ends the flags.
+    #[test]
+    fn a_document_is_not_a_flag() {
+        assert_eq!(positionals(&line(&["rubrica", "report"])), vec![PathBuf::from("report")]);
+        assert_eq!(
+            positionals(&line(&["rubrica", "--", "--notes.md"])),
+            vec![PathBuf::from("--notes.md")]
+        );
+        // The flags themselves are unchanged.
+        assert_eq!(positionals(&line(&["rubrica", "--report", "a.md"])), vec![PathBuf::from("a.md")]);
+        assert_eq!(
+            positionals(&line(&["rubrica", "--width", "900", "b.md"])),
+            vec![PathBuf::from("b.md")]
+        );
     }
 }
