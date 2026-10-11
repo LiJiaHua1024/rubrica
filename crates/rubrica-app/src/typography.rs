@@ -172,3 +172,18 @@ unsafe extern "system" fn proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> 
     }
     unsafe { DefWindowProcW(hwnd, msg, wp, lp) }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The form lays its fields out as the profile's own order -- the fonts first,
+    /// then the numbers -- and reads them back by position. The two only agree by
+    /// convention, and a reader that disagreed would index past the end of the table.
+    #[test]
+    fn the_form_field_order_matches_the_profile_layout() {
+        let p = Profile::default();
+        assert_eq!(p.fonts.len(), crate::profiles::FONT_LABELS.len());
+        assert_eq!(p.numbers.len(), 17);
+    }
+}
