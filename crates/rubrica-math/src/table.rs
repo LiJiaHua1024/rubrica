@@ -156,7 +156,7 @@ impl<'a> MathTable<'a> {
 
     /// A constant in design units, or 0 when the index is out of range.
     pub fn constant(&self, index: usize) -> i16 {
-        if index >= constant::COUNT {
+        if index >= constant::COUNT || self.constants == 0 {
             return 0;
         }
         let r = Reader::new(self.data);
@@ -258,7 +258,10 @@ impl<'a> MathTable<'a> {
     pub fn construction(&self, glyph: u16, vertical: bool) -> Option<Construction> {
         let r = Reader::new(self.data);
         let mv = self.variants;
-        if mv + 10 > self.data.len() {
+        // No subtable is the one answer a font with none can give, exactly as it is
+        // for the glyph info: reading offset zero as a position resolves the header's
+        // own version fields instead.
+        if mv == 0 || mv + 10 > self.data.len() {
             return None;
         }
         // Both coverage offsets, and every offset below them, are measured from the
@@ -318,7 +321,7 @@ impl<'a> MathTable<'a> {
     /// Minimum overlap two assembly parts must keep, in design units.
     pub fn min_connector_overlap(&self) -> u16 {
         let r = Reader::new(self.data);
-        if self.variants + 2 > self.data.len() {
+        if self.variants == 0 || self.variants + 2 > self.data.len() {
             return 0;
         }
         r.u16(self.variants)
@@ -920,6 +923,27 @@ mod tests {
             assert!(p.offset >= at, "the parts ran backwards: {grown:?}");
             at = p.offset;
         }
+    }
+
+    /// A table that declares no constants and no variants says nothing at all: the
+    /// italics correction has had its zero guard since the offset was read from the
+    /// wrong base, and the other two offsets get the same answer here.
+    #[test]
+    fn a_table_with_no_constants_or_variants_says_nothing() {
+        let mut t = Vec::new();
+        put(&mut t, 1); // major version
+        put(&mut t, 0); // minor version
+        put(&mut t, 0); // no MathConstants
+        put(&mut t, 0); // no MathGlyphInfo
+        put(&mut t, 0); // no MathVariants
+        t.resize(FAR_CONSTANTS + constant::COUNT * 4, 0);
+        let t = MathTable::parse(&t, 2048).expect("a header with no subtables still parses");
+        assert!(!t.has_math());
+        assert_eq!(t.constant(0), 0, "the version number is not a constant");
+        assert_eq!(t.constant(4), 0);
+        assert!(t.construction(100, true).is_none());
+        assert!(t.grow(100, 800).is_none());
+        assert_eq!(t.min_connector_overlap(), 0);
     }
 
     /// The units per em of the font whose table directory is `dir`, read from its
