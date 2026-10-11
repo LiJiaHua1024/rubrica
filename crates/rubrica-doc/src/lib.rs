@@ -1041,6 +1041,14 @@ impl Builder<'_> {
             }
             Event::HardBreak => {
                 if !self.alt("\n") {
+                    // Mark the join before making it, exactly as a soft break does:
+                    // a definition list is only recoverable if where the fold happened
+                    // survived.
+                    if let Some(b) = self.cur.as_mut() {
+                        if self.cell.is_none() {
+                            self.breaks.push(b.text.len());
+                        }
+                    }
                     self.put("\n", InlineStyle::EMPTY);
                 }
             }
@@ -1063,6 +1071,14 @@ impl Builder<'_> {
             // a lie about what the author meant.
             Event::InlineHtml(h) => {
                 if is_line_break(&h) && !self.alt("\n") {
+                    // `<br>` is a fold like any other, and it is recorded like one:
+                    // the definition list under it is only recoverable if where the
+                    // fold happened survived.
+                    if let Some(b) = self.cur.as_mut() {
+                        if self.cell.is_none() {
+                            self.breaks.push(b.text.len());
+                        }
+                    }
                     self.put("\n", InlineStyle::EMPTY);
                 }
             }
@@ -2368,5 +2384,21 @@ mod source_span_tests {
                 "{src}"
             );
         }
+    }
+
+    /// A hard break is a fold like a soft one, and it has to be recorded like one:
+    /// without the offset the `: ` on the next line is not on a line of its own, so
+    /// the definition list never opens.
+    #[test]
+    fn a_definition_after_a_hard_break_is_still_a_definition() {
+        let doc = Document::parse("term\\\n: def\n");
+        let kinds: Vec<_> = doc.blocks.iter().map(|b| b.kind).collect();
+        assert_eq!(kinds, vec![BlockKind::Term, BlockKind::Definition]);
+        assert_eq!(doc.blocks[1].text, "def");
+        // ... and the same for the only line break a table cell can be given.
+        let doc = Document::parse("term<br>: def\n");
+        let kinds: Vec<_> = doc.blocks.iter().map(|b| b.kind).collect();
+        assert_eq!(kinds, vec![BlockKind::Term, BlockKind::Definition]);
+        assert_eq!(doc.blocks[1].text, "def");
     }
 }
