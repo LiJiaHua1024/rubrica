@@ -964,12 +964,21 @@ struct Builder<'a> {
     /// Index into `notes` while a definition's blocks are being read, which is where
     /// [`Builder::close`] sends them instead of into the body.
     note: Option<usize>,
-    /// Destination and alt text of each `Tag::Image` that is open, outermost first.
+    /// Destination and piece start of each `Tag::Image` that is open, outermost
+    /// first.
     ///
     /// A stack because a figure may stand inside another's alt text, which is
     /// where CommonMark puts it and where its words belong: the inner figure's alt
-    /// becomes part of the outer one's rather than a second box in the prose.
-    images: Vec<(String, String)>,
+    /// becomes part of the outer one's rather than a second box in the prose. The
+    /// words themselves live in `alt_pieces`, shared by the whole stack, so that
+    /// closing an inner figure is one pop: handing its pieces to the outer figure
+    /// there would copy them once per level of nesting.
+    images: Vec<(String, usize)>,
+    /// The alt-text pieces of every open figure, in the order the author wrote
+    /// them: entry `images[k]` owns `alt_pieces[images[k].1..]`. Only the outermost
+    /// close reads them, once, and clears them; an inner close pops its entry and
+    /// leaves its pieces where the outer figure's own name continues.
+    alt_pieces: Vec<String>,
     /// The destination of the `Tag::Link` being read, if one is open: every run of
     /// text pushed while it is set belongs to it.
     link: Option<String>,
@@ -1145,13 +1154,14 @@ impl Builder<'_> {
     /// that missed it -- a code span, a formula, a break -- would be set as running
     /// text beside the figure it belongs to.
     fn alt(&mut self, s: &str) -> bool {
-        match self.images.last_mut() {
-            Some((_, alt)) => {
-                alt.push_str(s);
-                true
-            }
-            None => false,
+        if self.images.is_empty() {
+            return false;
         }
+        // The alt of the figure being read, as the pieces the author wrote rather
+        // than a string rebuilt at every level of nesting: they pile onto the one
+        // shared stack, and only the outermost close gathers them.
+        self.alt_pieces.push(s.to_string());
+        true
     }
 
     /// The number for `label`, handing out the next one on its first citation.
@@ -1266,7 +1276,8 @@ impl Builder<'_> {
                 }
             }
             Tag::Image { dest_url, .. } => {
-                self.images.push((dest_url.to_string(), String::new()));
+                let start = self.alt_pieces.len();
+                self.images.push((dest_url.to_string(), start));
             }
             Tag::FootnoteDefinition(label) => {
                 // Definitions are parsed after the whole body, so a cited label is
@@ -1359,14 +1370,16 @@ impl Builder<'_> {
                 self.link = None;
             }
             TagEnd::Image => {
-                let Some((src, alt)) = self.images.pop() else { return };
+                let Some((src, start)) = self.images.pop() else { return };
                 // A figure inside another's alt text is part of the outer one's name
                 // for it, not a second box in the prose: `![a ![b](j.png) c](i.png)`
-                // is one figure, called `a b c`.
-                if let Some((_, outer)) = self.images.last_mut() {
-                    outer.push_str(&alt);
+                // is one figure, called `a b c`. Its pieces stay on the shared
+                // stack, where the outer figure's own name continues past them.
+                if !self.images.is_empty() {
                     return;
                 }
+                let alt: String = self.alt_pieces[start..].concat();
+                self.alt_pieces.truncate(start);
                 self.push_object(ObjectKind::Image { src, alt });
             }
             _ => {}
@@ -2400,5 +2413,30 @@ mod source_span_tests {
         let kinds: Vec<_> = doc.blocks.iter().map(|b| b.kind).collect();
         assert_eq!(kinds, vec![BlockKind::Term, BlockKind::Definition]);
         assert_eq!(doc.blocks[1].text, "def");
+    }
+
+    /// Each level appended the whole inner alt, so the bytes copied grew with the
+    /// square of the nesting depth.
+    #[test]
+    fn deeply_nested_image_alt_text_is_gathered_in_one_pass() {
+        let src = |n: usize| format!("{}\n", "![a ".repeat(n) + &"](x)".repeat(n));
+        assert_eq!(Document::parse(&src(160_000)).blocks[0].objects.len(), 1);
+        // And the gathered name is the whole nesting, in order.
+        let alt = match &Document::parse(&src(1_000)).blocks[0].objects[0].kind {
+            ObjectKind::Image { alt, .. } => alt.clone(),
+            _ => panic!("nested figures gather into one image"),
+        };
+        assert_eq!(alt, "a ".repeat(1_000));
+        // Time both sizes: one gathering grows by four while the old one grew by
+        // sixteen, so the ratio tells them apart on any machine; the ceiling only
+        // guards against a gathering with an absurd constant.
+        let t0 = std::time::Instant::now();
+        let _ = Document::parse(&src(160_000));
+        let small = t0.elapsed().as_secs_f64();
+        let t = std::time::Instant::now();
+        let _ = Document::parse(&src(640_000));
+        let big = t.elapsed().as_secs_f64();
+        assert!(big < 8.0 * small.max(0.05), "{big:?} vs {small:?} for 640 000 levels");
+        assert!(big < 30.0, "{big:?} for 640 000 levels");
     }
 }
