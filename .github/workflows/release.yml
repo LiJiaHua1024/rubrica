@@ -49,10 +49,10 @@ jobs:
           $prev = git describe --tags --abbrev=0 "HEAD^" 2>$null
           if ($prev) {
             $header = "Changes since ${prev}:"
-            $log = git log "$prev..HEAD" --pretty=format:'- %s'
+            $log = git log --reverse "$prev..HEAD" --pretty=format:'- %s'
           } else {
             $header = "Changes:"
-            $log = git log -20 --pretty=format:'- %s'
+            $log = git log --reverse -20 --pretty=format:'- %s'
           }
           @($header, "") + $log | Set-Content -LiteralPath release-notes.md -Encoding utf8NoBOM
       - name: Publish the release
