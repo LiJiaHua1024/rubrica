@@ -394,7 +394,10 @@ fn span(seq: &[&Part], min_overlap: u16) -> (u32, u32) {
         max_sum += shared;
         min_sum += shared.min(min_overlap as u32);
     }
-    (total - max_sum, total - min_sum)
+    // A font may claim a connector longer than the part it joins: the specification
+    // only recommends otherwise. Saturating rather than wrapping is what keeps a
+    // hostile face from sending the parts' offsets somewhere else entirely.
+    (total.saturating_sub(max_sum), total.saturating_sub(min_sum))
 }
 
 /// Parts in order, with `reps` copies of every extender left in place of each one.
@@ -466,7 +469,7 @@ fn lay_out(seq: &[&Part], min_overlap: u16, extra: u32) -> Vec<Placed> {
             let shared = (p.end_connector as u32).min(next.start_connector as u32);
             let give = (per + (left != 0) as u32).min(room[i]).min(shared);
             left = left.saturating_sub(1);
-            at += p.full_advance as u32 - (shared - give);
+            at += (p.full_advance as u32).saturating_sub(shared - give);
         }
     }
     out
@@ -865,6 +868,58 @@ mod tests {
             }
         }
         None
+    }
+
+    const OVERJOINED: usize = 70;
+
+    /// A `MATH` table whose assembly claims connectors longer than the parts they
+    /// join: the specification only recommends that a connector fit inside its part,
+    /// and a face that says otherwise used to wrap the span arithmetic around.
+    fn overjoined() -> Vec<u8> {
+        let mut t = Vec::new();
+        put(&mut t, 1); // major version
+        put(&mut t, 0); // minor version
+        put(&mut t, FAR_CONSTANTS as u16);
+        put(&mut t, 0); // no MathGlyphInfo
+        put(&mut t, OVERJOINED as u16);
+        pad_to(&mut t, OVERJOINED);
+        // ---- GlyphVariation, whose every offset is measured from here.
+        put(&mut t, 0); // MinConnectorOverlap: nothing is shared
+        put(&mut t, 20); // VertCoverage -> 90
+        put(&mut t, 0); // no horizontal direction
+        put(&mut t, 1); // VertGlyphCount
+        put(&mut t, 0); // HorzGlyphCount
+        put(&mut t, 28); // glyph 100's construction -> 98
+        pad_to(&mut t, 90);
+        // ---- Coverage format 1: the one glyph.
+        put(&mut t, 1);
+        put(&mut t, 1);
+        put(&mut t, 100);
+        pad_to(&mut t, 98);
+        // ---- The construction: no ready-made variant, and an assembly of two parts.
+        put(&mut t, 4); // GlyphAssembly -> 102
+        put(&mut t, 0); // variantCount
+        // ---- The assembly, whose parts are no wider than their own connectors.
+        put(&mut t, 0); // the assembly's italics correction
+        put(&mut t, 2); // partCount
+        put(&mut t, 210); put(&mut t, 0); put(&mut t, 100); put(&mut t, 0); put(&mut t, 0);
+        put(&mut t, 211); put(&mut t, 100); put(&mut t, 0); put(&mut t, 0); put(&mut t, 1);
+        pad_to(&mut t, FAR_CONSTANTS + constant::COUNT * 4);
+        t
+    }
+
+    #[test]
+    fn an_assembly_whose_connectors_outrun_its_parts_does_not_wrap() {
+        let bytes = overjoined();
+        let t = MathTable::parse(&bytes, 2048).expect("the fixture is a version 1 table");
+        let c = t.construction(100, true).expect("coverage lists glyph 100");
+        assert_eq!(c.assembly.len(), 2, "the two parts were not read");
+        let grown = t.grow(100, 1000).expect("an assembly of two parts to build with");
+        let mut at = 0u16;
+        for p in &grown {
+            assert!(p.offset >= at, "the parts ran backwards: {grown:?}");
+            at = p.offset;
+        }
     }
 
     /// The units per em of the font whose table directory is `dir`, read from its
