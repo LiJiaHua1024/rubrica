@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-members = ["crates/rubrica-type", "crates/rubrica-app", "crates/rubrica-doc", "crates/rubrica-math", "crates/rubrica-workspace"]
+members = ["crates/rubrica-type", "crates/rubrica-app", "crates/rubrica-doc", "crates/rubrica-math", "crates/rubrica-mermaid", "crates/rubrica-workspace"]
 
 [workspace.package]
 version = "0.8.18"
@@ -13,6 +13,7 @@ repository = "https://github.com/LiJiaHua1024/rubrica"
 rubrica-type = { path = "crates/rubrica-type" }
 rubrica-doc = { path = "crates/rubrica-doc" }
 rubrica-math = { path = "crates/rubrica-math" }
+rubrica-mermaid = { path = "crates/rubrica-mermaid" }
 rubrica-workspace = { path = "crates/rubrica-workspace" }
 unicode-linebreak = "0.1"
 unicode-script = "0.5"

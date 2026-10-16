@@ -133,6 +133,9 @@ pub enum Key {
     /// Only the PDF writer says it, and that is built on request.
     #[cfg_attr(not(feature = "pdf"), allow(dead_code))]
     FootnoteContinued,
+    /// A fence that named a diagram and could not be drawn as one, with the reason in
+    /// place of {reason}.
+    DiagramError,
 
     MenuBack,
     MenuForward,
@@ -286,6 +289,7 @@ fn translate_en(key: Key) -> &'static str {
         Key::FindNoMatch => "no match",
         Key::FindOneMatch => "1 match",
         Key::FootnoteContinued => "Footnote {n} (continued)",
+        Key::DiagramError => "Diagram not drawn: {reason}",
 
         Key::MenuBack => "Back",
         Key::MenuForward => "Forward",
@@ -423,6 +427,7 @@ fn translate_zh_cn(key: Key) -> &'static str {
         Key::FindNoMatch => "无匹配项",
         Key::FindOneMatch => "1 个匹配项",
         Key::FootnoteContinued => "第 {n} 条注释（续）",
+        Key::DiagramError => "图表未绘制：{reason}",
 
         Key::MenuBack => "后退",
         Key::MenuForward => "前进",
@@ -560,6 +565,7 @@ fn translate_zh_tw(key: Key) -> &'static str {
         Key::FindNoMatch => "無相符項目",
         Key::FindOneMatch => "1 個相符項目",
         Key::FootnoteContinued => "第 {n} 則註解（繼）",
+        Key::DiagramError => "圖表未繪製：{reason}",
 
         Key::MenuBack => "返回",
         Key::MenuForward => "前進",
@@ -697,6 +703,7 @@ fn translate_ja(key: Key) -> &'static str {
         Key::FindNoMatch => "一致なし",
         Key::FindOneMatch => "1 件一致",
         Key::FootnoteContinued => "注 {n}（続き）",
+        Key::DiagramError => "図を描画できません：{reason}",
 
         Key::MenuBack => "戻る",
         Key::MenuForward => "進む",
@@ -834,6 +841,7 @@ fn translate_ko(key: Key) -> &'static str {
         Key::FindNoMatch => "일치 항목 없음",
         Key::FindOneMatch => "1개 일치",
         Key::FootnoteContinued => "각주 {n}(계속)",
+        Key::DiagramError => "다이어그램을 그리지 못했습니다: {reason}",
 
         Key::MenuBack => "뒤로",
         Key::MenuForward => "앞으로",
@@ -971,6 +979,7 @@ fn translate_fr(key: Key) -> &'static str {
         Key::FindNoMatch => "aucune correspondance",
         Key::FindOneMatch => "1 correspondance",
         Key::FootnoteContinued => "Note {n} (suite)",
+        Key::DiagramError => "Diagramme non dessiné : {reason}",
 
         Key::MenuBack => "Précédent",
         Key::MenuForward => "Suivant",
@@ -1108,6 +1117,7 @@ fn translate_de(key: Key) -> &'static str {
         Key::FindNoMatch => "keine Treffer",
         Key::FindOneMatch => "1 Treffer",
         Key::FootnoteContinued => "Fußnote {n} (fortgesetzt)",
+        Key::DiagramError => "Diagramm nicht gezeichnet: {reason}",
 
         Key::MenuBack => "Zurück",
         Key::MenuForward => "Vorwärts",
@@ -1245,6 +1255,7 @@ fn translate_es(key: Key) -> &'static str {
         Key::FindNoMatch => "sin coincidencias",
         Key::FindOneMatch => "1 coincidencia",
         Key::FootnoteContinued => "Nota {n} (continuación)",
+        Key::DiagramError => "Diagrama no dibujado: {reason}",
 
         Key::MenuBack => "Atrás",
         Key::MenuForward => "Adelante",
@@ -1382,6 +1393,7 @@ fn translate_ru(key: Key) -> &'static str {
         Key::FindNoMatch => "нет совпадений",
         Key::FindOneMatch => "1 совпадение",
         Key::FootnoteContinued => "Сноска {n} (продолжение)",
+        Key::DiagramError => "Диаграмма не построена: {reason}",
 
         Key::MenuBack => "Назад",
         Key::MenuForward => "Вперед",
@@ -1519,6 +1531,7 @@ fn translate_it(key: Key) -> &'static str {
         Key::FindNoMatch => "nessuna corrispondenza",
         Key::FindOneMatch => "1 corrispondenza",
         Key::FootnoteContinued => "Nota {n} (continua)",
+        Key::DiagramError => "Diagramma non disegnato: {reason}",
 
         Key::MenuBack => "Indietro",
         Key::MenuForward => "Avanti",
@@ -1656,6 +1669,7 @@ fn translate_pt(key: Key) -> &'static str {
         Key::FindNoMatch => "nenhuma correspondência",
         Key::FindOneMatch => "1 correspondência",
         Key::FootnoteContinued => "Nota {n} (continuação)",
+        Key::DiagramError => "Diagrama não desenhado: {reason}",
 
         Key::MenuBack => "Voltar",
         Key::MenuForward => "Avançar",

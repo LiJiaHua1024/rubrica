@@ -1,0 +1,6 @@
+# This project's sources are written on Windows and one large file
+# (crates/rubrica-app/src/view.rs) is stored with CRLF line endings. A CR
+# before the LF is a line ending there, not trailing whitespace, so tell the
+# whitespace rules that; `git diff --check` then stays a meaningful signal
+# instead of flagging every added line of that file.
+*.rs whitespace=cr-at-eol

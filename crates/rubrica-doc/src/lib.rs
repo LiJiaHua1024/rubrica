@@ -171,6 +171,18 @@ pub struct Block {
     /// block has no information to carry, and guessing a language from what the code
     /// looks like colours a wrong guess as confidently as a right one.
     pub lang: Option<String>,
+    /// The diagram a ```` ```mermaid ```` fence drew, read once here rather than by
+    /// the page on every frame.
+    ///
+    /// The block stays [`BlockKind::Code`] either way, so everything that already
+    /// knows how to set, select and copy a code block keeps working: a reader that
+    /// knows diagrams chooses to draw this instead of the text.
+    pub diagram: Option<rubrica_mermaid::Diagram>,
+    /// Why a ```` ```mermaid ```` fence could not be read: the line and sentence the
+    /// diagram parser gave. The block is shown as the code it was written as, with
+    /// this as the note beside it -- a diagram that cannot be drawn is a keystroke
+    /// away from being fixed, and hiding its source would take that away.
+    pub diagram_error: Option<String>,
 }
 
 /// An inline non-text box.
@@ -280,7 +292,8 @@ impl Block {
         Self { kind, spans: vec![Span { range: 0..text.len(), style: InlineStyle::EMPTY }],
             sources: vec![SourceSpan { range: 0..text.len(), source: 0 }],
             text, quote_depth: 0, list: None, item_depth: None, task: None, table: None,
-            objects: Vec::new(), actions: Vec::new(), lang: None }
+            objects: Vec::new(), actions: Vec::new(), lang: None, diagram: None,
+            diagram_error: None }
     }
 
     /// Headings and code are set ragged-right; justifying them is a defect.
@@ -1442,6 +1455,8 @@ impl Builder<'_> {
             actions: Vec::new(),
             table: None,
             lang: None,
+            diagram: None,
+            diagram_error: None,
         });
     }
 
@@ -1543,6 +1558,17 @@ impl Builder<'_> {
                 b.sources.retain(|s| s.range.start < b.text.len());
                 for s in b.sources.iter_mut() {
                     s.range.end = s.range.end.min(b.text.len());
+                }
+                // A ```` ```mermaid ```` fence is read as a diagram here, once, where
+                // the source is whole: a page that drew it would otherwise parse on
+                // every frame, and the reading is the same every time. A source this
+                // build cannot read stays a code block, with the reason kept for the
+                // note the reader puts beside it.
+                if b.lang.as_deref() == Some("mermaid") {
+                    match rubrica_mermaid::parse(&b.text) {
+                        Ok(diagram) => b.diagram = Some(diagram),
+                        Err(e) => b.diagram_error = Some(e.describe()),
+                    }
                 }
             }
             if worth_setting(&b) {
@@ -1733,6 +1759,8 @@ fn piece(base: &Block, range: std::ops::Range<usize>, kind: BlockKind) -> Option
             .filter_map(|a| cut(a.range.clone()).map(|range| Action { range, kind: a.kind.clone() }))
             .collect(),
         lang: None,
+        diagram: None,
+        diagram_error: None,
     })
 }
 
@@ -2438,5 +2466,50 @@ mod source_span_tests {
         let big = t.elapsed().as_secs_f64();
         assert!(big < 8.0 * small.max(0.05), "{big:?} vs {small:?} for 640 000 levels");
         assert!(big < 30.0, "{big:?} for 640 000 levels");
+    }
+}
+
+/// The ```` ```mermaid ```` fence: read here, once, and either drawn by the page or
+/// shown as the code it was written as with the reason beside it.
+#[cfg(test)]
+mod diagram_tests {
+    use super::*;
+
+    #[test]
+    fn a_mermaid_fence_keeps_its_source_and_gets_a_diagram() {
+        let doc = Document::parse("```mermaid\nflowchart LR\n a[Start] --> b[Done]\n```\n");
+        let block = &doc.blocks[0];
+        assert_eq!(block.kind, BlockKind::Code, "the block stays a code block");
+        assert_eq!(block.lang.as_deref(), Some("mermaid"));
+        assert_eq!(block.text, "flowchart LR\n a[Start] --> b[Done]", "the source is kept");
+        assert!(block.diagram_error.is_none());
+        let diagram = block.diagram.as_ref().expect("a diagram");
+        assert_eq!(diagram.kind(), rubrica_mermaid::DiagramKind::Flow);
+        assert_eq!(diagram.element_count(), 2);
+    }
+
+    #[test]
+    fn a_mermaid_fence_that_cannot_be_read_stays_code_with_its_reason() {
+        let doc = Document::parse("```mermaid\nflowchart TD\n a --> b nonsense\n```\n");
+        let block = &doc.blocks[0];
+        assert_eq!(block.kind, BlockKind::Code);
+        assert_eq!(block.diagram, None);
+        let reason = block.diagram_error.as_deref().expect("a reason");
+        // The line is against the fence's own contents, the first of which is the
+        // header: this error is on the second line the author wrote.
+        assert!(reason.starts_with("line 2: "), "{reason}");
+        assert!(reason.contains("not a link"), "{reason}");
+        assert!(block.text.contains("nonsense"), "the source is still there to fix");
+    }
+
+    #[test]
+    fn a_fence_that_only_looks_like_mermaid_is_not_read_as_one() {
+        // Another language that happens to hold a diagram's words; an indented block
+        // with no info string; and an attribute after the name, which names the same
+        // language the fence reader already knows.
+        let doc = Document::parse("```text\nflowchart TD\n a --> b\n```\n\n    flowchart TD\n");
+        assert!(doc.blocks.iter().all(|b| b.diagram.is_none() && b.diagram_error.is_none()));
+        let doc = Document::parse("```mermaid,ignore\nflowchart TD\n a --> b\n```\n");
+        assert!(doc.blocks[0].diagram.is_some(), "the comma form still names mermaid");
     }
 }

@@ -105,7 +105,8 @@ pub fn report(source: &str, path: Option<&str>, o: &Options) -> Result<()> {
     let store = crate::images::ImageStore::new().ok();
     let base = path.map(std::path::Path::new).and_then(|p| p.parent());
     let mut math = crate::math::MathStore::new();
-    let mut objects = crate::view::Objects::new(store.as_ref(), base, &mut math);
+    let mut diagrams = crate::diagram::DiagramStore::new();
+    let mut objects = crate::view::Objects::new(store.as_ref(), base, &mut math, &mut diagrams);
     let hyphenator = if hyphenate {
         crate::hyphen::shared()
     } else {
@@ -160,6 +161,23 @@ pub fn report(source: &str, path: Option<&str>, o: &Options) -> Result<()> {
         }
         lines.push(l);
     }
+    // A diagram's words do not travel as `Op::Runs` -- they ride inside the diagram's
+    // own op, so that one scene's paint order (panels, boxes, edges, labels) survives
+    // an op list that is searched in reading order -- so the census above is blind to
+    // every label a diagram carries. They are shaped again here, through the very
+    // requests the drawing shapes them with, and merged into the same two tables: a
+    // diagram's words are glyphs drawn on this page exactly as a paragraph's are.
+    diagrams.each_label(|text, role, size, italic, face| {
+        let req = crate::diagram::label_request(face, role, italic);
+        for r in font.shape_runs(text, 0..text.len(), &req, size, 0.0) {
+            let fam = font.face_family(r.face);
+            *census.entry(fam.clone()).or_default() += r.glyphs.len();
+            let holes = r.glyphs.iter().filter(|g| **g == 0).count();
+            if holes > 0 {
+                *notdef.entry(fam).or_default() += holes;
+            }
+        }
+    });
 
     let col_dip = column_pt * k;
     // The measure's right edge in device pixels: where every justified line ends,
@@ -352,10 +370,13 @@ pub fn report(source: &str, path: Option<&str>, o: &Options) -> Result<()> {
         .chain(doc.footnotes.iter().flat_map(|f| f.blocks.iter()))
         .collect();
     {
+        // A fence that was drawn as a diagram is not set as code at all: its words are
+        // painted as diagram labels, and the `diagrams` line below is where it is
+        // counted. A fence whose drawing failed is exactly what this census is about.
         let code: Vec<&rubrica_doc::Block> = shown
             .iter()
             .copied()
-            .filter(|b| b.kind == rubrica_doc::BlockKind::Code)
+            .filter(|b| b.kind == rubrica_doc::BlockKind::Code && b.diagram.is_none())
             .collect();
         let named = code.iter().filter(|b| b.lang.is_some()).count();
         let read = code
@@ -419,11 +440,61 @@ pub fn report(source: &str, path: Option<&str>, o: &Options) -> Result<()> {
             families.join(", ")
         );
     }
+    // Diagrams, counted from the store and the source rather than from the ops: the
+    // ops hold what was drawn, and a fence that did not parse has its source on the
+    // page and no drawing at all -- the interesting document is the one where those
+    // two disagree, and this is where a reader of the report can see it. The rows are
+    // each scene's own arithmetic, one line per diagram, because a summary cannot
+    // tell a box that wrapped from one that was placed a line too low.
+    let fences = shown
+        .iter()
+        .filter(|b| b.diagram.is_some() || b.diagram_error.is_some())
+        .count();
+    if fences > 0 {
+        let rows = diagrams.rows();
+        let failed = shown.iter().filter(|b| b.diagram_error.is_some()).count();
+        let elements: usize = rows.iter().map(|r| r.elements).sum();
+        let edges: usize = rows.iter().map(|r| r.edges).sum();
+        let count: (usize, usize) = rows
+            .iter()
+            .fold((0, 0), |(s, l), r| (s + r.shapes, l + r.labels));
+        println!(
+            "diagrams     : {fences} fence(s), {} drawn, {elements} element(s), {edges} link(s), {} shape(s), {} label(s), {failed} not drawn",
+            rows.len(),
+            count.0,
+            count.1
+        );
+        for (i, r) in rows.iter().enumerate() {
+            println!(
+                "  [{i}] {:<10} {} element(s), {} link(s)  {:.1} x {:.1}pt  {} shape(s), {} label(s)",
+                r.kind, r.elements, r.edges, r.width, r.height, r.shapes, r.labels
+            );
+        }
+        for b in shown.iter().filter(|b| b.diagram_error.is_some()) {
+            if let Some(reason) = b.diagram_error.as_deref() {
+                println!("  !! not drawn: {reason}");
+            }
+        }
+        // A diagram is scaled down to the column, so a shape outside its own scene box
+        // is painted over whatever stands beside it with nothing on the page to say so.
+        // The layout should never produce one, which is why it is checked.
+        let outside = diagrams.outside();
+        if outside.is_empty() && !rows.is_empty() {
+            println!("  bounds     : every shape and label inside its scene");
+        }
+        if !outside.is_empty() {
+            println!("!! {} piece(s) outside their scene box:", outside.len());
+            for line in outside.iter().take(8) {
+                println!("  {line}");
+            }
+        }
+    }
     // A formula's arithmetic is invisible in a summary: a brace that was grown to its
     // grid and a brace drawn as one natural-size glyph are the same one line of the
     // census and a screen apart on the page. This prints the display list itself.
     if shapes {
         math.dump(&font);
+        diagrams.dump(&font);
         for op in ops {
             let crate::view::Op::Runs(runs) = op else { continue };
             for run in runs {

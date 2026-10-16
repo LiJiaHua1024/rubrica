@@ -817,6 +817,7 @@ dependencies = [
  "printpdf",
  "rubrica-doc",
  "rubrica-math",
+ "rubrica-mermaid",
  "rubrica-type",
  "rubrica-workspace",
  "windows",
@@ -830,11 +831,16 @@ name = "rubrica-doc"
 version = "0.8.18"
 dependencies = [
  "pulldown-cmark",
+ "rubrica-mermaid",
  "rubrica-type",
 ]
 
 [[package]]
 name = "rubrica-math"
+version = "0.8.18"
+
+[[package]]
+name = "rubrica-mermaid"
 version = "0.8.18"
 
 [[package]]

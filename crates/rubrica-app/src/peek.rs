@@ -1671,7 +1671,9 @@ impl Peek {
         let k = dpi / 72.0;
         self.images = images::ImageStore::new().ok();
         let mut math = crate::math::MathStore::new();
-        let mut objects = Objects::new(self.images.as_ref(), path.parent(), &mut math);
+        let mut diagrams = crate::diagram::DiagramStore::new();
+        let mut objects =
+            Objects::new(self.images.as_ref(), path.parent(), &mut math, &mut diagrams);
         self.page = Some(build_ops(
             font,
             &self.theme,
@@ -2034,6 +2036,35 @@ impl Peek {
                                         D2D1_BITMAP_INTERPOLATION_MODE_LINEAR,
                                         None,
                                     );
+                                }
+                            }
+                        }
+                        Op::Diagram { left, top: dtop, shapes, runs, .. } => {
+                            let dx = pan(*left, *dtop);
+                            // The factory is cloned out of self first: the brushes are
+                            // built on demand, and a borrow of `self` for the brush
+                            // closure cannot be held across another borrow of `self`.
+                            let factory = self.d2d.clone();
+                            {
+                                let mut brush = |role: ColorRole| self.brush(role);
+                                crate::diagram::paint_diagram_shapes(
+                                    &target, &factory, shapes, dx, 0.0, &mut brush,
+                                );
+                            }
+                            // The preview sets the page at its own scroll offset, so a
+                            // diagram lands where the page put it: no `up` to take off.
+                            for run in runs {
+                                let dx = pan(run.x, run.baseline);
+                                if dx != 0.0 {
+                                    let mut moved = run.clone();
+                                    moved.x += dx;
+                                    if let Some(brush) = self.brush(moved.color) {
+                                        draw_glyph_run(&target, &moved, &brush);
+                                    }
+                                    continue;
+                                }
+                                if let Some(brush) = self.brush(run.color) {
+                                    draw_glyph_run(&target, run, &brush);
                                 }
                             }
                         }

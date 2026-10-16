@@ -1,0 +1,10 @@
+[package]
+name = "rubrica-mermaid"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Mermaid diagram source to a positioned scene, for Rubrica's own typesetter"
+
+[dependencies]

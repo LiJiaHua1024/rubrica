@@ -8,6 +8,7 @@
 #![windows_subsystem = "windows"]
 
 mod clipboard;
+mod diagram;
 mod font;
 mod find;
 mod highlight;

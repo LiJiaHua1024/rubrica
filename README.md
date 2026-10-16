@@ -125,6 +125,22 @@ Ordinary TeX reactions whose identifiers can be recognised as chemical elements
 also use upright lettering and longer reaction arrows. Arrow conditions are centred
 at a readable size; arrows grow to leave room on both sides of their labels.
 
+Mermaid fences are drawn rather than set as code. Flowcharts (`flowchart`/`graph`,
+both directions, the full set of node shapes, arrow styles, edge labels in pipes or
+between two dashes, subgraphs and self-loops), sequence diagrams (participants,
+messages, notes, fragments), state diagrams (including `[*]` and `: transition
+labels`), class diagrams, ER diagrams, pie charts, mindmaps and tree views
+(`treeView`/`treeView-beta`: indentation or box-drawing rows, quoted names,
+`##` descriptions, `:::highlight`, `icon(...)` read and dropped) come out as
+shapes, arrows and labels. Lines, fills and words take their colours from the light
+and dark palettes, and the words are shaped through the same pipeline as the prose,
+so they stay real, selectable text in exported PDFs. A fence that cannot be drawn --
+a syntax error, or a diagram kind this reader does not draw such as `gantt` --
+stays a code block with a one-line reason above it, and diagrams past the size
+ceiling are refused the same way rather than laid out. `fixtures/mermaid-flow.md`
+and its siblings exercise the families; `--report` counts each diagram's elements,
+links, shapes and labels, and `--report --shapes` dumps them.
+
 ## Reading features
 
 Selection by mouse and keyboard with clipboard copy, a caret that follows the pointer,
@@ -216,11 +232,13 @@ typesetting) happens off the keystroke, after a posted message.
 | `rubrica-type` | the line breaker: paragraph model, Knuth–Plass solver, justification, script classification, hyphenation |
 | `rubrica-doc` | Markdown to blocks, spans, tables, footnotes and inline objects |
 | `rubrica-math` | a LaTeX subset to boxes, measured through a `MathMeasure` the caller implements |
+| `rubrica-mermaid` | Mermaid fences to scenes: a parser, a layered layout and shape primitives, with no dependencies at all |
 | `rubrica-app` | the window: Direct2D/DirectWrite painting, selection, hit-testing, themes, settings, workspace navigation, `--report`, PNG/PDF export, and the `--peek` spacebar service |
 | `rubrica-workspace` | tab identity, preview/pinned state, recent files, and versioned session snapshots |
 
 The first three have no dependency on Windows and no dependency on each other's
-internals, which is why the whole engine is testable from a console.
+internals; `rubrica-mermaid` is portable the same way, and `rubrica-doc` reaches it
+only through its public API, which is why the whole engine is testable from a console.
 
 ## Known limitations
 

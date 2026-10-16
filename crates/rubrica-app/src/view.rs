@@ -21,8 +21,10 @@ use rubrica_type::{BreakOptions, Hyphenation, typeset, typeset_hyphenated};
 #[cfg(feature = "pdf")]
 use printpdf::{
     Actions as PdfActions, BuiltinFont, Color as PdfColor, Codepoint, FontId as PdfFontId,
+    Line as PdfLine, LinePoint as PdfLinePoint,
     LinkAnnotation as PdfLinkAnnotation, Op as PdfOp, ParsedFont, PdfDocument,
-    PdfFontHandle, PdfPage, PdfSaveOptions, PdfParseErrorSeverity, Point as PdfPoint, RawImage,
+    PdfFontHandle, PdfPage, PdfSaveOptions, PdfParseErrorSeverity, Point as PdfPoint,
+    Polygon as PdfPolygon, PolygonRing as PdfPolygonRing, RawImage,
     Rect as PdfRect, DictItem,
     Rgb as PdfRgb, TextItem, TextMatrix as PdfTextMatrix, XObjectTransform,
 };
@@ -111,6 +113,7 @@ use crate::find::Needle;
 use crate::font::{cjk_char, FaceRequest, FontEngine, GlyphRun, ObjectBox, Style as RunStyle};
 use crate::hyphen::Hyphenator;
 use crate::images::ImageStore;
+use crate::diagram::DiagramStore;
 use crate::math::MathStore;
 use crate::tree::{self, Entry as TreeEntry, EntryKind as TreeEntryKind};
 use rubrica_workspace::{DocumentRef, FileRef, Tab, TabId, TabKind, Workspace};
@@ -534,6 +537,25 @@ pub enum Op {
     Image { path: PathBuf, x: f32, y: f32, w: f32, h: f32 },
     Rect { x: f32, y: f32, w: f32, h: f32, color: ColorRole },
     Line { x0: f32, y0: f32, x1: f32, y1: f32, thickness: f32, color: ColorRole },
+    /// A diagram: its outlines and its words, in device independent pixels.
+    ///
+    /// One op for a whole diagram rather than one per shape, because the two orders
+    /// it has to keep are not the same order. The scene is built to be painted in
+    /// the order its vectors hold -- panels behind boxes, boxes behind edges, edge
+    /// labels over both -- and inside one op that order is simply kept. The display
+    /// list, meanwhile, is searched for the band in front of the reader by bisection
+    /// over the ops' tops, which is only an answer while the tops never go back up;
+    /// a diagram emitted shape by shape would file an edge above the box below it
+    /// and unsort the whole page. Kept whole, a diagram is one tall figure whose own
+    /// ends the search can trust, exactly as a full-page image is one op.
+    Diagram {
+        left: f32,
+        top: f32,
+        right: f32,
+        bottom: f32,
+        shapes: Vec<crate::diagram::DiagramShape>,
+        runs: Vec<PaintRun>,
+    },
 }
 
 /// The op's topmost ink, in the display list's own coordinates.
@@ -546,6 +568,7 @@ pub fn op_top(op: &Op) -> f32 {
         Op::Runs(runs) => runs.first().map_or(0.0, |r| r.baseline),
         Op::Image { y, .. } | Op::Rect { y, .. } => *y,
         Op::Line { y0, y1, .. } => y0.min(*y1),
+        Op::Diagram { top, .. } => *top,
     }
 }
 
@@ -569,6 +592,7 @@ pub fn op_bottom(op: &Op) -> f32 {
         Op::Runs(runs) => runs.iter().fold(op_top(op), |low, r| low.max(r.baseline + r.em)),
         Op::Image { y, h, .. } | Op::Rect { y, h, .. } => y + h,
         Op::Line { y0, y1, thickness, .. } => y0.max(*y1) + thickness,
+        Op::Diagram { bottom, .. } => *bottom,
     }
 }
 
@@ -796,11 +820,13 @@ fn spawn_layout(
         }
         let images = ImageStore::new().ok();
         let mut math = MathStore::new();
+        let mut diagrams = DiagramStore::new();
         let hyphenator = if request.hyphenate { crate::hyphen::shared() } else { None };
         // The profile's math store and the image sizes are the same work the window
         // would do for this document; a relayout redoes them, which is why the
         // caches that outlive a document live on the window's engine.
-        let mut objects = Objects::new(images.as_ref(), request.base.as_deref(), &mut math);
+        let mut objects =
+            Objects::new(images.as_ref(), request.base.as_deref(), &mut math, &mut diagrams);
         let mut sink = RemoteSink {
             epoch: request.epoch,
             cancel,
@@ -1842,6 +1868,9 @@ pub struct View {
     /// Typeset formulas, one store per profile so a tab switch that flips the profile
     /// back and forth keeps each profile's work; see [`View::math_for`].
     maths: HashMap<String, MathStore>,
+    /// Typeset diagrams, one store per profile for the same reason formulas are: a
+    /// diagram's boxes are as wide as the profile's face draws them.
+    diagrams: HashMap<String, DiagramStore>,
     /// English word breaks, when the embedded dictionary loaded.
     hyphenator: Option<&'static Hyphenator>,
     /// What the reader is looking for, and everywhere the page has it. `Some` while the
@@ -3304,6 +3333,7 @@ fn new_view(path: Option<PathBuf>, extra: Vec<PathBuf>) -> Result<(Box<View>, cr
         press_at: None,
         images: None,
         maths: HashMap::new(),
+        diagrams: HashMap::new(),
         hyphenator: None,
         find: None,
         edit: None,
@@ -3973,6 +4003,7 @@ impl View {
                 },
                 Op::Rect { x, y, w, .. } | Op::Image { x, y, w, .. } => include(*x, x + w, *y),
                 Op::Line { x0, y0, x1, .. } => include(x0.min(*x1), x0.max(*x1), *y0),
+                Op::Diagram { left, right, top, .. } => include(*left, *right, *top),
             }
         }
         if !left.is_finite() { left = 0.0; right = width; }
@@ -6974,9 +7005,14 @@ impl View {
         // table's reach into the right margin would land past the window's edge.
         let page_w = (self.client_w - self.content_dx()).max(1.0);
         let profile = self.profile.clone();
-        let math = self.maths.entry(profile).or_default();
-        let mut objects =
-            Objects::new(self.images.as_ref(), self.path.as_deref().and_then(|p| p.parent()), math);
+        let math = self.maths.entry(profile.clone()).or_default();
+        let diagrams = self.diagrams.entry(profile).or_default();
+        let mut objects = Objects::new(
+            self.images.as_ref(),
+            self.path.as_deref().and_then(|p| p.parent()),
+            math,
+            diagrams,
+        );
         let page = build_ops(
             &mut self.font,
             &self.theme,
@@ -7350,6 +7386,8 @@ struct Ctx<'a> {
     client_pt: Pt,
     /// Typeset formulas, by cache index. Layout only reads this; interning wrote it.
     math: &'a MathStore,
+    /// The diagrams this pass's fences were typeset into, read the same way.
+    diagrams: &'a DiagramStore,
     /// Which footnote a citation's label names, which is how a raised number becomes a
     /// jump to a position on the page.
     notes: &'a HashMap<String, usize>,
@@ -7374,6 +7412,8 @@ struct Blk<'a> {
     left: Pt,
     column: Pt,
     table: Option<&'a PreparedTable>,
+    /// A diagram this block is, as an index into the layout's own [`DiagramStore`].
+    diagram: Option<usize>,
     /// Where words in this block may split, and the advance of the hyphen glyph at
     /// this block's body size.
     hyphenation: Hyphenation<'a>,
@@ -7435,6 +7475,10 @@ struct Prepared {
     /// body text that lines up with neither is not hung.
     hang: Pt,
     table: Option<PreparedTable>,
+    /// The block's diagram, typeset into the objects' store: an index into the
+    /// [`DiagramStore`] the same layout pass was handed, or `None` for a block that is
+    /// not a diagram.
+    diagram: Option<usize>,
     /// The block's clickable ranges, with the marker's length added to both ends so the
     /// same offsets index [`Prepared::text`] as for [`Prepared::spans`].
     actions: Vec<Action>,
@@ -7850,6 +7894,41 @@ fn source_line(line: &mut SelLine, _text: &str, start: usize, sources: &[rubrica
         .map(|(first, last)| first.source..last.source + last.range.len());
 }
 
+/// The line a fence that named a diagram gets when it could not be drawn: the reason,
+/// once, set in the prose's own face above the source. The words of the reason come
+/// from the parser -- `line 7: unknown diagram kind` -- and the frame around them from
+/// the reader's language, so a fence is diagnosable in every language the app speaks.
+fn layout_diagram_error(
+    font: &FontEngine,
+    theme: &Theme,
+    blk: &Blk<'_>,
+    ops: &mut Vec<Op>,
+    y: Pt,
+    reason: &str,
+    k: f32,
+) -> Pt {
+    let message = i18n::t(crate::settings::current_language(), Key::DiagramError)
+        .replace("{reason}", reason);
+    let (face, size) = crate::diagram::body_face(theme, None);
+    let shaped = font.shape_runs(&message, 0..message.len(), &face, size, 0.0);
+    let ascent = shaped.iter().map(|r| r.ascent).fold(0.0f32, f32::max);
+    let descent = shaped.iter().map(|r| r.descent).fold(0.0f32, f32::max);
+    let baseline = y + ascent;
+    let mut runs = Vec::new();
+    let mut at = blk.left;
+    for r in &shaped {
+        if let Some(run) = paint_run(font, r, at, 0.0, k, ColorRole::Muted, Some(&message)) {
+            at += r.width();
+            runs.push(run);
+        }
+    }
+    seat(&mut runs, baseline, k);
+    if !runs.is_empty() {
+        ops.push(Op::Runs(runs));
+    }
+    baseline + descent + theme.base * 0.35
+}
+
 /// Typeset one block into the display list and return the new document y.
 fn layout_block(
     font: &mut FontEngine,
@@ -7877,6 +7956,38 @@ fn layout_block(
     }
     if let Some(t) = blk.table {
         return layout_table(font, ctx, blk, t, &mut Out { ops, hots, sel, hyphens, wide, table_headers, table_spans, note_spans, math_texts }, y);
+    }
+    // A fence this build drew is a figure: it takes the whole column, its words are
+    // measured by the diagram's own layout rather than by the code grid, and it reports
+    // its own height. It is one op for the whole drawing, because the order its parts
+    // are painted in is the scene's own -- panels behind boxes, boxes behind edges,
+    // labels over both -- and that is not the order the page's ops are searched in;
+    // see [`Op::Diagram`].
+    if let Some(index) = blk.diagram {
+        if let Some(entry) = ctx.diagrams.get(index) {
+            let ink = crate::diagram::paint(font, entry, left, y + theme.base * 0.25, column, k);
+            let bottom = ink.bottom;
+            ops.push(Op::Diagram {
+                left: ink.left,
+                top: ink.top,
+                right: ink.right,
+                bottom,
+                shapes: ink.shapes,
+                runs: ink.runs,
+            });
+            return bottom / k + theme.base * 0.5;
+        }
+        // Typeset, but not in this layout's store: a page laid by another store, or a
+        // relayout whose store has not measured it yet. Falling through to the fence's
+        // own code keeps the words on the page rather than dropping the block, and
+        // costs nothing when the store is the one that set it.
+    }
+    // A fence that named a diagram and has none to show says why, once, above the
+    // source it failed on: the reader sees both the reason and the words it could not
+    // be drawn from, which is the page that lets the fence be fixed. Silently setting
+    // the source alone would read as a limit of the writer rather than of this build.
+    if let Some(reason) = b.diagram_error.as_deref() {
+        y = layout_diagram_error(font, theme, blk, ops, y, reason, k);
     }
     if text.trim().is_empty() {
         return y;
@@ -10083,7 +10194,7 @@ impl View {
         let max_h = (BUBBLE_MAX_LINES * leading.cjk.max(leading.latin) * self.theme.note_size())
             .min((self.content_bottom() - TOPBAR_H) * BUBBLE_MAX_SCREEN / k)
             .max(self.theme.note_size());
-        let View { font, theme, doc, maths, images, path, profile, .. } = self;
+        let View { font, theme, doc, maths, diagrams, images, path, profile, .. } = self;
         let note = doc.footnotes.get(index)?;
         // A style table of the bubble's own, because a `StyleId` is an index into
         // whichever table made it and the page's ids would name the wrong faces.
@@ -10093,6 +10204,7 @@ impl View {
                 images.as_ref(),
                 path.as_deref().and_then(|p| p.parent()),
                 maths.entry(profile.clone()).or_default(),
+                diagrams.entry(profile.clone()).or_default(),
             );
             note.blocks
                 .iter()
@@ -10116,6 +10228,7 @@ impl View {
         let notes = HashMap::new();
         let anchors = HashMap::new();
         let store = maths.get(profile)?;
+        let dstore = diagrams.get(profile)?;
         let ctx = Ctx {
             theme,
             styles: &styles,
@@ -10124,6 +10237,7 @@ impl View {
             // the paint never shifts a bubble's ops.
             client_pt: Pt::MAX / 4.0,
             math: store,
+            diagrams: dstore,
             notes: &notes,
             anchors: &anchors,
             base: path.as_deref().and_then(|p| p.parent()),
@@ -10159,6 +10273,7 @@ impl View {
                     left: 0.0,
                     column: measure,
                     table: p.table.as_ref(),
+                    diagram: p.diagram,
                     // A note in a panel this narrow is a pointer to the rest of
                     // itself rather than the text itself, and a word split across two
                     // lines of it reads worse than one over-long line.
@@ -10200,6 +10315,7 @@ impl View {
                 Op::Runs(runs) => runs.first().map_or(last, |r| r.baseline),
                 Op::Rect { y, .. } | Op::Image { y, .. } => *y,
                 Op::Line { y0, y1, .. } => y0.min(*y1),
+                Op::Diagram { top, .. } => *top,
             };
             tops.push(last);
         }
@@ -10410,6 +10526,33 @@ impl View {
                             D2D1_BITMAP_INTERPOLATION_MODE_LINEAR,
                             None,
                         );
+                    }
+                }
+                Op::Diagram { left, top: dtop, bottom: dbottom, shapes, runs, .. } => {
+                    if *dbottom < top || *dtop > bottom {
+                        continue;
+                    }
+                    let dx = pan(*left, *dtop);
+                    let mut brush = |role: ColorRole| self.brushes.get(&role).cloned();
+                    unsafe {
+                        crate::diagram::paint_diagram_shapes(
+                            target, &self.d2d, shapes, dx, -up, &mut brush,
+                        );
+                    }
+                    // The runs are the diagram's words, drawn through the same
+                    // painter the page's prose goes through. The pan is applied here
+                    // as well, so a diagram's ink and its labels move together if it
+                    // ever finds itself inside a panned region.
+                    if dx == 0.0 {
+                        self.draw_runs(target, runs, up);
+                    } else {
+                        shifted.clear();
+                        for run in runs {
+                            let mut run = run.clone();
+                            run.x += dx;
+                            shifted.push(run);
+                        }
+                        self.draw_runs(target, &shifted, up);
                     }
                 }
                 Op::Runs(runs) => {
@@ -11187,6 +11330,10 @@ pub struct Objects<'a> {
     /// Formulas typeset so far: written while styles are interned, read back when the
     /// same style ids are laid out, so no document is set twice.
     math: &'a mut MathStore,
+    /// Diagrams typeset so far, keyed the same way their fences are: a source measured
+    /// once serves every relayout of it, and the report read the same store the page
+    /// was drawn from.
+    diagrams: &'a mut DiagramStore,
 }
 
 impl<'a> Objects<'a> {
@@ -11194,8 +11341,9 @@ impl<'a> Objects<'a> {
         images: Option<&'a ImageStore>,
         base_dir: Option<&'a std::path::Path>,
         math: &'a mut MathStore,
+        diagrams: &'a mut DiagramStore,
     ) -> Objects<'a> {
-        Objects { images, base_dir, math }
+        Objects { images, base_dir, math, diagrams }
     }
 
     /// The style for one object span, or `None` when it cannot be shown and its
@@ -11409,12 +11557,20 @@ fn prepare_block(
         };
         PreparedTable { head: prep(&t.head), rows: t.rows.iter().map(|r| prep(r)).collect() }
     });
+    // A fence this build can draw is measured here, once per source and face, the way
+    // objects are: the diagram's own layout is the expensive half of showing one, and
+    // both the window's relayouts and `--report` come back through this function.
+    let diagram = b.diagram.as_ref().map(|d| {
+        let (face, size) = crate::diagram::body_face(theme, smaller);
+        objects.diagrams.intern(font, &b.text, d, size, &face)
+    });
     Prepared {
         text,
         spans,
         base: base.0 as usize,
         hang,
         table,
+        diagram,
         actions: b
             .actions
             .iter()
@@ -11549,7 +11705,8 @@ pub(crate) fn export_png(
     let store = ImageStore::new().ok();
     let base = input_path.and_then(Path::parent);
     let mut math = crate::math::MathStore::new();
-    let mut objects = Objects::new(store.as_ref(), base, &mut math);
+    let mut diagrams = DiagramStore::new();
+    let mut objects = Objects::new(store.as_ref(), base, &mut math, &mut diagrams);
     let hyphenator = if hyphenate { crate::hyphen::Hyphenator::english() } else { None };
     let page = build_ops(
         &mut font,
@@ -11656,6 +11813,35 @@ unsafe fn write_png(
                     target.DrawBitmap(&bitmap, Some(&r), 1.0, D2D1_BITMAP_INTERPOLATION_MODE_LINEAR, None);
                 }
             }
+            Op::Diagram { shapes, runs, .. } => {
+                {
+                    let mut shape_brush = |role: ColorRole| brush(role).ok();
+                    unsafe {
+                        crate::diagram::paint_diagram_shapes(
+                            &target, &factory, shapes, 0.0, 0.0, &mut shape_brush,
+                        );
+                    }
+                }
+                for run in runs {
+                    let description = DWRITE_GLYPH_RUN {
+                        fontFace: std::mem::ManuallyDrop::new(Some(run.face.clone())),
+                        fontEmSize: run.em,
+                        glyphCount: run.glyphs.len() as u32,
+                        glyphIndices: run.glyphs.as_ptr(),
+                        glyphAdvances: run.advances.as_ptr(),
+                        glyphOffsets: run.offsets.as_ptr(),
+                        isSideways: false.into(),
+                        bidiLevel: run.bidi_level as u32,
+                    };
+                    target.DrawGlyphRun(
+                        Vector2::new(glyph_origin(run.x, run.advances.iter().sum(), run.bidi_level), run.baseline),
+                        &description,
+                        &brush(run.color)?,
+                        DWRITE_MEASURING_MODE_NATURAL,
+                    );
+                    let _ = std::mem::ManuallyDrop::into_inner(description.fontFace);
+                }
+            }
             Op::Runs(runs) => {
                 for run in runs {
                     let description = DWRITE_GLYPH_RUN {
@@ -11752,7 +11938,8 @@ pub fn export_pdf(
     let store = ImageStore::new().ok();
     let base = input_path.and_then(Path::parent);
     let mut math = crate::math::MathStore::new();
-    let mut objects = Objects::new(store.as_ref(), base, &mut math);
+    let mut diagrams = DiagramStore::new();
+    let mut objects = Objects::new(store.as_ref(), base, &mut math, &mut diagrams);
     let hyphenator = if hyphenate { crate::hyphen::Hyphenator::english() } else { None };
     let page = build_ops(
         &mut font,
@@ -11811,9 +11998,42 @@ fn translate_pdf_op(op: &Op, dy: f32) -> Op {
     match &mut translated {
         Op::Runs(runs) => for run in runs { run.baseline += dy; },
         Op::Image { y, .. } | Op::Rect { y, .. } => *y += dy,
-        Op::Line { y0, y1, .. } => { *y0 += dy; *y1 += dy; }
+        Op::Line { y0, y1, .. } => { *y0 += dy; *y1 += dy; },
+        Op::Diagram { top, bottom, shapes, runs, .. } => {
+            *top += dy;
+            *bottom += dy;
+            for run in runs {
+                run.baseline += dy;
+            }
+            for shape in shapes {
+                shift_shape_path(&mut shape.path, dy);
+            }
+        }
     }
     translated
+}
+
+/// Move one scene path down by `dy`.
+///
+/// A page reserves room for a carried-over table header or note and hands its own ops
+/// to the writer shifted past it; a diagram is the one op whose ink is not held in
+/// scalars, so its outline follows its box only if every vertex is moved with it.
+#[cfg(feature = "pdf")]
+fn shift_shape_path(path: &mut rubrica_mermaid::ShapePath, dy: f32) {
+    fn down(p: &mut rubrica_mermaid::Point, dy: f32) {
+        p.y += dy;
+    }
+    down(&mut path.start, dy);
+    for cmd in &mut path.cmds {
+        match cmd {
+            rubrica_mermaid::PathCmd::MoveTo(p) | rubrica_mermaid::PathCmd::LineTo(p) => down(p, dy),
+            rubrica_mermaid::PathCmd::CubicTo(a, b, c) => {
+                down(a, dy);
+                down(b, dy);
+                down(c, dy);
+            }
+        }
+    }
 }
 
 /// Whether an op has any ink in the band that runs from `top` for `band` points.
@@ -11847,6 +12067,9 @@ fn op_intersects_band(op: &Op, top: Pt, band: Pt) -> bool {
         Op::Runs(runs) => runs
             .iter()
             .any(|run| !run.glyphs.is_empty() && (run.baseline - top) >= 0.0 && (run.baseline - top) < band),
+        Op::Diagram { top: dtop, bottom: dbottom, .. } => {
+            dbottom - top > 0.0 && dtop - top < band
+        }
     }
 }
 
@@ -12022,6 +12245,172 @@ fn actual_text_span(text: &str) -> PdfOp {
 #[cfg(all(test, feature = "pdf"))]
 fn unicode_for_glyph(source: &str, clusters: &[u16], glyph_count: usize, index: usize) -> Option<String> {
     unicode_by_glyph(source, clusters, glyph_count).get(index).cloned().flatten()
+}
+
+/// One batch of shaped runs as PDF text.
+///
+/// Shared by the page's own `Op::Runs` and by the words inside an `Op::Diagram`:
+/// a diagram's labels are shaped through the same shaper and carry the same
+/// `source`, so the writer sets them with real glyph ids and an `ActualText` span
+/// -- a diagram's words are selectable and extractable like any other text, and
+/// its glyphs come out of the same embedded faces.
+#[cfg(feature = "pdf")]
+#[allow(clippy::too_many_arguments)]
+fn pdf_emit_runs(
+    ops: &mut Vec<PdfOp>,
+    runs: &[PaintRun],
+    fonts: &mut HashMap<usize, PdfFontId>,
+    missing_font_faces: &mut Vec<String>,
+    pdf: &mut PdfDocument,
+    font: &FontEngine,
+    top: Pt,
+    content_height: Pt,
+    height: Pt,
+    dark: bool,
+) {
+    for run in runs {
+        if run.glyphs.is_empty() {
+            continue;
+        }
+        let baseline = run.baseline - top;
+        if baseline < 0.0 || baseline >= content_height {
+            continue;
+        }
+        let font_id = if let Some(id) = fonts.get(&run.face_index) {
+            id.clone()
+        } else {
+            let Some((bytes, face_index)) = font.font_file(run.face_index) else {
+                missing_font_faces.push(run.family.clone());
+                continue;
+            };
+            let mut font_warnings = Vec::new();
+            let Some(parsed) = ParsedFont::from_bytes(&bytes, face_index, &mut font_warnings)
+            else {
+                missing_font_faces.push(run.family.clone());
+                continue;
+            };
+            let id = pdf.add_font(&parsed);
+            fonts.insert(run.face_index, id.clone());
+            id
+        };
+        ops.push(PdfOp::SetFillColor { col: pdf_color(run.color, dark) });
+        ops.push(PdfOp::SetFont {
+            font: PdfFontHandle::External(font_id),
+            size: printpdf::Pt(run.em),
+        });
+        ops.push(PdfOp::StartTextSection);
+        if let Some(source) = run.source.as_deref() {
+            ops.push(actual_text_span(source));
+        }
+        let unicode = run
+            .source
+            .as_deref()
+            .map(|source| unicode_by_glyph(source, &run.clusters, run.glyphs.len()));
+        for (i, glyph) in run.glyphs.iter().enumerate() {
+            let item = unicode
+                .as_ref()
+                .and_then(|values| values.get(i).cloned().flatten())
+                .map(|cid| TextItem::GlyphIds(vec![Codepoint::with_cid(*glyph, 0.0, cid)]))
+                .unwrap_or_else(|| TextItem::GlyphIds(vec![Codepoint::new(*glyph, 0.0)]));
+            let offset = run.offsets.get(i).copied().unwrap_or_default();
+            let direction = if run.bidi_level % 2 == 1 { -1.0 } else { 1.0 };
+            let x = pdf_glyph_x(run.x, &run.advances, run.bidi_level, i)
+                + offset.advanceOffset * direction;
+            let glyph_baseline = baseline - offset.ascenderOffset;
+            ops.push(PdfOp::SetTextMatrix {
+                matrix: PdfTextMatrix::Raw([
+                    1.0,
+                    0.0,
+                    0.0,
+                    1.0,
+                    x,
+                    height - glyph_baseline,
+                ]),
+            });
+            ops.push(PdfOp::ShowText { items: vec![item] });
+        }
+        ops.push(PdfOp::EndTextSection);
+        if run.source.is_some() {
+            ops.push(PdfOp::EndMarkedContent);
+        }
+    }
+}
+
+/// One scene shape as PDF path operations: its outline, then its inner figures.
+///
+/// A closed outline goes through `DrawPolygon`, whose serializer closes the path
+/// once at the end and picks fill, stroke or both from the mode -- which is why the
+/// fill and the outline must be handed over in one op rather than two: the outline
+/// of a filled shape sits on the same vertices as its fill, and two round trips
+/// would draw it twice. An open outline, and every figure a `MoveTo` opens inside
+/// the path, must go through `DrawLine` instead: `DrawPolygon` closes *every*
+/// figure it is handed, so a relationship curve filed there would come out with a
+/// chord from its end back to its start that the scene never drew.
+#[cfg(feature = "pdf")]
+fn pdf_shape_ops(ops: &mut Vec<PdfOp>, shape: &crate::diagram::DiagramShape, height: Pt, dark: bool) {
+    let point = |bezier: bool, p: rubrica_mermaid::Point| PdfLinePoint {
+        p: pdf_point(p.x, height - p.y),
+        bezier,
+    };
+    // One figure per `MoveTo`, the outline first.
+    let mut figures: Vec<(rubrica_mermaid::Point, Vec<PdfLinePoint>)> =
+        vec![(shape.path.start, Vec::new())];
+    for cmd in &shape.path.cmds {
+        match cmd {
+            rubrica_mermaid::PathCmd::MoveTo(p) => figures.push((*p, Vec::new())),
+            rubrica_mermaid::PathCmd::LineTo(p) => {
+                figures.last_mut().unwrap().1.push(point(false, *p));
+            }
+            rubrica_mermaid::PathCmd::CubicTo(a, b, c) => {
+                let points = &mut figures.last_mut().unwrap().1;
+                points.push(point(true, *a));
+                points.push(point(true, *b));
+                points.push(point(false, *c));
+            }
+        }
+    }
+    let (start, first) = figures.remove(0);
+    let mut outline = vec![point(false, start)];
+    outline.extend(first);
+    let filled = shape.path.closed && shape.fill.is_some();
+    let stroked = shape.stroke.is_some();
+    if !filled && !stroked {
+        return;
+    }
+    if let Some((width, role)) = shape.stroke {
+        ops.push(PdfOp::SetOutlineColor { col: pdf_color(role, dark) });
+        ops.push(PdfOp::SetOutlineThickness { pt: printpdf::Pt(width) });
+    }
+    if filled {
+        if let Some(role) = shape.fill {
+            ops.push(PdfOp::SetFillColor { col: pdf_color(role, dark) });
+        }
+    }
+    if shape.path.closed {
+        let mode = match (filled, stroked) {
+            (true, true) => printpdf::PaintMode::FillStroke,
+            (true, false) => printpdf::PaintMode::Fill,
+            (false, _) => printpdf::PaintMode::Stroke,
+        };
+        ops.push(PdfOp::DrawPolygon {
+            polygon: PdfPolygon {
+                rings: vec![PdfPolygonRing { points: outline }],
+                mode,
+                ..Default::default()
+            },
+        });
+    } else {
+        ops.push(PdfOp::DrawLine { line: PdfLine { points: outline, is_closed: false } });
+    }
+    // Inner figures are the shape's own lines -- a subroutine's side bars, not a
+    // second outline -- so they are stroked as they stand and never filled.
+    if stroked {
+        for (start, points) in figures {
+            let mut line = vec![point(false, start)];
+            line.extend(points);
+            ops.push(PdfOp::DrawLine { line: PdfLine { points: line, is_closed: false } });
+        }
+    }
 }
 
 #[cfg(feature = "pdf")]
@@ -12219,73 +12608,21 @@ fn write_pdf(
                     ops.push(PdfOp::UseXobject { id, transform });
                     ops.push(PdfOp::RestoreGraphicsState);
                 }
-                Op::Runs(runs) => {
-                    for run in runs {
-                        if run.glyphs.is_empty() {
-                            continue;
-                        }
-                        let baseline = run.baseline - top;
-                        if baseline < 0.0 || baseline >= content_height {
-                            continue;
-                        }
-                        let font_id = if let Some(id) = fonts.get(&run.face_index) {
-                            id.clone()
-                        } else {
-                            let Some((bytes, face_index)) = font.font_file(run.face_index) else {
-                                missing_font_faces.push(run.family.clone());
-                                continue;
-                            };
-                            let mut font_warnings = Vec::new();
-                            let Some(parsed) = ParsedFont::from_bytes(&bytes, face_index, &mut font_warnings)
-                            else {
-                                missing_font_faces.push(run.family.clone());
-                                continue;
-                            };
-                            let id = pdf.add_font(&parsed);
-                            fonts.insert(run.face_index, id.clone());
-                            id
-                        };
-                        ops.push(PdfOp::SetFillColor { col: pdf_color(run.color, dark) });
-                        ops.push(PdfOp::SetFont {
-                            font: PdfFontHandle::External(font_id),
-                            size: printpdf::Pt(run.em),
-                        });
-                        ops.push(PdfOp::StartTextSection);
-                        if let Some(source) = run.source.as_deref() {
-                            ops.push(actual_text_span(source));
-                        }
-                        let unicode = run
-                            .source
-                            .as_deref()
-                            .map(|source| unicode_by_glyph(source, &run.clusters, run.glyphs.len()));
-                        for (i, glyph) in run.glyphs.iter().enumerate() {
-                            let item = unicode
-                                .as_ref()
-                                .and_then(|values| values.get(i).cloned().flatten())
-                                .map(|cid| TextItem::GlyphIds(vec![Codepoint::with_cid(*glyph, 0.0, cid)]))
-                                .unwrap_or_else(|| TextItem::GlyphIds(vec![Codepoint::new(*glyph, 0.0)]));
-                            let offset = run.offsets.get(i).copied().unwrap_or_default();
-                            let direction = if run.bidi_level % 2 == 1 { -1.0 } else { 1.0 };
-                            let x = pdf_glyph_x(run.x, &run.advances, run.bidi_level, i)
-                                + offset.advanceOffset * direction;
-                            let glyph_baseline = baseline - offset.ascenderOffset;
-                            ops.push(PdfOp::SetTextMatrix {
-                                matrix: PdfTextMatrix::Raw([
-                                    1.0,
-                                    0.0,
-                                    0.0,
-                                    1.0,
-                                    x,
-                                    height - glyph_baseline,
-                                ]),
-                            });
-                            ops.push(PdfOp::ShowText { items: vec![item] });
-                        }
-                        ops.push(PdfOp::EndTextSection);
-                        if run.source.is_some() {
-                            ops.push(PdfOp::EndMarkedContent);
-                        }
+                Op::Runs(runs) => pdf_emit_runs(
+                    &mut ops, runs, &mut fonts, &mut missing_font_faces, &mut pdf, font, top,
+                    content_height, height, dark,
+                ),
+                Op::Diagram { top: dtop, bottom: dbottom, shapes, runs, .. } => {
+                    if *dbottom - top <= 0.0 || *dtop - top >= content_height {
+                        continue;
                     }
+                    for shape in shapes {
+                        pdf_shape_ops(&mut ops, shape, height, dark);
+                    }
+                    pdf_emit_runs(
+                        &mut ops, runs, &mut fonts, &mut missing_font_faces, &mut pdf, font, top,
+                        content_height, height, dark,
+                    );
                 }
             }
         }
@@ -12769,6 +13106,7 @@ pub fn build_in_chunks(
             styles: &styles,
             client_pt,
             math: &*objects.math,
+            diagrams: &*objects.diagrams,
             notes: &notes,
             anchors: &anchors,
             base: objects.base_dir,
@@ -12838,6 +13176,7 @@ pub fn build_in_chunks(
                     left,
                     column: inner,
                     table: p.table.as_ref(),
+                    diagram: p.diagram,
                     hyphenation: Hyphenation { points: &hyphens, width: hyphen_width },
                     size,
                     leading: theme.line_spacing(b.kind),
@@ -12868,6 +13207,7 @@ pub fn build_in_chunks(
         styles: &styles,
         client_pt,
         math: &*objects.math,
+        diagrams: &*objects.diagrams,
         notes: &notes,
         anchors: &anchors,
         base: objects.base_dir,
@@ -12911,6 +13251,7 @@ pub fn build_in_chunks(
                         left,
                         column,
                         table: p.table.as_ref(),
+                        diagram: p.diagram,
                         hyphenation: Hyphenation { points: &hyphens, width: hyphen_width },
                         size,
                         leading: theme.note_leading(),
@@ -13167,7 +13508,8 @@ mod tests {
             "Before the table.\n\n| A | B | C | D |\n| --- | --- | --- | --- |\n| {row} |\n\nAfter the table.\n"
         ));
         let mut math = MathStore::new();
-        let mut objects = Objects::new(None, None, &mut math);
+        let mut diagrams = DiagramStore::new();
+        let mut objects = Objects::new(None, None, &mut math, &mut diagrams);
         for width in [1800.0, 700.0, 1800.0] {
             let page = build_ops(&mut font, &Theme::default(), &doc, width, 96.0, &mut objects, None);
             let (left, right) = page.ops.iter().filter_map(|op| match op {
@@ -14411,6 +14753,7 @@ mod tests {
         let theme = Theme::default();
         let styles: Vec<AppStyle> = Vec::new();
         let math = crate::math::MathStore::new();
+        let diagrams = DiagramStore::new();
         let empty = HashMap::new();
         let mut anchors = HashMap::new();
         anchors.insert(slug("Global Breaking"), 0usize);
@@ -14419,6 +14762,7 @@ mod tests {
             styles: &styles,
             client_pt: 525.0,
             math: &math,
+            diagrams: &diagrams,
             notes: &empty,
             anchors: &anchors,
             base: None,
@@ -14460,12 +14804,14 @@ mod tests {
         let theme = Theme::default();
         let styles: Vec<AppStyle> = Vec::new();
         let math = crate::math::MathStore::new();
+        let diagrams = DiagramStore::new();
         let empty = HashMap::new();
         let ctx = Ctx {
             theme: &theme,
             styles: &styles,
             client_pt: 525.0,
             math: &math,
+            diagrams: &diagrams,
             notes: &empty,
             anchors: &empty,
             base: Some(&dir),
@@ -15289,7 +15635,8 @@ mod tests {
             "# 宽表\n\n| 工具 | 密钥库 | 配置目录 | 格式 | 计量 | 费用 |\n|:--|:--|:--|:--|:--|:--|\n| CodeBuddy IDE (CN) | `secret://tenant.credentials.key.db` | `%APPDATA%/CodeBuddy/CN/State/` | SQLite | `codebuddy-sessions.vscdb` | credits |\n",
         );
         let mut math = crate::math::MathStore::new();
-        let mut objects = Objects::new(None, None, &mut math);
+        let mut diagrams = crate::diagram::DiagramStore::new();
+        let mut objects = Objects::new(None, None, &mut math, &mut diagrams);
         let page = build_ops(&mut font, &Theme::default(), &doc, 700.0, DPI, &mut objects, None);
 
         // The grid's own rules: a vertical one is a column boundary, and together
@@ -15343,13 +15690,14 @@ mod tests {
             return;
         }
         let mut math = crate::math::MathStore::new();
+        let mut diagrams = crate::diagram::DiagramStore::new();
         // Tokens no break can cut, one to a column: the squeeze cannot bring
         // this grid back onto the page, and its right edge lands past the
         // window's.
         let wide = Document::parse(
             "| # | 位置 | 问题 | 修复 |\n|:--|:--|:--|:--|\n| 41 | `mathItalicsCorrectionInfoOffset` | `extendedShapeCoverageOffset` `mathKernInfoOffset` `MathGlyphInfo` | `italicsCorrectionOffset` `mathItalicsCorrectionInfoOffset` |\n",
         );
-        let mut objects = Objects::new(None, None, &mut math);
+        let mut objects = Objects::new(None, None, &mut math, &mut diagrams);
         let page = build_ops(&mut font, &Theme::default(), &wide, 700.0, DPI, &mut objects, None);
         assert!(!page.wide_regions.is_empty(), "a grid past the window's edge registered no region");
         for r in &page.wide_regions {
@@ -15366,7 +15714,7 @@ mod tests {
         let centered = Document::parse(
             "| 甲 | 一二三四五六七八九十甲乙丙丁戊己庚辛壬癸子丑寅卯辰巳午未申酉戌亥 | x |\n|:--|:--|:--|\n| 1 | 一二三四五六七八九十甲乙丙丁戊己庚辛壬癸子丑寅卯辰巳午未申酉戌亥 | 2 |\n",
         );
-        let mut objects = Objects::new(None, None, &mut math);
+        let mut objects = Objects::new(None, None, &mut math, &mut diagrams);
         let page = build_ops(&mut font, &Theme::default(), &centered, 700.0, DPI, &mut objects, None);
         assert!(page.wide_regions.is_empty(), "a grid the window holds whole registered a region");
     }
@@ -15384,7 +15732,8 @@ mod tests {
         }
         let doc = Document::parse("$$g(a)=\\frac{x^{2}}{e^{x}}a+\\frac{x-1}{e^{x}}+e$$\n");
         let mut math = crate::math::MathStore::new();
-        let mut objects = Objects::new(None, None, &mut math);
+        let mut diagrams = crate::diagram::DiagramStore::new();
+        let mut objects = Objects::new(None, None, &mut math, &mut diagrams);
         let page = build_ops(&mut font, &Theme::default(), &doc, 700.0, DPI, &mut objects, None);
         let keys: Vec<_> = page.wide_regions.iter().filter_map(|r| match &r.kind {
             WideKind::Formula(key) => Some(key.clone()),
@@ -15439,7 +15788,8 @@ mod tests {
         );
         let doc = Document::parse(&source);
         let mut math = crate::math::MathStore::new();
-        let mut objects = Objects::new(None, None, &mut math);
+        let mut diagrams = crate::diagram::DiagramStore::new();
+        let mut objects = Objects::new(None, None, &mut math, &mut diagrams);
         let page = build_ops(&mut font, &Theme::default(), &doc, 700.0, DPI, &mut objects, None);
         assert_eq!(
             page.table_spans.len(),
@@ -15486,7 +15836,8 @@ mod tests {
             "After the grid.\n",
         ));
         let mut math = crate::math::MathStore::new();
-        let mut objects = Objects::new(None, None, &mut math);
+        let mut diagrams = crate::diagram::DiagramStore::new();
+        let mut objects = Objects::new(None, None, &mut math, &mut diagrams);
         let page = build_ops(&mut font, &Theme::default(), &doc, 700.0, DPI, &mut objects, None);
         assert!(page.ops.len() > 8, "the page laid out too little to say anything: {}", page.ops.len());
         for (i, w) in page.ops.windows(2).enumerate() {
@@ -15510,7 +15861,8 @@ mod tests {
         }
         let doc = Document::parse("# 一\n\n正文。\n");
         let mut math = crate::math::MathStore::new();
-        let mut objects = Objects::new(None, None, &mut math);
+        let mut diagrams = crate::diagram::DiagramStore::new();
+        let mut objects = Objects::new(None, None, &mut math, &mut diagrams);
         let page = build_ops(&mut font, &Theme::default(), &doc, 700.0, DPI, &mut objects, None);
         assert!(page.height > 0.0, "the page never said how tall its content is");
         assert!(page.column > 0.0, "the page never said how wide its measure is");
