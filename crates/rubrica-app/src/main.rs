@@ -97,6 +97,7 @@ fn main() -> Result<()> {
             has_flag(&argv, "--keep-line-breaks")
                 || prefs.line_breaks.unwrap_or_else(settings::keep_line_breaks),
             !has_flag(&argv, "--no-html-images") && settings::show_html_images(),
+            !has_flag(&argv, "--no-highlights") && settings::show_highlights(),
             zoom,
             face,
             measure,
@@ -139,6 +140,7 @@ fn main() -> Result<()> {
             has_flag(&argv, "--keep-line-breaks")
                 || prefs.line_breaks.unwrap_or_else(settings::keep_line_breaks),
             !has_flag(&argv, "--no-html-images") && settings::show_html_images(),
+            !has_flag(&argv, "--no-highlights") && settings::show_highlights(),
             zoom,
             face,
             measure,
@@ -174,6 +176,7 @@ fn main() -> Result<()> {
         let keep_line_breaks = has_flag(&argv, "--keep-line-breaks")
             || preferences.line_breaks.unwrap_or_else(settings::keep_line_breaks);
         let html_images = !has_flag(&argv, "--no-html-images") && settings::show_html_images();
+        let show_highlights = !has_flag(&argv, "--no-highlights") && settings::show_highlights();
         let source_view = has_flag(&argv, "--source") || preferences.source;
         let hyphenate = !has_flag(&argv, "--no-hyphenate");
         let options = report::Options {
@@ -186,6 +189,7 @@ fn main() -> Result<()> {
             shapes: has_flag(&argv, "--shapes"),
             keep_line_breaks,
             html_images,
+            show_highlights,
             source_view,
             plain,
             text_options: preferences.text,

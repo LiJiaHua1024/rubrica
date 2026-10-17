@@ -21,6 +21,7 @@ use pulldown_cmark::{
 };
 
 mod emphasis;
+mod highlight;
 mod scripts;
 pub mod plain;
 pub mod stats;
@@ -77,6 +78,11 @@ impl InlineStyle {
     /// mirror of [`InlineStyle::SUPERSCRIPT`] and set at the same size, so `H<sub>2</sub>O`
     /// reads as the formula it is while the citation digits keep their one scale.
     pub const SUBSCRIPT: InlineStyle = InlineStyle(1 << 8);
+    /// Words the author marked with `==`, drawn as a highlighter's band behind them.
+    ///
+    /// A band rather than an ink: nothing about the words' own voice changes, which
+    /// is why the renderer draws a fill under the run and leaves its colour alone.
+    pub const HIGHLIGHT: InlineStyle = InlineStyle(1 << 9);
 
     #[inline]
     pub const fn bits(self) -> u16 {
@@ -183,6 +189,19 @@ pub struct Scripts {
     pub lowered: usize,
 }
 
+/// How many `==` pairs a block's reading found, and how many of its own words they
+/// covered.
+///
+/// The count is kept for the same reason [`Scripts`] is: a highlight is drawn as a
+/// band behind the words, and a band a reader cannot ask a report about is a band
+/// nobody can check. Cells count into the block that carries their table, since a
+/// cell has no reader of its own.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Highlights {
+    /// `==` pairs read, which is one band per pair on a page.
+    pub bands: usize,
+}
+
 #[derive(Clone, Debug)]
 pub struct Block {
     pub kind: BlockKind,
@@ -235,6 +254,8 @@ pub struct Block {
     pub diagram_error: Option<String>,
     /// What the [`scripts`] pass read in this block: see [`Scripts`].
     pub scripts: Scripts,
+    /// What the [`highlight`] pass read in this block: see [`Highlights`].
+    pub highlights: Highlights,
 }
 
 /// An inline non-text box.
@@ -352,7 +373,7 @@ impl Block {
             sources: vec![SourceSpan { range: 0..text.len(), source: 0 }],
             text, quote_depth: 0, list: None, item_depth: None, task: None, table: None,
             objects: Vec::new(), actions: Vec::new(), lang: None, diagram: None,
-            diagram_error: None, scripts: Scripts::default() }
+            diagram_error: None, scripts: Scripts::default(), highlights: Highlights::default() }
     }
 
     /// Headings and code are set ragged-right; justifying them is a defect.
@@ -416,6 +437,23 @@ impl Block {
             let found = scripts::relax(&mut cell.body(), original);
             self.scripts.raised += found.raised;
             self.scripts.lowered += found.lowered;
+        }
+    }
+
+    /// Read the `==highlight==` marks of the Pandoc `mark` extension, once the block
+    /// is otherwise finished: see [`highlight`].
+    ///
+    /// It runs between [`relax_emphasis`] and [`relax_scripts`], because both of the
+    /// passes on either side edit the text and the marks read here are the author's
+    /// own two characters until this pass takes them: letting a script pass run first
+    /// would leave `==x^2^==` to be read by a pass that has already moved the bytes
+    /// its `==` sits against.
+    fn relax_highlights(&mut self, original: &str) {
+        if self.kind != BlockKind::Code {
+            self.highlights.bands += highlight::relax(&mut self.body(), original);
+        }
+        for cell in self.table.iter_mut().flat_map(|t| t.head.iter_mut().chain(t.rows.iter_mut().flatten())) {
+            self.highlights.bands += highlight::relax(&mut cell.body(), original);
         }
     }
 }
@@ -560,6 +598,11 @@ pub struct ParseOptions {
     /// off when a document's markup is the thing being read rather than its pictures;
     /// Markdown's own `![]()` figures are not affected by it.
     pub html_images: bool,
+    /// Whether `==words==` is read as a highlight. The switch a reader turns off when
+    /// a document's equals signs are its own -- a page of comparisons, a page quoting
+    /// a page of marks -- and which, off, leaves the two characters as the author
+    /// typed them.
+    pub show_highlights: bool,
 }
 
 impl Default for ParseOptions {
@@ -567,7 +610,7 @@ impl Default for ParseOptions {
     /// one non-default choice here is [`ParseOptions::keep_line_breaks`], which every
     /// caller states for itself.
     fn default() -> Self {
-        Self { keep_line_breaks: false, html_images: true }
+        Self { keep_line_breaks: false, html_images: true, show_highlights: true }
     }
 }
 
@@ -1681,6 +1724,7 @@ impl Builder<'_> {
             diagram: None,
             diagram_error: None,
             scripts: Scripts::default(),
+            highlights: Highlights::default(),
         });
     }
 
@@ -1824,6 +1868,12 @@ impl Builder<'_> {
                 // filtered out of it later.
                 for mut b in split_definitions(b, breaks) {
                     b.relax_emphasis(self.original);
+                    // The reader's highlight switch is honoured by not reading at all:
+                    // off, the block keeps the two equals signs exactly as it was
+                    // written, which is what "show the syntax as itself" means.
+                    if self.options.show_highlights {
+                        b.relax_highlights(self.original);
+                    }
                     b.relax_scripts(self.original);
                     if !worth_setting(&b) {
                         continue;
@@ -2012,6 +2062,7 @@ fn piece(base: &Block, range: std::ops::Range<usize>, kind: BlockKind) -> Option
         // nothing to carry over; the fields are copied rather than defaulted anyway,
         // because the order of the two steps is not this function's to promise.
         scripts: base.scripts,
+        highlights: base.highlights,
     })
 }
 

@@ -209,7 +209,7 @@ pub(crate) fn style_range(spans: &mut Vec<Span>, range: Range<usize>, style: Inl
 
 /// Delete the given byte ranges and move everything that pointed into the text
 /// onto what is left of it.
-fn cut(t: &mut Text<'_>, cuts: &[Range<usize>]) {
+pub(crate) fn cut(t: &mut Text<'_>, cuts: &[Range<usize>]) {
     let mut kept = String::with_capacity(t.text.len());
     let mut at = 0usize;
     for c in cuts {

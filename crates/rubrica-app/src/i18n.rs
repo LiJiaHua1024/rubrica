@@ -192,6 +192,7 @@ pub enum Key {
 
     MenuReadSource,
     MenuHtmlImages,
+    MenuHighlights,
 
     MenuExternalEditor,
     MenuOpenInEditor,
@@ -347,6 +348,7 @@ fn translate_en(key: Key) -> &'static str {
 
         Key::MenuReadSource => "Read Source",
         Key::MenuHtmlImages => "Show HTML image tags",
+        Key::MenuHighlights => "Show ==text== as a highlight",
 
         Key::MenuExternalEditor => "External editor",
         Key::MenuOpenInEditor => "Open in Editor",
@@ -486,6 +488,7 @@ fn translate_zh_cn(key: Key) -> &'static str {
 
         Key::MenuReadSource => "阅读源码",
         Key::MenuHtmlImages => "显示 HTML 图片标签",
+        Key::MenuHighlights => "将 ==文字== 显示为荧光标记",
 
         Key::MenuExternalEditor => "外部编辑器",
         Key::MenuOpenInEditor => "在编辑器中打开",
@@ -625,6 +628,7 @@ fn translate_zh_tw(key: Key) -> &'static str {
 
         Key::MenuReadSource => "檢視原始碼",
         Key::MenuHtmlImages => "顯示 HTML 圖片標籤",
+        Key::MenuHighlights => "將 ==文字== 顯示為螢光標記",
 
         Key::MenuExternalEditor => "外部編輯器",
         Key::MenuOpenInEditor => "在編輯器中開啟",
@@ -764,6 +768,7 @@ fn translate_ja(key: Key) -> &'static str {
 
         Key::MenuReadSource => "ソースを表示",
         Key::MenuHtmlImages => "HTML 画像タグを表示",
+        Key::MenuHighlights => "==テキスト== を蛍光マーカーで表示",
 
         Key::MenuExternalEditor => "外部エディタ",
         Key::MenuOpenInEditor => "エディタで開く",
@@ -903,6 +908,7 @@ fn translate_ko(key: Key) -> &'static str {
 
         Key::MenuReadSource => "소스 보기",
         Key::MenuHtmlImages => "HTML 이미지 태그 표시",
+        Key::MenuHighlights => "==텍스트== 를 형광펜으로 표시",
 
         Key::MenuExternalEditor => "외부 편집기",
         Key::MenuOpenInEditor => "편집기에서 열기",
@@ -1042,6 +1048,7 @@ fn translate_fr(key: Key) -> &'static str {
 
         Key::MenuReadSource => "Afficher la source",
         Key::MenuHtmlImages => "Afficher les balises d'image HTML",
+        Key::MenuHighlights => "Afficher ==texte== en surligné",
 
         Key::MenuExternalEditor => "Éditeur externe",
         Key::MenuOpenInEditor => "Ouvrir dans l'éditeur",
@@ -1181,6 +1188,7 @@ fn translate_de(key: Key) -> &'static str {
 
         Key::MenuReadSource => "Quelltext anzeigen",
         Key::MenuHtmlImages => "HTML-Bildtags anzeigen",
+        Key::MenuHighlights => "==Text== hervorgehoben anzeigen",
 
         Key::MenuExternalEditor => "Externer Editor",
         Key::MenuOpenInEditor => "Im Editor öffnen",
@@ -1320,6 +1328,7 @@ fn translate_es(key: Key) -> &'static str {
 
         Key::MenuReadSource => "Ver código fuente",
         Key::MenuHtmlImages => "Mostrar etiquetas de imagen HTML",
+        Key::MenuHighlights => "Mostrar ==texto== resaltado",
 
         Key::MenuExternalEditor => "Editor externo",
         Key::MenuOpenInEditor => "Abrir en el editor",
@@ -1459,6 +1468,7 @@ fn translate_ru(key: Key) -> &'static str {
 
         Key::MenuReadSource => "Просмотр исходного текста",
         Key::MenuHtmlImages => "Показывать теги изображений HTML",
+        Key::MenuHighlights => "Показывать ==текст== как выделение",
 
         Key::MenuExternalEditor => "Внешний редактор",
         Key::MenuOpenInEditor => "Открыть в редакторе",
@@ -1598,6 +1608,7 @@ fn translate_it(key: Key) -> &'static str {
 
         Key::MenuReadSource => "Visualizza sorgente",
         Key::MenuHtmlImages => "Mostra tag immagine HTML",
+        Key::MenuHighlights => "Mostra ==testo== evidenziato",
 
         Key::MenuExternalEditor => "Editor esterno",
         Key::MenuOpenInEditor => "Apri nell'editor",
@@ -1737,6 +1748,7 @@ fn translate_pt(key: Key) -> &'static str {
 
         Key::MenuReadSource => "Exibir código-fonte",
         Key::MenuHtmlImages => "Mostrar tags de imagem HTML",
+        Key::MenuHighlights => "Mostrar ==texto== realçado",
 
         Key::MenuExternalEditor => "Editor externo",
         Key::MenuOpenInEditor => "Abrir no editor",

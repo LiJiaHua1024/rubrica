@@ -12,6 +12,8 @@ cargo run -q -p rubrica-app -- --report --width 900 fixtures/mermaid-tree.md
 cargo run -q -p rubrica-app -- --report --width 900 fixtures/html.md
 cargo run -q -p rubrica-app -- --report --width 900 --no-html-images fixtures/html.md
 cargo run -q -p rubrica-app -- --report --width 900 fixtures/subsuper.md
+cargo run -q -p rubrica-app -- --report --width 900 fixtures/highlight.md
+cargo run -q -p rubrica-app -- --report --width 900 --no-highlights fixtures/highlight.md
 ```
 
 - `notes.md` exercises footnotes, citations, table layout, and formulas in cells.
@@ -45,6 +47,17 @@ cargo run -q -p rubrica-app -- --report --width 900 fixtures/subsuper.md
   prints the raised/lowered counts and the three numbers the marks were set with
   (from the formula face's `MATH` table); `--shapes` shows a script's run beside a
   citation's mark, the two the same size and raise.
+- `highlight.md` exercises Pandoc's `==mark==`: a pair around a word and around a
+  phrase carried across a wrapped line (one band under every word it crosses, a
+  soft break included), a mark heading a paragraph or glued to the words on
+  either side (`x==y==z`, `中文==高亮==中文`, a Hebrew word), the shapes a pair is
+  refused (`== a ==`, `==a ==`, `== a==`, comparison signs, a backslash-made
+  sign), and runs of three or more equals signs, which this reader keeps whole
+  where Pandoc cuts a pair out of them. A mark wraps emphasis, strong, a link, a
+  formula and a script without disturbing any of them, marks inside table cells
+  and a definition are read the same way, and inline/fenced code is immune. The
+  report's `highlight` line counts the marked spans and the bands drawn;
+  `--no-highlights` reads the same page with every mark as written.
 
 The parser tests also read these exact files so their document structure remains
 reproducible without a font or a desktop session.

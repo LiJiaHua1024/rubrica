@@ -7,7 +7,7 @@
 //! what is actually painted rather than what a second implementation would have
 //! produced -- and it never touches the desktop.
 //!
-//! Run: `rubrica-app --report [file.md] [--width 1080] [--dpi 96] [--zoom 120] [--face 1] [--measure 0] [--shapes] [--no-html-images]`
+//! Run: `rubrica-app --report [file.md] [--width 1080] [--dpi 96] [--zoom 120] [--face 1] [--measure 0] [--shapes] [--no-html-images] [--no-highlights]`
 
 use std::collections::BTreeMap;
 
@@ -44,6 +44,9 @@ pub struct Options {
     /// the words a tag with no tag would have said, so the same page can be reported
     /// both ways and the figures line below is the difference.
     pub html_images: bool,
+    /// Whether `==marked==` is drawn as a highlighter band. Off leaves the equals
+    /// signs the author typed, so the highlight line below is the difference.
+    pub show_highlights: bool,
     pub source_view: bool,
     pub plain: Option<bool>,
     pub text_options: rubrica_doc::plain::TextOptions,
@@ -63,6 +66,7 @@ pub fn report(source: &str, path: Option<&str>, o: &Options) -> Result<()> {
         shapes,
         keep_line_breaks,
         html_images,
+        show_highlights,
         source_view,
         plain,
         text_options,
@@ -103,7 +107,7 @@ pub fn report(source: &str, path: Option<&str>, o: &Options) -> Result<()> {
     } else {
         rubrica_doc::Document::parse_with(
             source,
-            rubrica_doc::ParseOptions { keep_line_breaks, html_images },
+            rubrica_doc::ParseOptions { keep_line_breaks, html_images, show_highlights },
         )
     };
     // No render target exists here, so figures are measured from their files
@@ -473,6 +477,23 @@ pub fn report(source: &str, path: Option<&str>, o: &Options) -> Result<()> {
             theme.scripts.scale, theme.scripts.raise, theme.scripts.sink
         );
     }
+    // A highlight is the one mark whose whole effect is a fill, and a `==` pair that
+    // laid down no band is a mark the reader never sees. Counted from both sides for
+    // the reason the strike rules are: the text says how many marks were read, the ops
+    // say how many were drawn, and a page where the two disagree is the interesting
+    // one. The reader's switch is visible here as well -- turned off, no pair is read
+    // and this line does not stand at all -- as is a code span's own `==`, which is
+    // never a mark.
+    let (bands, marked) = shown.iter().fold((0usize, 0usize), |(b, k), blk| {
+        (b + blk.highlights.bands, k + usize::from(blk.highlights.bands > 0))
+    });
+    if bands > 0 {
+        let rects = ops
+            .iter()
+            .filter(|op| matches!(op, crate::view::Op::Rect { color: ColorRole::Highlight, .. }))
+            .count();
+        println!("highlight    : {bands} span(s) in {marked} block(s) -> {rects} band(s) drawn");
+    }
     // Diagrams, counted from the store and the source rather than from the ops: the
     // ops hold what was drawn, and a fence that did not parse has its source on the
     // page and no drawing at all -- the interesting document is the one where those
@@ -579,6 +600,15 @@ pub fn report(source: &str, path: Option<&str>, o: &Options) -> Result<()> {
                 println!("glyph run    : level={} left={:.2} origin={:.2} width={:.2} baseline={:.2} face={} glyphs={:?}",
                     run.bidi_level, run.x, origin, width, run.baseline, run.family, run.glyphs);
             }
+        }
+        // The bands a highlighted page draws, with the geometry the reader sees. A
+        // band is invisible to a census of glyphs and runs, so this is the only place
+        // its reach and height can be read out of a report at all.
+        for op in ops {
+            let crate::view::Op::Rect { x, y, w, h, color: ColorRole::Highlight } = op else {
+                continue;
+            };
+            println!("band         : left={x:.2} top={y:.2} width={w:.2} height={h:.2}");
         }
     }
     // Counted two ways on purpose: the marks in the text are what the reader can

@@ -104,6 +104,10 @@ pub struct ResolvedStyle {
     /// table at paint time, so a struck Han span and a struck Latin span each sit at
     /// the height their own designer chose.
     pub strike: bool,
+    /// Lay a band of the reader's highlighter behind the run's words, for `==marked==`
+    /// text. A flag for the same reason as the two above: the band is geometry the
+    /// painter works out from the size it is drawing at, not part of the run's face.
+    pub highlight: bool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -116,6 +120,10 @@ pub enum ColorRole {
     /// A block surface (the code panel), not an ink: a text colour used as a fill
     /// reads as a smudge rather than a panel.
     Surface,
+    /// The band a `==marked==` span sits on. A fill like [`ColorRole::Surface`], but
+    /// drawn per span and under the words it marks rather than once per block, so
+    /// what it has to satisfy is the page's own ink on top of it.
+    Highlight,
     /// The paper a page-stack reader puts under the display list.
     PageSurface,
     /// The soft edge and shadow that lift a page-stack card off the reader background.
@@ -609,6 +617,7 @@ impl Theme {
             mono: role == Role::Mono,
             raise,
             strike: inline.contains(InlineStyle::STRIKETHROUGH),
+            highlight: inline.contains(InlineStyle::HIGHLIGHT),
         }
     }
 

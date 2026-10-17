@@ -302,6 +302,25 @@ pub fn record_show_html_images(show: bool) {
     write_word(SUBKEY, "HtmlImages", u32::from(show));
 }
 
+/// Whether a `==marked==` span is drawn as a band of colour, or read as the two equals
+/// signs the author typed. The reader's own switch and the same rule as the HTML
+/// figures above: a missing value means on, because a reader of prose wants its marks
+/// read rather than explained.
+pub fn show_highlights() -> bool {
+    highlights_of(word(SUBKEY, "Highlights"))
+}
+
+/// What the stored word means on its own: marks unless the reader said no, and a value
+/// this build never wrote -- a hand-edited registry, an older build's -- means the
+/// default as well, because a garbage number is not a reader's choice.
+fn highlights_of(stored: Option<u32>) -> bool {
+    stored != Some(0)
+}
+
+pub fn record_show_highlights(show: bool) {
+    write_word(SUBKEY, "Highlights", u32::from(show));
+}
+
 /// Whether the reader wants the spacebar peek watching: a choice of the reader's
 /// own menu, honoured again the next time a reader window opens.
 pub fn peek_enabled() -> bool {
@@ -1106,6 +1125,22 @@ mod tests {    use super::*;
         clear(sub);
         write_word(sub, "HtmlImages", 0);
         assert_eq!(word(sub, "HtmlImages"), Some(0), "the off came back as something else");
+        clear(sub);
+    }
+
+    /// The highlight switch is the second setting whose absence means on, and it is a
+    /// differently worded choice: a reader who never chose gets the marks drawn.
+    #[test]
+    fn the_highlight_switch_is_on_until_it_is_turned_off() {
+        assert!(highlights_of(None), "a reader who never chose gets the marks");
+        assert!(highlights_of(Some(1)));
+        assert!(!highlights_of(Some(0)), "a chosen off is an off");
+        assert!(highlights_of(Some(7)), "a number this build never wrote is no choice at all");
+        // And the choice travels to the registry and back like every other one.
+        let sub = "Software\\Rubrica Test Highlights";
+        clear(sub);
+        write_word(sub, "Highlights", 0);
+        assert_eq!(word(sub, "Highlights"), Some(0), "the off came back as something else");
         clear(sub);
     }
 

@@ -1622,6 +1622,9 @@ impl Peek {
                     // document override: whether an `<img>` is a picture or a name is
                     // a stand on the markup, and a stand belongs to the reader.
                     html_images: settings::show_html_images(),
+                    // The same stand, for the markup's own marks: the preview draws
+                    // `==text==` exactly as the window does, or leaves it as typed.
+                    show_highlights: settings::show_highlights(),
                 },
             )
         };

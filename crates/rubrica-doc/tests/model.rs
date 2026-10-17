@@ -1679,6 +1679,252 @@ fn no_run_of_marks_can_make_the_scripts_pass_panic_or_read_past_the_text() {
     }
 }
 
+// --- the semantics of `==highlight==` ---------------------------------------
+
+#[test]
+fn a_pair_of_equals_signs_highlights_the_words_between_them() {
+    let b = &Document::parse("==text==\n").blocks[0];
+    // The marks are gone and the words they wrapped are where the author put them:
+    // a delimiter the reader consumed is not printed.
+    assert_eq!(b.text, "text");
+    assert_eq!(runs_of(b, InlineStyle::HIGHLIGHT), ["text"]);
+    // The block remembers the pair, which is what a report has to count on.
+    assert_eq!(b.highlights, rubrica_doc::Highlights { bands: 1 });
+}
+
+#[test]
+fn a_mark_may_touch_the_words_on_either_side() {
+    let b = &Document::parse("x==y==z and 中文==高亮==中文 and e==mc==\n").blocks[0];
+    assert_eq!(b.text, "xyz and 中文高亮中文 and emc");
+    assert_eq!(runs_of(b, InlineStyle::HIGHLIGHT), ["y", "高亮", "mc"]);
+    assert_eq!(b.highlights, rubrica_doc::Highlights { bands: 3 });
+}
+
+#[test]
+fn nothing_is_asked_of_what_stands_before_a_mark() {
+    // Pandoc begins a mark on the strength of the word *after* the `==`, not the
+    // space before it: a highlight opens at the start of a paragraph and after a
+    // space, which is where prose puts one.
+    let b = &Document::parse("==a== and x ==b== y and x==c==y\n").blocks[0];
+    assert_eq!(b.text, "a and x b y and xcy");
+    assert_eq!(runs_of(b, InlineStyle::HIGHLIGHT), ["a", "b", "c"]);
+}
+
+#[test]
+fn a_mark_needs_a_word_after_it_and_one_before_its_close() {
+    // The same rule read from either end: `== a ==` stands in front of a space and
+    // `==a ==` closes on one, so neither is a mark -- while a phrase with a space
+    // inside it is one, because only the edges are asked about.
+    let b = &Document::parse("== a == and ==a == and == a== and ==text == and == text==\n")
+        .blocks[0];
+    assert_eq!(b.text, "== a == and ==a == and == a== and ==text == and == text==");
+    assert!(runs_of(b, InlineStyle::HIGHLIGHT).is_empty(), "{b:?}");
+    assert_eq!(b.highlights, rubrica_doc::Highlights::default());
+    let b = &Document::parse("==two words==\n").blocks[0];
+    assert_eq!(b.text, "two words");
+    assert_eq!(runs_of(b, InlineStyle::HIGHLIGHT), ["two words"]);
+}
+
+#[test]
+fn a_chain_of_comparisons_is_not_a_highlight() {
+    let b = &Document::parse("a == b == c and x == a== y and unclosed ==\n").blocks[0];
+    assert_eq!(b.text, "a == b == c and x == a== y and unclosed ==");
+    assert!(runs_of(b, InlineStyle::HIGHLIGHT).is_empty(), "{b:?}");
+}
+
+#[test]
+fn a_run_whose_pair_was_already_spent_is_the_authors_own() {
+    // Pandoc's scan stops at the first `==` it can see, so a pair is only ever
+    // closed by the very next run: the middle `==` of `==a == b==` was never part
+    // of one and is printed, and the same print keeps the trailing run of
+    // `==a ==b== c==` out of the pair already spent on `b`.
+    let b = &Document::parse("==a == b==\n").blocks[0];
+    assert_eq!(b.text, "==a == b==");
+    assert!(runs_of(b, InlineStyle::HIGHLIGHT).is_empty(), "{b:?}");
+    let b = &Document::parse("==a ==b==\n").blocks[0];
+    assert_eq!(b.text, "==a b");
+    assert_eq!(runs_of(b, InlineStyle::HIGHLIGHT), ["b"]);
+    let b = &Document::parse("==a ==b== c==\n").blocks[0];
+    assert_eq!(b.text, "==a b c==");
+    assert_eq!(runs_of(b, InlineStyle::HIGHLIGHT), ["b"]);
+}
+
+#[test]
+fn a_run_that_closes_does_not_open_and_the_pair_after_it_is_another() {
+    let b = &Document::parse("==a==b==\n").blocks[0];
+    assert_eq!(b.text, "ab==");
+    assert_eq!(runs_of(b, InlineStyle::HIGHLIGHT), ["a"]);
+    let b = &Document::parse("==a==b==c==\n").blocks[0];
+    assert_eq!(b.text, "abc");
+    assert_eq!(runs_of(b, InlineStyle::HIGHLIGHT), ["a", "c"]);
+    assert_eq!(b.highlights, rubrica_doc::Highlights { bands: 2 });
+}
+
+#[test]
+fn an_escaped_equals_sign_pairs_with_nothing_and_is_printed() {
+    // The backslash is the parser's to consume; what is left is the author's own
+    // `=` and it must not find a partner. Only the source can say which `=` it was,
+    // because the text no longer holds the backslash.
+    let b = &Document::parse("\\==a==\n").blocks[0];
+    assert_eq!(b.text, "==a==");
+    assert!(runs_of(b, InlineStyle::HIGHLIGHT).is_empty(), "{b:?}");
+    let b = &Document::parse("a\\=b==c==\n").blocks[0];
+    assert_eq!(b.text, "a=bc");
+    assert_eq!(runs_of(b, InlineStyle::HIGHLIGHT), ["c"]);
+    let b = &Document::parse("==a\\=b==\n").blocks[0];
+    assert_eq!(b.text, "a=b");
+    assert_eq!(runs_of(b, InlineStyle::HIGHLIGHT), ["a=b"]);
+}
+
+#[test]
+fn a_stretch_of_three_or_more_equals_signs_is_printed() {
+    // Pandoc cuts a `==` out of these and still marks the words; here a run this
+    // reader has no reading for is left for the author to shorten -- a run of four
+    // equals signs is far more often a line drawn by hand than a doubled mark.
+    let b = &Document::parse("====text==== and ===text=== and x====y and a ====== b\n").blocks[0];
+    assert_eq!(b.text, "====text==== and ===text=== and x====y and a ====== b");
+    assert!(runs_of(b, InlineStyle::HIGHLIGHT).is_empty(), "{b:?}");
+    assert_eq!(b.highlights, rubrica_doc::Highlights::default());
+}
+
+#[test]
+fn equals_signs_inside_code_are_the_authors_own_characters() {
+    let doc = Document::parse("`x==y==` and z==w== and\n\n```\na == b\n```\n");
+    let para = &doc.blocks[0];
+    assert_eq!(para.text, "x==y== and zw and");
+    assert_eq!(runs_of(para, InlineStyle::HIGHLIGHT), ["w"]);
+    let code = &doc.blocks[1];
+    assert_eq!(code.kind, BlockKind::Code);
+    assert_eq!(code.text, "a == b");
+    assert!(!code.spans.iter().any(|s| s.style.contains(InlineStyle::HIGHLIGHT)));
+    assert_eq!(code.highlights, rubrica_doc::Highlights::default());
+}
+
+#[test]
+fn a_mark_reaches_across_emphasis_a_link_and_a_formula() {
+    let b = &Document::parse("==*a*b== and x==[c](u)==y and ==$z$==\n").blocks[0];
+    assert_eq!(b.text, "ab and xcy and \u{fffc}");
+    // A style inside the pair divides the band's spans, not its reading: the words
+    // the marks wrapped are all there, in order, and the count is of marks.
+    assert_eq!(runs_of(b, InlineStyle::HIGHLIGHT).concat(), "abc\u{fffc}");
+    assert_eq!(b.highlights, rubrica_doc::Highlights { bands: 3 });
+    // The styles the words already had stay under the band: a highlight is a colour
+    // behind them and not a voice of its own.
+    assert!(style_of(b, "a").contains(InlineStyle::EMPHASIS));
+    assert_eq!(&b.text[b.actions[0].range.clone()], "c");
+    assert_eq!(b.objects.len(), 1, "{b:?}");
+}
+
+#[test]
+fn a_nested_style_inside_a_mark_keeps_both_meanings() {
+    let b = &Document::parse("==a~~b~~c== and ==x^2^== and ~~d==e==f~~\n").blocks[0];
+    assert_eq!(b.text, "abc and x2 and def");
+    assert_eq!(runs_of(b, InlineStyle::HIGHLIGHT).concat(), "abcx2e");
+    assert_eq!(b.highlights, rubrica_doc::Highlights { bands: 3 });
+    assert!(style_of(b, "b").contains(InlineStyle::STRIKETHROUGH));
+    assert!(style_of(b, "2").contains(InlineStyle::SUPERSCRIPT));
+    assert!(style_of(b, "f").contains(InlineStyle::STRIKETHROUGH));
+}
+
+#[test]
+fn a_table_cell_reads_marks_as_its_prose_does() {
+    let src = "| a | b |\n| --- | --- |\n| ==H== | x==y== |\n";
+    let doc = Document::parse(src);
+    let table = doc.blocks[0].table.as_ref().expect("a grid");
+    let (h, mid) = (&table.rows[0][0], &table.rows[0][1]);
+    assert_eq!(h.text, "H");
+    assert_eq!(mid.text, "xy");
+    assert_eq!(runs_in(&h.text, &h.spans, InlineStyle::HIGHLIGHT), ["H"]);
+    assert_eq!(runs_in(&mid.text, &mid.spans, InlineStyle::HIGHLIGHT), ["y"]);
+    // A cell has no reader of its own, so its marks are counted with the block's:
+    // a report that missed them would call a table of marks a page without any.
+    assert_eq!(doc.blocks[0].highlights, rubrica_doc::Highlights { bands: 2 });
+    // The map back into the source survived the cut: the `H` is the source's own.
+    assert_eq!(rubrica_doc::source_at(&h.sources, 0), src.find('H'));
+}
+
+#[test]
+fn the_words_of_a_mark_map_back_to_their_own_source_bytes() {
+    let src = "==one== and ==two words== end\n";
+    let b = &Document::parse(src).blocks[0];
+    assert_eq!(b.text, "one and two words end");
+    for word in ["one", "two words", "end"] {
+        let at = b.text.find(word).unwrap();
+        assert_eq!(rubrica_doc::source_at(&b.sources, at), src.find(word), "{word}");
+    }
+}
+
+#[test]
+fn turning_highlights_off_leaves_the_marks_as_written() {
+    let off = || rubrica_doc::ParseOptions { show_highlights: false, ..Default::default() };
+    let b = &Document::parse_with("==text== and x ==a== y\n", off()).blocks[0];
+    assert_eq!(b.text, "==text== and x ==a== y");
+    assert!(runs_of(b, InlineStyle::HIGHLIGHT).is_empty(), "{b:?}");
+    assert_eq!(b.highlights, rubrica_doc::Highlights::default());
+    // A fence keeps its equals signs with the switch either way.
+    let doc = Document::parse_with("```\na == b\n```\n", off());
+    assert_eq!(doc.blocks[0].text, "a == b");
+}
+
+#[test]
+fn no_run_of_marks_can_make_the_highlight_pass_panic_or_read_past_the_text() {
+    // Everything a malformed document can do with the marks, over a small alphabet:
+    // unpaired, crossed, nested, escaped, next to code. The pass reads bytes as well
+    // as characters, so the shapes that would run off an end or into a continuation
+    // byte are exactly the ones worth asking about.
+    let fragments = ["=", "==", "a", " ", "\\", "`", "*", "中", "\u{fffc}", "\n"];
+    for a in fragments {
+        for b in fragments {
+            for c in fragments {
+                for d in fragments {
+                    let src: String = [a, b, c, d].concat();
+                    let doc = Document::parse(&src);
+                    for block in &doc.blocks {
+                        check_ranges(block);
+                    }
+                }
+            }
+        }
+    }
+    // Long and deep shapes: a run of a thousand marks, a pair longer than a line,
+    // escapes to the last byte, and a valley of dead runs between two live ones.
+    let long = ["=".repeat(1000), "==".repeat(500), format!("=={}==", "=".repeat(500)),
+        format!("{}a{}", "\\=".repeat(200), "=".repeat(200)),
+        format!("=={}", "a=".repeat(300)), format!("=={} ==", "==".repeat(300)),
+        "\\=".to_string(), "==\\".to_string()].join(" ");
+    for block in &Document::parse(&long).blocks {
+        check_ranges(block);
+    }
+}
+
+#[test]
+fn tracked_highlight_fixture_keeps_its_bands() {
+    // The page the fixture is written on is the page the parser is held to:
+    // prose, a wrapped pair, a table and a definition keep their readings, and
+    // the shapes a pair refuses keep theirs as written.
+    let doc = Document::parse(include_str!("../../../fixtures/highlight.md"));
+    let code = doc.blocks.iter().find(|b| b.kind == BlockKind::Code).expect("a fence");
+    assert!(code.text.contains("a == b == c"));
+    assert!(runs_of(code, InlineStyle::HIGHLIGHT).is_empty(), "{code:?}");
+    let text: String = doc.blocks.iter().map(|b| &b.text).cloned().collect::<Vec<_>>().join("\n");
+    for literal in ["== a ==", "==a ==", "== a==", "===three===", "====four====", "==this=="] {
+        assert!(text.contains(literal), "{literal} must stand as written");
+    }
+    let bands: usize = doc.blocks.iter().map(|b| b.highlights.bands).sum();
+    assert_eq!(bands, 22);
+    let table = doc.blocks.iter().find(|b| b.table.is_some()).expect("a grid");
+    let cells: Vec<String> = table.table.as_ref().unwrap().rows.iter().flatten()
+        .flat_map(|c| runs_in(&c.text, &c.spans, InlineStyle::HIGHLIGHT)).collect();
+    assert_eq!(cells, ["table cells", "read"]);
+    assert_eq!(table.highlights, rubrica_doc::Highlights { bands: 2 });
+    let def = doc.blocks.iter().find(|b| b.kind == BlockKind::Definition).expect("a definition");
+    assert_eq!(def.highlights, rubrica_doc::Highlights { bands: 1 });
+    // The heading's backticked `==` is code, not a mark.
+    let head = &doc.blocks[0];
+    assert!(matches!(head.kind, BlockKind::Heading(_)), "{head:?}");
+    assert!(runs_of(head, InlineStyle::HIGHLIGHT).is_empty(), "{head:?}");
+}
+
 /// Every range a block holds must lie inside the text it indexes, and its source
 /// map must stay bounded by the source it names.
 fn check_ranges(block: &rubrica_doc::Block) {

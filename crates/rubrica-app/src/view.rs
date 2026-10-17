@@ -363,6 +363,10 @@ pub(crate) struct Palette {
     pub(crate) tab_inactive: Rgb,
     pub(crate) tab_hover: Rgb,
     pub(crate) on_accent: Rgb,
+    /// The highlighter a `==marked==` span is covered with. A fill rather than an
+    /// ink, and one that has to leave the page's own text readable through it: the
+    /// band goes under the words, so the ink is the page's against this colour.
+    pub(crate) highlight: Rgb,
 }
 
 impl Palette {
@@ -391,6 +395,11 @@ impl Palette {
                 tab_inactive: Rgb::gray(0.168),
                 tab_hover: Rgb::gray(0.21),
                 on_accent: Rgb::gray(0.05),
+                // A highlighter pen run dry on a night page: enough colour to be
+                // seen on the paper, dark enough that the page's light ink still
+                // reads over it. A full-brightness yellow would be the one place
+                // on the page the eye is dragged to.
+                highlight: Rgb { r: 0.32, g: 0.28, b: 0.09 },
             }
         } else {
             Palette {
@@ -416,6 +425,10 @@ impl Palette {
                 tab_inactive: Rgb { r: 0.968, g: 0.965, b: 0.958 },
                 tab_hover: Rgb { r: 0.925, g: 0.921, b: 0.911 },
                 on_accent: Rgb { r: 1.0, g: 1.0, b: 1.0 },
+                // The highlighter itself: a yellow pale enough that the page's near
+                // black ink keeps its contrast on top of it, and warm enough that it
+                // reads as a mark someone made rather than as a tint of the paper.
+                highlight: Rgb { r: 0.98, g: 0.90, b: 0.42 },
             }
         }
     }
@@ -426,6 +439,7 @@ impl Palette {
             ColorRole::Muted | ColorRole::Faint => self.muted,
             ColorRole::Accent => self.accent,
             ColorRole::Surface => self.code_bg,
+            ColorRole::Highlight => self.highlight,
             ColorRole::PageSurface => self.page_surface,
             ColorRole::PageShadow => self.page_shadow,
             ColorRole::Keyword => self.keyword,
@@ -475,6 +489,10 @@ struct AppStyle {
     /// Strike the run's own ink, per face: like `raise`, this is painting rather
     /// than measuring, so it stays out of [`RunStyle`].
     strike: bool,
+    /// Lay the highlighter band behind this run's words. Like `strike` it is a mark
+    /// the reader asked for and the painter draws: the band's geometry comes from
+    /// the style's own size, so it stays out of [`RunStyle`] as well.
+    highlight: bool,
 }
 
 /// The thing behind an object placeholder.
@@ -1675,6 +1693,9 @@ pub struct View {
     /// Whether an `<img>` in a document's markup becomes the figure it names. A
     /// reader's own switch, remembered for the next document and the next launch.
     show_html_images: bool,
+    /// Whether `==marked==` is read as a highlight or printed as the two equals signs
+    /// the author typed. The reader's own switch, remembered like the one above.
+    show_highlights: bool,
     ops: Vec<Op>,
     /// Whether [`Self::ops`] is non-decreasing by [`op_top`], which is what lets a
     /// paint binary-search the visible band. Recomputed whenever ops are replaced.
@@ -2635,6 +2656,9 @@ enum Command {
     DocumentLineBreaks(Option<bool>),
     /// The reader's HTML image switch: whether an `<img>` becomes the figure it names.
     HtmlImages(bool),
+    /// The reader's highlight switch: whether `==marked==` is a band of colour or the
+    /// two equals signs the author typed.
+    Highlights(bool),
     SourceView,
     PlainText(Option<bool>),
     TextParagraphs(ParagraphRule),
@@ -2711,6 +2735,8 @@ struct MenuState {
     /// The HTML image switch, read when the menu was asked for like the other
     /// remembered preferences above.
     show_html_images: bool,
+    /// The highlight switch, read from the same place and at the same moment.
+    show_highlights: bool,
     /// The spacebar peek's remembered preference, read when the menu was asked for.
     peek: bool,
     /// The space bar's meaning and the focus rule, from the same place.
@@ -2897,6 +2923,10 @@ fn menu_items(s: &MenuState) -> Vec<MenuRow> {
         // reader asked for the words its alt text carries instead, and Markdown's own
         // `![]()` figures are not what it turns off.
         check(Command::HtmlImages(!s.show_html_images), i18n::t(s.lang, Key::MenuHtmlImages), s.show_html_images),
+        // And this one is about the markup's own marks: a `==marked==` span is drawn
+        // unless the reader asked for the equals signs the author typed instead --
+        // which is what a page about Markdown's own syntax needs.
+        check(Command::Highlights(!s.show_highlights), i18n::t(s.lang, Key::MenuHighlights), s.show_highlights),
         MenuRow::Gap,
         check(Command::TextParagraphs(ParagraphRule::Auto), i18n::t(s.lang, Key::MenuParagraphsAuto), s.text_options.paragraphs == ParagraphRule::Auto),
         check(Command::TextParagraphs(ParagraphRule::Lines), i18n::t(s.lang, Key::MenuParagraphsLines), s.text_options.paragraphs == ParagraphRule::Lines),
@@ -3270,6 +3300,7 @@ fn new_view(path: Option<PathBuf>, extra: Vec<PathBuf>) -> Result<(Box<View>, cr
         keep_line_breaks: false,
         line_break_override: None,
         show_html_images: true,
+        show_highlights: true,
         ops: Vec::new(),
         ops_sorted: true,
         ops_reach: Vec::new(),
@@ -4109,6 +4140,7 @@ impl View {
         self.stamp = path.as_deref().and_then(stamp_of);
         self.keep_line_breaks = crate::settings::keep_line_breaks();
         self.show_html_images = crate::settings::show_html_images();
+        self.show_highlights = crate::settings::show_highlights();
         let mut preferences = path.as_deref().map(crate::settings::document).unwrap_or_default();
         preferences.text = reading::text_options_for(path.as_deref(), preferences.text);
         let profile = crate::profiles::selected(preferences.plain.unwrap_or_else(|| reading::is_plain(path.as_deref())));
@@ -4226,6 +4258,7 @@ impl View {
         else { Document::parse_with(&source, rubrica_doc::ParseOptions {
             keep_line_breaks: preferences.line_breaks.unwrap_or(self.keep_line_breaks),
             html_images: self.show_html_images,
+            show_highlights: self.show_highlights,
         }) };
         trace("page-ready");
 
@@ -4326,13 +4359,14 @@ impl View {
     /// and every glyph run of every frame, and a fixed list is checked in nanoseconds.
     fn ensure_brushes(&mut self) {
         let Some(rt) = self.target.clone() else { return };
-        const ROLES: [ColorRole; 17] = [
+        const ROLES: [ColorRole; 18] = [
             ColorRole::Text,
             ColorRole::Muted,
             ColorRole::Accent,
             ColorRole::Code,
             ColorRole::Faint,
             ColorRole::Surface,
+            ColorRole::Highlight,
             ColorRole::PageSurface,
             ColorRole::PageShadow,
             ColorRole::Keyword,
@@ -5921,6 +5955,7 @@ impl View {
             keep_line_breaks: self.keep_line_breaks,
             line_break_override: self.line_break_override,
             show_html_images: self.show_html_images,
+            show_highlights: self.show_highlights,
             peek: crate::settings::peek_enabled(),
             peek_space: crate::peek::space_mode(),
             peek_focus_close: crate::peek::focus_close(),
@@ -6136,6 +6171,11 @@ impl View {
                 crate::settings::record_show_html_images(show);
                 self.reparse(hwnd);
             }
+            Command::Highlights(show) => {
+                self.show_highlights = show;
+                crate::settings::record_show_highlights(show);
+                self.reparse(hwnd);
+            }
             Command::SourceView => {
                 self.source_view = !self.source_view;
                 self.reparse(hwnd);
@@ -6298,6 +6338,7 @@ impl View {
         Document::parse_with(&self.source, rubrica_doc::ParseOptions {
             keep_line_breaks: self.line_break_override.unwrap_or(self.keep_line_breaks),
             html_images: self.show_html_images,
+            show_highlights: self.show_highlights,
         })
     }
 
@@ -7645,6 +7686,17 @@ fn seat(runs: &mut [PaintRun], baseline: Pt, k: f32) {
     }
 }
 
+/// How far above its own baseline a highlighter band reaches, in ems of the marked
+/// run's size, and how tall the band is.
+///
+/// The reach clears the tallest ascender a face here owns and the foot covers most of
+/// a descender, so the band holds the whole of its words. Both numbers are the style's
+/// own rather than the face's -- a band is geometry about the mark, not about the ink --
+/// which is what lets a Latin run and the fallback face that carries one Han word
+/// inside it lay down one unbroken band.
+const BAND_TOP: f32 = 0.95;
+const BAND_H: f32 = 1.25;
+
 /// A strike rule still being grown, with the style it belongs to.
 struct Rule {
     style: StyleId,
@@ -7676,7 +7728,17 @@ fn merge_rule(
 ) {
     if let Some(r) = pending.as_mut().filter(|r| r.style == next.style) {
         if (r.top - next.top).abs() < 0.01 && (r.h - next.h).abs() < 0.01 {
-            r.w += next.w;
+            // The two pieces are one rule, so it grows to where the piece reaches
+            // rather than only by how wide the piece was drawn: the space between two
+            // struck words is a slot of its own, and a rule that added widths alone
+            // ended short of its last word by every space it had crossed -- which is
+            // exactly the glue this function exists to cover. Reached out on both
+            // sides rather than to the right, because a right-to-left piece stands to
+            // the left of the one that came before it.
+            let left = r.x.min(next.x);
+            let right = (r.x + r.w).max(next.x + next.w);
+            r.x = left;
+            r.w = right - left;
             return;
         }
     }
@@ -8121,6 +8183,11 @@ fn layout_block(
         // ideograph and every word its own node, so a struck Chinese phrase would
         // otherwise draw a separate op per character.
         let mut ruled: Option<Rule> = None;
+        // The highlighter's band, collected the same way and for the same reason.
+        // It is not a bar: a band goes *under* the words it marks, so it is laid
+        // down before the line's runs rather than with the strike rules after them.
+        let mut lit: Option<Rule> = None;
+        let mut bands: Vec<(Pt, Pt, Pt, Pt, ColorRole)> = Vec::new();
         let mut line_wide: Option<(WideKind, Pt, Pt, Pt)> = None;
         for slot in placed {
             let Some(node_id) = slot.node else {
@@ -8136,6 +8203,12 @@ fn layout_block(
             // closes the rule, so it never covers text the author did not mark.
             if ruled.as_ref().is_some_and(|r| r.style != node.style) {
                 end_rule(&mut ruled, &mut bars);
+            }
+            // And a marked node's band is closed the same way by the first node
+            // wearing another style, which is what a plain word in the middle of a
+            // sentence does to it.
+            if lit.as_ref().is_some_and(|r| r.style != node.style) {
+                end_rule(&mut lit, &mut bands);
             }
             if let Some(o) = st.object {
                 // An object contributes its own box to the line and is drawn from
@@ -8257,6 +8330,24 @@ fn layout_block(
                         },
                     );
                 }
+                if st.highlight && r.width() > 0.0 {
+                    // The band's geometry is the style's own and not the face's: one
+                    // reach and one height for every piece of a marked span, so a
+                    // fallback face in the middle of a word does not seam the band
+                    // into two. `st.raise` walks it up with a script it marks.
+                    merge_rule(
+                        &mut lit,
+                        &mut bands,
+                        Rule {
+                            style: node.style,
+                            x,
+                            top: -BAND_TOP * st.size - st.raise,
+                            w: r.width(),
+                            h: BAND_H * st.size,
+                            color: ColorRole::Highlight,
+                        },
+                    );
+                }
                 at += r.width();
             }
             if hyphen {
@@ -8268,6 +8359,7 @@ fn layout_block(
             segs.push((node.text.clone(), line_left + slot.x - mark_shift, at));
         }
         end_rule(&mut ruled, &mut bars);
+        end_rule(&mut lit, &mut bands);
         let natural = ascent + descent;
         let line_h = (size * leading.for_mixed(mixed)).max(natural * 1.02);
         let baseline = y + (line_h - natural) * 0.5 + ascent;
@@ -8275,6 +8367,15 @@ fn layout_block(
         for mut text in line_math_texts.drain(..) {
             text.y = baseline;
             math_texts.push(text);
+        }
+        // The bands stand in front of the line they mark rather than behind it with
+        // the strike rules: a band is the paper a highlighted word is written on, and
+        // one filed after the runs would paint over the words instead of under them.
+        // It is also where the list's own reading order wants them -- a band reaches
+        // above its own baseline, and a band filed after the run it belongs to would
+        // sit above an op that came first.
+        for (x, top, w, h, color) in bands {
+            ops.push(Op::Rect { x: x * k, y: (baseline + top) * k, w: w * k, h: h * k, color });
         }
         // A line with nothing in it pushes no op at all. An empty run list has no
         // baseline to be found from, so `op_top` would answer 0 for it -- an op above
@@ -9638,6 +9739,7 @@ impl View {
         // to this document as much as to the one after it.
         self.keep_line_breaks = crate::settings::keep_line_breaks();
         self.show_html_images = crate::settings::show_html_images();
+        self.show_highlights = crate::settings::show_highlights();
         let preferences = path.as_deref().map(crate::settings::document).unwrap_or_default();
         self.line_break_override = preferences.line_breaks;
         self.plain_override = preferences.plain;
@@ -10828,6 +10930,13 @@ fn layout_table(
     };
 
     let mut paint_row = |cells: &[PreparedCell], top: Pt, head: bool, ops: &mut Vec<Op>, hots: &mut Vec<Hot>, sel: &mut Vec<SelLine>| -> Pt {
+        // Where this row's own ops begin, which is where its highlighter bands go:
+        // filed there rather than beside the cell that owns each one, because a band
+        // reaches above the baseline of the cell laid out before it, and the list's
+        // reading-order check reads that as a page out of order. Gathered here and
+        // spliced in below, sorted by where they stand.
+        let band_at = ops.len();
+        let mut row_bands: Vec<(Pt, Pt, Pt, Pt, ColorRole)> = Vec::new();
         // Measure every cell first: the row is as tall as its tallest cell.
         let mut heights = vec![0.0f32; cols];
         // How far one line of each cell steps down. Normally the body leading, but an
@@ -10893,6 +11002,12 @@ fn layout_table(
                 // already in device pixels, ascent and descent still in points.
                 let mut pics: Vec<(std::path::PathBuf, f32, f32, Pt, Pt)> = Vec::new();
                 let mut ruled: Option<Rule> = None;
+                // This line's highlighter bands, in the same shape as the strike
+                // rules -- one per marked run of the cell, in the style's own
+                // geometry -- but gathered into the row's own list, since a band
+                // reaches above the baseline of the cell the row drew before it.
+                let mut lit: Option<Rule> = None;
+                let mut bands: Vec<(Pt, Pt, Pt, Pt, ColorRole)> = Vec::new();
                 for slot in placed {
                     let Some(node_id) = slot.node else {
                         mark_glue(&c.text, &slot, x + pad + shift, &mut segs, &mut marks);
@@ -10906,6 +11021,9 @@ fn layout_table(
                     let st = &styles[node.style.0 as usize];
                     if ruled.as_ref().is_some_and(|r| r.style != node.style) {
                         end_rule(&mut ruled, &mut bars);
+                    }
+                    if lit.as_ref().is_some_and(|r| r.style != node.style) {
+                        end_rule(&mut lit, &mut bands);
                     }
                     let mut at = x + pad + shift + slot.x;
                     if let Some(o) = st.object {
@@ -11000,6 +11118,22 @@ fn layout_table(
                                 },
                             );
                         }
+                        if st.highlight && width > 0.0 {
+                            // The same style-own geometry as a prose band, so a cell's
+                            // mark and a paragraph's are one band seen in two places.
+                            merge_rule(
+                                &mut lit,
+                                &mut bands,
+                                Rule {
+                                    style: node.style,
+                                    x: drawn,
+                                    top: -BAND_TOP * st.size - st.raise,
+                                    w: width,
+                                    h: BAND_H * st.size,
+                                    color: ColorRole::Highlight,
+                                },
+                            );
+                        }
                         let source = if hyphen { None } else { from.get(range.clone()).map(str::to_owned) };
                         runs.push(PaintRun {
                             bidi_level: r.bidi_level,
@@ -11037,6 +11171,13 @@ fn layout_table(
                     segs.push((node.text.clone(), x + pad + shift + slot.x - mark_shift, at));
                 }
                 end_rule(&mut ruled, &mut bars);
+                end_rule(&mut lit, &mut bands);
+                // The line's bands are stated where they will stand rather than
+                // pushed here: the row splices all of them in at its own top, sorted,
+                // once every cell has had its say.
+                row_bands.extend(bands.drain(..).map(|(x, top, w, h, color)| {
+                    (x * k, (ly + ascent + top) * k, w * k, h * k, color)
+                }));
                 seat(&mut runs, ly + ascent, k);
                 for mut text in line_math_texts.drain(..) {
                     text.y = ly + ascent;
@@ -11094,6 +11235,16 @@ fn layout_table(
                 ly += step[i];
             }
             x += widths[i];
+        }
+        // In at the top, where nothing precedes them but the line they stand on, and
+        // in the order they stand in: a band from a wrapped cell's second line must
+        // not be filed in front of one from the column beside it.
+        if !row_bands.is_empty() {
+            row_bands.sort_by(|a, b| a.1.total_cmp(&b.1));
+            let rects = row_bands
+                .drain(..)
+                .map(|(x, y, w, h, color)| Op::Rect { x, y, w, h, color });
+            ops.splice(band_at..band_at, rects);
         }
         row_h
     };
@@ -11309,6 +11460,9 @@ fn intern_object(styles: &mut Vec<AppStyle>, source: ObjectSource, color: ColorR
         object: Some(object),
         source: Some(source),
         strike: false,
+        // A figure is not a word: the mark syntax never reaches one, so it never
+        // wears a band.
+        highlight: false,
     };
     if let Some(i) = styles.iter().position(|s| *s == app) {
         return StyleId(i as u16);
@@ -11336,6 +11490,7 @@ fn intern(styles: &mut Vec<AppStyle>, fallback: &[String], r: crate::theme::Reso
         object: None,
         source: None,
         strike: r.strike,
+        highlight: r.highlight,
     };
     if let Some(i) = styles.iter().position(|s| *s == app) {
         return StyleId(i as u16);
@@ -11704,6 +11859,7 @@ pub(crate) fn export_png(
     source_view: bool,
     keep_line_breaks: bool,
     html_images: bool,
+    show_highlights: bool,
     zoom: Zoom,
     face: Option<usize>,
     measure: Option<usize>,
@@ -11729,7 +11885,7 @@ pub(crate) fn export_png(
     } else if plain {
         reading::parse_plain(source, input_path, text_options)
     } else {
-        Document::parse_with(source, rubrica_doc::ParseOptions { keep_line_breaks, html_images })
+        Document::parse_with(source, rubrica_doc::ParseOptions { keep_line_breaks, html_images, show_highlights })
     };
     let mut font = FontEngine::new().map_err(|e| -> Error { format!("DirectWrite: {e}").into() })?;
     if !font.probe() {
@@ -11944,6 +12100,7 @@ pub fn export_pdf(
     source_view: bool,
     keep_line_breaks: bool,
     html_images: bool,
+    show_highlights: bool,
     zoom: Zoom,
     face: Option<usize>,
     measure: Option<usize>,
@@ -11969,7 +12126,7 @@ pub fn export_pdf(
     } else if plain {
         reading::parse_plain(source, input_path, text_options)
     } else {
-        Document::parse_with(source, rubrica_doc::ParseOptions { keep_line_breaks, html_images })
+        Document::parse_with(source, rubrica_doc::ParseOptions { keep_line_breaks, html_images, show_highlights })
     };
     let mut font = FontEngine::new().map_err(|e| -> Error { format!("DirectWrite: {e}").into() })?;
     if !font.probe() {
@@ -15893,6 +16050,176 @@ mod tests {
         }
     }
 
+    /// A highlight is a band under its words, so it is filed before the line's own
+    /// runs -- filed after, it would paint over the words it marks -- and it has to
+    /// cover the whole of the mark, spaces between its words included, rather than
+    /// stop short at its last word by every space the merge crossed.
+    #[test]
+    fn a_band_stands_under_its_words_and_covers_the_whole_mark() {
+        let Ok(mut font) = FontEngine::new() else { return };
+        if !font.probe() {
+            return;
+        }
+        let theme = Theme::default();
+        let doc = Document::parse("Before ==a marked phrase here== after.\n");
+        let mut math = crate::math::MathStore::new();
+        let mut diagrams = crate::diagram::DiagramStore::new();
+        let mut objects = Objects::new(None, None, &mut math, &mut diagrams);
+        let page = build_ops(&mut font, &theme, &doc, 700.0, DPI, &mut objects, None);
+        let k = DPI / 72.0;
+        let size = theme.body_size(BlockKind::Paragraph);
+        let bands: Vec<(usize, f32, f32, f32, f32)> = page
+            .ops
+            .iter()
+            .enumerate()
+            .filter_map(|(i, op)| match op {
+                Op::Rect { x, y, w, h, color: ColorRole::Highlight } => Some((i, *x, *y, *w, *h)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(bands.len(), 1, "one mark is one band: {bands:?}");
+        let (band_at, bx, by, bw, bh) = bands[0];
+        // The marked words, as the painter drew them: where the first begins and where
+        // the last ends.
+        let mut left = f32::MAX;
+        let mut right = f32::MIN;
+        let mut baseline = f32::NAN;
+        let mut ink_at = usize::MAX;
+        for (i, op) in page.ops.iter().enumerate() {
+            let Op::Runs(runs) = op else { continue };
+            for r in runs {
+                let marked = r.source.as_deref().is_some_and(|t| {
+                    matches!(t.trim(), "a" | "marked" | "phrase" | "here")
+                });
+                if !marked {
+                    continue;
+                }
+                left = left.min(r.x);
+                right = right.max(r.x + r.advances.iter().sum::<f32>());
+                baseline = r.baseline;
+                ink_at = ink_at.min(i);
+            }
+        }
+        assert!(left < right, "the marked words were never drawn");
+        assert!(band_at < ink_at, "the band is filed after the words it is under");
+        assert!(
+            (bx - left).abs() < 0.05 && (bx + bw - right).abs() < 0.05,
+            "the band covers {bx:.2}..{:.2}, the marked words {left:.2}..{right:.2}",
+            bx + bw,
+        );
+        // Its geometry is the mark's own, in ems of the size the run is set at: the
+        // band reaches 0.95em above the baseline and stands 1.25em tall, so it holds
+        // the words and still stops inside the line's own step.
+        assert!(
+            (bh - BAND_H * size * k).abs() < 0.05,
+            "band height {bh:.2} is not {BAND_H}em of {size}pt",
+        );
+        assert!(
+            (by - (baseline - BAND_TOP * size * k)).abs() < 0.05,
+            "band top {by:.2} is not {BAND_TOP}em above the baseline {baseline:.2}",
+        );
+        assert!(by + bh > baseline, "the band stops at the baseline and leaves descenders bare");
+    }
+
+    /// A band reaches above the baseline of its own words, which is above the top of
+    /// the cell the grid drew before it -- one filed beside its cell would sit above
+    /// the op in front of it, and a single inversion latches the whole page out of the
+    /// search over its ops. So the places a band can stand are all here at once: prose
+    /// between two other blocks, a grid's own header and a later column, and a
+    /// definition under a term.
+    #[test]
+    fn a_highlighted_page_leaves_the_list_in_reading_order() {
+        let Ok(mut font) = FontEngine::new() else { return };
+        if !font.probe() {
+            return;
+        }
+        let doc = Document::parse(concat!(
+            "Prose ==with a marked clause== here.\n\n",
+            "| plain | ==marked== |\n|:--|:--|\n| 1 | ==two words== |\n\n",
+            "After the grid ==another== mark.\n\n",
+            "Term\n: ==a defined mark==\n",
+        ));
+        let mut math = crate::math::MathStore::new();
+        let mut diagrams = crate::diagram::DiagramStore::new();
+        let mut objects = Objects::new(None, None, &mut math, &mut diagrams);
+        let page = build_ops(&mut font, &Theme::default(), &doc, 700.0, DPI, &mut objects, None);
+        let bands = page
+            .ops
+            .iter()
+            .filter(|op| matches!(op, Op::Rect { color: ColorRole::Highlight, .. }))
+            .count();
+        assert!(bands >= 4, "the page drew {bands} band(s) for four marks");
+        for (i, w) in page.ops.windows(2).enumerate() {
+            assert!(
+                op_top(&w[0]) <= op_top(&w[1]),
+                "op {i} sits above the one before it: {} > {}",
+                op_top(&w[0]),
+                op_top(&w[1]),
+            );
+        }
+    }
+
+    /// With the reader's switch off the two equals signs are the author's own
+    /// characters: no band is drawn and the mark is set as written -- which is the
+    /// whole difference the `--report` line exists to show.
+    #[test]
+    fn the_highlight_switch_off_leaves_the_marks_as_written() {
+        let Ok(mut font) = FontEngine::new() else { return };
+        if !font.probe() {
+            return;
+        }
+        let doc = Document::parse_with(
+            "A ==marked== word.\n",
+            rubrica_doc::ParseOptions { show_highlights: false, ..Default::default() },
+        );
+        assert!(doc.blocks[0].text.contains("==marked=="), "the mark was read anyway");
+        let mut math = crate::math::MathStore::new();
+        let mut diagrams = crate::diagram::DiagramStore::new();
+        let mut objects = Objects::new(None, None, &mut math, &mut diagrams);
+        let page = build_ops(&mut font, &Theme::default(), &doc, 700.0, DPI, &mut objects, None);
+        assert!(
+            !page.ops.iter().any(|op| matches!(op, Op::Rect { color: ColorRole::Highlight, .. })),
+            "a band was drawn with the switch off",
+        );
+    }
+
+    /// A rule grows by where the next piece of its span reaches rather than by how wide
+    /// that piece was drawn: the space between two struck words is a slot of the line
+    /// of its own, and a rule that only added widths ended short of its last word by
+    /// every space it had crossed -- the very glue the merge exists to cover.
+    #[test]
+    fn a_merged_rule_covers_the_spaces_its_span_crossed() {
+        let piece = |style: u16, x: f32, w: f32| Rule {
+            style: StyleId(style),
+            x,
+            top: -5.0,
+            w,
+            h: 1.0,
+            color: ColorRole::Faint,
+        };
+        let mut pending = None;
+        let mut bars = Vec::new();
+        merge_rule(&mut pending, &mut bars, piece(3, 10.0, 20.0));
+        merge_rule(&mut pending, &mut bars, piece(3, 36.0, 20.0));
+        end_rule(&mut pending, &mut bars);
+        assert_eq!(bars, vec![(10.0, -5.0, 46.0, 1.0, ColorRole::Faint)]);
+        // A piece standing to the left, as a right-to-left run does, reaches the rule
+        // out on that side too rather than leaving it where it was.
+        let mut pending = None;
+        let mut bars = Vec::new();
+        merge_rule(&mut pending, &mut bars, piece(3, 10.0, 20.0));
+        merge_rule(&mut pending, &mut bars, piece(3, 2.0, 4.0));
+        end_rule(&mut pending, &mut bars);
+        assert_eq!(bars, vec![(2.0, -5.0, 28.0, 1.0, ColorRole::Faint)]);
+        // Another style is another rule, however close the two stand.
+        let mut pending = None;
+        let mut bars = Vec::new();
+        merge_rule(&mut pending, &mut bars, piece(3, 10.0, 20.0));
+        merge_rule(&mut pending, &mut bars, piece(4, 30.0, 20.0));
+        end_rule(&mut pending, &mut bars);
+        assert_eq!(bars.len(), 2, "styles 3 and 4 are two spans: {bars:?}");
+    }
+
     /// The height the content reaches is what the reader scrolls against and what
     /// the page breaks are read from, and a document with no notes always ends on
     /// an empty batch -- so the batch may be dropped, never the finish.
@@ -16490,6 +16817,21 @@ mod document_interaction_tests {
                     ratio(ink, &palette.bg),
                 );
             }
+            // A marked word is the page's own ink sitting on the highlighter's band
+            // rather than on the paper, so that pair is measured too: the band goes
+            // under the words, and the words are what has to stay readable.
+            assert!(
+                ratio(&palette.text, &palette.highlight) >= 4.5,
+                "{which} highlighted text {:.2}",
+                ratio(&palette.text, &palette.highlight),
+            );
+            // And the band has to be told from the paper at all: a highlighter run dry
+            // is a mark the reader cannot find.
+            assert!(
+                ratio(&palette.highlight, &palette.bg) >= 1.15,
+                "{which} highlighter against the page {:.2}",
+                ratio(&palette.highlight, &palette.bg),
+            );
         }
     }
 

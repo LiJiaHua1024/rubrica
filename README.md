@@ -98,7 +98,10 @@ and column, images, links and footnotes, strikethrough, autolinks, Pandoc's `H~2
 `x^2^` scripts (the scale and the shift are read from the formula face's `MATH` table,
 so a script, a `<sup>` and a footnote's `¹` are set with one pair of numbers; a mark
 alone, or a run of two or more, is printed as written rather than read as Pandoc's
-degenerate empty script), raw HTML read for its
+degenerate empty script), `==marked==` words (a pair of equals signs paints a band
+behind its words wherever prose stands -- a wrapped phrase, a table cell, a definition
+-- wrapping emphasis, links, formulas and scripts without disturbing them, while a run
+of three or more equals signs is printed as written), raw HTML read for its
 meaning -- `<b>` and `<i>` dress their words, `<sub>`/`<sup>` set as real scripts,
 `<br>` and separator tags part fields, `<img>` draws the figure it names (Typora's
 `style="zoom:87%"` included), a whole `<table>` or `<details>` is shown as the source it
@@ -171,8 +174,8 @@ source view, `Ctrl+4` switches between continuous scrolling and the page stack, 
 
 Right-click opens the menu: navigation, copy, select all, find, the contents, zoom, the
 installed reading faces, the measure, the theme, the text-reading switches (plain text
-or Markdown, **Show HTML image tags**), open tabs, recent documents, and the workspace
-tree.
+or Markdown, **Show HTML image tags**, **Show `==text==` as a highlight**), open tabs,
+recent documents, and the workspace tree.
 
 | Key | |
 | --- | --- |
