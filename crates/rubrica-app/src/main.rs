@@ -117,6 +117,8 @@ fn main() -> Result<()> {
                 || prefs.line_breaks.unwrap_or_else(settings::keep_line_breaks),
             !has_flag(&argv, "--no-html-images") && settings::show_html_images(),
             !has_flag(&argv, "--no-highlights") && settings::show_highlights(),
+            table_lines(&argv)?,
+            code_capsule(&argv)?,
             zoom,
             face,
             measure,
@@ -164,6 +166,8 @@ fn main() -> Result<()> {
                 || prefs.line_breaks.unwrap_or_else(settings::keep_line_breaks),
             !has_flag(&argv, "--no-html-images") && settings::show_html_images(),
             !has_flag(&argv, "--no-highlights") && settings::show_highlights(),
+            table_lines(&argv)?,
+            code_capsule(&argv)?,
             zoom,
             face,
             measure,
@@ -208,6 +212,10 @@ fn main() -> Result<()> {
         let dark = has_flag(&argv, "--dark");
         let word = text_flag(&argv, "--theme").map(lossy);
         let colour = themes::headless(word.as_deref(), dark, dark)?;
+        // The two drawing switches in effect for this run, from the flags or the
+        // reader's remembered choice.
+        let table_lines = table_lines(&argv)?;
+        let code_capsule = code_capsule(&argv)?;
         let options = report::Options {
             width,
             dpi,
@@ -219,6 +227,8 @@ fn main() -> Result<()> {
             keep_line_breaks,
             html_images,
             show_highlights,
+            table_lines,
+            code_capsule,
             source_view,
             plain,
             text_options: preferences.text,
@@ -319,10 +329,10 @@ fn has_flag(argv: &[OsString], name: &str) -> bool {
 /// `--width` and friends. A double-click names one; a multi-selection "open with" names
 /// several, and each of them is wanted.
 fn positionals(argv: &[OsString]) -> Vec<PathBuf> {
-    const TAKES_VALUE: [&str; 13] = [
+    const TAKES_VALUE: [&str; 15] = [
         "--width", "--dpi", "--zoom", "--face", "--measure", "--profile",
         "--export-png", "--export-width", "--export-scale", "--export-pdf",
-        "--pdf-width", "--pdf-height", "--theme",
+        "--pdf-width", "--pdf-height", "--theme", "--tables", "--inline-code",
     ];
     let mut skip_next = false;
     let mut flags_done = false;
@@ -374,6 +384,31 @@ fn flag(argv: &[OsString], name: &str) -> Option<f32> {
         .position(|a| a == name)
         .and_then(|i| argv.get(i + 1))
         .and_then(|v| v.to_string_lossy().parse().ok())
+}
+
+/// Which rules a table draws, from `--tables` or the reader's remembered choice.
+///
+/// A word this build does not know is refused rather than guessed at: a headless run
+/// has no window to explain itself in, and drawing the wrong set of rules for a name
+/// nobody understood is worse than not drawing at all.
+fn table_lines(argv: &[OsString]) -> Result<theme::TableLines> {
+    match text_flag(argv, "--tables").map(lossy).as_deref() {
+        None => Ok(settings::table_lines()),
+        Some("grid") => Ok(theme::TableLines::Grid),
+        Some("booktabs") => Ok(theme::TableLines::Booktabs),
+        Some(other) => Err(format!("--tables wants `grid` or `booktabs`, not `{other}`").into()),
+    }
+}
+
+/// Whether an inline code span wears a capsule, from `--inline-code` or the reader's
+/// remembered choice. Refused rather than guessed for the reason `--tables` is.
+fn code_capsule(argv: &[OsString]) -> Result<bool> {
+    match text_flag(argv, "--inline-code").map(lossy).as_deref() {
+        None => Ok(settings::code_capsule()),
+        Some("plain") => Ok(false),
+        Some("capsule") => Ok(true),
+        Some(other) => Err(format!("--inline-code wants `plain` or `capsule`, not `{other}`").into()),
+    }
 }
 
 /// A size the report can divide by.

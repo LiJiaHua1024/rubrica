@@ -174,8 +174,19 @@ source view, `Ctrl+4` switches between continuous scrolling and the page stack, 
 
 Right-click opens the menu: navigation, copy, select all, find, the contents, zoom, the
 installed reading faces, the measure, the theme, the text-reading switches (plain text
-or Markdown, **Show HTML image tags**, **Show `==text==` as a highlight**), open tabs,
-recent documents, and the workspace tree.
+or Markdown, **Show HTML image tags**, **Show `==text==` as a highlight**, **Table
+lines**, **Inline code**), open tabs, recent documents, and the workspace tree.
+
+A page's own furniture has two more choices, and both are drawn rather than measured: a
+table can be ruled as the full grid or as the printed table's three rules (a rule above,
+one under the header, one below the last row, and no verticals), and an inline code span
+can be set as the monospaced face and its own ink or on a capsule of its own. Neither
+switch moves a row, a column, or the reader's place — the lines and the box stand on
+coordinates the layout had already placed, so both can be changed mid-page. The headless
+runs take `--tables grid|booktabs` and `--inline-code plain|capsule`, both defaulting to
+the design every page was drawn with before the switches existed (the grid, and plain
+code); a `--report` carries a `tables` or `inline code` line only when the other design
+was asked for.
 
 | Key | |
 | --- | --- |

@@ -108,6 +108,11 @@ pub struct ResolvedStyle {
     /// text. A flag for the same reason as the two above: the band is geometry the
     /// painter works out from the size it is drawing at, not part of the run's face.
     pub highlight: bool,
+    /// Draw a capsule behind the run's words, for inline code. A flag for the same
+    /// reason as the three above, and one that says nothing about measurement: the
+    /// capsule's box is painted from the run's own size, so the line breaks where it
+    /// broke before it was drawn.
+    pub capsule: bool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -299,6 +304,24 @@ impl Measure {
     pub const DESIGN: usize = 1;
 }
 
+/// Which rules a table draws around and inside itself.
+///
+/// A reader's choice rather than a document's, because both sets say the same thing
+/// about the same grid -- where a column ends and a row begins -- and which one reads
+/// better is a matter of taste: a spreadsheet of every boundary, or the three rules of
+/// a printed table. Only the lines change between them; every coordinate a cell is
+/// measured at is the same in both, so switching one for the other cannot move a row,
+/// a column, or the reader's place on the page.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum TableLines {
+    /// A rule under every row and between every column, the design's original set.
+    #[default]
+    Grid,
+    /// A rule above the table, under its header, and below its last row; nothing
+    /// between rows and no vertical rules at all.
+    Booktabs,
+}
+
 /// How a script is set against the word it belongs to: the fraction of the word's
 /// size one is set at, and how far a raised one is lifted and a lowered one sunk,
 /// as fractions of the word's own size.
@@ -379,6 +402,14 @@ pub struct Theme {
     /// The face [`Theme::scripts`] came from, or empty while the fallback numbers
     /// stand -- so a report can say where the marks were set from.
     pub scripts_from: String,
+    /// Whether inline code is drawn as a capsule behind its words. The switch, not
+    /// the geometry: a capsule is painted from the run's own size, so turning this
+    /// on changes nothing about how the line was measured or where it broke. Off
+    /// by default, which reads code as the face and ink the author asked for.
+    pub code_capsule: bool,
+    /// Which rules a table draws around and inside itself. Read by the grid's own
+    /// layout, so switching it redraws nothing about a cell but its lines.
+    pub table_lines: TableLines,
 }
 
 impl Default for Theme {
@@ -418,6 +449,8 @@ impl Default for Theme {
             measure: Measure::DESIGN,
             scripts: ScriptMetrics::default(),
             scripts_from: String::new(),
+            code_capsule: false,
+            table_lines: TableLines::default(),
         }
     }
 }
@@ -464,6 +497,23 @@ impl Theme {
 
     pub fn set_wide_table_factor(&mut self, factor: f32) {
         self.wide_table_factor = factor.clamp(0.0, 1.0);
+    }
+
+    /// Draw a capsule behind inline code, or read it as plain monospaced ink.
+    ///
+    /// A painting decision only: the flag travels to the painter through
+    /// [`ResolvedStyle::capsule`] and never reaches the measurement a line was
+    /// broken on, so a reader can turn it on mid-page without losing their place.
+    pub fn set_code_capsule(&mut self, capsule: bool) {
+        self.code_capsule = capsule;
+    }
+
+    /// Draw a table as a grid, or as the three rules of a printed table.
+    ///
+    /// Like [`Theme::set_code_capsule`] this chooses ink rather than geometry: both
+    /// sets of rules stand on the same lines the layout already placed.
+    pub fn set_table_lines(&mut self, lines: TableLines) {
+        self.table_lines = lines;
     }
 
     /// Read how scripts are set from the faces a formula would be set in.
@@ -632,6 +682,10 @@ impl Theme {
             raise,
             strike: inline.contains(InlineStyle::STRIKETHROUGH),
             highlight: inline.contains(InlineStyle::HIGHLIGHT),
+            // Inline code only: a fence's own text is no `Event::Code` span, so a
+            // capsule never reaches a code block. The switch decides, not the kind
+            // of block the span is set in -- code is code in a heading too.
+            capsule: self.code_capsule && inline.contains(InlineStyle::CODE),
         }
     }
 
@@ -747,6 +801,44 @@ mod tests {
             t.resolve(BlockKind::Paragraph, InlineStyle::CODE | InlineStyle::LINK).color,
             ColorRole::Code
         );
+    }
+
+    /// The two drawing switches the theme carries: which rules a table draws, and
+    /// whether a code span wears a capsule. Neither is geometry -- the capsule flag
+    /// reaches the painter through the resolved style and never a measurement -- so
+    /// what is checked here is that each is remembered, defaults to the design as it
+    /// stood, and lands on the span kinds it belongs to.
+    #[test]
+    fn the_two_drawing_switches_are_remembered_and_reach_only_the_marks_they_name() {
+        let mut t = Theme::default();
+        // The design as it stood: the grid, and code read as plain monospaced ink.
+        assert_eq!(t.table_lines, TableLines::Grid);
+        assert!(!t.code_capsule);
+        assert!(!t.resolve_at(BlockKind::Paragraph, InlineStyle::CODE, t.base).capsule);
+
+        t.set_table_lines(TableLines::Booktabs);
+        t.set_code_capsule(true);
+        assert_eq!(t.table_lines, TableLines::Booktabs);
+        assert!(t.code_capsule);
+        // The capsule marks inline code and nothing else: a plain word, a link and a
+        // fenced block's own text all keep the painter they had.
+        assert!(t.resolve(BlockKind::Paragraph, InlineStyle::CODE).capsule);
+        assert!(t.resolve(BlockKind::Heading(2), InlineStyle::CODE).capsule, "code in a heading is still code");
+        assert!(t.resolve_at(BlockKind::Table, InlineStyle::CODE, t.base).capsule);
+        assert!(!t.resolve(BlockKind::Paragraph, InlineStyle::EMPTY).capsule);
+        assert!(!t.resolve(BlockKind::Paragraph, InlineStyle::LINK).capsule);
+        assert!(!t.resolve(BlockKind::Code, InlineStyle::EMPTY).capsule, "a fence is no inline code span");
+
+        // And the capsule flag never reaches a measurement: the span is measured by its
+        // glyphs with the switch on and off alike.
+        let off = Theme::default();
+        let mut on = Theme::default();
+        on.set_code_capsule(true);
+        let a = off.resolve(BlockKind::Paragraph, InlineStyle::CODE);
+        let b = on.resolve(BlockKind::Paragraph, InlineStyle::CODE);
+        assert_eq!((a.size, a.raise, a.weight), (b.size, b.raise, b.weight));
+        assert_eq!(a.family, b.family);
+        assert_ne!(a.capsule, b.capsule);
     }
 
     #[test]

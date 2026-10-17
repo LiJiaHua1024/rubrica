@@ -14,6 +14,9 @@ cargo run -q -p rubrica-app -- --report --width 900 --no-html-images fixtures/ht
 cargo run -q -p rubrica-app -- --report --width 900 fixtures/subsuper.md
 cargo run -q -p rubrica-app -- --report --width 900 fixtures/highlight.md
 cargo run -q -p rubrica-app -- --report --width 900 --no-highlights fixtures/highlight.md
+cargo run -q -p rubrica-app -- --report --width 900 fixtures/tables.md
+cargo run -q -p rubrica-app -- --report --width 900 --tables booktabs fixtures/tables.md
+cargo run -q -p rubrica-app -- --report --width 900 --inline-code capsule fixtures/tables.md
 ```
 
 - `notes.md` exercises footnotes, citations, table layout, and formulas in cells.
@@ -58,6 +61,19 @@ cargo run -q -p rubrica-app -- --report --width 900 --no-highlights fixtures/hig
   and a definition are read the same way, and inline/fenced code is immune. The
   report's `highlight` line counts the marked spans and the bands drawn;
   `--no-highlights` reads the same page with every mark as written.
+- `tables.md` exercises the reader's two drawing switches, which change ink and
+  nothing else: a table ruled as a full grid against the printed table's three
+  rules (`--tables grid|booktabs`), and an inline code span set as its monospaced
+  face and ink against the same span on a capsule of its own
+  (`--inline-code plain|capsule`). Neither switch moves a row, a column, or the
+  reader's place, so the two reports are the same page seen twice -- the report
+  carries a `tables` line only when the three rules were asked for and an
+  `inline code` line only when capsules were, each the record that the other
+  design was not what got drawn. It also holds code in prose, lists, table cells,
+  a heading and a definition (all drawn, none of it measured differently with a
+  capsule), a wrapped span that draws one box per line it crosses, a fence whose
+  own text never wears one, and a 26-row table `--pdf-height` cuts across pages so
+  every segment can be checked for a complete frame.
 
 The parser tests also read these exact files so their document structure remains
 reproducible without a font or a desktop session.

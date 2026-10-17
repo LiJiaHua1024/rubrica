@@ -12,7 +12,7 @@
 use std::collections::BTreeMap;
 
 use crate::font::FontEngine;
-use crate::theme::{ColorRole, Measure, TextFace, Theme, Zoom};
+use crate::theme::{ColorRole, Measure, TableLines, TextFace, Theme, Zoom};
 use crate::view::build_ops;
 use crate::{Error, Result};
 
@@ -47,6 +47,15 @@ pub struct Options {
     /// Whether `==marked==` is drawn as a highlighter band. Off leaves the equals
     /// signs the author typed, so the highlight line below is the difference.
     pub show_highlights: bool,
+    /// Which rules a table draws around and inside itself. The default grid prints no
+    /// line -- it is the design every page was drawn with before the switch -- so the
+    /// `tables` line stands only when the reader asked for the printed table's three
+    /// rules, and is itself the evidence that the other set was drawn.
+    pub table_lines: TableLines,
+    /// Whether an inline code span wears a capsule. Off is plain text in the code
+    /// colour, which is how every page was drawn before the switch, so the
+    /// `inline code` line stands only when capsules were asked for.
+    pub code_capsule: bool,
     pub source_view: bool,
     pub plain: Option<bool>,
     pub text_options: rubrica_doc::plain::TextOptions,
@@ -72,6 +81,8 @@ pub fn report(source: &str, path: Option<&str>, o: &Options) -> Result<()> {
         keep_line_breaks,
         html_images,
         show_highlights,
+        table_lines,
+        code_capsule,
         source_view,
         plain,
         text_options,
@@ -94,6 +105,11 @@ pub fn report(source: &str, path: Option<&str>, o: &Options) -> Result<()> {
     if Measure::ALL.get(measure).is_some() {
         theme.set_measure(measure);
     }
+    // The two drawing switches, set before any layout runs: both reach only the
+    // painter, never a measurement, so a report with either on lays out the very grid
+    // and the very lines the default drew.
+    theme.set_table_lines(table_lines);
+    theme.set_code_capsule(code_capsule);
     // The script geometry is the formula face's, so it is read here -- after the
     // profile and the command line have had their say about which face that is --
     // rather than inside `Theme::default`, which has no font engine to ask.
@@ -506,6 +522,46 @@ pub fn report(source: &str, path: Option<&str>, o: &Options) -> Result<()> {
             .filter(|op| matches!(op, crate::view::Op::Rect { color: ColorRole::Highlight, .. }))
             .count();
         println!("highlight    : {bands} span(s) in {marked} block(s) -> {rects} band(s) drawn");
+    }
+    // A table's rules and an inline code span's capsule are both drawing choices of
+    // the reader's rather than marks an author wrote, and both reach only the painter:
+    // the grid the cells sit on is the same either way. Each line therefore stands only
+    // when its switch is away from the design every page was drawn with before it
+    // existed -- so a report of a page nobody switched stays the report it always was,
+    // and a report that does carry the line is itself the record that the other set of
+    // lines, or the plain code colour, was not what got drawn.
+    if table_lines != TableLines::Grid {
+        let tables = shown.iter().filter(|b| b.kind == rubrica_doc::BlockKind::Table).count();
+        println!("tables       : {tables} table(s) drawn with the printed table's three rules");
+    }
+    if code_capsule {
+        let spans: usize = shown
+            .iter()
+            .map(|b| {
+                let prose = b
+                    .spans
+                    .iter()
+                    .filter(|s| s.style.contains(rubrica_doc::InlineStyle::CODE))
+                    .count();
+                let cells = b.table.as_ref().map_or(0, |t| {
+                    t.head
+                        .iter()
+                        .chain(t.rows.iter().flatten())
+                        .map(|c| {
+                            c.spans
+                                .iter()
+                                .filter(|s| s.style.contains(rubrica_doc::InlineStyle::CODE))
+                                .count()
+                        })
+                        .sum::<usize>()
+                });
+                prose + cells
+            })
+            .sum();
+        println!(
+            "inline code  : {spans} code span(s), {} capsule(s) drawn",
+            page.capsules_drawn
+        );
     }
     // Diagrams, counted from the store and the source rather than from the ops: the
     // ops hold what was drawn, and a fence that did not parse has its source on the

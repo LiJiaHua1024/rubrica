@@ -193,6 +193,10 @@ pub enum Key {
     MenuReadSource,
     MenuHtmlImages,
     MenuHighlights,
+    /// The submenu label for how an inline code span is drawn.
+    MenuInlineCode,
+    MenuInlineCodePlain,
+    MenuInlineCodeCapsule,
 
     MenuColourTheme,
     MenuLightTheme,
@@ -230,6 +234,10 @@ pub enum Key {
     MenuNextChapter,
     MenuWideTableNarrow,
     MenuWideTableWiden,
+    /// The submenu label for which rules a table draws.
+    MenuTableLines,
+    MenuTableGrid,
+    MenuTableBooktabs,
     MenuPreviousFile,
     MenuNextFile,
 
@@ -361,6 +369,9 @@ fn translate_en(key: Key) -> &'static str {
         Key::MenuReadSource => "Read Source",
         Key::MenuHtmlImages => "Show HTML image tags",
         Key::MenuHighlights => "Show ==text== as a highlight",
+        Key::MenuInlineCode => "Inline code",
+        Key::MenuInlineCodePlain => "Plain text",
+        Key::MenuInlineCodeCapsule => "Capsule",
 
         Key::MenuColourTheme => "Colour theme",
         Key::MenuLightTheme => "Light theme",
@@ -394,6 +405,9 @@ fn translate_en(key: Key) -> &'static str {
         Key::MenuNextChapter => "Next chapter",
         Key::MenuWideTableNarrow => "Wide table: Borrow less margin",
         Key::MenuWideTableWiden => "Wide table: Borrow more margin",
+        Key::MenuTableLines => "Table lines",
+        Key::MenuTableGrid => "Full grid",
+        Key::MenuTableBooktabs => "Three rules",
         Key::MenuPreviousFile => "Previous file",
         Key::MenuNextFile => "Next file",
 
@@ -509,6 +523,9 @@ fn translate_zh_cn(key: Key) -> &'static str {
         Key::MenuReadSource => "阅读源码",
         Key::MenuHtmlImages => "显示 HTML 图片标签",
         Key::MenuHighlights => "将 ==文字== 显示为荧光标记",
+        Key::MenuInlineCode => "行内代码",
+        Key::MenuInlineCodePlain => "纯文字",
+        Key::MenuInlineCodeCapsule => "胶囊底色",
 
         Key::MenuColourTheme => "配色主题",
         Key::MenuLightTheme => "浅色主题",
@@ -542,6 +559,9 @@ fn translate_zh_cn(key: Key) -> &'static str {
         Key::MenuNextChapter => "下一章",
         Key::MenuWideTableNarrow => "宽表格：少占边距",
         Key::MenuWideTableWiden => "宽表格：多占边距",
+        Key::MenuTableLines => "表格线",
+        Key::MenuTableGrid => "完整网格",
+        Key::MenuTableBooktabs => "三线表",
         Key::MenuPreviousFile => "上一个文件",
         Key::MenuNextFile => "下一个文件",
 
@@ -657,6 +677,9 @@ fn translate_zh_tw(key: Key) -> &'static str {
         Key::MenuReadSource => "檢視原始碼",
         Key::MenuHtmlImages => "顯示 HTML 圖片標籤",
         Key::MenuHighlights => "將 ==文字== 顯示為螢光標記",
+        Key::MenuInlineCode => "行內程式碼",
+        Key::MenuInlineCodePlain => "純文字",
+        Key::MenuInlineCodeCapsule => "膠囊底色",
 
         Key::MenuColourTheme => "配色主題",
         Key::MenuLightTheme => "淺色主題",
@@ -690,6 +713,9 @@ fn translate_zh_tw(key: Key) -> &'static str {
         Key::MenuNextChapter => "下一章",
         Key::MenuWideTableNarrow => "寬表格：少佔邊距",
         Key::MenuWideTableWiden => "寬表格：多佔邊距",
+        Key::MenuTableLines => "表格線",
+        Key::MenuTableGrid => "完整網格",
+        Key::MenuTableBooktabs => "三線表",
         Key::MenuPreviousFile => "上一個檔案",
         Key::MenuNextFile => "下一個檔案",
 
@@ -805,6 +831,9 @@ fn translate_ja(key: Key) -> &'static str {
         Key::MenuReadSource => "ソースを表示",
         Key::MenuHtmlImages => "HTML 画像タグを表示",
         Key::MenuHighlights => "==テキスト== を蛍光マーカーで表示",
+        Key::MenuInlineCode => "インラインコード",
+        Key::MenuInlineCodePlain => "プレーンテキスト",
+        Key::MenuInlineCodeCapsule => "カプセル背景",
 
         Key::MenuColourTheme => "配色テーマ",
         Key::MenuLightTheme => "ライトテーマ",
@@ -838,6 +867,9 @@ fn translate_ja(key: Key) -> &'static str {
         Key::MenuNextChapter => "次の章",
         Key::MenuWideTableNarrow => "幅広テーブル: 余白の借用を減らす",
         Key::MenuWideTableWiden => "幅広テーブル: 余白の借用を増やす",
+        Key::MenuTableLines => "テーブルの罫線",
+        Key::MenuTableGrid => "完全なグリッド",
+        Key::MenuTableBooktabs => "三本罫線",
         Key::MenuPreviousFile => "前のファイル",
         Key::MenuNextFile => "次のファイル",
 
@@ -953,6 +985,9 @@ fn translate_ko(key: Key) -> &'static str {
         Key::MenuReadSource => "소스 보기",
         Key::MenuHtmlImages => "HTML 이미지 태그 표시",
         Key::MenuHighlights => "==텍스트== 를 형광펜으로 표시",
+        Key::MenuInlineCode => "인라인 코드",
+        Key::MenuInlineCodePlain => "일반 텍스트",
+        Key::MenuInlineCodeCapsule => "캡슐 배경",
 
         Key::MenuColourTheme => "색상 테마",
         Key::MenuLightTheme => "밝은 테마",
@@ -986,6 +1021,9 @@ fn translate_ko(key: Key) -> &'static str {
         Key::MenuNextChapter => "다음 장",
         Key::MenuWideTableNarrow => "넓은 표: 여백 축소",
         Key::MenuWideTableWiden => "넓은 표: 여백 확대",
+        Key::MenuTableLines => "표 테두리",
+        Key::MenuTableGrid => "전체 격자",
+        Key::MenuTableBooktabs => "삼선 표",
         Key::MenuPreviousFile => "이전 파일",
         Key::MenuNextFile => "다음 파일",
 
@@ -1101,6 +1139,9 @@ fn translate_fr(key: Key) -> &'static str {
         Key::MenuReadSource => "Afficher la source",
         Key::MenuHtmlImages => "Afficher les balises d'image HTML",
         Key::MenuHighlights => "Afficher ==texte== en surligné",
+        Key::MenuInlineCode => "Code en ligne",
+        Key::MenuInlineCodePlain => "Texte simple",
+        Key::MenuInlineCodeCapsule => "Pastille",
 
         Key::MenuColourTheme => "Thème de couleurs",
         Key::MenuLightTheme => "Thème clair",
@@ -1134,6 +1175,9 @@ fn translate_fr(key: Key) -> &'static str {
         Key::MenuNextChapter => "Chapitre suivant",
         Key::MenuWideTableNarrow => "Tableau large : Moins de marge",
         Key::MenuWideTableWiden => "Tableau large : Plus de marge",
+        Key::MenuTableLines => "Lignes du tableau",
+        Key::MenuTableGrid => "Grille complète",
+        Key::MenuTableBooktabs => "Trois règles",
         Key::MenuPreviousFile => "Fichier précédent",
         Key::MenuNextFile => "Fichier suivant",
 
@@ -1249,6 +1293,9 @@ fn translate_de(key: Key) -> &'static str {
         Key::MenuReadSource => "Quelltext anzeigen",
         Key::MenuHtmlImages => "HTML-Bildtags anzeigen",
         Key::MenuHighlights => "==Text== hervorgehoben anzeigen",
+        Key::MenuInlineCode => "Code in der Zeile",
+        Key::MenuInlineCodePlain => "Nur Text",
+        Key::MenuInlineCodeCapsule => "Kapsel",
 
         Key::MenuColourTheme => "Farbschema",
         Key::MenuLightTheme => "Helles Schema",
@@ -1282,6 +1329,9 @@ fn translate_de(key: Key) -> &'static str {
         Key::MenuNextChapter => "Nächstes Kapitel",
         Key::MenuWideTableNarrow => "Breite Tabelle: Weniger Rand nutzen",
         Key::MenuWideTableWiden => "Breite Tabelle: Mehr Rand nutzen",
+        Key::MenuTableLines => "Tabellenlinien",
+        Key::MenuTableGrid => "Volles Raster",
+        Key::MenuTableBooktabs => "Drei Linien",
         Key::MenuPreviousFile => "Vorherige Datei",
         Key::MenuNextFile => "Nächste Datei",
 
@@ -1397,6 +1447,9 @@ fn translate_es(key: Key) -> &'static str {
         Key::MenuReadSource => "Ver código fuente",
         Key::MenuHtmlImages => "Mostrar etiquetas de imagen HTML",
         Key::MenuHighlights => "Mostrar ==texto== resaltado",
+        Key::MenuInlineCode => "Código en línea",
+        Key::MenuInlineCodePlain => "Texto simple",
+        Key::MenuInlineCodeCapsule => "Cápsula",
 
         Key::MenuColourTheme => "Tema de color",
         Key::MenuLightTheme => "Tema claro",
@@ -1430,6 +1483,9 @@ fn translate_es(key: Key) -> &'static str {
         Key::MenuNextChapter => "Capítulo siguiente",
         Key::MenuWideTableNarrow => "Tabla ancha: Tomar menos margen",
         Key::MenuWideTableWiden => "Tabla ancha: Tomar más margen",
+        Key::MenuTableLines => "Líneas de la tabla",
+        Key::MenuTableGrid => "Cuadrícula completa",
+        Key::MenuTableBooktabs => "Tres reglas",
         Key::MenuPreviousFile => "Archivo anterior",
         Key::MenuNextFile => "Archivo siguiente",
 
@@ -1545,6 +1601,9 @@ fn translate_ru(key: Key) -> &'static str {
         Key::MenuReadSource => "Просмотр исходного текста",
         Key::MenuHtmlImages => "Показывать теги изображений HTML",
         Key::MenuHighlights => "Показывать ==текст== как выделение",
+        Key::MenuInlineCode => "Код в строке",
+        Key::MenuInlineCodePlain => "Простой текст",
+        Key::MenuInlineCodeCapsule => "Плашка",
 
         Key::MenuColourTheme => "Цветовая тема",
         Key::MenuLightTheme => "Светлая тема",
@@ -1578,6 +1637,9 @@ fn translate_ru(key: Key) -> &'static str {
         Key::MenuNextChapter => "Следующая глава",
         Key::MenuWideTableNarrow => "Широкая таблица: Меньше отступа",
         Key::MenuWideTableWiden => "Широкая таблица: Больше отступа",
+        Key::MenuTableLines => "Линии таблицы",
+        Key::MenuTableGrid => "Полная сетка",
+        Key::MenuTableBooktabs => "Три линии",
         Key::MenuPreviousFile => "Предыдущий файл",
         Key::MenuNextFile => "Следующий файл",
 
@@ -1693,6 +1755,9 @@ fn translate_it(key: Key) -> &'static str {
         Key::MenuReadSource => "Visualizza sorgente",
         Key::MenuHtmlImages => "Mostra tag immagine HTML",
         Key::MenuHighlights => "Mostra ==testo== evidenziato",
+        Key::MenuInlineCode => "Codice in linea",
+        Key::MenuInlineCodePlain => "Testo semplice",
+        Key::MenuInlineCodeCapsule => "Capsula",
 
         Key::MenuColourTheme => "Tema colori",
         Key::MenuLightTheme => "Tema chiaro",
@@ -1726,6 +1791,9 @@ fn translate_it(key: Key) -> &'static str {
         Key::MenuNextChapter => "Capitolo successivo",
         Key::MenuWideTableNarrow => "Tabella larga: Meno margine",
         Key::MenuWideTableWiden => "Tabella larga: Più margine",
+        Key::MenuTableLines => "Linee della tabella",
+        Key::MenuTableGrid => "Griglia completa",
+        Key::MenuTableBooktabs => "Tre righe",
         Key::MenuPreviousFile => "File precedente",
         Key::MenuNextFile => "File successivo",
 
@@ -1841,6 +1909,9 @@ fn translate_pt(key: Key) -> &'static str {
         Key::MenuReadSource => "Exibir código-fonte",
         Key::MenuHtmlImages => "Mostrar tags de imagem HTML",
         Key::MenuHighlights => "Mostrar ==texto== realçado",
+        Key::MenuInlineCode => "Código em linha",
+        Key::MenuInlineCodePlain => "Texto simples",
+        Key::MenuInlineCodeCapsule => "Cápsula",
 
         Key::MenuColourTheme => "Tema de cores",
         Key::MenuLightTheme => "Tema claro",
@@ -1874,6 +1945,9 @@ fn translate_pt(key: Key) -> &'static str {
         Key::MenuNextChapter => "Próximo capítulo",
         Key::MenuWideTableNarrow => "Tabela larga: Reduzir margem",
         Key::MenuWideTableWiden => "Tabela larga: Aumentar margem",
+        Key::MenuTableLines => "Linhas da tabela",
+        Key::MenuTableGrid => "Grade completa",
+        Key::MenuTableBooktabs => "Três linhas",
         Key::MenuPreviousFile => "Arquivo anterior",
         Key::MenuNextFile => "Próximo arquivo",
 

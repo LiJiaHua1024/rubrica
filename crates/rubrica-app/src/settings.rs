@@ -23,7 +23,7 @@ use windows::Win32::System::Registry::{
 };
 
 use crate::i18n::Language;
-use crate::theme::{Measure, TextFace, Zoom};
+use crate::theme::{Measure, TableLines, TextFace, Zoom};
 use crate::view::utf16;
 use rubrica_workspace::{DocumentRef, FileRef, SessionSnapshot, SessionTab, TabKind, Workspace, WorkspaceSnapshot};
 
@@ -319,6 +319,42 @@ fn highlights_of(stored: Option<u32>) -> bool {
 
 pub fn record_show_highlights(show: bool) {
     write_word(SUBKEY, "Highlights", u32::from(show));
+}
+
+/// Which rules a table draws around and inside itself: the grid, or the three rules of
+/// a printed table. The reader's own switch, and a missing value -- and a number this
+/// build never wrote -- means the grid, because that is the design every page was drawn
+/// at until the switch existed.
+pub fn table_lines() -> TableLines {
+    table_lines_of(word(SUBKEY, "TableLines"))
+}
+
+/// What the stored word means on its own: the grid unless the reader asked for the
+/// printed table's three rules by name.
+fn table_lines_of(stored: Option<u32>) -> TableLines {
+    if stored == Some(1) { TableLines::Booktabs } else { TableLines::Grid }
+}
+
+pub fn record_table_lines(lines: TableLines) {
+    write_word(SUBKEY, "TableLines", u32::from(lines == TableLines::Booktabs));
+}
+
+/// Whether an inline code span is drawn with a capsule behind it, or as the plain text
+/// its author typed. A missing value means plain -- the design as it stood, and the two
+/// switches of this pair are the only ones a missing value reads as off rather than on,
+/// because both change how the page has always looked.
+pub fn code_capsule() -> bool {
+    code_capsule_of(word(SUBKEY, "CodeCapsule"))
+}
+
+/// What the stored word means on its own: plain unless the reader asked for a capsule
+/// by name, and a number this build never wrote is no request at all.
+fn code_capsule_of(stored: Option<u32>) -> bool {
+    stored == Some(1)
+}
+
+pub fn record_code_capsule(on: bool) {
+    write_word(SUBKEY, "CodeCapsule", u32::from(on));
 }
 
 /// The colour theme the reader chose for one appearance, where `false` is light and
@@ -1157,6 +1193,33 @@ mod tests {    use super::*;
         clear(sub);
         write_word(sub, "Highlights", 0);
         assert_eq!(word(sub, "Highlights"), Some(0), "the off came back as something else");
+        clear(sub);
+    }
+
+    /// The two drawing switches of a page's own furniture: which rules a table draws,
+    /// and whether a code span wears a capsule. Both are choices with a shape every
+    /// page was drawn in before they existed, so a value nobody wrote -- and a number
+    /// this build never wrote -- means the design as it stood: the grid, and the plain
+    /// code colour beside it.
+    #[test]
+    fn the_table_and_code_switches_lean_back_to_the_way_pages_were_already_drawn() {
+        assert_eq!(table_lines_of(None), TableLines::Grid, "a reader who never chose gets the grid");
+        assert_eq!(table_lines_of(Some(0)), TableLines::Grid);
+        assert_eq!(table_lines_of(Some(1)), TableLines::Booktabs);
+        assert_eq!(table_lines_of(Some(7)), TableLines::Grid, "a number this build never wrote is no choice at all");
+
+        assert!(!code_capsule_of(None), "a reader who never chose gets plain code");
+        assert!(!code_capsule_of(Some(0)));
+        assert!(code_capsule_of(Some(1)));
+        assert!(!code_capsule_of(Some(7)), "a number this build never wrote is no choice at all");
+
+        // And both choices travel to the registry and back like every other one.
+        let sub = "Software\\Rubrica Test TableLines";
+        clear(sub);
+        write_word(sub, "TableLines", 1);
+        assert_eq!(word(sub, "TableLines"), Some(1), "the choice came back as something else");
+        write_word(sub, "CodeCapsule", 0);
+        assert_eq!(word(sub, "CodeCapsule"), Some(0), "the off came back as something else");
         clear(sub);
     }
 

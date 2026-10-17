@@ -117,7 +117,7 @@ use crate::diagram::DiagramStore;
 use crate::math::MathStore;
 use crate::tree::{self, Entry as TreeEntry, EntryKind as TreeEntryKind};
 use rubrica_workspace::{DocumentRef, FileRef, Tab, TabId, TabKind, Workspace};
-use crate::theme::{ColorRole, Leading, Measure, Role, TextFace, Theme, Zoom};
+use crate::theme::{ColorRole, Leading, Measure, Role, TableLines, TextFace, Theme, Zoom};
 use crate::{Error, Result};
 
 /// The character drawn at a discretionary break, and the range to shape it from.
@@ -549,6 +549,10 @@ struct AppStyle {
     /// the reader asked for and the painter draws: the band's geometry comes from
     /// the style's own size, so it stays out of [`RunStyle`] as well.
     highlight: bool,
+    /// Draw a capsule behind this run's words. A painting mark like `highlight`, and
+    /// one that never touches measurement: the box is worked out from the size it is
+    /// drawn at, from the same numbers the band uses.
+    capsule: bool,
 }
 
 /// The thing behind an object placeholder.
@@ -1648,6 +1652,16 @@ pub(crate) struct TableSpan {
     pub y: Pt,
     pub height: Pt,
     pub header: usize,
+    /// The table's own left and right edges, in points. A page that cuts the table
+    /// draws its closing rule between them, because the cut segment's ink stops
+    /// where the page does and only the layout knows how wide the grid was.
+    pub left: Pt,
+    pub right: Pt,
+    /// The rule that closes a cut segment: how thick, and in which colour. The two
+    /// sets of table lines end differently -- the grid's faint hairline, or booktabs'
+    /// heavy bottom rule -- and a segment cut between pages has to end the way the
+    /// table it belongs to does.
+    pub cut: (Pt, ColorRole),
 }
 
 #[cfg_attr(not(feature = "pdf"), allow(dead_code))]
@@ -1704,6 +1718,11 @@ pub struct Page {
     pub(crate) note_spans: Vec<NoteSpan>,
     #[cfg_attr(not(feature = "pdf"), allow(dead_code))]
     pub(crate) math_texts: Vec<MathTextFragment>,
+    /// How many inline-code capsules the page laid down, which is the number a report
+    /// sets against the code spans it read: a capsule is one box per line a span
+    /// crosses, so the count is never fewer than the spans and says which mark the
+    /// switches were on.
+    pub(crate) capsules_drawn: usize,
 }
 
 pub struct View {
@@ -2741,6 +2760,12 @@ enum Command {
     /// The reader's highlight switch: whether `==marked==` is a band of colour or the
     /// two equals signs the author typed.
     Highlights(bool),
+    /// The reader's table-line switch: which rules a table draws, the grid or the
+    /// three rules of a printed table. Only the lines change between them.
+    TableLines(TableLines),
+    /// The reader's inline-code switch: whether a code span wears a capsule behind
+    /// it, or is set as plain text with the code colour.
+    InlineCode(bool),
     SourceView,
     PlainText(Option<bool>),
     TextParagraphs(ParagraphRule),
@@ -2819,6 +2844,11 @@ struct MenuState {
     show_html_images: bool,
     /// The highlight switch, read from the same place and at the same moment.
     show_highlights: bool,
+    /// The table-line switch, read from the same place again: which rules a table
+    /// draws, which the reader chose.
+    table_lines: TableLines,
+    /// And the inline-code switch: whether a code span wears a capsule behind it.
+    code_capsule: bool,
     /// The spacebar peek's remembered preference, read when the menu was asked for.
     peek: bool,
     /// The space bar's meaning and the focus rule, from the same place.
@@ -3058,6 +3088,12 @@ fn menu_items(s: &MenuState) -> Vec<MenuRow> {    // A tab in a menu string star
         // unless the reader asked for the equals signs the author typed instead --
         // which is what a page about Markdown's own syntax needs.
         check(Command::Highlights(!s.show_highlights), i18n::t(s.lang, Key::MenuHighlights), s.show_highlights),
+        // How an inline code span is drawn: plain text in the code colour, which is
+        // how the page has always set it, or the same span on a capsule of its own.
+        MenuRow::Sub { label: i18n::t(s.lang, Key::MenuInlineCode), items: vec![
+            check(Command::InlineCode(false), i18n::t(s.lang, Key::MenuInlineCodePlain), !s.code_capsule),
+            check(Command::InlineCode(true), i18n::t(s.lang, Key::MenuInlineCodeCapsule), s.code_capsule),
+        ] },
         MenuRow::Gap,
         check(Command::TextParagraphs(ParagraphRule::Auto), i18n::t(s.lang, Key::MenuParagraphsAuto), s.text_options.paragraphs == ParagraphRule::Auto),
         check(Command::TextParagraphs(ParagraphRule::Lines), i18n::t(s.lang, Key::MenuParagraphsLines), s.text_options.paragraphs == ParagraphRule::Lines),
@@ -3068,6 +3104,13 @@ fn menu_items(s: &MenuState) -> Vec<MenuRow> {    // A tab in a menu string star
         row(Command::NextChapter, format!("{}\tCtrl+Alt+Down", i18n::t(s.lang, Key::MenuNextChapter)), s.chapter + 1 < s.chapter_titles.len()),
         row(Command::WideTableNarrow, i18n::t(s.lang, Key::MenuWideTableNarrow), true),
         row(Command::WideTableWiden, i18n::t(s.lang, Key::MenuWideTableWiden), true),
+        // What a table is ruled with: every boundary of the grid, or the three rules
+        // of a printed table. Only the lines change -- which is why the switch is a
+        // preference and not a document's own choice.
+        MenuRow::Sub { label: i18n::t(s.lang, Key::MenuTableLines), items: vec![
+            check(Command::TableLines(TableLines::Grid), i18n::t(s.lang, Key::MenuTableGrid), s.table_lines == TableLines::Grid),
+            check(Command::TableLines(TableLines::Booktabs), i18n::t(s.lang, Key::MenuTableBooktabs), s.table_lines == TableLines::Booktabs),
+        ] },
         row(Command::Neighbor(false), format!("{}\tCtrl+Alt+Left", i18n::t(s.lang, Key::MenuPreviousFile)), s.previous),
         row(Command::Neighbor(true), format!("{}\tCtrl+Alt+Right", i18n::t(s.lang, Key::MenuNextFile)), s.next),
     ] });
@@ -4318,6 +4361,11 @@ impl View {
         self.keep_line_breaks = crate::settings::keep_line_breaks();
         self.show_html_images = crate::settings::show_html_images();
         self.show_highlights = crate::settings::show_highlights();
+        // The two drawing switches are the theme's own: the painter asks the theme
+        // which rules a table draws and whether a code span wears a capsule, so a
+        // remembered choice has to be on the theme before the first layout runs.
+        self.theme.set_table_lines(crate::settings::table_lines());
+        self.theme.set_code_capsule(crate::settings::code_capsule());
         let mut preferences = path.as_deref().map(crate::settings::document).unwrap_or_default();
         preferences.text = reading::text_options_for(path.as_deref(), preferences.text);
         let profile = crate::profiles::selected(preferences.plain.unwrap_or_else(|| reading::is_plain(path.as_deref())));
@@ -6146,6 +6194,8 @@ impl View {
             line_break_override: self.line_break_override,
             show_html_images: self.show_html_images,
             show_highlights: self.show_highlights,
+            table_lines: self.theme.table_lines,
+            code_capsule: self.theme.code_capsule,
             peek: crate::settings::peek_enabled(),
             peek_space: crate::peek::space_mode(),
             peek_focus_close: crate::peek::focus_close(),
@@ -6391,6 +6441,24 @@ impl View {
                 self.show_highlights = show;
                 crate::settings::record_show_highlights(show);
                 self.reparse(hwnd);
+            }
+            // The two switches below change ink rather than text: nothing is parsed
+            // again, the page is laid out again around the reader's own place, and
+            // the choice is written down. A switch that never moved a line is the
+            // whole point of them, so neither touches the document model at all.
+            Command::TableLines(lines) => {
+                if lines != self.theme.table_lines {
+                    self.theme.set_table_lines(lines);
+                    crate::settings::record_table_lines(lines);
+                    self.relayout_in_place(hwnd);
+                }
+            }
+            Command::InlineCode(capsule) => {
+                if capsule != self.theme.code_capsule {
+                    self.theme.set_code_capsule(capsule);
+                    crate::settings::record_code_capsule(capsule);
+                    self.relayout_in_place(hwnd);
+                }
             }
             Command::SourceView => {
                 self.source_view = !self.source_view;
@@ -7824,6 +7892,10 @@ struct Out<'a> {
     table_spans: &'a mut Vec<TableSpan>,
     note_spans: &'a mut Vec<NoteSpan>,
     math_texts: &'a mut Vec<MathTextFragment>,
+    /// How many inline-code capsules the page has drawn, counted where they are laid
+    /// down. The number a report compares against the code spans it read: a span with
+    /// no boxes behind it is a capsule the reader never sees.
+    capsules_drawn: &'a mut usize,
 }
 
 /// How many lines the solver broke on a discretionary hyphen, and how many hyphen marks
@@ -8002,9 +8074,22 @@ fn seat(runs: &mut [PaintRun], baseline: Pt, k: f32) {
 const BAND_TOP: f32 = 0.95;
 const BAND_H: f32 = 1.25;
 
+/// How far, in ems of the marked run's size, a capsule reaches out past the advance
+/// on each side of a code span.
+///
+/// The pad is geometry about the mark rather than the ink, and it is drawn, never
+/// measured: the layout core still charges the span its glyphs and nothing more, so
+/// turning capsules on cannot move a line -- the box simply reaches over the space
+/// between the span and the words beside it.
+const CAPSULE_PAD_EM: f32 = 0.15;
+
 /// A strike rule still being grown, with the style it belongs to.
 struct Rule {
-    style: StyleId,
+    /// What the rule is being accumulated for. A style id for a strike rule or a
+    /// highlighter band, which end where the style ends; a style span for a capsule,
+    /// which is the run the reader asked for one around -- two code spans separated
+    /// by a word share one style, and a key of the style would swallow the word.
+    key: u32,
     x: Pt,
     top: Pt,
     w: Pt,
@@ -8021,9 +8106,9 @@ fn end_rule(rule: &mut Option<Rule>, bars: &mut Vec<(Pt, Pt, Pt, Pt, ColorRole)>
 
 /// Start or extend the strike rule being accumulated across a line.
 ///
-/// Extended by style, not by geometry: every ideograph and every word is its own
+/// Extended by key, not by geometry: every ideograph and every word is its own
 /// node, while the glue between two of them is part of the same struck span and has
-/// to be covered too. A different style ends the run -- which is what separates an
+/// to be covered too. A different key ends the run -- which is what separates an
 /// intervening unstruck word, and what gives a bilingual span one rule per face at
 /// that face's own height instead of one averaged over both.
 fn merge_rule(
@@ -8031,7 +8116,7 @@ fn merge_rule(
     bars: &mut Vec<(Pt, Pt, Pt, Pt, ColorRole)>,
     next: Rule,
 ) {
-    if let Some(r) = pending.as_mut().filter(|r| r.style == next.style) {
+    if let Some(r) = pending.as_mut().filter(|r| r.key == next.key) {
         if (r.top - next.top).abs() < 0.01 && (r.h - next.h).abs() < 0.01 {
             // The two pieces are one rule, so it grows to where the piece reaches
             // rather than only by how wide the piece was drawn: the space between two
@@ -8049,6 +8134,17 @@ fn merge_rule(
     }
     end_rule(pending, bars);
     *pending = Some(next);
+}
+
+/// The style span a node belongs to, as an index, for a mark that is drawn per span
+/// rather than per style. A capsule is one: `` `a` `b` `` is one style table entry and
+/// two capsules, and only the span each word sits in tells them apart -- the style id
+/// says the two are the same and would draw one box around both, word between them
+/// included. `None` for a node no span covers, which is the block's own prose.
+fn span_of(spans: &[StyleSpan], node: &std::ops::Range<usize>) -> Option<usize> {
+    let i = spans.partition_point(|s| s.range.start <= node.start);
+    let s = spans.get(i.checked_sub(1)?)?;
+    (node.end <= s.range.end).then_some(i - 1)
 }
 
 /// Extend this line's clickable rectangles by the node that was just laid out, whose
@@ -8335,7 +8431,7 @@ fn layout_block(
     out: &mut Out<'_>,
     mut y: Pt,
 ) -> Pt {
-    let Out { ops, hots, sel, hyphens, wide, table_headers, table_spans, note_spans, math_texts } = out;
+    let Out { ops, hots, sel, hyphens, wide, table_headers, table_spans, note_spans, math_texts, capsules_drawn } = out;
     let Ctx { theme, styles, math, k, .. } = *ctx;
     let Blk { b, text, spans, base, left, column, hyphenation, size, hang, actions, .. } = *blk;
     let leading = &blk.leading;
@@ -8353,7 +8449,7 @@ fn layout_block(
         return y + theme.base * 0.6;
     }
     if let Some(t) = blk.table {
-        return layout_table(font, ctx, blk, t, &mut Out { ops, hots, sel, hyphens, wide, table_headers, table_spans, note_spans, math_texts }, y);
+        return layout_table(font, ctx, blk, t, &mut Out { ops, hots, sel, hyphens, wide, table_headers, table_spans, note_spans, math_texts, capsules_drawn }, y);
     }
     // A fence this build drew is a figure: it takes the whole column, its words are
     // measured by the diagram's own layout rather than by the code grid, and it reports
@@ -8493,6 +8589,11 @@ fn layout_block(
         // down before the line's runs rather than with the strike rules after them.
         let mut lit: Option<Rule> = None;
         let mut bands: Vec<(Pt, Pt, Pt, Pt, ColorRole)> = Vec::new();
+        // A code span's capsule, gathered the same way and laid down under the
+        // words with the bands -- but keyed by the span it belongs to rather than by
+        // the style, since a capsule is the mark of the span the reader asked for.
+        let mut caps: Option<Rule> = None;
+        let mut capsules: Vec<(Pt, Pt, Pt, Pt, ColorRole)> = Vec::new();
         let mut line_wide: Option<(WideKind, Pt, Pt, Pt)> = None;
         for slot in placed {
             let Some(node_id) = slot.node else {
@@ -8506,14 +8607,23 @@ fn layout_block(
             let st = &styles[node.style.0 as usize];
             // A node of any other style -- unstruck, or struck in another face --
             // closes the rule, so it never covers text the author did not mark.
-            if ruled.as_ref().is_some_and(|r| r.style != node.style) {
+            if ruled.as_ref().is_some_and(|r| r.key != node.style.0 as u32) {
                 end_rule(&mut ruled, &mut bars);
             }
             // And a marked node's band is closed the same way by the first node
             // wearing another style, which is what a plain word in the middle of a
             // sentence does to it.
-            if lit.as_ref().is_some_and(|r| r.style != node.style) {
+            if lit.as_ref().is_some_and(|r| r.key != node.style.0 as u32) {
                 end_rule(&mut lit, &mut bands);
+            }
+            // A capsule is keyed by the span rather than by the style: two code
+            // spans separated by a word wear the same style, and closing only on a
+            // style change would draw one box around the word between them. The
+            // first node outside the span closes the box the same way a plain word
+            // closes a band.
+            let capsule_key = span_of(spans, &node.text).map_or(0, |i| i as u32 + 1);
+            if caps.as_ref().is_some_and(|c| c.key != capsule_key) {
+                end_rule(&mut caps, &mut capsules);
             }
             if let Some(o) = st.object {
                 // An object contributes its own box to the line and is drawn from
@@ -8626,7 +8736,7 @@ fn layout_block(
                         &mut ruled,
                         &mut bars,
                         Rule {
-                            style: node.style,
+                            key: node.style.0 as u32,
                             x,
                             top: dy - pos - weight * 0.5,
                             w: r.width(),
@@ -8644,12 +8754,31 @@ fn layout_block(
                         &mut lit,
                         &mut bands,
                         Rule {
-                            style: node.style,
+                            key: node.style.0 as u32,
                             x,
                             top: -BAND_TOP * st.size - st.raise,
                             w: r.width(),
                             h: BAND_H * st.size,
                             color: ColorRole::Highlight,
+                        },
+                    );
+                }
+                if st.capsule && r.width() > 0.0 {
+                    // A code span's capsule: the style's own vertical reach with a pad
+                    // of its size reaching out over the advance on both sides. Keyed
+                    // by the span, and merged across the span's own pieces, so the two
+                    // faces that carry one span lay down one box, not two.
+                    let cap_pad = st.size * CAPSULE_PAD_EM;
+                    merge_rule(
+                        &mut caps,
+                        &mut capsules,
+                        Rule {
+                            key: capsule_key,
+                            x: x - cap_pad,
+                            top: -BAND_TOP * st.size - st.raise,
+                            w: r.width() + cap_pad * 2.0,
+                            h: BAND_H * st.size,
+                            color: ColorRole::Surface,
                         },
                     );
                 }
@@ -8665,6 +8794,7 @@ fn layout_block(
         }
         end_rule(&mut ruled, &mut bars);
         end_rule(&mut lit, &mut bands);
+        end_rule(&mut caps, &mut capsules);
         let natural = ascent + descent;
         let line_h = (size * leading.for_mixed(mixed)).max(natural * 1.02);
         let baseline = y + (line_h - natural) * 0.5 + ascent;
@@ -8672,6 +8802,14 @@ fn layout_block(
         for mut text in line_math_texts.drain(..) {
             text.y = baseline;
             math_texts.push(text);
+        }
+        // The capsules first, in front of the line they sit behind, and before the
+        // bands for the one span that wears both marks: nothing about text is drawn
+        // by either, and the two reach the same height, so their order is only the
+        // tie-break of a sort -- a capsule under a band keeps a band's colour whole.
+        **capsules_drawn += capsules.len();
+        for (x, top, w, h, color) in capsules {
+            ops.push(Op::Rect { x: x * k, y: (baseline + top) * k, w: w * k, h: h * k, color });
         }
         // The bands stand in front of the line they mark rather than behind it with
         // the strike rules: a band is the paper a highlighted word is written on, and
@@ -10049,6 +10187,8 @@ impl View {
         self.keep_line_breaks = crate::settings::keep_line_breaks();
         self.show_html_images = crate::settings::show_html_images();
         self.show_highlights = crate::settings::show_highlights();
+        self.theme.set_table_lines(crate::settings::table_lines());
+        self.theme.set_code_capsule(crate::settings::code_capsule());
         let preferences = path.as_deref().map(crate::settings::document).unwrap_or_default();
         self.line_break_override = preferences.line_breaks;
         self.plain_override = preferences.plain;
@@ -10697,6 +10837,7 @@ impl View {
         let (mut headers, mut spans) = (Vec::new(), Vec::new());
         let (mut note_spans, mut math_texts) = (Vec::new(), Vec::new());
         let mut breaks = HyphenCount::default();
+        let mut capsules_drawn = 0usize;
         // This note's own marker width, hung for all of its blocks: the page takes the
         // widest marker across every note so their numbers stand in one column there,
         // and a bubble showing one note has no other column to line up with.
@@ -10739,6 +10880,7 @@ impl View {
                     table_spans: &mut spans,
                     note_spans: &mut note_spans,
                     math_texts: &mut math_texts,
+                    capsules_drawn: &mut capsules_drawn,
                 },
                 y,
             );
@@ -11131,7 +11273,7 @@ fn layout_table(
     out: &mut Out<'_>,
     mut y: Pt,
 ) -> Pt {
-    let Out { ops, hots, sel, hyphens, wide, table_headers, table_spans, note_spans: _, math_texts } = out;
+    let Out { ops, hots, sel, hyphens, wide, table_headers, table_spans, note_spans: _, math_texts, capsules_drawn } = out;
     let Ctx { theme, styles, client_pt, k, math, wide_limit, .. } = *ctx;
     let Blk { left: block_left, column, .. } = *blk;
     let size = theme.base;
@@ -11317,6 +11459,10 @@ fn layout_table(
                 // reaches above the baseline of the cell the row drew before it.
                 let mut lit: Option<Rule> = None;
                 let mut bands: Vec<(Pt, Pt, Pt, Pt, ColorRole)> = Vec::new();
+                // And the cell's own capsule boxes, keyed by the span for the same
+                // reason the prose's are, gathered into the row's list too.
+                let mut caps: Option<Rule> = None;
+                let mut capsules: Vec<(Pt, Pt, Pt, Pt, ColorRole)> = Vec::new();
                 for slot in placed {
                     let Some(node_id) = slot.node else {
                         mark_glue(&c.text, &slot, x + pad + shift, &mut segs, &mut marks);
@@ -11328,11 +11474,18 @@ fn layout_table(
                     };
                     let node = para.node(node_id);
                     let st = &styles[node.style.0 as usize];
-                    if ruled.as_ref().is_some_and(|r| r.style != node.style) {
+                    if ruled.as_ref().is_some_and(|r| r.key != node.style.0 as u32) {
                         end_rule(&mut ruled, &mut bars);
                     }
-                    if lit.as_ref().is_some_and(|r| r.style != node.style) {
+                    if lit.as_ref().is_some_and(|r| r.key != node.style.0 as u32) {
                         end_rule(&mut lit, &mut bands);
+                    }
+                    // A cell's code span has a capsule of its own, keyed by the span
+                    // for the same reason the prose's is: a capsule belongs to the
+                    // span, and two of them in one cell share a style.
+                    let capsule_key = span_of(&c.spans, &node.text).map_or(0, |i| i as u32 + 1);
+                    if caps.as_ref().is_some_and(|cap| cap.key != capsule_key) {
+                        end_rule(&mut caps, &mut capsules);
                     }
                     let mut at = x + pad + shift + slot.x;
                     if let Some(o) = st.object {
@@ -11417,7 +11570,7 @@ fn layout_table(
                                 &mut ruled,
                                 &mut bars,
                                 Rule {
-                                    style: node.style,
+                                    key: node.style.0 as u32,
                                     x: drawn,
                                     // Same offset as the raised mark it may strike through.
                                     top: -st.raise - pos - weight * 0.5,
@@ -11434,12 +11587,30 @@ fn layout_table(
                                 &mut lit,
                                 &mut bands,
                                 Rule {
-                                    style: node.style,
+                                    key: node.style.0 as u32,
                                     x: drawn,
                                     top: -BAND_TOP * st.size - st.raise,
                                     w: width,
                                     h: BAND_H * st.size,
                                     color: ColorRole::Highlight,
+                                },
+                            );
+                        }
+                        if st.capsule && width > 0.0 {
+                            // A cell's capsule, the same box a paragraph draws: the
+                            // style's own vertical reach and a pad of its own size
+                            // reaching out over the advance on both sides.
+                            let cap_pad = st.size * CAPSULE_PAD_EM;
+                            merge_rule(
+                                &mut caps,
+                                &mut capsules,
+                                Rule {
+                                    key: capsule_key,
+                                    x: drawn - cap_pad,
+                                    top: -BAND_TOP * st.size - st.raise,
+                                    w: width + cap_pad * 2.0,
+                                    h: BAND_H * st.size,
+                                    color: ColorRole::Surface,
                                 },
                             );
                         }
@@ -11481,9 +11652,16 @@ fn layout_table(
                 }
                 end_rule(&mut ruled, &mut bars);
                 end_rule(&mut lit, &mut bands);
-                // The line's bands are stated where they will stand rather than
-                // pushed here: the row splices all of them in at its own top, sorted,
-                // once every cell has had its say.
+                end_rule(&mut caps, &mut capsules);
+                // The line's bands and capsules are stated where they will stand
+                // rather than pushed here: the row splices all of them in at its own
+                // top, sorted, once every cell has had its say. The capsules go in
+                // first, since both are laid under the row's ink and a capsule is
+                // the smaller of the two where one span wears both marks.
+                **capsules_drawn += capsules.len();
+                row_bands.extend(capsules.drain(..).map(|(x, top, w, h, color)| {
+                    (x * k, (ly + ascent + top) * k, w * k, h * k, color)
+                }));
                 row_bands.extend(bands.drain(..).map(|(x, top, w, h, color)| {
                     (x * k, (ly + ascent + top) * k, w * k, h * k, color)
                 }));
@@ -11563,18 +11741,25 @@ fn layout_table(
     // Rules are fractions of the type size, not device pixels: at 200% dpi a hairline
     // set in pixels is a bar.
     let rule = size * 0.05;
+    // Which set of rules this table draws. Both sets say the same thing about the
+    // same grid, and the difference is only which lines are laid down: no coordinate
+    // below reads this flag, so a switch between the two cannot move a row, a column,
+    // or a reader's place on the page.
+    let booktabs = theme.table_lines == TableLines::Booktabs;
     let header_start = ops.len();
     ops.push(Op::Rect { x: left * k, y: y * k, w: grid_w * k, h: 0.0, color: ColorRole::Surface });
     let panel = ops.len() - 1;
     // The grid's top edge rides with the header block, so a pagination that carries the
-    // header to the next page carries the edge with it.
+    // header to the next page carries the edge with it. Booktabs draws it as its own
+    // heavier rule -- the first of the three the style is made of -- and the grid keeps
+    // the hairline that goes with the rest of its lines.
     ops.push(Op::Line {
         x0: left * k,
         y0: grid_top * k,
         x1: (left + grid_w) * k,
         y1: grid_top * k,
-        thickness: rule * 0.6 * k,
-        color: ColorRole::Faint,
+        thickness: if booktabs { rule * k } else { rule * 0.6 * k },
+        color: if booktabs { ColorRole::Muted } else { ColorRole::Faint },
     });
 
     let head_h = paint_row(&t.head, y, true, ops, hots, sel);
@@ -11595,7 +11780,9 @@ fn layout_table(
     // are the widths themselves rather than `grid_w` divided up: a cell is laid out at
     // its column's measured width, and a rule between two other numbers would sit on
     // top of somebody's ink. The grid's own two edges are rules too -- an open right
-    // side reads as a table cut off, not as a table ended.
+    // side reads as a table cut off, not as a table ended. Booktabs draws none of
+    // them: its columns stand apart by their own spacing, and the three rules the
+    // style is made of say where the table begins and ends.
     //
     // They stand in front of the rows because the list is read as a sequence of tops:
     // a rule pushed after them carried the grid's own top while sitting below every op
@@ -11605,19 +11792,21 @@ fn layout_table(
     // bottom, which is where the rows begin and what the op before them says too.
     let mut row_bottoms: Vec<f32> = Vec::with_capacity(t.rows.len());
     let vrules_at = ops.len();
-    let mut edge = left;
-    for i in 0..=widths.len() {
-        if i > 0 {
-            edge += widths[i - 1];
+    if !booktabs {
+        let mut edge = left;
+        for i in 0..=widths.len() {
+            if i > 0 {
+                edge += widths[i - 1];
+            }
+            ops.push(Op::Line {
+                x0: edge * k,
+                y0: y * k,
+                x1: edge * k,
+                y1: y * k,
+                thickness: rule * 0.6 * k,
+                color: ColorRole::Faint,
+            });
         }
-        ops.push(Op::Line {
-            x0: edge * k,
-            y0: y * k,
-            x1: edge * k,
-            y1: y * k,
-            thickness: rule * 0.6 * k,
-            color: ColorRole::Faint,
-        });
     }
     for r in &t.rows {
         let row_h = paint_row(r, y, false, ops, hots, sel);
@@ -11626,33 +11815,55 @@ fn layout_table(
         // A cell that wraps has no other ending. Without a rule under each row, the
         // second line of one cell reads as the first line of the cell below it -- which
         // is exactly the failure a grid of narrow columns produces on every row, and the
-        // reason the lines are drawn rather than left to the space between rows.
+        // reason the lines are drawn rather than left to the space between rows. Booktabs
+        // draws none of them: a row ends where the next begins, and the space between
+        // the two says so.
+        if !booktabs {
+            ops.push(Op::Line {
+                x0: left * k,
+                y0: y * k,
+                x1: (left + grid_w) * k,
+                y1: y * k,
+                thickness: rule * 0.6 * k,
+                color: ColorRole::Faint,
+            });
+        }
+    }
+    if booktabs {
+        // The style's third rule, standing where the grid's last row line stands --
+        // the table's foot, which is the one place the two sets agree to draw.
         ops.push(Op::Line {
             x0: left * k,
             y0: y * k,
             x1: (left + grid_w) * k,
             y1: y * k,
-            thickness: rule * 0.6 * k,
-            color: ColorRole::Faint,
+            thickness: rule * k,
+            color: ColorRole::Muted,
         });
-    }
-    // The grid's bottom is known, so the vertical rules reach it.
-    for op in &mut ops[vrules_at..vrules_at + widths.len() + 1] {
-        if let Op::Line { y1, .. } = op {
-            *y1 = y * k;
+    } else {
+        // The grid's bottom is known, so the vertical rules reach it.
+        for op in &mut ops[vrules_at..vrules_at + widths.len() + 1] {
+            if let Op::Line { y1, .. } = op {
+                *y1 = y * k;
+            }
         }
     }
-    // The header a continuation page redraws: the panel, the two rules, the
-    // header's own words, and the vertical rules' segment down to the first row
-    // -- without which a redrawn header arrives as a bar that ended, its columns
-    // missing. The rules are in the list from `vrules_at`, so the fragment is
-    // cut here rather than before them, and the segment is clipped to the first
-    // row's own bottom because the originals reach the grid's foot.
-    let first_bottom = t.rows.first().map_or(y, |_| row_bottoms[0]);
-    let mut header_ops = ops[header_start..vrules_at + widths.len() + 1].to_vec();
-    for op in header_ops.iter_mut().skip(vrules_at - header_start) {
-        if let Op::Line { y1, .. } = op {
-            *y1 = first_bottom * k;
+    // The header a continuation page redraws: the panel, the rules the style puts at
+    // the table's top, the header's own words, and -- for the grid -- the vertical
+    // rules' segment down to the first row, without which a redrawn header arrives
+    // as a bar that ended, its columns missing. The grid's rules are in the list from
+    // `vrules_at`, so its fragment is cut past them, and the segment is clipped to the
+    // first row's own bottom because the originals reach the grid's foot. Booktabs
+    // ends the fragment on its header rule, which says where the header ended the way
+    // the grid's segments do.
+    let frag_end = if booktabs { vrules_at } else { vrules_at + widths.len() + 1 };
+    let mut header_ops = ops[header_start..frag_end].to_vec();
+    if !booktabs {
+        let first_bottom = t.rows.first().map_or(y, |_| row_bottoms[0]);
+        for op in header_ops.iter_mut().skip(vrules_at - header_start) {
+            if let Op::Line { y1, .. } = op {
+                *y1 = first_bottom * k;
+            }
         }
     }
     if let Some(Op::Rect { h, .. }) = header_ops.first_mut() {
@@ -11693,7 +11904,14 @@ fn layout_table(
             kind: HotKind::Wide(index),
         });
     }
-    table_spans.push(TableSpan { y: grid_top, height: y - grid_top, header: header_index });
+    table_spans.push(TableSpan {
+        y: grid_top,
+        height: y - grid_top,
+        header: header_index,
+        left: left * k,
+        right: (left + grid_w) * k,
+        cut: if booktabs { (rule * k, ColorRole::Muted) } else { (rule * 0.6 * k, ColorRole::Faint) },
+    });
     y
 }
 
@@ -11772,6 +11990,7 @@ fn intern_object(styles: &mut Vec<AppStyle>, source: ObjectSource, color: ColorR
         // A figure is not a word: the mark syntax never reaches one, so it never
         // wears a band.
         highlight: false,
+        capsule: false,
     };
     if let Some(i) = styles.iter().position(|s| *s == app) {
         return StyleId(i as u16);
@@ -11800,6 +12019,7 @@ fn intern(styles: &mut Vec<AppStyle>, fallback: &[String], r: crate::theme::Reso
         source: None,
         strike: r.strike,
         highlight: r.highlight,
+        capsule: r.capsule,
     };
     if let Some(i) = styles.iter().position(|s| *s == app) {
         return StyleId(i as u16);
@@ -12169,6 +12389,8 @@ pub(crate) fn export_png(
     keep_line_breaks: bool,
     html_images: bool,
     show_highlights: bool,
+    table_lines: TableLines,
+    code_capsule: bool,
     zoom: Zoom,
     face: Option<usize>,
     measure: Option<usize>,
@@ -12189,6 +12411,10 @@ pub(crate) fn export_png(
         theme.set_measure(measure);
     }
     theme.set_zoom(zoom);
+    // The two drawing switches: both reach the painter and neither a measurement, so
+    // the page is laid out identically whether they are on or off.
+    theme.set_table_lines(table_lines);
+    theme.set_code_capsule(code_capsule);
     let doc = if source_view {
         Document::source(source)
     } else if plain {
@@ -12409,6 +12635,8 @@ pub fn export_pdf(
     keep_line_breaks: bool,
     html_images: bool,
     show_highlights: bool,
+    table_lines: TableLines,
+    code_capsule: bool,
     zoom: Zoom,
     face: Option<usize>,
     measure: Option<usize>,
@@ -12429,6 +12657,11 @@ pub fn export_pdf(
     if let Some(measure) = measure.filter(|i| Measure::ALL.get(*i).is_some()) {
         theme.set_measure(measure);
     }
+    // The two drawing switches, set before any layout runs: both choose which ink is
+    // painted and neither touches a measurement, so the PDF's lines and breaks are the
+    // same with them on or off.
+    theme.set_table_lines(table_lines);
+    theme.set_code_capsule(code_capsule);
     let doc = if source_view {
         Document::source(source)
     } else if plain {
@@ -13133,7 +13366,24 @@ fn write_pdf(
                 }
             }
         }
-        if source_ops.len() > from_page { ops.push(PdfOp::RestoreGraphicsState); }
+        if source_ops.len() > from_page {
+            // A table this page cut ends at the band's foot, and the visible segment
+            // needs the closing rule the table's own foot would have drawn: without it
+            // the last row the page shows hangs over the edge with nothing under it,
+            // and the table reads as broken off rather than continued. The rule is a
+            // filled rectangle hugging the clip's lower edge -- a stroked line centred
+            // there would hand half its thickness to the clipped-away side.
+            for span in &page.table_spans {
+                if span.y < top + body_height && span.y + span.height > top + body_height {
+                    let (thickness, color) = span.cut;
+                    ops.push(PdfOp::SetFillColor { col: pdf_color(color, palette) });
+                    ops.push(PdfOp::DrawRectangle {
+                        rectangle: pdf_filled_rect(span.left, height - content_height, span.right - span.left, thickness),
+                    });
+                }
+            }
+            ops.push(PdfOp::RestoreGraphicsState);
+        }
         for hot in &page.hotspots {
             if hot.y + hot.h <= top || hot.y >= top + body_height { continue; }
             let HotKind::Url(url) = &hot.kind else { continue };
@@ -13212,6 +13462,10 @@ pub struct LayoutChunk {
     pub table_spans: Vec<TableSpan>,
     pub note_spans: Vec<NoteSpan>,
     pub math_texts: Vec<MathTextFragment>,
+    /// Capsules laid down since the last batch, counted rather than listed: the
+    /// boxes themselves are ordinary rects in `ops`, so the number rides alongside
+    /// the ink it belongs to and a sink adds the two up the same way.
+    pub capsules_drawn: usize,
     /// Document y the batch reached.
     pub y: Pt,
     /// Blocks this batch laid out.
@@ -13254,6 +13508,7 @@ struct PageSink {
     table_spans: Vec<TableSpan>,
     note_spans: Vec<NoteSpan>,
     math_texts: Vec<MathTextFragment>,
+    capsules_drawn: usize,
     finals: Option<LayoutFinals>,
 }
 
@@ -13267,6 +13522,7 @@ impl LayoutSink for PageSink {
         self.table_spans.extend(chunk.table_spans);
         self.note_spans.extend(chunk.note_spans);
         self.math_texts.extend(chunk.math_texts);
+        self.capsules_drawn += chunk.capsules_drawn;
         true
     }
 
@@ -13293,6 +13549,7 @@ pub fn build_ops(
         table_spans: Vec::new(),
         note_spans: Vec::new(),
         math_texts: Vec::new(),
+        capsules_drawn: 0,
         finals: None,
     };
     build_in_chunks(font, theme, doc, client_w, dpi, objects, hyphenator, &mut sink);
@@ -13322,6 +13579,7 @@ pub fn build_ops(
         table_spans: sink.table_spans,
         note_spans: sink.note_spans,
         math_texts: sink.math_texts,
+        capsules_drawn: sink.capsules_drawn,
     }
 }
 
@@ -13436,6 +13694,10 @@ pub fn build_in_chunks(
     let mut headers_emitted: usize = 0;
     let mut note_spans: Vec<NoteSpan> = Vec::new();
     let mut math_texts: Vec<MathTextFragment> = Vec::new();
+    // Capsules this window has drawn. The boxes are ordinary rects and leave with
+    // `ops`; the count rides with them so the page can set it against the code spans
+    // it read, which is the report's evidence that the capsules are the spans' own.
+    let mut capsules_drawn: usize = 0;
     let mut breaks = HyphenCount::default();
     let mut note_tops: Vec<Pt> = Vec::with_capacity(doc.footnotes.len());
     // A citation names its note by the author's own label, while the page knows notes
@@ -13572,6 +13834,7 @@ pub fn build_in_chunks(
                     table_spans: std::mem::take(&mut table_spans),
                     note_spans: std::mem::take(&mut note_spans),
                     math_texts: std::mem::take(&mut math_texts),
+                    capsules_drawn: std::mem::take(&mut capsules_drawn),
                     y,
                     blocks,
                 }) {
@@ -13692,7 +13955,7 @@ pub fn build_in_chunks(
                     hang: if b.list.is_some() { level } else { 0.0 },
                     actions: &p.actions,
                 },
-                &mut Out { ops: &mut ops, hots: &mut hots, sel: &mut sel, hyphens: &mut breaks, wide: &mut wide, table_headers: &mut table_headers, table_spans: &mut table_spans, note_spans: &mut note_spans, math_texts: &mut math_texts },
+                &mut Out { ops: &mut ops, hots: &mut hots, sel: &mut sel, hyphens: &mut breaks, wide: &mut wide, table_headers: &mut table_headers, table_spans: &mut table_spans, note_spans: &mut note_spans, math_texts: &mut math_texts, capsules_drawn: &mut capsules_drawn },
                 y,
             );
         }
@@ -13765,7 +14028,7 @@ pub fn build_in_chunks(
                         hang: note_hang,
                         actions: &p.actions,
                     },
-                    &mut Out { ops: &mut ops, hots: &mut hots, sel: &mut sel, hyphens: &mut breaks, wide: &mut wide, table_headers: &mut table_headers, table_spans: &mut table_spans, note_spans: &mut note_spans, math_texts: &mut math_texts },
+                    &mut Out { ops: &mut ops, hots: &mut hots, sel: &mut sel, hyphens: &mut breaks, wide: &mut wide, table_headers: &mut table_headers, table_spans: &mut table_spans, note_spans: &mut note_spans, math_texts: &mut math_texts, capsules_drawn: &mut capsules_drawn },
                     y,
                 );
             }
@@ -14537,6 +14800,7 @@ mod tests {
             table_spans: Vec::new(),
             note_spans: Vec::new(),
             math_texts: Vec::new(),
+            capsules_drawn: 0,
         };
         let starts = pdf_page_starts(&page, 800.0);
         assert_eq!(starts, vec![0.0, 780.0]);
@@ -14587,6 +14851,7 @@ mod tests {
             table_spans: Vec::new(),
             note_spans: Vec::new(),
             math_texts: Vec::new(),
+            capsules_drawn: 0,
         };
         let starts = pdf_page_starts(&page, 800.0);
         for line in &page.sel {
@@ -14628,6 +14893,7 @@ mod tests {
             table_spans: Vec::new(),
             note_spans: Vec::new(),
             math_texts: Vec::new(),
+            capsules_drawn: 0,
         };
         assert_eq!(
             reader_page_starts(&page.sel, &page.anchor_tops, page.height, 400.0, 2.0),
@@ -16490,14 +16756,258 @@ mod tests {
         );
     }
 
+    /// Everything a page paints except its table rules, as text a comparison can hold:
+    /// the words, the rects (a table's panel, a highlighter band, a code span's
+    /// capsule) and the figures. Two builds of one document may differ only in which
+    /// rules they laid down, so this is what "the switch moved nothing else" is asked
+    /// of. A `Line` is recorded as a bare word so a style's own rules can be counted.
+    fn ink_of(page: &Page) -> Vec<String> {
+        page.ops
+            .iter()
+            .map(|op| match op {
+                Op::Runs(runs) => format!(
+                    "run{:?}",
+                    runs.iter()
+                        .map(|r| (r.x, r.baseline, r.color, r.advances.clone(), r.glyphs.clone(), r.family.clone()))
+                        .collect::<Vec<_>>()
+                ),
+                Op::Rect { x, y, w, h, color } => format!("rect {x:.3} {y:.3} {w:.3} {h:.3} {color:?}"),
+                Op::Image { path, x, y, w, h } => format!("img {path:?} {x:.3} {y:.3} {w:.3} {h:.3}"),
+                Op::Line { .. } => "line".to_string(),
+                Op::Diagram { left, top, right, bottom, .. } => {
+                    format!("diagram {left:.3} {top:.3} {right:.3} {bottom:.3}")
+                }
+            })
+            .collect()
+    }
+
+    /// A code span's capsule: one box behind the span's words, reaching half a step out
+    /// over the space on either side, standing the height of a highlighter band of the
+    /// span's own size and seated the same distance above its baseline. It is filed
+    /// before the words it is behind, and it is drawn rather than measured -- with the
+    /// switch off there is no box and not one word of the page has moved.
+    #[test]
+    fn a_capsule_stands_behind_its_code_span_and_reaches_past_it() {
+        let Ok(mut font) = FontEngine::new() else { return };
+        if !font.probe() {
+            return;
+        }
+        let mut theme = Theme::default();
+        theme.set_code_capsule(true);
+        let doc = Document::parse("Before `let x` after.\n");
+        let mut math = crate::math::MathStore::new();
+        let mut diagrams = crate::diagram::DiagramStore::new();
+        let mut objects = Objects::new(None, None, &mut math, &mut diagrams);
+        let page = build_ops(&mut font, &theme, &doc, 700.0, DPI, &mut objects, None);
+
+        let k = DPI / 72.0;
+        let size = theme.body_size(BlockKind::Paragraph);
+        let caps: Vec<(usize, f32, f32, f32, f32)> = page
+            .ops
+            .iter()
+            .enumerate()
+            .filter_map(|(i, op)| match op {
+                Op::Rect { x, y, w, h, color: ColorRole::Surface } => Some((i, *x, *y, *w, *h)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(caps.len(), 1, "one code span is one capsule: {caps:?}");
+        // The span's own words, as the painter drew them.
+        let mut left = f32::MAX;
+        let mut right = f32::MIN;
+        let mut baseline = f32::NAN;
+        let mut ink_at = usize::MAX;
+        for (i, op) in page.ops.iter().enumerate() {
+            let Op::Runs(runs) = op else { continue };
+            for r in runs {
+                if r.color != ColorRole::Code {
+                    continue;
+                }
+                left = left.min(r.x);
+                right = right.max(r.x + r.advances.iter().sum::<f32>());
+                baseline = r.baseline;
+                ink_at = ink_at.min(i);
+            }
+        }
+        assert!(left < right, "the code span was never drawn");
+        let (cap_at, cx, cy, cw, ch) = caps[0];
+        assert!(cap_at < ink_at, "the capsule is filed after the words it is behind");
+        let pad = size * CAPSULE_PAD_EM * k;
+        assert!(
+            (cx - (left - pad)).abs() < 0.05 && (cx + cw - (right + pad)).abs() < 0.05,
+            "the capsule covers {cx:.2}..{:.2}, the span {left:.2}..{right:.2} padded by {pad:.2}",
+            cx + cw,
+        );
+        assert!((ch - BAND_H * size * k).abs() < 0.05, "capsule height {ch:.2} is not {BAND_H}em of {size}pt");
+        assert!(
+            (cy - (baseline - BAND_TOP * size * k)).abs() < 0.05,
+            "capsule top {cy:.2} is not {BAND_TOP}em above the baseline {baseline:.2}",
+        );
+
+        // With the switch off the mark is plain ink: no box, and every run the very run
+        // it was, so a reader turning capsules on cannot lose their place on the page.
+        let off = Theme::default();
+        let mut objects = Objects::new(None, None, &mut math, &mut diagrams);
+        let plain = build_ops(&mut font, &off, &doc, 700.0, DPI, &mut objects, None);
+        assert!(
+            !plain.ops.iter().any(|op| matches!(op, Op::Rect { color: ColorRole::Surface, .. })),
+            "a capsule was drawn with the switch off",
+        );
+        let runs = |p: &Page| ink_of(p).into_iter().filter(|s| s.starts_with("run")).collect::<Vec<_>>();
+        assert_eq!(runs(&page), runs(&plain), "the switch moved the words it is drawn around");
+        assert_eq!(page.height, plain.height);
+    }
+
+    /// Two code spans split by a word are two capsules, not one box swallowing the word
+    /// between them -- the reason a capsule is keyed by the span it belongs to rather
+    /// than by the style the two spans share. And a cell's code span wears one too, laid
+    /// under the row's own ink.
+    #[test]
+    fn each_code_span_wears_its_own_capsule() {
+        let Ok(mut font) = FontEngine::new() else { return };
+        if !font.probe() {
+            return;
+        }
+        let mut theme = Theme::default();
+        theme.set_code_capsule(true);
+        let bodies = |page: &Page| {
+            page.ops
+                .iter()
+                .filter(|op| matches!(op, Op::Rect { color: ColorRole::Surface, h, .. } if *h > 0.0))
+                .count()
+        };
+        // `` `one` and `two` ``: one style, two spans, so two capsules.
+        let doc = Document::parse("A `one` and `two` here.\n");
+        let mut math = crate::math::MathStore::new();
+        let mut diagrams = crate::diagram::DiagramStore::new();
+        let mut objects = Objects::new(None, None, &mut math, &mut diagrams);
+        let page = build_ops(&mut font, &theme, &doc, 700.0, DPI, &mut objects, None);
+        assert_eq!(bodies(&page), 2, "two spans wear one capsule each, not one around both");
+        assert_eq!(page.capsules_drawn, 2, "the page counted its capsules");
+
+        // The same three spans with the switch off draw none of them.
+        let off = Theme::default();
+        let mut objects = Objects::new(None, None, &mut math, &mut diagrams);
+        let plain = build_ops(&mut font, &off, &doc, 700.0, DPI, &mut objects, None);
+        assert_eq!(bodies(&plain), 0);
+        assert_eq!(plain.capsules_drawn, 0);
+
+        // A code span in a cell: the panel is a rect of no height, so a box with a height
+        // inside the table's band is the cell's capsule and nothing else.
+        let grid = Document::parse("| 甲 | 乙 |\n|:--|:--|\n| `x` | y |\n");
+        let mut objects = Objects::new(None, None, &mut math, &mut diagrams);
+        let page = build_ops(&mut font, &theme, &grid, 700.0, DPI, &mut objects, None);
+        assert!(bodies(&page) >= 1, "a code span in a cell drew no capsule");
+        assert!(page.capsules_drawn >= 1);
+    }
+
+    /// The two sets of table lines are a choice about ink, and only about ink: the very
+    /// same page -- every word, every band, every cell, and how tall the table stands --
+    /// is laid out either way, and the difference is which rules are drawn. So a reader
+    /// can switch a table from its grid to the printed table's three rules without
+    /// moving a row, a column, or their place on the page.
+    #[test]
+    fn the_two_sets_of_table_lines_change_only_the_rules() {
+        let Ok(mut font) = FontEngine::new() else { return };
+        if !font.probe() {
+            return;
+        }
+        let doc = Document::parse("| 甲 | 乙 |\n|:--|:--|\n| 1 | 2 |\n| 3 | 4 |\n\nAfter.\n");
+        let mut math = crate::math::MathStore::new();
+        let mut diagrams = crate::diagram::DiagramStore::new();
+        let mut objects = Objects::new(None, None, &mut math, &mut diagrams);
+        let grid = build_ops(&mut font, &Theme::default(), &doc, 700.0, DPI, &mut objects, None);
+        let mut booktabs = Theme::default();
+        booktabs.set_table_lines(TableLines::Booktabs);
+        let mut objects = Objects::new(None, None, &mut math, &mut diagrams);
+        let book = build_ops(&mut font, &booktabs, &doc, 700.0, DPI, &mut objects, None);
+
+        let ink = |p: &Page| ink_of(p).into_iter().filter(|s| s != "line").collect::<Vec<_>>();
+        assert_eq!(ink(&grid), ink(&book), "the switch moved something other than a rule");
+        assert_eq!(grid.height, book.height, "the switch moved how tall the page is");
+        assert_eq!(grid.capsules_drawn, book.capsules_drawn);
+
+        // And the rules differ the way the two styles are said to: the grid rules every
+        // boundary in both directions; booktabs draws three horizontal rules -- above the
+        // table, under its header, and below its last row -- and no vertical at all.
+        let verticals = |p: &Page| {
+            p.ops.iter().filter(|op| matches!(op, Op::Line { x0, x1, .. } if (x0 - x1).abs() < 0.01)).count()
+        };
+        let horizontals = |p: &Page| {
+            p.ops.iter().filter(|op| matches!(op, Op::Line { x0, x1, .. } if (x0 - x1).abs() > 0.01)).count()
+        };
+        assert!(verticals(&grid) >= 3, "the grid drew no columns");
+        assert_eq!(verticals(&book), 0, "booktabs drew a vertical rule");
+        assert_eq!(horizontals(&book), 3, "booktabs is three rules");
+        assert!(horizontals(&grid) > 3, "the grid rules more rows than booktabs");
+
+        // The heavier rules are booktabs' own: its top and bottom rules are the muted ink
+        // at the full rule weight, where the grid's hairlines are faint.
+        let thick = |p: &Page| {
+            p.ops
+                .iter()
+                .filter(|op| matches!(op, Op::Line { thickness, color: ColorRole::Muted, .. } if *thickness > 0.0))
+                .count()
+        };
+        assert!(thick(&book) >= 2, "booktabs' top and foot rules are not its heavier ones");
+    }
+
+    /// A table a page cuts in two ends its visible segment the way the table itself ends:
+    /// the span carries the table's own edges and the rule its style closes with, so a
+    /// continuation knows both how wide to draw the closing rule and how heavy. The two
+    /// styles agree on everything but the closing rule, which is the whole difference.
+    #[test]
+    fn a_cut_table_segment_carries_the_closing_rule_of_its_style() {
+        let Ok(mut font) = FontEngine::new() else { return };
+        if !font.probe() {
+            return;
+        }
+        let doc = Document::parse("| 甲 | 乙 |\n|:--|:--|\n| 1 | 2 |\n");
+        let mut math = crate::math::MathStore::new();
+        let mut diagrams = crate::diagram::DiagramStore::new();
+        let mut objects = Objects::new(None, None, &mut math, &mut diagrams);
+        let grid = build_ops(&mut font, &Theme::default(), &doc, 700.0, DPI, &mut objects, None);
+        let mut booktabs = Theme::default();
+        booktabs.set_table_lines(TableLines::Booktabs);
+        let mut objects = Objects::new(None, None, &mut math, &mut diagrams);
+        let book = build_ops(&mut font, &booktabs, &doc, 700.0, DPI, &mut objects, None);
+
+        assert_eq!(grid.table_spans.len(), 1);
+        assert_eq!(book.table_spans.len(), 1);
+        let (g, b) = (&grid.table_spans[0], &book.table_spans[0]);
+        assert!(g.left < g.right, "the span has no width to close");
+        assert_eq!((g.y, g.height, g.left, g.right), (b.y, b.height, b.left, b.right));
+        assert_eq!(g.cut.1, ColorRole::Faint, "the grid closes with its own hairline");
+        assert_eq!(b.cut.1, ColorRole::Muted, "booktabs closes with its heavier rule");
+        assert!(b.cut.0 > g.cut.0, "booktabs' closing rule is not heavier than the grid's");
+    }
+
+    /// The span a node belongs to is asked for by the capsule, which repeats per span
+    /// rather than per style: a word between two spans of one style belongs to neither,
+    /// and a node reaching past its span's end is outside it too.
+    #[test]
+    fn the_span_a_node_belongs_to_is_not_the_style_it_shares() {
+        let spans = vec![
+            StyleSpan { range: 3..6, style: StyleId(1) },
+            StyleSpan { range: 11..14, style: StyleId(1) },
+        ];
+        assert_eq!(span_of(&spans, &(3..6)), Some(0));
+        assert_eq!(span_of(&spans, &(4..5)), Some(0));
+        assert_eq!(span_of(&spans, &(11..14)), Some(1));
+        assert_eq!(span_of(&spans, &(7..10)), None, "the word between two spans belongs to neither");
+        assert_eq!(span_of(&spans, &(0..2)), None, "nothing before the first span");
+        assert_eq!(span_of(&spans, &(11..15)), None, "a node past its span's end is outside it");
+        assert_eq!(span_of(&[], &(0..1)), None);
+    }
+
     /// A rule grows by where the next piece of its span reaches rather than by how wide
     /// that piece was drawn: the space between two struck words is a slot of the line
     /// of its own, and a rule that only added widths ended short of its last word by
     /// every space it had crossed -- the very glue the merge exists to cover.
     #[test]
     fn a_merged_rule_covers_the_spaces_its_span_crossed() {
-        let piece = |style: u16, x: f32, w: f32| Rule {
-            style: StyleId(style),
+        let piece = |key: u32, x: f32, w: f32| Rule {
+            key,
             x,
             top: -5.0,
             w,
