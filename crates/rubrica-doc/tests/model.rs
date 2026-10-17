@@ -1461,3 +1461,250 @@ fn a_multiline_code_span_maps_its_words_back_into_the_source() {
         "the second line maps back to its own bytes"
     );
 }
+
+/// Every run wearing the flag, in text order. A script may be cut into several
+/// spans where another style sits inside it, so this reads all of them.
+fn runs_in(text: &str, spans: &[rubrica_doc::Span], flag: InlineStyle) -> Vec<String> {
+    spans
+        .iter()
+        .filter(|s| s.style.contains(flag))
+        .map(|s| text[s.range.clone()].to_string())
+        .collect()
+}
+
+fn runs_of(b: &rubrica_doc::Block, flag: InlineStyle) -> Vec<String> {
+    runs_in(&b.text, &b.spans, flag)
+}
+
+#[test]
+fn an_ascii_formula_reads_as_its_scripts() {
+    let b = &Document::parse("H~2~O and 2^10^ and e~x~tra\n").blocks[0];
+    // The marks are gone and their words are where the author put them, and the
+    // rule that matters most -- a pair touching a word on both sides -- holds:
+    // `H~2~O` is exactly the shape pulldown's own extension turns down.
+    assert_eq!(b.text, "H2O and 210 and extra");
+    assert_eq!(runs_of(b, InlineStyle::SUBSCRIPT), ["2", "x"]);
+    assert_eq!(runs_of(b, InlineStyle::SUPERSCRIPT), ["10"]);
+    // The block also remembers what the reading found, which is what a report has
+    // to count on: the marks leave nothing of their own behind in the text.
+    assert_eq!(b.scripts, rubrica_doc::Scripts { raised: 1, lowered: 2 });
+}
+
+#[test]
+fn a_single_tilde_at_a_word_boundary_is_a_subscript_and_not_a_deletion() {
+    // The parser reads `a ~b~ c` as a deletion, but between single tildes it is
+    // Pandoc's subscript. A `~~` pair keeps its deletion, and neither reading is
+    // allowed to print a tilde.
+    let b = &Document::parse("a ~b~ c and ~~d~~ e\n").blocks[0];
+    assert_eq!(b.text, "a b c and d e");
+    assert_eq!(runs_of(b, InlineStyle::SUBSCRIPT), ["b"]);
+    assert_eq!(runs_of(b, InlineStyle::STRIKETHROUGH), ["d"]);
+    assert!(!b.text.contains('~'));
+}
+
+#[test]
+fn the_whitespace_of_a_script_must_be_escaped_and_an_escaped_one_is_not_a_break() {
+    let b = &Document::parse("x^a b^ and x^a\\ b^ and x~a b~ end\n").blocks[0];
+    // A plain space ends the reading; `\ ` is the one space a script may hold,
+    // and the reader prints it as the non-breaking space it stood for.
+    assert_eq!(b.text, "x^a b^ and xa\u{a0}b and x~a b~ end");
+    assert_eq!(runs_of(b, InlineStyle::SUPERSCRIPT), ["a\u{a0}b"]);
+    assert!(runs_of(b, InlineStyle::SUBSCRIPT).is_empty(), "{b:?}");
+    assert!(!b.text.contains('\\'), "{b:?}");
+}
+
+#[test]
+fn an_escaped_mark_pairs_with_nothing_and_is_printed() {
+    let b = &Document::parse("\\~a\\~ and \\^b\\^ and x\\^y^z\n").blocks[0];
+    // The backslashes are the parser's to consume; what is left are the author's
+    // own tildes and carets, and a mark they escaped must not find a partner. The
+    // second caret of `x\^y^z` has none either, so it is printed as it was written.
+    assert_eq!(b.text, "~a~ and ^b^ and x^y^z");
+    assert!(runs_of(b, InlineStyle::SUPERSCRIPT).is_empty(), "{b:?}");
+    assert!(runs_of(b, InlineStyle::SUBSCRIPT).is_empty(), "{b:?}");
+}
+
+#[test]
+fn a_mark_inside_code_is_the_authors_own_character() {
+    let doc = Document::parse("`x^2^` and y^2^ and\n\n```\nH~2~O\n```\n");
+    let para = &doc.blocks[0];
+    assert_eq!(para.text, "x^2^ and y2 and");
+    assert_eq!(runs_of(para, InlineStyle::SUPERSCRIPT), ["2"]);
+    let code = &doc.blocks[1];
+    assert_eq!(code.kind, BlockKind::Code);
+    assert_eq!(code.text, "H~2~O");
+    assert!(!code.spans.iter().any(|s| s.style.contains(InlineStyle::SUPERSCRIPT)
+        || s.style.contains(InlineStyle::SUBSCRIPT)));
+}
+
+#[test]
+fn a_script_reads_across_emphasis_and_a_link() {
+    let b = &Document::parse("x^a*b*c^ and y~[*d*](u)~z\n").blocks[0];
+    assert_eq!(b.text, "xabc and ydz");
+    // The pair raises every word it wraps, and the reading each word already had
+    // stays under the raise: a script is a size and a position, not a style.
+    for word in ["a", "b", "c"] {
+        let at = b.text.find(word).unwrap();
+        let span = b.spans.iter().find(|s| s.range.contains(&at)).unwrap();
+        assert!(span.style.contains(InlineStyle::SUPERSCRIPT), "{word}: {span:?}");
+    }
+    let b_at = b.text.find('b').unwrap();
+    let em = b.spans.iter().find(|s| s.range.contains(&b_at)).unwrap();
+    assert!(em.style.contains(InlineStyle::EMPHASIS), "{em:?}");
+    // The last `d`, not the one of `and`.
+    let d = b.text.rfind('d').unwrap();
+    assert_eq!(&b.text[b.actions[0].range.clone()], "d");
+    let link = b.spans.iter().find(|s| s.range.contains(&d)).unwrap();
+    assert!(link.style.contains(InlineStyle::SUBSCRIPT), "{link:?}");
+}
+
+#[test]
+fn a_pair_does_not_reach_across_a_mark_that_another_pair_already_spent() {
+    // Pandoc reads `~a^b~c^` as a lowered `a^b` and a printed `c^`: the caret was
+    // wrapped by the pair, so it opens nothing more.
+    let b = &Document::parse("~a^b~c^\n").blocks[0];
+    assert_eq!(b.text, "a^bc^");
+    assert_eq!(runs_of(b, InlineStyle::SUBSCRIPT), ["a^b"]);
+    assert!(runs_of(b, InlineStyle::SUPERSCRIPT).is_empty(), "{b:?}");
+    // And the same left-to-right reading decides which mark closes which: in
+    // `a^b c^d^` the first caret finds only whitespace before the second, so it
+    // stays printed and the last pair raises `d`.
+    let b = &Document::parse("a^b c^d^\n").blocks[0];
+    assert_eq!(b.text, "a^b cd");
+    assert_eq!(runs_of(b, InlineStyle::SUPERSCRIPT), ["d"]);
+}
+
+#[test]
+fn a_stretch_of_two_marks_is_left_as_it_was_written() {
+    // Pandoc eats the extra marks and can leave an empty script behind; here a
+    // stretch of two or more is syntax this reader has no reading for, and the
+    // author's characters are printed.
+    let b = &Document::parse("x^^2^^ and x^a~~b^ and a~~~b~~~c\n").blocks[0];
+    assert_eq!(b.text, "x^^2^^ and x^a~~b^ and a~~~b~~~c");
+    assert!(runs_of(b, InlineStyle::SUPERSCRIPT).is_empty(), "{b:?}");
+    assert!(runs_of(b, InlineStyle::SUBSCRIPT).is_empty(), "{b:?}");
+}
+
+#[test]
+fn a_struck_word_inside_a_script_keeps_both_meanings() {
+    let b = &Document::parse("x^a~~b~~c^\n").blocks[0];
+    assert_eq!(b.text, "xabc");
+    let stuck = b.spans.iter().find(|s| s.style.contains(InlineStyle::STRIKETHROUGH)).expect("struck");
+    assert_eq!(&b.text[stuck.range.clone()], "b");
+    // Every word of the pair is raised, the struck one included.
+    for word in ["a", "b", "c"] {
+        let at = b.text.find(word).unwrap();
+        let span = b.spans.iter().find(|s| s.range.contains(&at)).unwrap();
+        assert!(span.style.contains(InlineStyle::SUPERSCRIPT), "{word}: {span:?}");
+    }
+    // The same reading inside a deletion: the words between `~~` are struck *and*
+    // the middle one is lowered.
+    let b = &Document::parse("~~a ~b~ c~~\n").blocks[0];
+    assert_eq!(b.text, "a b c");
+    let b_at = b.text.find('b').unwrap();
+    let span = b.spans.iter().find(|s| s.range.contains(&b_at)).unwrap();
+    assert!(span.style.contains(InlineStyle::STRIKETHROUGH | InlineStyle::SUBSCRIPT), "{span:?}");
+}
+
+#[test]
+fn cjk_words_carry_scripts_as_their_ascii_twins_do() {
+    let b = &Document::parse("中文~下~标 与 记号^上^标\n").blocks[0];
+    assert_eq!(b.text, "中文下标 与 记号上标");
+    assert_eq!(runs_of(b, InlineStyle::SUBSCRIPT), ["下"]);
+    assert_eq!(runs_of(b, InlineStyle::SUPERSCRIPT), ["上"]);
+}
+
+#[test]
+fn a_table_cell_reads_scripts_as_its_prose_does() {
+    let src = "| a | b |\n| --- | --- |\n| H~2~O | x^2^ |\n";
+    let doc = Document::parse(src);
+    let table = doc.blocks[0].table.as_ref().expect("a grid");
+    let (two, square) = (&table.rows[0][0], &table.rows[0][1]);
+    assert_eq!(two.text, "H2O");
+    assert_eq!(square.text, "x2");
+    assert_eq!(runs_in(&two.text, &two.spans, InlineStyle::SUBSCRIPT), ["2"]);
+    assert_eq!(runs_in(&square.text, &square.spans, InlineStyle::SUPERSCRIPT), ["2"]);
+    // A cell has no reader of its own, so its marks are counted with the block's:
+    // a report that missed them would call a table of formulas a page without
+    // scripts.
+    assert_eq!(doc.blocks[0].scripts, rubrica_doc::Scripts { raised: 1, lowered: 1 });
+    // The map back into the source survived the cut: the `2` of `H~2~O` is the
+    // source's own `2`, not the tilde it followed.
+    assert_eq!(rubrica_doc::source_at(&two.sources, 1), src.find("2"));
+}
+
+#[test]
+fn a_script_and_a_citation_share_one_paragraph_and_one_size() {
+    let doc = Document::parse("x^2^[^1]\n\n[^1]: note\n");
+    let b = &doc.blocks[0];
+    assert_eq!(b.text, "x21");
+    // The citation number is raised by the parser and the `2` by the scripts pass;
+    // side by side and of one style they are one run.
+    assert_eq!(runs_of(b, InlineStyle::SUPERSCRIPT), ["21"]);
+    let cite = b.actions.iter().find(|a| matches!(a.kind, rubrica_doc::ActionKind::Cite(_))).expect("citation");
+    assert_eq!(&b.text[cite.range.clone()], "1");
+    assert!(runs_of(b, InlineStyle::SUBSCRIPT).is_empty(), "{b:?}");
+    // The citation is raised by the parser and not by the script pass: of the two
+    // raised runs on the page, this count owns exactly one.
+    assert_eq!(b.scripts, rubrica_doc::Scripts { raised: 1, lowered: 0 });
+}
+
+#[test]
+fn no_run_of_marks_can_make_the_scripts_pass_panic_or_read_past_the_text() {
+    // Everything a malformed document can do with the two marks, over a small
+    // alphabet: unpaired, crossed, nested, escaped, next to code. The pass reads
+    // bytes as well as characters, so the shapes that would run off an end or
+    // into a continuation byte are exactly the ones worth asking about.
+    let fragments = ["^", "~", "a", " ", "\\", "`", "*", "中", "\u{fffc}", "\n"];
+    for a in fragments {
+        for b in fragments {
+            for c in fragments {
+                for d in fragments {
+                    let src: String = [a, b, c, d].concat();
+                    let doc = Document::parse(&src);
+                    for block in &doc.blocks {
+                        check_ranges(block);
+                    }
+                }
+            }
+        }
+    }
+    // Long and deep shapes: a run of a thousand marks, a pair longer than a line,
+    // escapes to the last byte, and nesting two hundred deep.
+    let long = ["^".repeat(1000), "~".repeat(1000), format!("x^{}^", "a".repeat(10000)),
+        format!("^\\ {} ^", "\\ ".repeat(500)), format!("{}a{}", "^~".repeat(200), "~^".repeat(200)),
+        "~\\".to_string(), "\\^\\~".repeat(300)].join(" ");
+    for block in &Document::parse(&long).blocks {
+        check_ranges(block);
+    }
+}
+
+/// Every range a block holds must lie inside the text it indexes, and its source
+/// map must stay bounded by the source it names.
+fn check_ranges(block: &rubrica_doc::Block) {
+    let text = block.text.len();
+    for s in &block.spans {
+        assert!(s.range.end <= text, "span {:?} past {:?}", s.range, block.text);
+    }
+    for s in &block.sources {
+        assert!(s.range.end <= text, "source span {:?} past {:?}", s.range, block.text);
+    }
+    for o in &block.objects {
+        assert!(o.range.end <= text, "object {:?} past {:?}", o.range, block.text);
+    }
+    for a in &block.actions {
+        assert!(a.range.end <= text, "action {:?} past {:?}", a.range, block.text);
+    }
+    // A byte inside the text is still selectable after an edit only if some span
+    // covers it: a cut that moved one range and not another left a hole here.
+    for (at, c) in block.text.char_indices() {
+        if !c.is_alphanumeric() {
+            continue;
+        }
+        assert!(
+            block.spans.iter().any(|s| s.range.contains(&at)),
+            "byte {at} of {:?} is covered by no span",
+            block.text
+        );
+    }
+}

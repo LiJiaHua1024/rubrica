@@ -464,6 +464,34 @@ fn math_table_bytes(face: &IDWriteFontFace) -> Option<(Vec<u8>, u16)> {
     Some((crate::tables::table_bytes(face, b"MATH")?, metrics.designUnitsPerEm))
 }
 
+/// What a script is set with, from the `MATH` table of `family`: how much smaller
+/// than its word one is set, and how far a raised one is lifted and a lowered one
+/// sunk -- each as a fraction of the word's own em.
+///
+/// The same three numbers serve a formula's own scripts, an author's `x^2^` and a
+/// citation's `¹`, because on the page they are the same mark: the face that sets a
+/// formula is the face that knows where its exponents sit, and a page that took the
+/// number from two places would show two kinds of exponent side by side.
+///
+/// `None` when the family names no installed face, the face carries no usable `MATH`
+/// table, or a number it gives is zero or negative -- that being the table's own way
+/// of saying it has no requirement, which is exactly when the caller's fallback is
+/// the better answer. A number outside the sane bounds is clamped rather than
+/// refused: a damaged table should not set a script the size of its word.
+pub(crate) fn script_constants(font: &FontEngine, family: &str) -> Option<(f32, f32, f32)> {
+    let face = font.font_face(font.open_face(family, 400, false)?)?;
+    let (bytes, upem) = math_table_bytes(&face)?;
+    let table = MathTable::parse(&bytes, upem)?;
+    let scale =
+        table.constant(rubrica_math::table::constant::SCRIPT_PERCENT_SCALE_DOWN) as f32 / 100.0;
+    let raise = table.constant_pt(rubrica_math::table::constant::SUPERSCRIPT_SHIFT_UP, 1.0);
+    let sink = table.constant_pt(rubrica_math::table::constant::SUBSCRIPT_SHIFT_DOWN, 1.0);
+    if scale <= 0.0 || raise <= 0.0 || sink <= 0.0 {
+        return None;
+    }
+    Some((scale.clamp(0.05, 1.0), raise.clamp(0.0, 2.0), sink.clamp(0.0, 2.0)))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

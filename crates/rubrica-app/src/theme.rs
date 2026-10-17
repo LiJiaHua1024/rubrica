@@ -277,6 +277,30 @@ impl Measure {
     pub const DESIGN: usize = 1;
 }
 
+/// How a script is set against the word it belongs to: the fraction of the word's
+/// size one is set at, and how far a raised one is lifted and a lowered one sunk,
+/// as fractions of the word's own size.
+///
+/// The three come from the formula face's `MATH` table ([`Theme::learn_scripts`]),
+/// because that is the face that knows where its own exponents sit; the default is
+/// the design's own reading, for a machine whose faces carry no such table. They
+/// are held together rather than apart so a raised citation mark, an author's
+/// `x^2^` and a `<sup>` cannot drift to three different sizes on one page.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct ScriptMetrics {
+    pub scale: f32,
+    pub raise: f32,
+    pub sink: f32,
+}
+
+impl Default for ScriptMetrics {
+    fn default() -> Self {
+        // The design's own numbers, and the same for both marks: a raised mark sits
+        // near the word's cap height, a lowered one is sunk by a fifth of the word.
+        Self { scale: 0.7, raise: 0.62, sink: 0.2 }
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct Theme {
     pub fonts: Fonts,
@@ -327,6 +351,12 @@ pub struct Theme {
     /// Which of [`Measure::ALL`] the width cap came from, kept for the same reason
     /// [`Theme::face`] is: the menu has to check the row that is on the page.
     pub measure: usize,
+    /// How a superscript or a subscript is set, learned from a font engine by
+    /// [`Theme::learn_scripts`].
+    pub scripts: ScriptMetrics,
+    /// The face [`Theme::scripts`] came from, or empty while the fallback numbers
+    /// stand -- so a report can say where the marks were set from.
+    pub scripts_from: String,
 }
 
 impl Default for Theme {
@@ -364,6 +394,8 @@ impl Default for Theme {
             zoom: Zoom::DESIGN,
             face: 0,
             measure: Measure::DESIGN,
+            scripts: ScriptMetrics::default(),
+            scripts_from: String::new(),
         }
     }
 }
@@ -410,6 +442,35 @@ impl Theme {
 
     pub fn set_wide_table_factor(&mut self, factor: f32) {
         self.wide_table_factor = factor.clamp(0.0, 1.0);
+    }
+
+    /// Read how scripts are set from the faces a formula would be set in.
+    ///
+    /// A `MATH` table belongs to a face, so there is one place to ask and one moment
+    /// to ask it: a theme learns the three numbers once, and every raised or lowered
+    /// run on the page -- an author's `x^2^`, a `<sup>`, a citation's `¹` -- is
+    /// afterwards set from the same entry, whatever the block and whatever the size.
+    /// The faces in [`Fonts::math`] are tried in order, as the formula layout tries
+    /// them, so the mark and the formula beside it come from one face.
+    ///
+    /// A caller that never asks keeps [`ScriptMetrics::default`], which is why this
+    /// is a method and not part of construction: the numbers need a font engine, and
+    /// a theme is built before one exists.
+    pub fn learn_scripts(&mut self, font: &crate::font::FontEngine) {
+        let found = self.fonts.math.iter().find_map(|family| {
+            crate::math::script_constants(font, family)
+                .map(|(scale, raise, sink)| (family.clone(), ScriptMetrics { scale, raise, sink }))
+        });
+        match found {
+            Some((family, metrics)) => {
+                self.scripts = metrics;
+                self.scripts_from = family;
+            }
+            None => {
+                self.scripts = ScriptMetrics::default();
+                self.scripts_from.clear();
+            }
+        }
     }
 }
 
@@ -488,13 +549,17 @@ impl Theme {
         // at, and shallow enough to stay clear of the line below's ascenders. A run
         // wearing both bits is one mis-nested tag rather than two marks, and reads as
         // raised: an exponent is the more meaningful of the two on the same glyph.
+        //
+        // The three numbers are the theme's, not this function's: they come from the
+        // formula face's `MATH` table when one is installed, so `H~2~O` and the `2`
+        // of `$x^2$` are one size and one depth.
         let mut raise = 0.0;
         if inline.contains(InlineStyle::SUPERSCRIPT) {
-            size *= 0.7;
-            raise = block * 0.62;
+            size *= self.scripts.scale;
+            raise = block * self.scripts.raise;
         } else if inline.contains(InlineStyle::SUBSCRIPT) {
-            size *= 0.7;
-            raise = -block * 0.2;
+            size *= self.scripts.scale;
+            raise = -block * self.scripts.sink;
         }
         let mut weight = match kind {
             BlockKind::Heading(_) => 700,
@@ -720,6 +785,32 @@ mod tests {
         let both = t.resolve(BlockKind::Paragraph, InlineStyle::SUPERSCRIPT | InlineStyle::SUBSCRIPT);
         assert_eq!(both.size, sup.size);
         assert_eq!(both.raise, sup.raise);
+    }
+
+    /// The numbers of a script come from the formula face when this machine has one,
+    /// and from the design when it has not -- never from a mixture.
+    #[test]
+    fn script_metrics_are_learned_from_the_formula_face_or_fall_back_together() {
+        let Ok(font) = crate::font::FontEngine::new() else { return };
+        let mut t = Theme::default();
+        t.learn_scripts(&font);
+        if t.scripts_from.is_empty() {
+            assert_eq!(t.scripts, ScriptMetrics::default(), "no face answered, so all three fall back");
+        } else {
+            assert!(t.fonts.math.contains(&t.scripts_from), "{} is not a formula face", t.scripts_from);
+            assert!(t.scripts.scale > 0.0 && t.scripts.scale <= 1.0, "{:?}", t.scripts);
+            assert!(t.scripts.raise > 0.0 && t.scripts.sink > 0.0, "{:?}", t.scripts);
+        }
+        // Either way the resolved marks wear the learned numbers and nothing else:
+        // `x^2^`, a `<sup>` and a citation's `¹` are one size, because all three
+        // come through here.
+        let sup = t.resolve(BlockKind::Paragraph, InlineStyle::SUPERSCRIPT);
+        let sub = t.resolve(BlockKind::Paragraph, InlineStyle::SUBSCRIPT);
+        let body = t.resolve(BlockKind::Paragraph, InlineStyle::EMPTY);
+        assert!((sup.size - body.size * t.scripts.scale).abs() < 0.01);
+        assert!((sub.size - sup.size).abs() < 0.01);
+        assert!((sup.raise - body.size * t.scripts.raise).abs() < 0.01);
+        assert!((sub.raise + body.size * t.scripts.sink).abs() < 0.01);
     }
 
     #[test]

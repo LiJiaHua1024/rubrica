@@ -21,6 +21,7 @@ use pulldown_cmark::{
 };
 
 mod emphasis;
+mod scripts;
 pub mod plain;
 pub mod stats;
 
@@ -168,6 +169,20 @@ pub struct ListInfo {
     pub index: Option<u64>,
 }
 
+/// What a block's `~` and `^` marks were read as: how many of its words were raised
+/// and how many lowered.
+///
+/// The reading leaves no trace of its own once it is done -- a raised digit ends up
+/// the very span a citation's `[^1]` or an author's `<sup>` writes -- so the count is
+/// kept here for the one reader that has to tell them apart: a report that prints the
+/// script geometry only for a page that actually used the syntax. Cells count into
+/// the block that carries their table, since a cell has no reader of its own.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Scripts {
+    pub raised: usize,
+    pub lowered: usize,
+}
+
 #[derive(Clone, Debug)]
 pub struct Block {
     pub kind: BlockKind,
@@ -218,6 +233,8 @@ pub struct Block {
     /// this as the note beside it -- a diagram that cannot be drawn is a keystroke
     /// away from being fixed, and hiding its source would take that away.
     pub diagram_error: Option<String>,
+    /// What the [`scripts`] pass read in this block: see [`Scripts`].
+    pub scripts: Scripts,
 }
 
 /// An inline non-text box.
@@ -335,7 +352,7 @@ impl Block {
             sources: vec![SourceSpan { range: 0..text.len(), source: 0 }],
             text, quote_depth: 0, list: None, item_depth: None, task: None, table: None,
             objects: Vec::new(), actions: Vec::new(), lang: None, diagram: None,
-            diagram_error: None }
+            diagram_error: None, scripts: Scripts::default() }
     }
 
     /// Headings and code are set ragged-right; justifying them is a defect.
@@ -380,6 +397,25 @@ impl Block {
         // itself is the one kind here whose reading lives somewhere else.
         for cell in self.table.iter_mut().flat_map(|t| t.head.iter_mut().chain(t.rows.iter_mut().flatten())) {
             emphasis::relax(&mut cell.body(), original);
+        }
+    }
+
+    /// Read the sub- and superscripts Pandoc writes with `~` and `^`, once the block
+    /// is otherwise finished: see [`scripts`].
+    ///
+    /// It runs after [`relax_emphasis`] for the same reason that one runs after
+    /// [`split_definitions`]: both edit the text, and the pass that goes first must
+    /// not be reading offsets the other has moved.
+    fn relax_scripts(&mut self, original: &str) {
+        if self.kind != BlockKind::Code {
+            let found = scripts::relax(&mut self.body(), original);
+            self.scripts.raised += found.raised;
+            self.scripts.lowered += found.lowered;
+        }
+        for cell in self.table.iter_mut().flat_map(|t| t.head.iter_mut().chain(t.rows.iter_mut().flatten())) {
+            let found = scripts::relax(&mut cell.body(), original);
+            self.scripts.raised += found.raised;
+            self.scripts.lowered += found.lowered;
         }
     }
 }
@@ -1004,6 +1040,10 @@ struct Builder<'a> {
     breaks: Vec<usize>,
     inline: InlineStyle,
     inline_stack: Vec<InlineStyle>,
+    /// One entry per open `Tag::Strikethrough`: whether it is a `~sub~` the parser
+    /// misread rather than a `~~strike~~`, in which case its two tildes are the
+    /// author's own characters and the scripts pass pairs them later.
+    strike_literal: Vec<bool>,
     /// What the inline HTML tags around the text ask for, held apart from
     /// [`Builder::inline`] so that a `</b>` the author forgot cannot unbalance what a
     /// Markdown `*` opened: the two are ORed at each run of text.
@@ -1331,7 +1371,22 @@ impl Builder<'_> {
             }
             Tag::Emphasis => self.begin_inline(InlineStyle::EMPHASIS),
             Tag::Strong => self.begin_inline(InlineStyle::STRONG),
-            Tag::Strikethrough => self.begin_inline(InlineStyle::STRIKETHROUGH),
+            // The parser reads a single `~` at a word boundary as a deletion, but
+            // between single tildes it is Pandoc's subscript: `a ~b~ c` is `a`,
+            // a lowered `b`, `c`, and the distinction is the length of the two
+            // runs in the source (`~~` is a strike in both readings). A misread
+            // one is not entered as a deletion at all -- its tildes are written
+            // back as the text they are, and [`scripts`] reads the pair.
+            Tag::Strikethrough => {
+                let single = self.single_tilde_strike();
+                if !single {
+                    self.begin_inline(InlineStyle::STRIKETHROUGH);
+                }
+                self.strike_literal.push(single);
+                if single {
+                    self.put("~", self.style());
+                }
+            }
             Tag::Link { dest_url, .. } => {
                 self.begin_inline(InlineStyle::LINK);
                 // The first destination wins: CommonMark cannot nest anchors, but a
@@ -1382,6 +1437,20 @@ impl Builder<'_> {
         self.inline = self.inline_stack.pop().unwrap_or(InlineStyle::EMPTY);
     }
 
+    /// Whether the `Tag::Strikethrough` being reported is a pair of single tildes
+    /// rather than a `~~` one.
+    ///
+    /// Both events of a tag carry the whole span, not the delimiter run -- `a ~b~ c`
+    /// reports `2..5` at either end -- so the runs are counted off the source at the
+    /// span's two ends. The parser only forms a deletion from unescaped runs, so
+    /// both counts naming one tilde is exactly the case that is really a subscript.
+    fn single_tilde_strike(&self) -> bool {
+        let raw = &self.input[self.event_range.clone()];
+        let opens = raw.bytes().take_while(|b| *b == b'~').count();
+        let closes = raw.bytes().rev().take_while(|b| *b == b'~').count();
+        opens == 1 && closes == 1
+    }
+
     fn end(&mut self, tag: TagEnd) {
         match tag {
             TagEnd::Paragraph | TagEnd::Heading(_) | TagEnd::CodeBlock => self.close(),
@@ -1430,7 +1499,11 @@ impl Builder<'_> {
             TagEnd::List(_) => {
                 self.lists.pop();
             }
-            TagEnd::Emphasis | TagEnd::Strong | TagEnd::Strikethrough => self.end_inline(),
+            TagEnd::Emphasis | TagEnd::Strong => self.end_inline(),
+            TagEnd::Strikethrough => match self.strike_literal.pop() {
+                Some(true) => self.put("~", self.style()),
+                _ => self.end_inline(),
+            },
             TagEnd::Link => {
                 self.end_inline();
                 self.link = None;
@@ -1607,6 +1680,7 @@ impl Builder<'_> {
             lang: None,
             diagram: None,
             diagram_error: None,
+            scripts: Scripts::default(),
         });
     }
 
@@ -1750,6 +1824,7 @@ impl Builder<'_> {
                 // filtered out of it later.
                 for mut b in split_definitions(b, breaks) {
                     b.relax_emphasis(self.original);
+                    b.relax_scripts(self.original);
                     if !worth_setting(&b) {
                         continue;
                     }
@@ -1933,6 +2008,10 @@ fn piece(base: &Block, range: std::ops::Range<usize>, kind: BlockKind) -> Option
         lang: None,
         diagram: None,
         diagram_error: None,
+        // A piece is cut before either reading pass has run on its base, so there is
+        // nothing to carry over; the fields are copied rather than defaulted anyway,
+        // because the order of the two steps is not this function's to promise.
+        scripts: base.scripts,
     })
 }
 

@@ -1667,6 +1667,10 @@ impl Peek {
             self.font = Some(font);
         }
         let font = self.font.as_mut().expect("font loaded above");
+        // The theme was built before the engine existed, and a script's geometry is
+        // the formula face's: it is learned here, once per reveal, like the rest of
+        // the appearance.
+        self.theme.learn_scripts(font);
 
         let mut rect = RECT::default();
         unsafe { let _ = GetClientRect(self.hwnd, &mut rect); }

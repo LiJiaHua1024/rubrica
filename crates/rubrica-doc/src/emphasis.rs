@@ -186,7 +186,7 @@ fn flag(len: usize) -> InlineStyle {
 
 /// Give a byte range a style, splitting the spans it lands on so that the range
 /// comes out whole in one piece of the run list.
-fn style_range(spans: &mut Vec<Span>, range: Range<usize>, style: InlineStyle) {
+pub(crate) fn style_range(spans: &mut Vec<Span>, range: Range<usize>, style: InlineStyle) {
     let mut out: Vec<Span> = Vec::new();
     for s in spans.drain(..) {
         if s.range.end <= range.start || range.end <= s.range.start {
@@ -288,7 +288,7 @@ fn shift_range(cuts: &[Range<usize>], range: Range<usize>) -> Range<usize> {
 /// renderer looks the range up in the block's object table -- so two objects left
 /// adjacent by a cut have to stay two spans: merged, the range matches no record
 /// and both objects are set as their placeholder character, which no face draws.
-fn merge(spans: Vec<Span>) -> Vec<Span> {
+pub(crate) fn merge(spans: Vec<Span>) -> Vec<Span> {
     let mut out: Vec<Span> = Vec::with_capacity(spans.len());
     for s in spans {
         if s.range.start >= s.range.end {

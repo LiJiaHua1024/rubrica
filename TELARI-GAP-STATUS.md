@@ -2,7 +2,7 @@
 
 > 权威差距依据：`TELARI-GAP.md`（2026-10-16 调研，对照 Telari 0.6.3）。第五节"已领先"不计入目标。
 > 本文件是唯一进度权威：会话上下文只是缓存；恢复只看本文件。事件发生（完成子步骤、跑完闸门、换子 agent）时立刻更新，不攒批。
-> 建账：2026-10-16（冷启动）。最近更新：2026-10-17 G2 复核通过并提交；当前条目切至 G3（待启动子 agent）。
+> 建账：2026-10-16（冷启动）。最近更新：2026-10-17 G3 复核通过并提交；当前条目切至 G4（待启动子 agent）。
 
 ## 0. 用户侧操作（照此执行）
 
@@ -15,11 +15,11 @@
 
 ## 1. 恢复区（子 agent 运行时由子 agent 实时维护；master 复核后刷新）
 
-- 当前条目：**G3 `x^2^` / `H~2~` 上下标语法**（进行中，待启动子 agent）
-- 上一条目结论：**G2 HTML 的语义处理 已完成**（2026-10-17 master 复核：四闸门亲跑全绿——test 250+36+86+117+53+4+7+64+19、clippy 默认+`--features pdf`、release build、`git diff --check`；抽查 `fixtures/html.md` 前后数字逐条吻合——后 `18 blocks/1719pt`、`images: 4/3/1`；`--no-html-images` `18/1290pt`、`1/0/0`；前 21/1637pt、无 images 行；`--source` 前后逐字节相同；18 个既有 fixture 报告 0 差异；`--shapes` 三条 glyph run 与台账一致（sub 下沉 3.6dip、sup 与引注号同位移同宽 6.79）→ 判定达成，本地提交 `feat: read html by what its tags mean`）。需人工确认项（开关关闭时 alt 取舍、窗口/peek 观感）已记录。
-- 当前条目内的下一步动作：启动 G3 后台子 agent（先回源码核实现状、方案写进 §3-G3 再动手；验收：`x^2^`/`H~2~` 真上下标、字号与升降取自 MATH 常量、与脚注引注号共用尺寸、代码/行内代码内不生效、`\^`/`\~` 转义、`~~删除线~~` 不受影响）。
-- 后台子 agent sessionID：`待填`（G3）
-- 未提交改动清单：G2 全部改动已提交；此后台账编辑随 G3 提交。
+- 当前条目：**G4 `==highlight==` 荧光标记**（进行中，待启动子 agent）
+- 上一条目结论：**G3 `x^2^` / `H~2~` 上下标语法 已完成**（2026-10-17 master 复核：四闸门亲跑全绿——test 251+36+99+117+53+4+7+64+19、clippy 默认+`--features pdf`、release build、`git diff --check`；抽查：`fixtures/subsuper.md` 前后报告逐条一致（后 `scripts: 5 raised, 5 lowered; 0.730/0.366/0.204em from Cambria Math`、Segoe UI 929/复制 1428/删除线 4 段 0.49pt；前无 scripts 行、947/1448/2 段 0.67pt）、`--shapes` 探针几何逐位吻合（沉 3.67＝0.204×18dip、升 6.59＝0.366×18dip、宽 7.08＝0.73×9.70；前 6.79＝0.7em、升 11.16＝0.62em）、`--source` 三文件逐字节相同、20 个 fixture 的 `--report` 与 `--report --shapes` 全量对比各仅 html/notes/subsuper 有差（html 1 行 +0.3pt、notes 全部 ≤0.3pt，均为引注/`<sup>` 改用 MATH 度量）、复制语义与既有强调一致（语法标记不入复制文本）→ 判定达成，本地提交 `feat: read ^carets^ and ~tildes~ as scripts`）。需人工确认项（run≥2 字面偏离、`x^$a$^` 字面、Sup[Code] 读法、删除线被拆 4 段、非 cramped 上标、窗口/peek/PDF 目视）已记录。
+- 当前条目内的下一步动作：启动 G4 后台子 agent（先回源码核实现状、方案写进 §3-G4 再动手；验收：`==text==` 荧光标记、明暗主题各有合适样式、设置可关、代码/代码块内字面）。
+- 后台子 agent sessionID：`待填`（G4）
+- 未提交改动清单：G3 全部改动已提交（含 §3-G3 证据）；此后台账编辑随 G4 提交；未跟踪项仍只有 `.freebuff/` 与 `TELARI-GAP.md`（保留不动）。
 - 已知阻塞：无
 - 基线状态：2026-10-16 `cargo test --workspace --locked` 全绿（冷启动基线，master 亲跑）；G2 收尾复跑 250+36+86+117+53+4+7+64+19、0 失败
 - 分工约定：子 agent 拥有当前条目（§3.x 明细 + 本恢复区 + §5 日志）的写权，实时落盘；master 拥有状态总表（§2）、复核结论与 commit。一次只有一条 `进行中`，同一时刻只有一个写代码的子 agent。
@@ -35,8 +35,8 @@
 | --- | --- | --- | --- |
 | 1 | Mermaid 图表渲染 —— 最大空白 | 已完成 | §3.1（提交 `feat: draw mermaid fences as diagrams`） |
 | 2 | HTML 的语义处理 | 已完成 | §3.2（提交 `feat: read html by what its tags mean`） |
-| 3 | `x^2^` / `H~2~` 上下标语法 | 进行中 | §3.3（子 agent 待启动） |
-| 4 | `==highlight==` 荧光标记 | 未开始 | — |
+| 3 | `x^2^` / `H~2~` 上下标语法 | 已完成 | §3.3（提交 `feat: read ^carets^ and ~tildes~ as scripts`） |
+| 4 | `==highlight==` 荧光标记 | 进行中 | §3.4（子 agent 待启动） |
 
 ### 第二节 引擎能力已有、只是没暴露成选项
 
@@ -182,7 +182,38 @@
 ### G3 明细（`x^2^` / `H~2~`）
 
 - **验收口径**：Pandoc 规则渲染真上下标；字号与升降取数学字体的 MATH 常量，与脚注引注号共用一套尺寸；代码/代码块内不生效。
-- 证据：—
+- 现状核实（2026-10-17，源码 + 探针 crate `%TEMP%/opencode/g3probe` + pandoc 3.10 对照，约 60 例）：
+  - 本仓库解析选项为 `STRIKETHROUGH|TASKLISTS|TABLES|MATH|FOOTNOTES`（`lib.rs:462`）。此配置下：`^` 从不参与解析，`x^2^`、`H~2~`、`中文~下~标` 都以纯文本到达 `Builder`（`~`/`^` 的 run 不能 intraword 开合）；`~~del~~` 由 pulldown 自己解析成 Strikethrough（保留）。
+  - **单 `~` 被偷**：`a ~b~ c`、`~a~b~`、`~~s~~ and ~x~` 里的单词边界单 `~` 对会被 pulldown 当删除线（`Start/End(Strikethrough)`，`event_range` 是**整个 span** 而非分隔符 run：`a ~b~ c` 起止都是 `2..5`；run 长度需从 range 两端向 `input` 计数）。`ENABLE_SUBSCRIPT`/`ENABLE_SUPERSCRIPT` 已存在但仅 intraword 开合、且吞掉 `~~`，与 Pandoc 不符，不用。
+  - Pandoc 3.10 实测（`-t native`）：`x~2~y`/`H~2~O`/`e~x~tra` 均 intraword 成立（Pandoc 无 flanking 限制，`a ^b^`、`^a^`、`~lead~ word` 都成立）；`x^ a ^`、`x^a b^`、`~ a~`、`~a ~` 因未转义空白不成立；`x^a\ b^`→`Sup["a NBSP b"]`（`\ `＝转义空格→U+00A0）；`\^`/`\~` 不参与配对（`a\~b\~c`→字面，`\~~b~~`→`~`+Sub[b]+`~`）；`x^2\^3^`→`Sup["2^3"]`（转义字符留字面在内容里）；`x~a^b~c^`→`Sub[a^b]`+`c^`（跨字符的**交叉**配对被拒、被吞的“另一字符”开启点作废）；`a^b c^d^`→`a^b`+`c`+`Sup(d)`（先试闭、闭不成再当开启点）；`x^`c`^`→`Sup[Code]`（可跨代码 span），但 `x^`a b`^` 因空白被拒；`x^2^^`、`x^2`、`a^` 未配对保持字面；`~~a~b~~`、`x~~~~y`、`a~~~b~~~c`、`x^^2^^` 在 Pandoc 里是退化读法（空上下标/吃掉多余 `~`/`^`）——**不模仿**（见偏离）。
+  - Cambria Math（upem 2048）：`ScriptPercentScaleDown=73`（→0.73em）、`SuperscriptShiftUp=750`（→0.3662em）、`SubscriptShiftDown=418`（→0.2041em）。现 `theme.rs` 硬编码 0.7/0.62/0.2，将改为读表取值（缺表/非正值回退）。`SuperscriptShiftUpCramped=615` 存在但选非 cramped 值（普通文本基线，与 `<sup>`/引注号同一套，需人工确认）。
+- 方案（2026-10-17 定案，含回退与偏离）：
+  - **落点**：新增 `crates/rubrica-doc/src/scripts.rs`（后缀式扫描，仿 `emphasis.rs`；复用其 `Text`/`style_range`/`merge`/`pieces`/`join`/`shift_range`，改为 `pub(crate)`）。在 `Block::close` 的 `split_definitions` 循环里 `relax_emphasis` 之后逐个 piece 运行，表格 cell 同样跑（与 emphasis 同点）。
+  - **`Builder` 单 tilde 解偷**：`Tag::Strikethrough` 起止分隔符 run（从 `event_range.start` 向右、`event_range.end` 向左在 `input` 计数）都恰为 1 个 `~` 时，不压 `STRIKETHROUGH`（`strike_literal: Vec<bool>` 栈配对起止），起止各把 `~` 作字面文字写回；`~~`（run≥2）与其余 Strikethrough 行为不变。安全前提：pulldown 只有在起止 run 均未转义时才产 Strikethrough（`\~a\~`、`~a\~` 探针均无事件），故写回的两个 `~` 都该参与配对；起止 `~` 的 `sources` 由 `sources()` 的 `find` 得到（闭括号会映射到开括号源字节，两处都是未转义 `~`，奇偶判定结论相同）。
+  - **scripts pass 规则**（最终）：
+    1. 只认**长度恰为 1** 的 `^`/`~` run；跳过含 `InlineStyle::CODE` 的 span 内、含 U+FFFC 的 OBJECT 内、源码中反斜杠奇数为转义的 run（用 `source_at` + 反斜杠奇偶，与 emphasis 同法）。`BlockKind::Code` 整块跳过（同 emphasis）。
+    2. 左到右贪心配对（每字符一个栈）：先试“闭最近的同字符开启点”，成功条件=内容（open.end..close.start）满足：(a) 无未转义空白——空白仅当“前一个字节是文本反斜杠且该反斜杠在源码中奇偶为偶（即它转义了这个空格）”时放行；(b) 不含 U+FFFC；(c) 不含任何**未转义的长度≥2** 的 `^`/`~` run；(d) 不含已被其他配对消费掉的分隔符字节（防交叉）。闭不成就把该 run 当开启点压栈。
+    3. 配对成功→ `style_range(内容, SUPERSCRIPT|SUBSCRIPT)`；把该区间内**另一字符**栈上的开启点作废（Pandoc 同）；内容中的 `\ `（转义空格）切除反斜杠并替换为 U+00A0（三条 1 字节 `SourceSpan` 都指向空格源字节，保持 `source_at` 有界）。
+    4. 未配对 run、run≥2、被拒配对一律字面保留（不删除）。
+  - **偏离（有意，需人工确认）**：`~~a~b~~`/`a ~~ b ~~ c`/`x~~~~y`/`a~~~b~~~c`——Pandoc 会吃到空上下标或多吞 `~`；本实现 run≥2 一律字面（`~~a~b~~` 维持 pulldown 删除线读法）。`x^^2^^`/`x^a^^b^` 同理保持字面（Pandoc 产 `Superscript []`）。`x^$a$^`（对象在内容里）保持字面（Pandoc 为 Sup[Math]；本实现对象 span 只有 OBJECT 位，抬升无着落，宁字面不乱抬）。`x^`a^b`^` 跨含 `^` 的代码 span 会读成 Sup[Code]（Pandoc 在此裂成 `Sup["`a"]`+`` b`^ ``，本实现更整）。
+  - **app 侧度量**：`theme.rs` 加 `ScriptMetrics { scale, raise, sink }`（默认 0.7/0.62/0.2）与 `Theme::learn_scripts(&FontEngine)`：按 `fonts.math[0]` 再 `[1]` 取脸 → `math.rs` 新 `pub(crate) fn script_constants(font, family) -> Option<(f32,f32,f32)>`（`ScriptPercentScaleDown/100`、`SuperscriptShiftUp/upem`、`SubscriptShiftDown/upem`，非正→None，值钳在 0.05..=1.0 / 0..=2.0em）；`resolve_at` 的 SUP/SUB 分支改用 `self.scripts`（引注号、`<sup>/<sub>`、`^`/`~` 三者同源）。
+  - **调用点**：`view.rs::new_view`、`report.rs`、`peek.rs`（字体创建后）、`export_png`/`export_pdf`（建 theme + 字体后）、以及 6 处 `profiles::load(...).apply(&mut self.theme)` 之后（profile 可改 `fonts.math`）。
+  - **报告**：`--report` 在文档含 SUPERSCRIPT/SUBSCRIPT span 时新增 `scripts` 行（raised/lowered run 数 + MATH 来源与数值），其余 fixture 报告不受影响；`--shapes` 的 glyph run 数字用于钉尺寸位移。
+  - **fixtures**：新增 `fixtures/subsuper.md`（`H~2~O`、`x^2^`、intraword、CJK、`\ ` 转义、`\^`/`\~`、未配对、`~~del~~`、行内代码/围栏内不生效、与脚注同段），更新 `fixtures/README.md`；`README.md`/`IMPLEMENTATION.md` 同步。
+- 证据（2026-10-17，全部无头；改动未提交，等 master 复核）：
+  - **实现落点（`rubrica-doc`）**：新 `crates/rubrica-doc/src/scripts.rs`（后缀扫描 + 每字符一栈的贪心配对；复用 `emphasis.rs` 的 `Text`/`style_range`/`merge`/`pieces`/`join`/`shift_range`——改 `pub(crate)`；`apply` 按 `range.start` 排序后 `merge`，spans/sources/objects/actions 同步搬家）。`lib.rs`：`Scripts{raised,lowered}` 与 `Block.scripts`（表格 cell 计入所属 block）；`Block::close` 的 `split_definitions` 循环中 `relax_emphasis` 之后对正文与每个 cell 各跑 `relax_scripts`；`Builder` 的 `strike_literal` 解偷——`Tag::Strikethrough` 起止分隔符 run 皆恰为 1 个未转义 `~` 时不压 `STRIKETHROUGH`、起止各写回字面 `~`（`~~` 维持删除线）。
+  - **app 落点**：`math.rs::script_constants`（读 `SCRIPT_PERCENT_SCALE_DOWN/100`、`SuperscriptShiftUp`、`SubscriptShiftDown`；非正→None；scale 钳 0.05..=1.0、raise/sink 钳 0..=2.0）；`theme.rs::ScriptMetrics`（默认 0.7/0.62/0.2）+ `Theme.scripts`/`scripts_from` + `learn_scripts(&FontEngine)`（按 `fonts.math` 依序取脸，找不到则整体回退默认并清空来源；与公式布局同脸）+ `resolve_at` 的 SUP/SUB 分支改用 `self.scripts`——引注号、`<sup>/<sub>`、`^`/`~` 三者同源；调用点：`view.rs` 9 处（`new_view`、6 处 `profiles::load(...).apply` 之后、`export_png`、`export_pdf`）、`report.rs`、`peek.rs` 各 1 处。
+  - **报告口径**：`report.rs` 的 `scripts` 行只在 `Block.scripts` 计数>0 时打印——不是"文档含 SUP/SUB span"（否则含引注/`<sup>` 的 `html.md`、`notes.md` 也会多一行）；行内为 raised/lowered 计数、三个数值、来源脸名（无表时打印 "the design's own numbers"）。19 个 fixture（glob 含 `README.md`）+ `reading.txt`，前后各 20 份 `--report` 与 `--report --shapes`：仅 `html.md`（1 行 extent 630.4→630.7pt）、`notes.md`（位移全部 ≤0.3pt；`--width 900` 下 8 行、默认栏宽 18 行——计数随栏宽变，性质一致）、新 `subsuper.md` 有差异，且差异全部是引注/`<sup>/<sub>` 改用 MATH 值（验收要求本身）；`--source` 视图三个文件前后逐字节相同。
+  - **前后二进制**：前 = HEAD `8bc9167` 临时 worktree 构建 `%TEMP%/opencode/rubrica-before-g3.exe`（2 312 192B，先以 `notes.md` 与 G2 记录核对一致）；后 = 当前源码 `rubrica-after-g3.exe`（2 346 496B；与 `target/release/rubrica-app.exe` md5 同为 `474e3105e576e66a9d35c0d6e5388121`）。
+  - **fixture 数字**（`fixtures/subsuper.md`，13 blocks / 25 lines / 911pt 前后相同，故证据靠下列行）：
+    - 前：无 `scripts` 行；Segoe UI census 947 字形、copy 1448 字符、strike 2 span（thinnest 0.67pt）。
+    - 后：`scripts: 5 raised, 5 lowered run(s); 0.730em scale, 0.366em raise, 0.204em sink from the MATH table of Cambria Math`；Segoe UI 929、copy 1428、strike 4 span（thinnest 0.49pt——下标把删除线拆开，见待确认）。
+  - **`--shapes` 几何**（探针 `%TEMP%/opencode/g3shapes.md` = `H~2~O x^2^ e~x~tra 2^10^ z[^1] mc<sup>2</sup>`）：后：正文基线 69.00；下标 `2` 宽 7.08、基线 72.67（沉 3.67pt＝0.204em）；上标 `2`、引注 `1`、`<sup>2</sup>` 宽均 7.08（≈0.73×正文 `2` 的 9.70）、基线均 62.41（升 6.59pt＝0.366em）。前：引注 `1`/`<sup>2</sup>` 宽 6.79（=0.7em）、基线 61.06（升 11.16pt＝0.62em）。即"与脚注引注号共用一套尺寸/位移"由同一 `ScriptMetrics` 保证。
+  - **测试**：`cargo test --workspace --locked` → 251+36+99+117+53+4+7+64+19 全通过、0 失败（`rubrica-doc` 86→99：`tests/model.rs` 新增 13 个——`an_ascii_formula_reads_as_its_scripts`、`a_single_tilde_at_a_word_boundary_is_a_subscript_and_not_a_deletion`、`the_whitespace_of_a_script_must_be_escaped_and_an_escaped_one_is_not_a_break`、`an_escaped_mark_pairs_with_nothing_and_is_printed`、`a_mark_inside_code_is_the_authors_own_character`、`a_script_reads_across_emphasis_and_a_link`、`a_pair_does_not_reach_across_a_mark_that_another_pair_already_spent`、`a_stretch_of_two_marks_is_left_as_it_was_written`、`a_struck_word_inside_a_script_keeps_both_meanings`、`cjk_words_carry_scripts_as_their_ascii_twins_do`、`a_table_cell_reads_scripts_as_its_prose_does`、`a_script_and_a_citation_share_one_paragraph_and_one_size`、`no_run_of_marks_can_make_the_scripts_pass_panic_or_read_past_the_text`（后者为全组合 10^4 语料 + 千长串/200 层嵌套 + span/source/object/action 覆盖与有界不变量）；app 250→251：`theme.rs::script_metrics_are_learned_from_the_formula_face_or_fall_back_together`）；实现期间由测试抓出并修掉 2 个真 bug（整段被转义 piece 被误判为 run；replacement span 未排序致 NBSP 未并入邻 span）。
+  - **闸门**：`cargo clippy --workspace --all-targets --locked -- -D warnings`、`cargo clippy -p rubrica-app --all-targets --features pdf --locked -- -D warnings`、`cargo build --release --locked`、`git diff --check`——本轮收尾结果见 §5 最新一条。无新增 `#[allow]`，畸形输入有界（不 panic、不越界）。
+  - **主动偏离 Pandoc（需人工确认）**：① 长度≥2 的 run 一律字面——Pandoc 的 `~~a~b~~`/`x~~~~y`/`a~~~b~~~c`/`x^^2^^` 是退化读法（空上下标/多吞标记），本实现维持 `~~` 删除线读法或字面；② `x^$a$^` 保持字面（Pandoc 为 Sup[Math]；本实现对象 span 只有 OBJECT 位，抬升无着落，宁字面不乱抬）；③ `x^`a^b`^` 读成 Sup[Code]（Pandoc 裂成 `Sup["`a"]` + 余段字面；本实现更整）。
+  - **需人工确认的观感项**：① `~~a ~b~ c~~` 中下标把删除线拆成 4 段（thinnest 0.49pt）——横线在脚本处断开的观感；② 上标取非 cramped 的 `SuperscriptShiftUp`（750/2048），未用 `SuperscriptShiftUpCramped`（615），与引注/`<sup>` 同套普通文本基线；③ 窗口/`--peek`/PDF 目视（无头未验，按惯例留给桌面人工）。
+- **master 复核通过（2026-10-17）**：四闸门亲跑全绿（test 251+36+99+117+53+4+7+64+19；clippy 默认+pdf、release、`git diff --check`）；抽查：`subsuper.md` 前后报告逐条一致、`--shapes` 探针几何逐位吻合（沉 3.67＝0.204×18dip、升 6.59＝0.366×18dip、宽 7.08＝0.73×9.70；前 6.79/61.06＝0.7em/0.62em）、`--source` 三文件逐字节相同、20 fixture `--report` 与 `--shapes` 全量对比各仅 3 文件有差且全部由引注/`<sup>` 改用 MATH 度量所致、复制语义以强调探针对照确认一致（语法标记不入复制文本，非回归）；修正本节 notes.md 行数表述（width 900 下 8 行）→ G3 判定完成，本地提交 `feat: read ^carets^ and ~tildes~ as scripts`。
 
 ### G4 明细（`==highlight==`）
 
@@ -274,6 +305,10 @@
 
 ## 5. 事件日志（倒序，追加）
 
+- 2026-10-17 master：G3 复核通过——四闸门亲跑全绿（251+36+99+117+53+4+7+64+19）；抽查 `subsuper.md` 前后报告、`--shapes` 几何逐位、`--source` 逐字节、20 fixture `--report` 与 `--shapes` 全量（各仅 3 文件有差且全为引注/`<sup>` 的 MATH 度量所致）、复制语义对照强调探针（一致，标记不入复制文本）；修正 §3-G3 的 notes.md 行数表述（width 900 下 8 行）→ G3 标 `已完成` 并本地提交 `feat: read ^carets^ and ~tildes~ as scripts`；恢复区切至 G4。
+- 2026-10-17 G3 子 agent（`ses_eb8b011c0ffelOWA9muJltqYqS`）：G3 实现、验收与文档收尾完成，§1 改「等待 master 复核」。app 侧落地（`math.rs::script_constants`、`theme.rs::ScriptMetrics`+`learn_scripts`+`resolve_at` 同源、`report.rs` scripts 行、`view.rs`/`report.rs`/`peek.rs` 共 11 处调用点）；`fixtures/subsuper.md` 与 `fixtures/README.md`/`README.md`/`IMPLEMENTATION.md` 同步。前后二进制（`%TEMP%/opencode/rubrica-before-g3.exe` / `rubrica-after-g3.exe`，均与各自 target 产物逐字节一致）对 19 fixture + `reading.txt` 的 20 份 `--report`/`--shapes` 全量对比：仅 `html.md`（1 行 extent 630.4→630.7pt）、`notes.md`（6 行 ≤0.3pt）与新 fixture 有差，全部差异来自引注/`<sup>/<sub>` 改用 MATH 值（验收要求本身）；`--source` 前后逐字节相同；探针 `--shapes` 钉住：下标宽 7.08（0.73em）、沉 0.204em；上标/引注/`<sup>` 同宽 7.08、升 0.366em（前 6.79 / 0.62em）；subsuper 报告 `scripts: 5 raised, 5 lowered`（前无该行；census 947→929、copy 1448→1428、strike 2→4）。收尾闸门全绿：test 251+36+99+117+53+4+7+64+19、clippy 默认与 `--features pdf`、release build、`git diff --check`；偏离与观感待确认项已入 §3-G3。改动未提交，等 master 复核。
+- 2026-10-17 G3 子 agent（`ses_eb8b011c0ffelOWA9muJltqYqS`）：`rubrica-doc` 侧实现完成并自测全绿——新 `scripts.rs`（后缀扫描 + 栈式贪心配对 + 转义/代码/对象/宽度≥2/已消费分隔符五道拒绝 + `\ `→NBSP；`apply` 排序后 `merge`，spans/sources/objects/actions 同步搬家）；`Builder` 单 `~` 解偷（`strike_literal` 栈，起止 run 皆 1 个未转义 `~` 时不压 `STRIKETHROUGH`）；`Block::close` 里正文与表格 cell 各跑一次。`tests/model.rs` 新增 13 个测试（Pandoc 对照、快照全组合 10^4 语料、长串/深嵌套、source map 与 span 覆盖不变量），跑出并修掉 2 个真 bug（整段被转义 piece 误判为 run；replacement span 未排序导致 NBSP 未并入邻 span）与 3 个测试断言问题（`x\^y^z` 期望按 pandoc 实测定为字面、`find('d')` 撞 `and` 的 d、引用号与上标合并成一条 run）。`cargo test -p rubrica-doc --locked`：99 通过 / 0 失败。
+- 2026-10-17 G3 子 agent（`ses_eb8b011c0ffelOWA9muJltqYqS`）：现状核实与方案落盘 §3-G3——pulldown 探针（单 `~` 会被当 Strikethrough 偷走、`event_range` 是整个 span、`ENABLE_SUBSCRIPT` 不满足 Pandoc intraword）、pandoc 3.10 约 60 例对照（`\ `→NBSP、`\^`/`\~` 不参与配对、跨代码 span、交叉配对拒绝、栈式贪心）、Cambria Math 常量 73/750/418；方案定案（新 `scripts.rs` 后缀扫描 + `Builder` 解偷 + MATH 常数化 `ScriptMetrics` + `--report` scripts 行 + `fixtures/subsuper.md`），偏离项（run≥2 字面、对象不与配对）已写明。开始实现 `rubrica-doc`。
 - 2026-10-17 master：G2 复核通过——四闸门亲跑全绿（250+36+86+117+53+4+7+64+19）；抽查 `fixtures/html.md` 前后数字、`--source` 逐字节、18 个既有 fixture 报告 0 差异、三条 `--shapes` glyph run 全部一致；G2 标 `已完成` 并本地提交 `feat: read html by what its tags mean`；恢复区切至 G3。另记：昨日 master 误用 `--version` 裸启动 GUI 副本（开窗/占托盘），用户手动清理且自始未受影响——「验证只用无头模式」已写入 §0。
 - 2026-10-16 晚 用户关机暂停：G2 子 agent 已自报完成（实现+验收 1–7+四闸门自绿，改动未提交）；master 遵从用户指示不做复核、不派新子 agent；暂停记录与恢复步骤已写入 §1，复核与提交推迟到下次开工。
 - 2026-10-16 G2 子 agent（`ses_ebb6df8d8ffexGa2NoiqL32Gag`）：G2 实现与验收 1–7 全部完成，四闸门全绿（test 250+36+86+117+53+4+7+64+19、clippy 默认与 `--features pdf`、release build、`git diff --check`；无新增 `#[allow]`）；`fixtures/html.md` + `html-fig.png`/`html-wide.png` + `fixtures/README.md`、`README.md`、`IMPLEMENTATION.md` 同步；前后数字钉上验收：html.md `21 blocks/1637pt/1 code block` → `18/1719pt/3 code blocks + images 4/3/1`，zoom 两分支 `486.0×202.5pt`（无 zoom，栏宽收缩）vs `469.8×195.8pt`（87% 先于栏宽适配）；`--shapes` 三条 glyph run（`<sub>` +3.6dip、`<sup>` 与脚注引注号同为 −11.16dip、宽 6.79）钉住验收①；16 个既有 fixture（含 mermaid×9、notes）前后报告逐字节一致、`--source` 视图逐字节一致；报告 `images` 行与脚注 census 修正（`mc<sup>2</sup>` 不再误计引注）落盘。§1 改「等待 master 复核」，简报已出。

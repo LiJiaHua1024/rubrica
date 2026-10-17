@@ -3235,6 +3235,9 @@ fn new_view(path: Option<PathBuf>, extra: Vec<PathBuf>) -> Result<(Box<View>, cr
     if let Some(measure) = saved.measure {
         theme.set_measure(measure);
     }
+    // Before the first layout, so a start-up never shows one script size and then
+    // changes it: the numbers come from the face this machine would set a formula in.
+    theme.learn_scripts(&font);
     let dark = saved.dark.unwrap_or_else(system_prefers_dark);
 
     let lang_choice = crate::settings::language();
@@ -4110,6 +4113,10 @@ impl View {
         preferences.text = reading::text_options_for(path.as_deref(), preferences.text);
         let profile = crate::profiles::selected(preferences.plain.unwrap_or_else(|| reading::is_plain(path.as_deref())));
         if profile != "Default" { crate::profiles::load(&profile).apply(&mut self.theme); }
+        // A profile may name another formula face, and the script geometry follows
+        // the face: without this a page's `x^2^` would keep the size of the face the
+        // last profile named.
+        self.theme.learn_scripts(&self.font);
         self.profile = profile;
         let plain = preferences.plain.unwrap_or_else(|| reading::is_plain(path.as_deref()));
         let can_window = plain && !preferences.source && path.as_deref().is_some_and(|p| {
@@ -6398,6 +6405,7 @@ impl View {
         let profile = crate::profiles::selected(self.plain_override.unwrap_or_else(|| reading::is_plain(self.path.as_deref())));
         if profile != self.profile {
             crate::profiles::load(&profile).apply(&mut self.theme);
+            self.theme.learn_scripts(&self.font);
             self.profile = profile;
         }
         self.refresh_chapter_index(None);
@@ -6524,6 +6532,7 @@ impl View {
 
     fn apply_profile(&mut self, name: String, hwnd: HWND) {
         crate::profiles::load(&name).apply(&mut self.theme);
+        self.theme.learn_scripts(&self.font);
         self.profile = name;
         self.relayout_in_place(hwnd);
         self.remember();
@@ -9239,6 +9248,7 @@ impl View {
                 // theme its own profile asked for.
                 if page.profile != self.profile {
                     crate::profiles::load(&page.profile).apply(&mut self.theme);
+                    self.theme.learn_scripts(&self.font);
                     self.profile = page.profile.clone();
                 }
                 self.give_page(&mut page);
@@ -9284,6 +9294,7 @@ impl View {
         if let Some(mut page) = self.pages.remove(&previous) {
             if page.profile != self.profile {
                 crate::profiles::load(&page.profile).apply(&mut self.theme);
+                self.theme.learn_scripts(&self.font);
                 self.profile = page.profile.clone();
             }
             self.give_page(&mut page);
@@ -9650,6 +9661,7 @@ impl View {
         let profile = crate::profiles::selected(self.plain_override.unwrap_or_else(|| reading::is_plain(self.path.as_deref())));
         if profile != self.profile {
             crate::profiles::load(&profile).apply(&mut self.theme);
+            self.theme.learn_scripts(&self.font);
             self.profile = profile;
         }
         self.refresh_chapter_index(index);
@@ -11723,6 +11735,9 @@ pub(crate) fn export_png(
     if !font.probe() {
         return Err("no usable font face".into());
     }
+    // A script's geometry comes from the formula face, which needs the engine: the
+    // theme above was assembled without one and learns it now, before any layout.
+    theme.learn_scripts(&font);
     let _ = unsafe {
         CoInitializeEx(None, COINIT_APARTMENTTHREADED)
     };
@@ -11960,6 +11975,9 @@ pub fn export_pdf(
     if !font.probe() {
         return Err("no usable font face".into());
     }
+    // A script's geometry comes from the formula face, which needs the engine: the
+    // theme above was assembled without one and learns it now, before any layout.
+    theme.learn_scripts(&font);
     let store = ImageStore::new().ok();
     let base = input_path.and_then(Path::parent);
     let mut math = crate::math::MathStore::new();

@@ -94,7 +94,11 @@ ligatures, emoji, and bidirectional text remain selectable. Page breaks are plan
 
 CommonMark and GFM: headings, paragraphs, lists (ordered, nested, task lists), block
 quotes, fenced code with syntax colouring, tables with alignment and rules on every row
-and column, images, links and footnotes, strikethrough, autolinks, raw HTML read for its
+and column, images, links and footnotes, strikethrough, autolinks, Pandoc's `H~2~O` and
+`x^2^` scripts (the scale and the shift are read from the formula face's `MATH` table,
+so a script, a `<sup>` and a footnote's `¹` are set with one pair of numbers; a mark
+alone, or a run of two or more, is printed as written rather than read as Pandoc's
+degenerate empty script), raw HTML read for its
 meaning -- `<b>` and `<i>` dress their words, `<sub>`/`<sup>` set as real scripts,
 `<br>` and separator tags part fields, `<img>` draws the figure it names (Typora's
 `style="zoom:87%"` included), a whole `<table>` or `<details>` is shown as the source it

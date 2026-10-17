@@ -84,6 +84,10 @@ pub fn report(source: &str, path: Option<&str>, o: &Options) -> Result<()> {
     if Measure::ALL.get(measure).is_some() {
         theme.set_measure(measure);
     }
+    // The script geometry is the formula face's, so it is read here -- after the
+    // profile and the command line have had their say about which face that is --
+    // rather than inside `Theme::default`, which has no font engine to ask.
+    theme.learn_scripts(&font);
     let plain = plain.unwrap_or_else(|| crate::reading::is_plain(path.map(std::path::Path::new)));
     // The same paragraph rule the window opens the file with, so a report and a
     // reader agree about where a log file's lines end.
@@ -446,6 +450,27 @@ pub fn report(source: &str, path: Option<&str>, o: &Options) -> Result<()> {
         println!(
             "math         : {asked} formulae, {set} set from [{}], {bars} rules drawn, {measured} measured from a MATH table",
             families.join(", ")
+        );
+    }
+    // Scripts written as `x^2^` leave no mark of their own on the page: a raised run
+    // is the very thing a citation's `¹` or an author's `<sup>` writes. The counts
+    // therefore come from the reading itself, kept per block, and this line stands
+    // only on a page that used the syntax -- a citation-only page prints none. What
+    // follows the counts is where the two marks were set from, which is the formula
+    // face when one on this machine carries a `MATH` table and the design's own
+    // numbers when none does.
+    let (raised, lowered) = shown.iter().fold((0usize, 0usize), |(r, l), b| {
+        (r + b.scripts.raised, l + b.scripts.lowered)
+    });
+    if raised > 0 || lowered > 0 {
+        let from = if theme.scripts_from.is_empty() {
+            "the design's own numbers".to_string()
+        } else {
+            format!("the MATH table of {}", theme.scripts_from)
+        };
+        println!(
+            "scripts      : {raised} raised, {lowered} lowered run(s); {:.3}em scale, {:.3}em raise, {:.3}em sink from {from}",
+            theme.scripts.scale, theme.scripts.raise, theme.scripts.sink
         );
     }
     // Diagrams, counted from the store and the source rather than from the ops: the

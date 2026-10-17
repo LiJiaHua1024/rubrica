@@ -11,6 +11,7 @@ cargo run -q -p rubrica-app -- --report --width 900 fixtures/mermaid-flow.md
 cargo run -q -p rubrica-app -- --report --width 900 fixtures/mermaid-tree.md
 cargo run -q -p rubrica-app -- --report --width 900 fixtures/html.md
 cargo run -q -p rubrica-app -- --report --width 900 --no-html-images fixtures/html.md
+cargo run -q -p rubrica-app -- --report --width 900 fixtures/subsuper.md
 ```
 
 - `notes.md` exercises footnotes, citations, table layout, and formulas in cells.
@@ -35,6 +36,15 @@ cargo run -q -p rubrica-app -- --report --width 900 --no-html-images fixtures/ht
   The report's `images` line counts figures per source and prints each one's placed
   size. `--no-html-images` reports the same page with every `<img>` read as its alt
   words instead of its box; `--source` shows the file byte for byte.
+- `subsuper.md` exercises Pandoc's `~`/`^` scripts: intraword pairs both ways
+  (`H~2~O`, `2^10^`), CJK and emphasis inside a pair, the escaped space
+  (`x^a\ b^`, printed as a non-breaking space) against the refused plain one, the
+  author's own escaped marks (`\~`, `\^`), unpaired marks and runs of two or more
+  left literal, `~~deletion~~` untouched, the writer's own `x^$a$^` left literal
+  around a formula, and inline/fenced code immune. The report's `scripts` line
+  prints the raised/lowered counts and the three numbers the marks were set with
+  (from the formula face's `MATH` table); `--shapes` shows a script's run beside a
+  citation's mark, the two the same size and raise.
 
 The parser tests also read these exact files so their document structure remains
 reproducible without a font or a desktop session.
