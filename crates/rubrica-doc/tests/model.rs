@@ -369,7 +369,7 @@ fn an_image_becomes_one_object_box_not_prose() {
     assert_eq!(b.objects.len(), 1, "{b:?}");
     let o = &b.objects[0];
     assert_eq!(&b.text[o.range.clone()], "\u{FFFC}");
-    let rubrica_doc::ObjectKind::Image { src, alt } = &o.kind else {
+    let rubrica_doc::ObjectKind::Image { src, alt, .. } = &o.kind else {
         panic!("the image became {:?}", o.kind)
     };
     assert_eq!(src, "img/a.png");
@@ -455,7 +455,7 @@ fn a_cells_object_is_registered_where_its_placeholder_stands() {
     assert_eq!(
         cell.objects.iter().map(|o| o.kind.clone()).collect::<Vec<_>>(),
         vec![
-            rubrica_doc::ObjectKind::Image { src: "x.png".into(), alt: "p".into() },
+            rubrica_doc::ObjectKind::Image { src: "x.png".into(), alt: "p".into(), html: false, zoom: None },
             rubrica_doc::ObjectKind::Math { source: "y^2".into(), display: false },
         ],
         "both objects reach the cell, in the order the author wrote them"
@@ -692,13 +692,18 @@ fn a_citation_action_points_at_its_number_and_not_at_the_note() {
 fn a_raw_html_block_keeps_its_words_and_loses_its_markup() {
     // The alternative is the old behaviour, which is a document with a paragraph that
     // only exists as `<p>` tags: an author who wraps prose in a div for one class
-    // attribute is not announcing that the prose may be thrown away.
+    // attribute is not announcing that the prose may be thrown away. The `<b>` is not
+    // markup to be shown either: it is the weight of the word it wraps.
     let doc = Document::parse("<div class=\"note\">\nSee the <b>words</b>.\n</div>\n");
     assert_eq!(doc.blocks.len(), 1, "{:?}", doc.blocks);
     assert_eq!(doc.blocks[0].text, "See the words.");
     assert_eq!(
         doc.blocks[0].spans,
-        vec![rubrica_doc::Span { range: 0..14, style: InlineStyle::EMPTY }]
+        vec![
+            rubrica_doc::Span { range: 0..8, style: InlineStyle::EMPTY },
+            rubrica_doc::Span { range: 8..13, style: InlineStyle::STRONG },
+            rubrica_doc::Span { range: 13..14, style: InlineStyle::EMPTY },
+        ]
     );
 }
 
@@ -731,7 +736,12 @@ fn an_img_tag_becomes_the_figure_it_names() {
         b.objects,
         vec![rubrica_doc::ObjectSpan {
             range: 0..3,
-            kind: rubrica_doc::ObjectKind::Image { src: "shot.png".into(), alt: "A shot".into() }
+            kind: rubrica_doc::ObjectKind::Image {
+                src: "shot.png".into(),
+                alt: "A shot".into(),
+                html: true,
+                zoom: None,
+            }
         }]
     );
 }
@@ -757,6 +767,174 @@ fn a_comment_hides_nothing_else_and_a_loose_angle_bracket_stays() {
     let doc = Document::parse("<div><!-- 3 < 4 & 5 --></div>\n<p>x < y</p>\n");
     assert_eq!(doc.blocks.len(), 1, "{:?}", doc.blocks);
     assert_eq!(doc.blocks[0].text, "x < y");
+}
+
+// --- the semantics of raw HTML ----------------------------------------------
+
+/// The run of text carrying `flag`, which is what a tag that means something must
+/// cover -- one word and not its neighbours.
+fn run_of(b: &rubrica_doc::Block, flag: InlineStyle) -> String {
+    let s = b
+        .spans
+        .iter()
+        .find(|s| s.style.contains(flag))
+        .unwrap_or_else(|| panic!("no {:?} span in {:?}", flag, b.spans));
+    b.text[s.range.clone()].to_string()
+}
+
+/// The style over `word`, wherever it sits in the block's text. A word with the
+/// reader's own type merges into the run beside it, so the span is the one covering
+/// the word rather than the one equal to it.
+fn style_of(b: &rubrica_doc::Block, word: &str) -> InlineStyle {
+    let at = b.text.find(word).unwrap_or_else(|| panic!("{word:?} is not in {:?}", b.text));
+    let range = at..at + word.len();
+    b.spans
+        .iter()
+        .find(|s| s.range.start <= range.start && s.range.end >= range.end)
+        .unwrap_or_else(|| panic!("no span covers {word:?}"))
+        .style
+}
+
+#[test]
+fn a_sub_or_sup_tag_is_the_position_it_names() {
+    let b = &Document::parse("H<sub>2</sub>O and 2<sup>3</sup>\n").blocks[0];
+    // The tags are gone and the letters they marked are where the author put them, so
+    // the formula reads as a formula.
+    assert_eq!(b.text, "H2O and 23");
+    assert_eq!(run_of(b, InlineStyle::SUBSCRIPT), "2");
+    assert_eq!(run_of(b, InlineStyle::SUPERSCRIPT), "3");
+}
+
+#[test]
+fn the_formatting_tags_keep_their_words_and_lose_their_markup() {
+    let src = "a <b>b</b> <strong>c</strong> <i>d</i> <em>e</em> <code>f</code> \
+               <del>g</del> <span class=\"x\">h</span> <u>i</u> <mark>j</mark>\n";
+    let b = &Document::parse(src).blocks[0];
+    assert_eq!(b.text, "a b c d e f g h i j", "no tag name may reach the text");
+    assert!(!b.text.contains('<') && !b.text.contains('>'), "{:?}", b.text);
+    assert_eq!(run_of(b, InlineStyle::STRONG), "b");
+    assert_eq!(run_of(b, InlineStyle::EMPHASIS), "d");
+    assert_eq!(run_of(b, InlineStyle::CODE), "f");
+    assert_eq!(run_of(b, InlineStyle::STRIKETHROUGH), "g");
+    // `span`, `u` and `mark` ask for something the page has no answer for, so their
+    // words stay and the ask is dropped with the markup.
+    assert_eq!(style_of(b, "h"), InlineStyle::EMPTY);
+    assert_eq!(style_of(b, "i"), InlineStyle::EMPTY);
+    assert_eq!(style_of(b, "j"), InlineStyle::EMPTY);
+    // A second pair of the same weight is the same weight: `strong` is `b`.
+    assert_eq!(
+        b.spans.iter().filter(|s| s.style.contains(InlineStyle::STRONG)).count(),
+        2,
+        "{:?}",
+        b.spans
+    );
+}
+
+#[test]
+fn a_separator_tag_parts_two_fields_with_one_space() {
+    // A pasted table fragment arrives without its `<table>`: the row and cell tags part
+    // the fields, they do not swallow them or weld them together.
+    let b = &Document::parse("<tr><td>12</td><td>34</td></tr>\n").blocks[0];
+    assert_eq!(b.text, "12 34");
+    // CJK writing puts no space between two ideographs: the face already leaves one.
+    let b = &Document::parse("<tr><td>中</td><td>文</td></tr>\n").blocks[0];
+    assert_eq!(b.text, "中文");
+    // Digits beside an ideograph are two writings, and the space between them stays.
+    let b = &Document::parse("<tr><td>12</td><td>字</td></tr>\n").blocks[0];
+    assert_eq!(b.text, "12 字");
+    // And a fragment in the middle of a sentence is parted the same way.
+    let b = &Document::parse("cells <td>12</td><td>34</td> end\n").blocks[0];
+    assert_eq!(b.text, "cells 12 34 end");
+}
+
+#[test]
+fn a_whole_construction_is_read_as_the_source_it_was_written_as() {
+    // A table is the shape of its rows, and a reading that keeps the words and drops
+    // the shape has lost the point: the source is what the reader is owed, in the one
+    // form where every tag can be seen.
+    let src = "<table>\n<tr><td>a</td><td>1</td></tr>\n</table>\n";
+    let doc = Document::parse(src);
+    assert_eq!(doc.blocks.len(), 1, "{:?}", doc.blocks);
+    let b = &doc.blocks[0];
+    assert_eq!(b.kind, BlockKind::Code);
+    assert_eq!(b.lang.as_deref(), Some("html"), "the source is highlighted as markup");
+    assert_eq!(b.text, "<table>\n<tr><td>a</td><td>1</td></tr>\n</table>");
+    // A disclosure is a construction too.
+    let b = &Document::parse("<details>\n<summary>t</summary>\nbody\n</details>\n").blocks[0];
+    assert_eq!(b.kind, BlockKind::Code);
+    assert_eq!(b.lang.as_deref(), Some("html"));
+    assert!(b.text.contains("<summary>t</summary>"));
+    // A half-written table is prose with markup in it: the words are the reader's.
+    let b = &Document::parse("<table><tr><td>a</td></tr>\n").blocks[0];
+    assert_eq!(b.kind, BlockKind::Paragraph);
+    assert_eq!(b.text, "a");
+    assert!(b.objects.is_empty());
+}
+
+#[test]
+fn an_img_tag_keeps_its_name_and_the_size_its_author_gave_it() {
+    // The tag a Typora paste writes: the figure, its name, and the size as a percentage
+    // the figure is scaled to before the column has its say.
+    let b = &Document::parse("<img src=\"a.png\" alt=\"A\" style=\"zoom:87%\">\n").blocks[0];
+    assert_eq!(
+        b.objects,
+        vec![rubrica_doc::ObjectSpan {
+            range: 0..3,
+            kind: rubrica_doc::ObjectKind::Image {
+                src: "a.png".into(),
+                alt: "A".into(),
+                html: true,
+                zoom: Some(87),
+            }
+        }]
+    );
+    // A style with other properties in it still gives up its zoom, and a style with
+    // none says nothing: the figure keeps its natural size.
+    let zoom = |src: &str| match &Document::parse(src).blocks[0].objects[0].kind {
+        rubrica_doc::ObjectKind::Image { zoom, .. } => *zoom,
+        other => panic!("not a figure: {other:?}"),
+    };
+    assert_eq!(zoom("<img src=\"a.png\" style=\"color: red; zoom: 87%;\">\n"), Some(87));
+    assert_eq!(zoom("<img src=\"a.png\" style=\"zoom:0.5\">\n"), None);
+    assert_eq!(zoom("<img src=\"a.png\" style=\"zoom:0%\">\n"), None);
+    assert_eq!(zoom("<img src=\"a.png\">\n"), None);
+    // In the middle of a sentence the same tag is the same figure, and its own name
+    // never reaches the prose it stands in.
+    let b = &Document::parse("see <img src=\"b.png\" alt=\"B\"> here\n").blocks[0];
+    assert_eq!(b.text, "see \u{FFFC} here");
+    assert_eq!(b.objects.len(), 1, "{b:?}");
+}
+
+#[test]
+fn turning_html_images_off_leaves_their_names_and_not_their_boxes() {
+    let off = || rubrica_doc::ParseOptions { html_images: false, ..Default::default() };
+    // The name the figure carries is the text that stands in its place, in a sentence
+    // and in a block alike.
+    let b = &Document::parse_with("see <img src=\"a.png\" alt=\"A shot\"> here\n", off()).blocks[0];
+    assert_eq!(b.text, "see A shot here");
+    assert!(b.objects.is_empty(), "{b:?}");
+    let b = &Document::parse_with("<p><img src=\"a.png\" alt=\"A shot\"></p>\n", off()).blocks[0];
+    assert_eq!(b.text, "A shot");
+    assert!(b.objects.is_empty(), "{b:?}");
+    // A figure with no name leaves nothing, exactly as it would on a page whose
+    // images never arrived -- and Markdown's own figures are not the switch's to take.
+    assert!(Document::parse_with("<p><img src=\"a.png\"></p>\n", off()).blocks.is_empty());
+    let doc = Document::parse_with("see ![A shot](a.png) here\n", off());
+    assert_eq!(doc.blocks[0].objects.len(), 1, "{:?}", doc.blocks);
+}
+
+#[test]
+fn a_mis_nested_tag_costs_one_word_and_not_the_passage_after_it() {
+    // Authors write tags the way they think them, and a count answers a `</b>` with no
+    // `<b>` by closing what is open rather than holding the mismatch against the rest
+    // of the page.
+    let b = &Document::parse("a <b>b<i>c</b>d</i> e\n").blocks[0];
+    assert_eq!(b.text, "a bcd e");
+    assert!(style_of(b, "b").contains(InlineStyle::STRONG));
+    assert!(style_of(b, "c").contains(InlineStyle::STRONG | InlineStyle::EMPHASIS));
+    assert!(style_of(b, "d").contains(InlineStyle::EMPHASIS));
+    // The sentence after the tags is the reader's own type again.
+    assert_eq!(style_of(b, " e"), InlineStyle::EMPTY);
 }
 
 #[test]
@@ -858,7 +1036,7 @@ fn reader_newline_policy_preserves_breaks_without_changing_block_structure() {
     use rubrica_doc::ParseOptions;
     let source = "# Title\n\nfirst **bold**\nsecond\n\n- one\n  continuation\n\n```txt\na\nb\n```";
     let merged = Document::parse(source);
-    let kept = Document::parse_with(source, ParseOptions { keep_line_breaks: true });
+    let kept = Document::parse_with(source, ParseOptions { keep_line_breaks: true, ..ParseOptions::default() });
     assert_eq!(merged.blocks.len(), kept.blocks.len());
     assert_eq!(merged.blocks[1].text, "first bold second");
     assert_eq!(kept.blocks[1].text, "first bold\nsecond");
@@ -870,7 +1048,7 @@ fn reader_newline_policy_preserves_breaks_without_changing_block_structure() {
 
 #[test]
 fn kept_newlines_still_allow_definition_lists() {
-    let doc = Document::parse_with("A term\n: its definition\n", rubrica_doc::ParseOptions { keep_line_breaks: true });
+    let doc = Document::parse_with("A term\n: its definition\n", rubrica_doc::ParseOptions { keep_line_breaks: true, ..Default::default() });
     assert_eq!(doc.blocks[0].kind, BlockKind::Term);
     assert_eq!(doc.blocks[1].kind, BlockKind::Definition);
     assert_eq!(doc.blocks[1].text, "its definition");
@@ -1129,7 +1307,7 @@ fn an_images_alt_text_takes_every_inline_the_author_wrote_in_it() {
         let b = &Document::parse(src).blocks[0];
         assert_eq!(b.objects.len(), 1, "{b:?}");
         match &b.objects[0].kind {
-            rubrica_doc::ObjectKind::Image { src, alt } => (src.clone(), alt.clone()),
+            rubrica_doc::ObjectKind::Image { src, alt, .. } => (src.clone(), alt.clone()),
             other => panic!("not a figure: {other:?}"),
         }
     };

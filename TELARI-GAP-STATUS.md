@@ -2,7 +2,7 @@
 
 > 权威差距依据：`TELARI-GAP.md`（2026-10-16 调研，对照 Telari 0.6.3）。第五节"已领先"不计入目标。
 > 本文件是唯一进度权威：会话上下文只是缓存；恢复只看本文件。事件发生（完成子步骤、跑完闸门、换子 agent）时立刻更新，不攒批。
-> 建账：2026-10-16（冷启动）。最近更新：2026-10-16 G1 完成并提交（master 二轮复核通过）；当前条目切至 G2（待启动子 agent）。
+> 建账：2026-10-16（冷启动）。最近更新：2026-10-17 G2 复核通过并提交；当前条目切至 G3（待启动子 agent）。
 
 ## 0. 用户侧操作（照此执行）
 
@@ -10,17 +10,18 @@
 - 恢复：打开同一会话（`/sessions`）继续；上下文脏了就开新会话，把原始提示词再粘一次，master 检测到本文件会自动接上。
 - 最短恢复指令：`继续 goal-driven 流程：读 TELARI-GAP-STATUS.md 恢复进度，按恢复区的"下一步动作"接着做，不要从头开始。`
 - 硬约束：绝不 push；一个条目一个提交；不 amend / rebase / reset 已提交历史；不修改 `TELARI-GAP.md` 调研正文。
+- **运行约束（用户 2026-10-17 强调）**：验证一律用无头模式（`--report`、`--report --shapes`、带导出参数的 CLI），**绝不裸启动 GUI 进程**——连 `--version` 这类未识别参数都会把窗口/托盘拉起来；用户可能正在用 Rubrica，托盘单实例会被顶掉。
 - 用户未提交的无关改动：`.freebuff/`（未跟踪目录）、`TELARI-GAP.md`（未跟踪，证据基线）——保留不动，已记账。
 
 ## 1. 恢复区（子 agent 运行时由子 agent 实时维护；master 复核后刷新）
 
-- 当前条目：**G2 HTML 的语义处理**（进行中，待启动子 agent；先核实现状再动手）
-- 上一条目结论：**G1 Mermaid 已完成**（2026-10-16 master 第二轮复核：四闸门亲跑全绿——test 248+36+79+117+53+4+7+64+19、clippy 默认+`--features pdf`、release build、`git diff --check`；抽查 `fixtures/mermaid-tree.md` → `2 fence(s), 2 drawn, 15 element(s), 12 link(s), 24 shape(s), 18 label(s)`、kind 显示 `tree view`；`mermaid-flow.md` 场景 338.6 x 732.1pt、计数不变、`bounds` 全绿；`mermaid-broken.md` 拒绝文案已含 tree view → 判定达成，本地提交 `feat: draw mermaid fences as diagrams`）。窗口/`--peek`/PDF 观感属需人工确认，已记录。
-- 当前条目内的下一步动作：启动 G2 后台子 agent（先回源码核实 HTML/`<img>` 现状与差距文档说法是否一致，再按 §3-G2 验收口径动手；G2 未提交改动与后续台账编辑随 G2 提交）。
-- 后台子 agent sessionID：`待填`（G2；G1 的两个子会话均已完成，不复用）
-- 未提交改动清单：G1 全部改动已提交；本节及之后的台账编辑随 G2 提交。
+- 当前条目：**G3 `x^2^` / `H~2~` 上下标语法**（进行中，待启动子 agent）
+- 上一条目结论：**G2 HTML 的语义处理 已完成**（2026-10-17 master 复核：四闸门亲跑全绿——test 250+36+86+117+53+4+7+64+19、clippy 默认+`--features pdf`、release build、`git diff --check`；抽查 `fixtures/html.md` 前后数字逐条吻合——后 `18 blocks/1719pt`、`images: 4/3/1`；`--no-html-images` `18/1290pt`、`1/0/0`；前 21/1637pt、无 images 行；`--source` 前后逐字节相同；18 个既有 fixture 报告 0 差异；`--shapes` 三条 glyph run 与台账一致（sub 下沉 3.6dip、sup 与引注号同位移同宽 6.79）→ 判定达成，本地提交 `feat: read html by what its tags mean`）。需人工确认项（开关关闭时 alt 取舍、窗口/peek 观感）已记录。
+- 当前条目内的下一步动作：启动 G3 后台子 agent（先回源码核实现状、方案写进 §3-G3 再动手；验收：`x^2^`/`H~2~` 真上下标、字号与升降取自 MATH 常量、与脚注引注号共用尺寸、代码/行内代码内不生效、`\^`/`\~` 转义、`~~删除线~~` 不受影响）。
+- 后台子 agent sessionID：`待填`（G3）
+- 未提交改动清单：G2 全部改动已提交；此后台账编辑随 G3 提交。
 - 已知阻塞：无
-- 基线状态：2026-10-16 `cargo test --workspace --locked` 全绿（冷启动基线，master 亲跑）
+- 基线状态：2026-10-16 `cargo test --workspace --locked` 全绿（冷启动基线，master 亲跑）；G2 收尾复跑 250+36+86+117+53+4+7+64+19、0 失败
 - 分工约定：子 agent 拥有当前条目（§3.x 明细 + 本恢复区 + §5 日志）的写权，实时落盘；master 拥有状态总表（§2）、复核结论与 commit。一次只有一条 `进行中`，同一时刻只有一个写代码的子 agent。
 
 ## 2. 条目状态总表
@@ -33,8 +34,8 @@
 | # | 条目 | 状态 | 证据 |
 | --- | --- | --- | --- |
 | 1 | Mermaid 图表渲染 —— 最大空白 | 已完成 | §3.1（提交 `feat: draw mermaid fences as diagrams`） |
-| 2 | HTML 的语义处理 | 未开始 | — |
-| 3 | `x^2^` / `H~2~` 上下标语法 | 未开始 | — |
+| 2 | HTML 的语义处理 | 已完成 | §3.2（提交 `feat: read html by what its tags mean`） |
+| 3 | `x^2^` / `H~2~` 上下标语法 | 进行中 | §3.3（子 agent 待启动） |
 | 4 | `==highlight==` 荧光标记 | 未开始 | — |
 
 ### 第二节 引擎能力已有、只是没暴露成选项
@@ -145,7 +146,38 @@
 ### G2 明细（HTML 的语义处理）
 
 - **验收口径**：`<sub>`/`<sup>` 画成真上下标；`<b>`、`<span>` 等格式标签剥掉、文字接上；`<td>`、`<br>` 分隔标签掉字不粘字（`12 34`；中英文之间不插空格）；块级 HTML（`<table>`、`<details>`）以源码样式完整显示、纯包裹标签不显示；`<img>` 可显示（含 Typora 的 `style="zoom:87%"`），有"Show HTML image tags"开关。
-- 证据：—
+- 现状核实（2026-10-16，源码逐条核对 `crates/rubrica-doc/src/lib.rs` + 既有测试，差距文档 §一.2 的说法需要修正）：
+  - 差距文档称 "`Event::Html | Event::InlineHtml` 一律按 `InlineStyle::DELIMITER` 当文本画（`lib.rs:366`）——整块 HTML 会铺满版面"：**不成立**。该行（现 `lib.rs:379`）在 `Document::source` 里，是**源码视图**路径，本就应当逐字显示，不动。阅读视图（`parse_with`）对 `Event::Html` 走 `set_html`/`html_pieces`：块内文字保留、标记剥掉、`<img>`→图元、`<h1-6>`→标题、`<hr>`→分隔线、`<script>` 等非散文元素整段隐藏（测试 `a_raw_html_block_keeps_its_words_and_loses_its_markup`、`htmls_block_level_tags_end_the_line_they_arrive_on`、`an_img_tag_becomes_the_figure_it_names`、`a_scripts_words_are_not_prose`）。
+  - "HTML 图片不显示"：**部分不成立**。整块 HTML 里的 `<img>` 已有图片对象（上列测试）；缺的是 ① 行内 `<img>`（句子中间的 `<img …>`，`Event::InlineHtml` 只认 `<br>`，其余直接丢）② Typora 的 `style="zoom:87%"` 完全不读（`attr` 只取 src/alt）。
+  - "`<sub>/<sup>` 不成上下标"：**成立**（未知行内标签一律丢，`InlineStyle` 只有 `SUPERSCRIPT`，位 0..7 已用满，加 `SUBSCRIPT` 需把 `u8` 放宽到 `u16`）。
+  - `<b>/<i>/<em>/<strong>/<span>`：标签已剥、文字已接（`a_br_tag_breaks_the_line_like_a_backslash` 第 3 段），但**不带语义**：`<b>` 不加粗、`<i>` 不斜体、`<code>` 不是行内代码，块内 HTML 路径同样全平。
+  - `<td>12</td><td>34</td>`：行内路径直接粘成 `1234`（丢标签不补边界）；块路径把 `td/th/tr` 当块级结束符 → `12`、`34` 两个块，与验收"读作 12 34、CJK 之间不插空格"都不符。`<br>` 已是强制换行（保持）。
+  - 块级 HTML：现在一律剥标签取字（`<table>` 会变成一串 `12 34` 文字），无"完整构造成源码样式显示"的概念；`<div>` 包裹已不显示其标签（保持，验收要求的"纯包裹标签不显示"成立）。
+  - 开关：不存在；设置（菜单）里也没有入口。
+- 方案（2026-10-16 定案，含取舍）：
+  - **行内语义**：`InlineStyle` 放宽到 `u16` 并新增 `SUBSCRIPT`；`tag_name` 的映射表：`b/strong`→`STRONG`、`i/em`→`EMPHASIS`、`code`→`CODE`、`del/s/strike`→`STRIKETHROUGH`、`sup`→`SUPERSCRIPT`、`sub`→`SUBSCRIPT`；`span` 与未知标签只丢标记。开/闭标签用**计数器**（`[u8; 16]`，按位计）而不是栈：作者写错嵌套或漏闭合时最坏是样式少一层，不会粘住后半篇。行内事件与块内 `Fragments` 两条路径共用同一张映射表。
+  - **上下标度量**：复用既有 `SUPERSCRIPT`（0.7em、抬升 0.62×block），`SUBSCRIPT` 同尺寸 0.7em、下沉 0.2×block（沿用 `ResolvedStyle.raise` 的正负号：负值下滑，绘制端 `dy = -raise` 已同时管 ascent 与 descent，表格单元路径同样按 `ascent.max(r.ascent + raise)` 计算）。与脚注引注号共用一套尺寸（同一 0.7em）。
+  - **分隔标签**：`td/th/tr` 为"分隔标签"（`<br>` 保持换行）：`Builder` 攒一个待补边界，在下一段文字落笔时决定——两侧都是 CJK（`rubrica_type::classify::Role::of`，与排版引擎同一分类器）则不插空格，否则补一个空格；已有空白或行首行尾不补。块路径同步：`td/th/tr` 从 `BLOCK_LEVEL` 移到分隔集合，不再切成两个块。
+  - **块级源码显示**：块内出现**完整的** `<table>…</table>` 或 `<details>…</details>`（同块内开闭配对）→ 整块原文以 `BlockKind::Code` + `lang=Some("html")` 呈现（源码样式、可高亮、可复制）；纯包裹标签（孤立的 `<div>`、`<div>…Markdown…</div>` 这种只有行内内容的包裹）仍只留文字。开闭配对判定在 `Fragments` 扫标签时顺带记录（不解析、不重排 HTML）。
+  - **`<img>`**：`ObjectKind::Image` 增 `html: bool` 与 `zoom: Option<u16>`（百分比，整数，Eq 友好）；`style` 里的 `zoom:NN%` 解析进 `zoom`；行内 `<img>` 与块内 `<img>` 都出图元；app 侧 `ImageStore::fit_zoomed`：自然尺寸 × zoom% 后再按栏宽收缩（沿用既有相对路径/alt/尺寸上限设施）。
+  - **开关**：菜单「文本阅读」子菜单加 `Show HTML image tags` 复选项（复用 `MenuTextReading` 的位置），命令 `Command::HtmlImages(bool)`，持久化到 `HKCU\Software\Rubrica\HtmlImages`（缺省=开，`DefaultHtmlImages` 语义），11 种界面语言加 `Key::MenuHtmlImages`。**关掉时** `<img>` 按**无标签的替代文字**呈现（alt 原文，空 alt 什么都不留）——这是取舍点，记为**需人工确认**（另一候选：整段按纯文本原样显示标签）。
+  - **报告**：`--report` 增加 `images` 汇总行（图元数、其中来自 `<img>` 的数、带 zoom 的数、逐图放置尺寸）与 `--no-html-images` CLI，前后对照有可复现数字。范围外（有意）：`<a>` 不变成链接、行内完整 `<table>` 不转源码、`width/height` 属性不读、`class/style` 其余样式不读。
+- 证据（2026-10-16，实现与全部验收 1–7；复核入口）：
+  - **实现落点**（"为什么"注释随代码）：
+    - `rubrica-doc/src/lib.rs`：`InlineStyle` 由 `u8` 放宽到 `u16` + `SUBSCRIPT`（bit 8）；`OpenTags`（`[u8;16]` 按位计的开标签计数器，`open` 返回"是否首个开启"、`close` 返回"是否已全关"）；`Builder.html_style`/`html_tags`/`separate` 与 `style()`（作者标记与读者标记 OR）；`Event::InlineHtml → inline_html()`（`<br>`、`<img>`、分隔标签、样式映射、未知标签丢弃）；`set_html` 处理 `Piece::{Text{text,style}, Image{src,alt,zoom}, Source}`，`push_source` 把完整构造发成 `BlockKind::Code`+`lang=Some("html")`；`put`（消费 `separate`，旧体改名 `write`）；`Fragments` 重写（`words`/`tag`/`flush`/`paragraph_end`/`shows_a_whole_element`）；`WHOLE = [table, details]`；`SEPARATORS = [td, th, tr]` 移出 `BLOCK_LEVEL`（27→24 项）；`inline_style()` 映射 `b/strong→STRONG`、`i/em→EMPHASIS`、`code→CODE`、`del/s/strike→STRIKETHROUGH`、`sup→SUPERSCRIPT`、`sub→SUBSCRIPT`；`zoom_percent()` 读 `style="zoom:87%"`（1..=1000）；`boundary_wants_space()` 用 `rubrica_type::classify::Role::of`（与断行同一分类器）。
+    - `rubrica-app`：`view.rs` 设置字段 `show_html_images` + 菜单「文本阅读」里 `check(Command::HtmlImages(!s.show_html_images), Key::MenuHtmlImages, s.show_html_images)`、`Command::HtmlImages(bool)`（记录+重排）、parse 两处与导出两处接 `html_images`、`Objects::intern` 走 `ImageStore::fit_zoomed`；`images.rs` `fit`→`fit_zoomed(path, column, zoom)`（缩放后再按栏宽收缩，只缩不放）；`theme.rs` `resolve_at` 加 `SUBSCRIPT` 分支（0.7em、`raise = -0.2×block`，与 `SUPERSCRIPT` 的 0.7em 同尺寸；两 bit 同开按上标处理=一次错嵌套而非双重变换）；`settings.rs` `show_html_images()`/`html_images_of()`/`record_show_html_images()`（`HKCU\Software\Rubrica\HtmlImages`，缺省开、非 0 都算开）；`i18n.rs` `Key::MenuHtmlImages` 11 语言；`main.rs` `--no-html-images` + `--report` 的 `html_images`；`report.rs` `Options.html_images` + `images` 汇总行 + 脚注 census 修正；`peek.rs` 预览 parse 接开关。
+  - **单测**：`rubrica-doc/tests/model.rs` 新增 7 个（`a_sub_or_sup_tag_is_the_position_it_names`、`the_formatting_tags_keep_their_words_and_lose_their_markup`、`a_separator_tag_parts_two_fields_with_one_space`、`a_whole_construction_is_read_as_the_source_it_was_written_as`、`an_img_tag_keeps_its_name_and_the_size_its_author_gave_it`、`turning_html_images_off_leaves_their_names_and_not_their_boxes`、`a_mis_nested_tag_costs_one_word_and_not_the_passage_after_it`；helpers `run_of`/`style_of`），model 79→86；`rubrica-app/src/theme.rs` `a_subscript_is_small_sunk_and_the_same_size_as_its_raised_twin`；`settings.rs` `the_html_images_switch_is_on_until_it_is_turned_off`（缺省开/0=关/垃圾值=开 + 注册表往返）。
+  - **验收①（真上下标、与脚注引注号同尺寸）**：`--report --shapes --width 900 fixtures/html.md` 的 glyph run——`H<sub>2</sub>O` 的 "2"：`left=680.45 width=6.79 baseline=135.03`（段基线 131.43 之下 3.6dip = 2.7pt = 0.2×13.5pt）；`mc<sup>2</sup>` 的 "2"：`left=149.82 width=6.79 baseline=154.66`（段基线 165.82 之上 11.16dip = 8.37pt = 0.62×13.5pt）；同段引注号 "1"：`left=366.12 width=6.79 baseline=154.66`——与上标 run 位移、宽度逐位相同（同尺寸证据）。
+  - **验收②（格式标签映射、未知标签纯文字、标签不显示）**：`the_formatting_tags_keep_their_words_and_lose_their_markup` 一条覆盖 `b`/`strong`/`i`/`em`/`code`/`del` 的映射与 `span`/`u`/`mark` 的"留字丢形"（`InlineStyle::EMPTY`），并断言文字里不出现 `<`/`>`；`a_raw_html_block_keeps_its_words_and_loses_its_markup` 断言块路径同为 `STRONG` 段；fixture 另含 `<a>`（只留字）与 `<mark>` 实例，散文段落里无标签字形（标签只在 ④ 的源码块与 ⑦ 的代码内原样出现）。
+  - **验收③（分隔标签）**：单测 `a_separator_tag_parts_two_fields_with_one_space`（块路径 `<tr><td>12</td><td>34</td></tr>` → `12 34`、`中`/`文` → `中文`、`12`/`字` → `12 字`、句中央 `<td>` 同样补空格；行内路径 `cells <td>12</td><td>34</td> end` → `cells 12 34 end`）；fixture 报告行 10 片段 `numbers, while 数据字…` + 行 11 `keeps the line bre…`（`<br>` 换行、CJK 相邻无空格）；`<br>` 的行内路径（`a_br_tag_breaks_the_line_like_a_backslash`）与表格单元路径（`a_cells_own_text_holds_its_link_its_citation_and_its_break`）两条既有测试保持全绿。
+  - **验收④（完整构造成源码、纯包裹标不显示）**：完整 `<table>`/`<details>` → `BlockKind::Code` + `lang=html`；fixture 报告 `code: 3 block(s), 3 named a language, 3 of those a language this build reads`，行 17–24 全部 Consolas（`<table>`…`</details>` 原文）；孤立 `<div>` 只有文字（报告行 12–14）；before 二进制同一 fixture 把表拆成 `a`/`b`/`c`/`d` 四个单字母块并给 `<summary>` 与正文粘成 `Kept wholeA disclo…`——正是本条目要修的两类错误。
+  - **验收⑤（`<img>` 显示、zoom 先缩放后适配）**：fixture 报告 `images: 4 figure(s), 3 from an <img> tag, 1 with a zoom`——`html-fig.png`（240×120px=180×90pt）两条（行内 `<img>` 与 Markdown `![]()` 并排只留字差异）；`html-wide.png`（720×300px=540×225pt）无 zoom：`486.0 x 202.5pt`（自然宽 540pt>栏宽 486pt，被栏宽收缩）；同文件 `zoom 87%`：`469.8 x 195.8pt`（=540×0.87，先按作者尺寸缩放后已放进栏宽、不再放大也不再缩）——把 "先缩放再适配" 的两种分支都钉在数字上；相对路径经 `ImageStore::resolve`（既有设施，含 `%XX`），alt 经 `ObjectKind::Image.alt`（开关关闭时的替身，见⑥）。
+  - **验收⑥（开关）**：菜单「文本阅读」子菜单 `Show HTML image tags`（默认勾选）+ `HKCU\Software\Rubrica\HtmlImages`（缺省=开）+ `Key::MenuHtmlImages` 11 语言（声明 + 11 个 match 臂，`Key` 是穷尽 match，缺语言不编译）；`--report --no-html-images fixtures/html.md`：`images: 1 figure(s), 0 from an <img> tag, 0 with a zoom`、行 28 变成 `a wide figure`（alt 文字上纸）、复制文本 1902 chars（+0 html 图元）。**关掉时按无标签 alt 文字处理记"需人工确认"**（另一候选为原样显示标签）。
+  - **验收⑦（代码内原样、`Document::source` 逐字、不回退）**：fixture 的 ```html 围栏与行内 `` `<sub>` `` 在报告里仍是 Consolas 字样；`--report --source fixtures/html.md` 前后二进制**逐字节相同**（61 行、1975pt，`H<sub>2</sub>O`、`<strong>`、`<img src=…` 全部按字画出）；16 个既有 fixture（chemistry/defs/delims/math_ledger/notes/rtl/reading/mermaid-×9）`--report --width 900` 前后二进制输出**逐一逐字节相同**（含 notes.md），mermaid 与全部既有能力零回退。
+  - **前后数字（`fixtures/html.md`，`--report --width 900`；"前"=`%TEMP%/opencode/rubrica-before-g2.exe`，"后"=当前 release）**：前 `blocks 21 / lines 33 / height 1637pt`、`code: 1 block(s)`、无 images 行、复制 1807 chars / 3 对象；后 `blocks 18 / lines 36 / height 1719pt`、`code: 3 block(s)`、`images: 4 figure(s), 3 from an <img> tag, 1 with a zoom`、复制 1955 chars / 4 对象；`--no-html-images` 后 `blocks 18 / lines 38 / height 1290pt`、`images: 1 figure(s), 0 from an <img> tag`、复制 1902 chars / 1 对象。`fixtures/README.md` 已加命令与说明；`README.md`（"What it reads" 的 raw HTML 句 + 菜单句）、`IMPLEMENTATION.md`（验收清单 G2 条目 + 工作日志）同步。
+  - **收尾闸门（2026-10-16，全绿）**：`cargo test --workspace --locked`（250+36+86+117+53+4+7+64+19，0 失败）；`cargo clippy --workspace --all-targets --locked -- -D warnings`；`cargo clippy -p rubrica-app --all-targets --features pdf --locked -- -D warnings`；`cargo build --release --locked`；`git diff --check`。无新增 `#[allow]`。
+  - **需人工确认**：①开关关闭时按"无标签 alt 文字"呈现（另一候选：原样显示标签），空 alt 什么都不留——取舍已按阻力最小路径落盘；②窗口/`--peek` 观感（`<sub>` 下沉 0.2em、行内 `<img>` 与文字基线的衔接、菜单勾选与持久化的现场手感）属桌面人工检查，注册表读写已有单测；③范围外（有意，不扩）：`<a>` 不变成链接、行内完整 `<table>` 不转源码、`width/height` 与其余 `style` 属性不读、`<td>` 分隔只补一个空格。
+- **master 复核通过（2026-10-17）**：四闸门亲跑全绿；`fixtures/html.md` 前后数字（后 18/1719、`images 4/3/1`；`--no-html-images` 18/1290、`1/0/0`；前 21/1637、无 images 行）、`--source` 前后逐字节相同、18 个既有 fixture 报告 0 差异、三条 `--shapes` glyph run（sub 680.45/135.03、sup 149.82/154.66、引注 366.12/154.66）全部抽查一致 → G2 判定完成，本地提交 `feat: read html by what its tags mean`。
 
 ### G3 明细（`x^2^` / `H~2~`）
 
@@ -241,6 +273,12 @@
 - G15 Space 翻页模型差异：**待核实**（差距文档只描述"模型不同"）。核实点：Space 键现行为与页栈语义。
 
 ## 5. 事件日志（倒序，追加）
+
+- 2026-10-17 master：G2 复核通过——四闸门亲跑全绿（250+36+86+117+53+4+7+64+19）；抽查 `fixtures/html.md` 前后数字、`--source` 逐字节、18 个既有 fixture 报告 0 差异、三条 `--shapes` glyph run 全部一致；G2 标 `已完成` 并本地提交 `feat: read html by what its tags mean`；恢复区切至 G3。另记：昨日 master 误用 `--version` 裸启动 GUI 副本（开窗/占托盘），用户手动清理且自始未受影响——「验证只用无头模式」已写入 §0。
+- 2026-10-16 晚 用户关机暂停：G2 子 agent 已自报完成（实现+验收 1–7+四闸门自绿，改动未提交）；master 遵从用户指示不做复核、不派新子 agent；暂停记录与恢复步骤已写入 §1，复核与提交推迟到下次开工。
+- 2026-10-16 G2 子 agent（`ses_ebb6df8d8ffexGa2NoiqL32Gag`）：G2 实现与验收 1–7 全部完成，四闸门全绿（test 250+36+86+117+53+4+7+64+19、clippy 默认与 `--features pdf`、release build、`git diff --check`；无新增 `#[allow]`）；`fixtures/html.md` + `html-fig.png`/`html-wide.png` + `fixtures/README.md`、`README.md`、`IMPLEMENTATION.md` 同步；前后数字钉上验收：html.md `21 blocks/1637pt/1 code block` → `18/1719pt/3 code blocks + images 4/3/1`，zoom 两分支 `486.0×202.5pt`（无 zoom，栏宽收缩）vs `469.8×195.8pt`（87% 先于栏宽适配）；`--shapes` 三条 glyph run（`<sub>` +3.6dip、`<sup>` 与脚注引注号同为 −11.16dip、宽 6.79）钉住验收①；16 个既有 fixture（含 mermaid×9、notes）前后报告逐字节一致、`--source` 视图逐字节一致；报告 `images` 行与脚注 census 修正（`mc<sup>2</sup>` 不再误计引注）落盘。§1 改「等待 master 复核」，简报已出。
+
+- 2026-10-16 G2 子 agent（`ses_ebb6df8d8ffexGa2NoiqL32Gag`）：现状核实完成并落 §3-G2（差距文档 §一.2 三条说法：整块 HTML 当文本画=**不成立**（那是源码视图路径）、HTML 图片不显示=**部分不成立**（块内已出图，行内/zoom 缺失）、`<sub>/<sup>` 不成上下标=**成立**）；方案定案（u16+`SUBSCRIPT`、计数器式行内样式、CJK 感知分隔、完整 `<table>/<details>` 转源码 Code 块、`ObjectKind::Image` 加 `html/zoom`、菜单开关+11 语言、`--report` images 行）；改动前二进制备份 `%TEMP%/opencode/rubrica-before-g2.exe`；下一步开始 `rubrica-doc` 实现。
 
 - 2026-10-16 master：G1 第二轮复核通过——四项闸门亲跑全绿（mermaid 53）；release 二进制抽查 `mermaid-tree.md`（2 drawn、kind `tree view`、bounds 全绿）、`mermaid-flow.md`（338.6 x 732.1pt、计数不变）、`mermaid-broken.md`（拒绝文案含 tree view）；G1 标 `已完成` 并本地提交 `feat: draw mermaid fences as diagrams`；恢复区切至 G2。
 - 2026-10-16 续作子 agent（`ses_ebba1c625ffedQ3erfhgcjuTEq`）：G1 剩余两块完成落盘——①treeView 第九图类型（解析/布局/app 接线/降级文案/`fixtures/mermaid-tree.md`/前后 `--report` 数字）；②排版不变量：新增两条语料测试（`fixtures/mermaid-*.md` 全量，边标签 backdrop 两两不碰、subgraph 面板含成员且不碰非成员盒与标签），首跑复现 flow 病灶后修三处（同边界多标签按槽分层并加宽 rank 间隙、`settle_panels` 让盒与整组让开面板、sequence fragment 标签独立条带）；README/IMPLEMENTATION/fixtures/README 已更新；台账续 8 记录证据。下一步：收尾闸门复跑 + master 复核。

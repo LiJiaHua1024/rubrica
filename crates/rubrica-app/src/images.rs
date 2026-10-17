@@ -147,12 +147,19 @@ impl ImageStore {
         read
     }
 
-    /// Fit an image into `column` points of measure, shrinking only.
+    /// Fit an image into `column` points of measure, shrinking only, after the size its
+    /// author asked for.
     ///
-    /// Upscaling a small figure to fill the column would blur it and let a diagram
-    /// compete with the prose it illustrates, so a narrow image keeps its size.
-    pub fn fit(&self, path: &Path, column: Pt) -> Option<(Pt, Pt)> {
+    /// `zoom` is the whole percentage an `<img>` tag's `style` carried, and it is
+    /// applied to the natural size before the column has its say: a figure the author
+    /// made small stays small on a wide page, and one they made large is still not
+    /// allowed to run past the measure. Upscaling a small figure to fill the column
+    /// would blur it and let a diagram compete with the prose it illustrates, so a
+    /// narrow image keeps its size.
+    pub fn fit_zoomed(&self, path: &Path, column: Pt, zoom: Option<u16>) -> Option<(Pt, Pt)> {
         let (w, h) = self.natural_size(path)?;
+        let s = zoom.map_or(1.0, |z| f32::from(z) / 100.0);
+        let (w, h) = (w * s, h * s);
         if w <= column || w <= 0.0 {
             Some((w, h))
         } else {

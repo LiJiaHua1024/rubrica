@@ -7,7 +7,7 @@
 //! what is actually painted rather than what a second implementation would have
 //! produced -- and it never touches the desktop.
 //!
-//! Run: `rubrica-app --report [file.md] [--width 1080] [--dpi 96] [--zoom 120] [--face 1] [--measure 0] [--shapes]`
+//! Run: `rubrica-app --report [file.md] [--width 1080] [--dpi 96] [--zoom 120] [--face 1] [--measure 0] [--shapes] [--no-html-images]`
 
 use std::collections::BTreeMap;
 
@@ -40,6 +40,10 @@ pub struct Options {
     /// default because it is a page of numbers per formula, not a summary.
     pub shapes: bool,
     pub keep_line_breaks: bool,
+    /// Whether an `<img>` tag renders as the figure it names. Off turns it back into
+    /// the words a tag with no tag would have said, so the same page can be reported
+    /// both ways and the figures line below is the difference.
+    pub html_images: bool,
     pub source_view: bool,
     pub plain: Option<bool>,
     pub text_options: rubrica_doc::plain::TextOptions,
@@ -58,6 +62,7 @@ pub fn report(source: &str, path: Option<&str>, o: &Options) -> Result<()> {
         measure,
         shapes,
         keep_line_breaks,
+        html_images,
         source_view,
         plain,
         text_options,
@@ -92,7 +97,10 @@ pub fn report(source: &str, path: Option<&str>, o: &Options) -> Result<()> {
     } else if plain {
         rubrica_doc::plain::parse(source, text_options)
     } else {
-        rubrica_doc::Document::parse_with(source, rubrica_doc::ParseOptions { keep_line_breaks })
+        rubrica_doc::Document::parse_with(
+            source,
+            rubrica_doc::ParseOptions { keep_line_breaks, html_images },
+        )
     };
     // No render target exists here, so figures are measured from their files
     // through WIC but not decoded to bitmaps -- enough to lay out and report.
@@ -489,6 +497,49 @@ pub fn report(source: &str, path: Option<&str>, o: &Options) -> Result<()> {
             }
         }
     }
+    // Figures, one line each because a summary cannot tell a figure that kept the size
+    // its author gave it from one the measure shrank -- and because the two ways a page
+    // shows a picture, Markdown's `![]()` and HTML's `<img>`, are tallied apart: the
+    // setting that turns the second back into its name is visible exactly here as the
+    // count of tagged figures falling to zero while their words stay on the page.
+    let figures: Vec<&rubrica_doc::ObjectKind> = shown
+        .iter()
+        .flat_map(|b| &b.objects)
+        .map(|o| &o.kind)
+        .filter(|k| matches!(k, rubrica_doc::ObjectKind::Image { .. }))
+        .collect();
+    if !figures.is_empty() {
+        let mut html = 0usize;
+        let mut zoomed = 0usize;
+        let mut placed: Vec<String> = Vec::new();
+        for kind in &figures {
+            let rubrica_doc::ObjectKind::Image { src, html: from_tag, zoom, .. } = kind else {
+                continue;
+            };
+            html += usize::from(*from_tag);
+            zoomed += usize::from(zoom.is_some());
+            // The size the page was laid out with, measured the very way the layout
+            // measured it, so a figure that only shrinks on one of the two paths is
+            // caught by the numbers rather than by an eye.
+            let path = crate::images::ImageStore::resolve(base, src);
+            let size = store.as_ref().and_then(|s| s.fit_zoomed(&path, column_pt, *zoom));
+            let note = match zoom {
+                Some(z) => format!(", zoom {z}%"),
+                None => String::new(),
+            };
+            placed.push(match size {
+                Some((w, h)) => format!("{src}{note}: {w:.1} x {h:.1}pt"),
+                None => format!("{src}{note}: not measured"),
+            });
+        }
+        println!(
+            "images       : {} figure(s), {html} from an <img> tag, {zoomed} with a zoom",
+            figures.len()
+        );
+        for (i, p) in placed.iter().enumerate() {
+            println!("  [{i}] {p}");
+        }
+    }
     // A formula's arithmetic is invisible in a summary: a brace that was grown to its
     // grid and a brace drawn as one natural-size glyph are the same one line of the
     // census and a screen apart on the page. This prints the display list itself.
@@ -509,10 +560,25 @@ pub fn report(source: &str, path: Option<&str>, o: &Options) -> Result<()> {
     // follow, the entries in `footnotes` are what the author defined, and a document
     // where those disagree is the interesting one -- an uncited definition still has
     // to be set, and a citation with no note behind it has nothing to show.
+    //
+    // A raised number only counts with a citation action over it: a formula's
+    // `mc<sup>2</sup>` wears the very same mark, and counting it here printed a
+    // citation whose note never existed -- and whose rect the page cannot show.
     let cited = {
         let mut numbers: Vec<usize> = Vec::new();
-        for (text, s) in all_spans(&doc) {
-            if s.style.contains(rubrica_doc::InlineStyle::SUPERSCRIPT) {
+        for (text, spans, actions) in all_spans(&doc) {
+            for s in spans {
+                if !s.style.contains(rubrica_doc::InlineStyle::SUPERSCRIPT) {
+                    continue;
+                }
+                let reachable = actions.iter().any(|a| {
+                    matches!(a.kind, rubrica_doc::ActionKind::Cite(_))
+                        && a.range.start < s.range.end
+                        && s.range.start < a.range.end
+                });
+                if !reachable {
+                    continue;
+                }
                 if let Ok(n) = text[s.range.clone()].parse::<usize>() {
                     if !numbers.contains(&n) {
                         numbers.push(n);
@@ -601,7 +667,8 @@ pub fn report(source: &str, path: Option<&str>, o: &Options) -> Result<()> {
     // no rule has lost the whole point of the mark, and one that sets a rule per
     // ideograph would be the same picture at a dozen times the ops.
     let struck = all_spans(&doc)
-        .filter(|(_, s)| s.style.contains(rubrica_doc::InlineStyle::STRIKETHROUGH))
+        .flat_map(|(_, spans, _)| spans)
+        .filter(|s| s.style.contains(rubrica_doc::InlineStyle::STRIKETHROUGH))
         .count();
     if struck > 0 {
         let rules: Vec<f32> = ops
@@ -706,18 +773,18 @@ fn all_actions(doc: &rubrica_doc::Document) -> impl Iterator<Item = &rubrica_doc
     })
 }
 
-/// Every styled run, with the text its range indexes: a cell's spans count into its
-/// own cell's text, not into the block's.
-fn all_spans(doc: &rubrica_doc::Document) -> impl Iterator<Item = (&str, &rubrica_doc::Span)> {
+/// Every styled run, with the text its range indexes and the actions its block or
+/// cell carries: a cell's spans count into its own cell's text, not into the block's.
+fn all_spans(
+    doc: &rubrica_doc::Document,
+) -> impl Iterator<Item = (&str, &[rubrica_doc::Span], &[rubrica_doc::Action])> {
     all_blocks(doc).flat_map(|b| {
         let cells = b
             .table
             .iter()
             .flat_map(|t| t.head.iter().chain(t.rows.iter().flatten()))
-            .map(|c| (c.text.as_str(), &c.spans));
-        std::iter::once((b.text.as_str(), &b.spans))
-            .chain(cells)
-            .flat_map(|(text, spans)| spans.iter().map(move |s| (text, s)))
+            .map(|c| (c.text.as_str(), c.spans.as_slice(), c.actions.as_slice()));
+        std::iter::once((b.text.as_str(), b.spans.as_slice(), b.actions.as_slice())).chain(cells)
     })
 }
 

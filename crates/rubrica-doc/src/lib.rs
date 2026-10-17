@@ -54,7 +54,7 @@ pub fn source_at(spans: &[SourceSpan], byte: usize) -> Option<usize> {
 /// Character-level decoration. Block-level scale and colour come from
 /// [`BlockKind`], so a heading is not also "just a big paragraph".
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub struct InlineStyle(pub u8);
+pub struct InlineStyle(pub u16);
 
 impl InlineStyle {
     pub const EMPTY: InlineStyle = InlineStyle(0);
@@ -72,9 +72,13 @@ impl InlineStyle {
     /// about the *voice* of the digits changes, only where they sit on the line.
     pub const SUPERSCRIPT: InlineStyle = InlineStyle(1 << 6);
     pub const DELIMITER: InlineStyle = InlineStyle(1 << 7);
+    /// Lowered text that belongs to the word before it: `<sub>` in raw HTML. The
+    /// mirror of [`InlineStyle::SUPERSCRIPT`] and set at the same size, so `H<sub>2</sub>O`
+    /// reads as the formula it is while the citation digits keep their one scale.
+    pub const SUBSCRIPT: InlineStyle = InlineStyle(1 << 8);
 
     #[inline]
-    pub const fn bits(self) -> u8 {
+    pub const fn bits(self) -> u16 {
         self.0
     }
     #[inline]
@@ -88,6 +92,37 @@ impl InlineStyle {
     #[inline]
     pub fn remove(&mut self, other: InlineStyle) {
         self.0 &= !other.0;
+    }
+    /// Which bit of the style this is, for the maps that hold one count per style.
+    #[inline]
+    fn bit(self) -> usize {
+        self.0.trailing_zeros() as usize
+    }
+}
+
+/// The inline HTML elements open around some text, counted rather than stacked.
+///
+/// A count because the source is an author's, not a compiler's: an unclosed `<b>`
+/// then wears one word of weight too much and nothing more, where a stack would hold
+/// the whole nesting and a mis-nested close would hand the rest of the page a
+/// stranger's style. Counted by style bit, so a tag spelled two ways (`b` and
+/// `strong`) shares one entry -- and the count cannot exceed 255, which no document
+/// reaches and which a saturating add keeps from wrapping if one did.
+#[derive(Clone, Copy, Default)]
+struct OpenTags([u8; 16]);
+
+impl OpenTags {
+    /// Count an opening tag, and say whether this element is now open at all.
+    fn open(&mut self, style: InlineStyle) -> bool {
+        let was_closed = self.0[style.bit()] == 0;
+        self.0[style.bit()] = self.0[style.bit()].saturating_add(1);
+        was_closed
+    }
+
+    /// Count a closing tag, and say whether the last one has now closed.
+    fn close(&mut self, style: InlineStyle) -> bool {
+        self.0[style.bit()] = self.0[style.bit()].saturating_sub(1);
+        self.0[style.bit()] == 0
     }
 }
 
@@ -278,7 +313,14 @@ pub enum Align {
 pub enum ObjectKind {
     /// `src` is as written in the document; resolving it against the document's
     /// directory is the caller's job, since only the caller knows that directory.
-    Image { src: String, alt: String },
+    ///
+    /// `html` records that the author wrote an `<img>` tag rather than Markdown's
+    /// `![]()`: the two read the same on the page and the difference is the reader's
+    /// own, which is what the "Show HTML image tags" switch is against.
+    ///
+    /// `zoom` is the `style="zoom:87%"` a Typora paste carries, in whole per cent:
+    /// the natural size is scaled by it before the column gets its say.
+    Image { src: String, alt: String, html: bool, zoom: Option<u16> },
     /// A formula in the source's own notation, with the delimiters removed.
     ///
     /// `display` is the `$$...$$` form: its own block, with its limits stacked and
@@ -441,7 +483,8 @@ impl Document {
 /// is the OR that folding the marks over each window gives. A file is read this way
 /// on every source view, and the pass it replaces grew with the square of its size.
 fn source_spans(marked: &[(std::ops::Range<usize>, InlineStyle)], boundaries: &[usize]) -> Vec<Span> {
-    let mut delta = vec![[0i32; 8]; boundaries.len() + 1];
+    const BITS: usize = 16;
+    let mut delta = vec![[0i32; BITS]; boundaries.len() + 1];
     for (range, style) in marked {
         // The windows `[boundaries[i], boundaries[i + 1]]` a mark covers: those that
         // begin at or after it starts, up to the last that ends at or before it ends.
@@ -458,25 +501,38 @@ fn source_spans(marked: &[(std::ops::Range<usize>, InlineStyle)], boundaries: &[
             delta[last][bit] -= 1;
         }
     }
-    let mut open = [0i32; 8];
+    let mut open = [0i32; BITS];
     boundaries
         .windows(2)
         .enumerate()
         .filter(|(_, r)| r[0] < r[1])
         .map(|(i, r)| {
-            for bit in 0..8 {
+            for bit in 0..BITS {
                 open[bit] += delta[i][bit];
             }
-            let bits = (0..8).fold(0, |bits, bit| bits | i32::from(open[bit] > 0) << bit);
-            Span { range: r[0]..r[1], style: InlineStyle(bits as u8) }
+            let bits = (0..BITS).fold(0, |bits, bit| bits | i32::from(open[bit] > 0) << bit);
+            Span { range: r[0]..r[1], style: InlineStyle(bits as u16) }
         })
         .collect()
 }
 
 /// Reader preferences that change Markdown's interpretation without changing the file.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ParseOptions {
     pub keep_line_breaks: bool,
+    /// Whether an HTML `<img>` becomes the figure it names. The switch a reader turns
+    /// off when a document's markup is the thing being read rather than its pictures;
+    /// Markdown's own `![]()` figures are not affected by it.
+    pub html_images: bool,
+}
+
+impl Default for ParseOptions {
+    /// A reader of prose wants the pictures a page has, so the default is on: the
+    /// one non-default choice here is [`ParseOptions::keep_line_breaks`], which every
+    /// caller states for itself.
+    fn default() -> Self {
+        Self { keep_line_breaks: false, html_images: true }
+    }
 }
 
 impl ObjectKind {
@@ -487,7 +543,7 @@ impl ObjectKind {
                 let fence = if *display { "$$" } else { "$" };
                 format!("{fence}{source}{fence}")
             }
-            Self::Image { src, alt } => format!("![{alt}]({src})"),
+            Self::Image { src, alt, .. } => format!("![{alt}]({src})"),
         }
     }
 }
@@ -948,6 +1004,16 @@ struct Builder<'a> {
     breaks: Vec<usize>,
     inline: InlineStyle,
     inline_stack: Vec<InlineStyle>,
+    /// What the inline HTML tags around the text ask for, held apart from
+    /// [`Builder::inline`] so that a `</b>` the author forgot cannot unbalance what a
+    /// Markdown `*` opened: the two are ORed at each run of text.
+    html_style: InlineStyle,
+    /// The HTML elements open around the text, counted per style.
+    html_tags: OpenTags,
+    /// A boundary a separator tag (`</td>`, `<tr>`) left behind: the next word is a
+    /// field of its own, and a space parts it from the field before unless the
+    /// writing on the two sides says otherwise; see [`boundary_wants_space`].
+    separate: bool,
     quote_depth: u8,
     /// One entry per open list, holding its info and the next item number.
     lists: Vec<(ListInfo, u64)>,
@@ -1036,14 +1102,14 @@ impl Builder<'_> {
             Event::End(tag) => self.end(tag),
             Event::Text(t) => {
                 if !self.alt(&t) {
-                    self.put(&t, self.inline);
+                    self.put(&t, self.style());
                 }
             }
             Event::Code(t) => {
                 if self.alt(&t) {
                     return;
                 }
-                let mut st = self.inline;
+                let mut st = self.style();
                 st.insert(InlineStyle::CODE);
                 self.put(&t, st);
             }
@@ -1085,25 +1151,12 @@ impl Builder<'_> {
                     b.task = Some(checked);
                 }
             }
-            // `<br>` is the one piece of inline HTML with typographic meaning, and
-            // authors reach for it because a table cell or a list item has no other
-            // way to break a line. An inline tag carries a style the reader's page has
-            // no answer for, so it is dropped with its name: the words between it and
-            // its partner are already text, and printing the markup among them would be
-            // a lie about what the author meant.
-            Event::InlineHtml(h) => {
-                if is_line_break(&h) && !self.alt("\n") {
-                    // `<br>` is a fold like any other, and it is recorded like one:
-                    // the definition list under it is only recoverable if where the
-                    // fold happened survived.
-                    if let Some(b) = self.cur.as_mut() {
-                        if self.cell.is_none() {
-                            self.breaks.push(b.text.len());
-                        }
-                    }
-                    self.put("\n", InlineStyle::EMPTY);
-                }
-            }
+            // Inline HTML in a paragraph: the tags a reader's page has an answer for
+            // become the break, the figure, or the voice and position they name, and
+            // the rest are dropped with their markup -- the words between them are
+            // already text, and printing the markup among them would be a lie about
+            // what the author meant. See [`Builder::inline_html`].
+            Event::InlineHtml(h) => self.inline_html(&h),
             // A block of raw HTML is collected rather than answered chunk by chunk,
             // because the parser cuts it at line ends and a sentence does not stop
             // there; see [`html_pieces`].
@@ -1393,7 +1446,7 @@ impl Builder<'_> {
                 }
                 let alt: String = self.alt_pieces[start..].concat();
                 self.alt_pieces.truncate(start);
-                self.push_object(ObjectKind::Image { src, alt });
+                self.push_object(ObjectKind::Image { src, alt, html: false, zoom: None });
             }
             _ => {}
         }
@@ -1405,12 +1458,18 @@ impl Builder<'_> {
     /// source -- so what arrives here is what the author typed between the tags, which is
     /// the words of a paragraph and sometimes a `<b>` nobody can see.
     fn set_html(&mut self, raw: &str) {
-        for piece in html_pieces(raw) {
+        for piece in html_pieces(raw, self.options.html_images) {
             match piece {
-                Piece::Text(t) => self.put(&t, self.inline),
-                Piece::Image { src, alt } => {
-                    self.push_object(ObjectKind::Image { src, alt });
+                // The block's own style is the reader's; the piece's is the markup's,
+                // and a `<b>` inside a blockquote's HTML means bold for the same
+                // reason a Markdown `**` there does.
+                Piece::Text { text, style } => self.put(&text, self.style() | style),
+                Piece::Image { src, alt, zoom } => {
+                    self.push_object(ObjectKind::Image { src, alt, html: true, zoom });
                 }
+                // A construction the author showed whole: read as its source, in the
+                // one place a reader can see the tags their page was built from.
+                Piece::Source(text) => self.push_source(&text),
                 Piece::Paragraph => self.close(),
                 Piece::Rule => {
                     self.close();
@@ -1423,6 +1482,97 @@ impl Builder<'_> {
                 }
             }
         }
+    }
+
+    /// Lay a block of raw markup out as the code it is.
+    ///
+    /// A `<table>` or `<details>` a block carries whole is a construction rather than
+    /// prose with markup in it: its shape is what the author is showing, and the only
+    /// reading that keeps the shape is the one its own lines were written in. The
+    /// block is a code block like any other, so it is highlighted, selectable, and
+    /// copyable exactly as a fence of the same markup would be.
+    fn push_source(&mut self, text: &str) {
+        self.close();
+        self.open(BlockKind::Code);
+        if let Some(b) = self.cur.as_mut() {
+            b.lang = Some("html".to_string());
+        }
+        self.push(text, InlineStyle::EMPTY);
+        self.close();
+    }
+
+    /// One inline HTML tag, taken as what it means on a page.
+    ///
+    /// `<br>` and the tag that names a figure are what an author reaches for inside a
+    /// sentence; others dress the words (`<b>`, `<sub>`) or part two fields (`</td>`),
+    /// and the ones with no answer here -- `<span>`, `<a>`, a tag nobody has heard of
+    /// -- are dropped with their markup, which is the reading that neither swallows the
+    /// author's words nor prints their tools among them.
+    fn inline_html(&mut self, html: &str) {
+        if is_line_break(html) {
+            if self.alt("\n") {
+                return;
+            }
+            // `<br>` is a fold like any other, and it is recorded like one: the
+            // definition list under it is only recoverable if where the fold happened
+            // survived.
+            if let Some(b) = self.cur.as_mut() {
+                if self.cell.is_none() {
+                    self.breaks.push(b.text.len());
+                }
+            }
+            self.put("\n", self.style());
+            return;
+        }
+        let inner = html.trim().trim_start_matches('<').trim_end_matches('>');
+        let (name, closing) = tag_name(inner);
+        if name.is_empty() {
+            return;
+        }
+        if name == "img" {
+            let alt = attr(inner, "alt").unwrap_or_default();
+            // The reader who turned the switch off asked for the markup's words
+            // rather than its pictures: the name the figure carries is what stands in
+            // its place, and a figure with no name leaves nothing -- as it would on a
+            // page whose images never arrived.
+            if !self.options.html_images {
+                self.put(&alt, self.style());
+                return;
+            }
+            let src = attr(inner, "src").unwrap_or_default();
+            if src.is_empty() {
+                return;
+            }
+            // A figure inside another's alt text is part of that name, not a second
+            // box in the prose: the words it carries are what it contributes there.
+            if self.alt(&alt) {
+                return;
+            }
+            self.push_object(ObjectKind::Image { src, alt, html: true, zoom: zoom_percent(inner) });
+            return;
+        }
+        if SEPARATORS.contains(&name.as_str()) {
+            // The two halves of a parted field arrive as two tags or as one, and
+            // either way the prose after it is another word: [`Builder::put`] owes the
+            // space between them.
+            self.separate = true;
+            return;
+        }
+        if let Some(style) = inline_style(&name) {
+            if closing {
+                if self.html_tags.close(style) {
+                    self.html_style.remove(style);
+                }
+            } else if self.html_tags.open(style) {
+                self.html_style.insert(style);
+            }
+        }
+    }
+
+    /// The decoration every run of text carries: the reader's own emphasis and what
+    /// the author's HTML asked for, which meet on the same letters.
+    fn style(&self) -> InlineStyle {
+        self.inline | self.html_style
     }
 
     fn open(&mut self, kind: BlockKind) {
@@ -1466,6 +1616,28 @@ impl Builder<'_> {
     /// sink of its own. A `<br>` in a cell is the only way an author can break a line
     /// there, and it is a real break only if it reaches the cell.
     fn put(&mut self, s: &str, style: InlineStyle) {
+        if s.is_empty() {
+            return;
+        }
+        if std::mem::take(&mut self.separate) {
+            // A separator tag left this boundary behind, and the two sides of it are
+            // two fields rather than one word: a space stands between them where the
+            // writing on either side leaves room for one, and nowhere else. See
+            // [`boundary_wants_space`].
+            let text = self.cell.as_ref().map(|c| c.text.as_str()).or_else(|| self.cur.as_ref().map(|b| b.text.as_str()));
+            let boundary = (text.and_then(|t| t.chars().last()), s.chars().next());
+            if let (Some(before), Some(after)) = boundary {
+                if boundary_wants_space(before, after) {
+                    self.write(" ", style);
+                }
+            }
+        }
+        self.write(s, style);
+    }
+
+    /// Append one run of text where it belongs, the reader's bookkeeping around it
+    /// unchanged.
+    fn write(&mut self, s: &str, style: InlineStyle) {
         let link = self.link.clone().map(ActionKind::Url);
         let sources = self.cell.as_ref().map(|c| self.sources(s, c.text.len()));
         match self.cell.as_mut() {
@@ -1815,10 +1987,15 @@ fn fence_language(info: &str) -> Option<String> {
 
 /// One piece of a raw HTML block, its markup already turned into what it means on a page.
 enum Piece {
-    /// Prose, its whitespace collapsed to what a browser makes of it.
-    Text(String),
-    /// `<img>`: a figure, named as the document names it.
-    Image { src: String, alt: String },
+    /// Prose, its whitespace collapsed to what a browser makes of it, wearing the
+    /// decoration its markup gave it.
+    Text { text: String, style: InlineStyle },
+    /// `<img>`: a figure, named as the document names it, sized as its author's
+    /// `style` asks for.
+    Image { src: String, alt: String, zoom: Option<u16> },
+    /// One whole element of [`WHOLE`], kept as its author wrote it: the shape is what
+    /// the block is showing, so the source is what the reader is owed.
+    Source(String),
     /// `<h1>` to `<h6>`.
     Heading(u8),
     /// The end of a block-level element, so that what follows is another paragraph.
@@ -1835,11 +2012,21 @@ const NOT_PROSE: [&str; 6] = ["script", "style", "head", "title", "textarea", "t
 /// The elements that start on a line of their own, and so end the paragraph they arrive in
 /// the middle of. `<li>` is one of them because two of them are two lines rather than one
 /// sentence with a gap in it.
-const BLOCK_LEVEL: [&str; 27] = [
+const BLOCK_LEVEL: [&str; 24] = [
     "address", "article", "aside", "blockquote", "dd", "div", "dl", "dt", "fieldset",
     "figcaption", "figure", "footer", "form", "header", "hgroup", "li", "main", "nav", "ol",
-    "p", "pre", "section", "table", "td", "th", "tr", "ul",
+    "p", "pre", "section", "table", "ul",
 ];
+
+/// The elements that part two fields rather than ending a line: a table's row and cells
+/// reach a reader as the words in them, and `</td><td>` between two of those words is one
+/// space, not a paragraph break. The space itself is [`boundary_wants_space`]'s business.
+const SEPARATORS: [&str; 3] = ["td", "th", "tr"];
+
+/// The elements a block may show whole: a table and a disclosure are constructions whose
+/// shape is the point, and a block holding one complete is read as its source rather than
+/// word by word (see [`Piece::Source`]).
+const WHOLE: [&str; 2] = ["table", "details"];
 
 /// The prose and the figures a raw HTML block carries, taken out of its markup.
 ///
@@ -1851,8 +2038,11 @@ const BLOCK_LEVEL: [&str; 27] = [
 /// break, a figure, a heading, the end of a paragraph -- and the rest of the markup is
 /// dropped along with the shape it gave, which is the only reading of it that does not
 /// either swallow the author's words or print their tools among them.
-fn html_pieces(raw: &str) -> Vec<Piece> {
-    let mut f = Fragments::default();
+///
+/// `html_images` is the reader's switch: off, an `<img>` is read as the words it carries
+/// rather than as the figure it names.
+fn html_pieces(raw: &str, html_images: bool) -> Vec<Piece> {
+    let mut f = Fragments { html_images, ..Fragments::default() };
     let mut rest = raw;
     while let Some(at) = rest.find('<') {
         f.words(&rest[..at]);
@@ -1893,22 +2083,49 @@ fn html_pieces(raw: &str) -> Vec<Piece> {
         rest = &after[close + 1..];
     }
     f.words(rest);
+    if f.shows_a_whole_element() {
+        // A construction the block holds complete is read as its author wrote it, not
+        // word by word: a table's shape is the point, and a page that has thrown the
+        // tags away has nothing left of it.
+        return vec![Piece::Source(raw.to_string())];
+    }
     f.finish()
 }
 
 /// The block being gathered, one tag at a time.
+///
+/// The gathering is deliberately shallow -- words, and where a tag says they break --
+/// because a page has an answer for a handful of elements and none for the rest, and
+/// dropping the markup it cannot honour is what keeps it from printing an author's tools
+/// among the author's words.
 #[derive(Default)]
 struct Fragments {
     out: Vec<Piece>,
     /// The prose gathered since the last piece, its whitespace already collapsed.
     text: String,
+    /// Whether the reader wants an `<img>` drawn; off, the figure's name is the text
+    /// that stands in its place.
+    html_images: bool,
+    /// The decoration the open elements give the prose being gathered.
+    style: InlineStyle,
+    /// The elements open around the prose, counted rather than stacked.
+    open: OpenTags,
     /// A space the text ended with, still owed to the word after it. A tag is not a break in
     /// a sentence: `<b>word</b> next` is a line with a space in it, and `<b>word</b>next` is
     /// one word -- which is what the author between the tags wrote.
     owed: bool,
+    /// A boundary a separator tag left: the next word is another field, and whether a
+    /// space parts the two is [`boundary_wants_space`]'s business.
+    separate: bool,
+    /// The last character handed over, which outlives the piece it sits in: the space a
+    /// `</td>` owes is decided against the word before it, tag or no tag in between.
+    last: Option<char>,
     /// Whether the element being read holds a program's source rather than prose, which one
     /// tag decides and a later one undoes.
     hidden: bool,
+    /// For each element of [`WHOLE`]: whether one opened in this block, and how many of
+    /// them are still open. The pair counts a construction the block may be showing whole.
+    whole: [(bool, u8); WHOLE.len()],
 }
 
 impl Fragments {
@@ -1918,14 +2135,25 @@ impl Fragments {
         if self.hidden || run.is_empty() {
             return;
         }
-        for word in run.split_whitespace() {
-            if self.owed && !self.text.is_empty() {
-                self.text.push(' ');
-            }
-            self.text.push_str(&resolve_entities(word));
+        if run.starts_with(char::is_whitespace) && self.last.is_some() {
+            // Whitespace at the head of the run is a space between the word before it
+            // and the first word of this one, tags or no tags in between.
             self.owed = true;
         }
-        self.owed = run.ends_with(char::is_whitespace);
+        for word in run.split_whitespace() {
+            if let Some(before) = self.last {
+                let after = word.chars().next().unwrap_or(' ');
+                if self.owed || (self.separate && boundary_wants_space(before, after)) {
+                    self.text.push(' ');
+                }
+            }
+            self.separate = false;
+            let word = resolve_entities(word);
+            self.last = word.chars().last();
+            self.text.push_str(&word);
+            self.owed = true;
+        }
+        self.owed = run.ends_with(char::is_whitespace) && self.last.is_some();
     }
 
     /// The tag between two runs of text.
@@ -1943,57 +2171,111 @@ impl Fragments {
         if self.hidden {
             return;
         }
-        match name.as_str() {
-            "br" => {
-                self.text.push('\n');
-                self.owed = false;
+        if name == "br" {
+            self.text.push('\n');
+            self.owed = false;
+            return;
+        }
+        if name == "img" {
+            let src = attr(tag, "src").unwrap_or_default();
+            let alt = attr(tag, "alt").unwrap_or_default();
+            // The reader who turned the switch off asked for the markup's words rather
+            // than its pictures: the name the figure carries is what stands in its place.
+            if !self.html_images {
+                self.words(&alt);
+                return;
             }
-            "img" => {
-                let src = attr(tag, "src").unwrap_or_default();
-                let alt = attr(tag, "alt").unwrap_or_default();
-                self.flush();
-                // A figure with no file named is a hole in the page, which is worse than
-                // the empty alt text that was meant to fill it.
-                if !src.is_empty() {
-                    self.out.push(Piece::Image { src, alt });
-                }
+            self.flush();
+            // A figure with no file named is a hole in the page, which is worse than
+            // the empty alt text that was meant to fill it.
+            if !src.is_empty() {
+                self.out.push(Piece::Image { src, alt, zoom: zoom_percent(tag) });
             }
-            "hr" => {
-                self.flush();
-                self.out.push(Piece::Rule);
+            return;
+        }
+        if name == "hr" {
+            self.flush();
+            self.out.push(Piece::Rule);
+            self.paragraph_end();
+            return;
+        }
+        if let Some(level) = heading(&name) {
+            self.flush();
+            if closing {
                 self.paragraph_end();
+            } else {
+                self.out.push(Piece::Heading(level));
             }
-            _ if let Some(level) = heading(&name) => {
-                self.flush();
-                if closing {
-                    self.paragraph_end();
-                } else {
-                    self.out.push(Piece::Heading(level));
+            return;
+        }
+        if let Some(style) = inline_style(&name) {
+            // The words before and after the tag wear different cloth, so the prose
+            // gathered so far is handed over before the style changes.
+            self.flush();
+            if closing {
+                if self.open.close(style) {
+                    self.style.remove(style);
                 }
+            } else if self.open.open(style) {
+                self.style.insert(style);
             }
-            _ if BLOCK_LEVEL.contains(&name.as_str()) => self.paragraph_end(),
-            _ => {}
+            return;
+        }
+        if let Some(i) = WHOLE.iter().position(|w| *w == name) {
+            if closing {
+                self.whole[i].1 = self.whole[i].1.saturating_sub(1);
+            } else {
+                self.whole[i].0 = true;
+                self.whole[i].1 = self.whole[i].1.saturating_add(1);
+            }
+        }
+        if SEPARATORS.contains(&name.as_str()) {
+            self.separate = true;
+            return;
+        }
+        if BLOCK_LEVEL.contains(&name.as_str()) {
+            self.paragraph_end();
         }
     }
 
     /// End the paragraph being gathered, if there is one to end: two block tags together
     /// are not a paragraph the reader is owed, and neither is one that opens the block.
     fn paragraph_end(&mut self) {
+        // The paragraph is over, so the space the last word was owed is not owed to
+        // anything: `</p>` starts a new one.
+        self.owed = false;
+        self.separate = false;
         self.flush();
         if !self.out.is_empty() && !matches!(self.out.last(), Some(Piece::Paragraph)) {
             self.out.push(Piece::Paragraph);
         }
     }
 
-    /// Hand the prose gathered so far over as a piece of its own.
+    /// Hand the prose gathered so far over as a piece of its own, with the space its
+    /// last word was owed: a tag in the middle of a sentence is not a break, so
+    /// `<b>a</b> b` is two words and not one.
     fn flush(&mut self) {
-        if !self.text.is_empty() {
-            self.out.push(Piece::Text(std::mem::take(&mut self.text)));
+        if self.text.is_empty() {
+            return;
         }
-        self.owed = false;
+        if self.owed {
+            self.text.push(' ');
+            self.last = Some(' ');
+            self.owed = false;
+        }
+        self.out.push(Piece::Text { text: std::mem::take(&mut self.text), style: self.style });
+    }
+
+    /// Whether the block held one of [`WHOLE`]'s elements complete -- an opening and a
+    /// closing tag inside this one block -- which is an author showing a construction
+    /// rather than writing prose with markup in it.
+    fn shows_a_whole_element(&self) -> bool {
+        self.whole.iter().any(|(seen, depth)| *seen && *depth == 0)
     }
 
     fn finish(mut self) -> Vec<Piece> {
+        self.owed = false;
+        self.separate = false;
         self.flush();
         self.out
     }
@@ -2058,6 +2340,63 @@ fn attr(tag: &str, key: &str) -> Option<String> {
         return Some(resolve_entities(value));
     }
     None
+}
+
+/// The decoration an HTML element's words wear, if the page has one to give them.
+///
+/// One table for both readings of a document -- the markup in a paragraph and the markup
+/// of a block -- because `<b>` is bold wherever it stands. An element not named here is
+/// dropped with its markup and its words kept: `<span>`, `<a>`, `<mark>` and the rest ask
+/// for something the page has no answer for, and losing the words would be a worse
+/// answer than losing the ask.
+fn inline_style(name: &str) -> Option<InlineStyle> {
+    Some(match name {
+        "b" | "strong" => InlineStyle::STRONG,
+        "i" | "em" => InlineStyle::EMPHASIS,
+        "code" => InlineStyle::CODE,
+        "del" | "s" | "strike" => InlineStyle::STRIKETHROUGH,
+        "sup" => InlineStyle::SUPERSCRIPT,
+        "sub" => InlineStyle::SUBSCRIPT,
+        _ => return None,
+    })
+}
+
+/// The `zoom` an image tag carries in `style="zoom:87%"`, as whole per cent.
+///
+/// Typora writes a resized figure that way, and a document that has been through it is
+/// the case this answers. A style without a `zoom` says nothing and the figure keeps its
+/// natural size, as do the values no figure could have been meant at -- the column
+/// already has the last word on how wide a figure is drawn.
+fn zoom_percent(tag: &str) -> Option<u16> {
+    let style = attr(tag, "style")?;
+    for part in style.split(';') {
+        let Some((name, value)) = part.split_once(':') else { continue };
+        if !name.trim().eq_ignore_ascii_case("zoom") {
+            continue;
+        }
+        let Some(percent) = value.trim().strip_suffix('%') else { continue };
+        let Ok(zoom) = percent.trim().parse::<u16>() else { continue };
+        if (1..=1000).contains(&zoom) {
+            return Some(zoom);
+        }
+    }
+    None
+}
+
+/// Whether a space belongs between two runs of prose the markup parted: the fields of a
+/// table (`<td>12</td><td>34</td>`) and anything else a separator tag stands between.
+///
+/// Two fields want the space the tags took away -- `12 34` is two numbers and `1234` is
+/// one -- unless the writing on either side supplies a space of its own, or both sides
+/// are CJK, which already carry their own air and are broken by a space between them.
+/// The classifier asked here is the one the line breaker breaks by, so the two cannot
+/// drift apart.
+fn boundary_wants_space(before: char, after: char) -> bool {
+    use rubrica_type::classify::Role;
+    if before.is_whitespace() || after.is_whitespace() {
+        return false;
+    }
+    !(Role::of(before) == Role::Cjk && Role::of(after) == Role::Cjk)
 }
 
 /// The character references worth resolving, besides the numeric ones. An HTML block is
@@ -2417,7 +2756,7 @@ mod source_span_tests {
         // And the newline policy must not decide whether a block survives.
         for src in ["$$:$$\n:\n", "#$$:x$$\n:\n"] {
             let merged = Document::parse(src);
-            let kept = Document::parse_with(src, ParseOptions { keep_line_breaks: true });
+            let kept = Document::parse_with(src, ParseOptions { keep_line_breaks: true, ..ParseOptions::default() });
             assert_eq!(merged.blocks.len(), kept.blocks.len(), "{src}");
             assert_eq!(
                 merged.blocks.iter().map(|b| b.kind).collect::<Vec<_>>(),

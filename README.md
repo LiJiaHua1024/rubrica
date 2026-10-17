@@ -94,8 +94,12 @@ ligatures, emoji, and bidirectional text remain selectable. Page breaks are plan
 
 CommonMark and GFM: headings, paragraphs, lists (ordered, nested, task lists), block
 quotes, fenced code with syntax colouring, tables with alignment and rules on every row
-and column, images, links and footnotes, strikethrough, autolinks, raw HTML kept as text,
-YAML front matter dropped as metadata, and `\(...\)`, `\[...\]` and `$...$` formulas.
+and column, images, links and footnotes, strikethrough, autolinks, raw HTML read for its
+meaning -- `<b>` and `<i>` dress their words, `<sub>`/`<sup>` set as real scripts,
+`<br>` and separator tags part fields, `<img>` draws the figure it names (Typora's
+`style="zoom:87%"` included), a whole `<table>` or `<details>` is shown as the source it
+was written as, and a wrapper tag is dropped rather than printed -- YAML front matter
+dropped as metadata, and `\(...\)`, `\[...\]` and `$...$` formulas.
 Definition lists (`Term` over a line starting `: `) are read as terms and definitions.
 
 One deliberate leave from CommonMark, settled heuristically: an ordered marker (`3.` or
@@ -162,8 +166,9 @@ source view, `Ctrl+4` switches between continuous scrolling and the page stack, 
 `Ctrl+Shift+O` opens the file in an editor at the current source position.
 
 Right-click opens the menu: navigation, copy, select all, find, the contents, zoom, the
-installed reading faces, the measure, the theme, open tabs, recent documents, and the
-workspace tree.
+installed reading faces, the measure, the theme, the text-reading switches (plain text
+or Markdown, **Show HTML image tags**), open tabs, recent documents, and the workspace
+tree.
 
 | Key | |
 | --- | --- |

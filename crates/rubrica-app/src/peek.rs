@@ -1618,6 +1618,10 @@ impl Peek {
                 &decoded.text,
                 rubrica_doc::ParseOptions {
                     keep_line_breaks: prefs.line_breaks.unwrap_or_else(settings::keep_line_breaks),
+                    // The preview follows the reader's own switch rather than a
+                    // document override: whether an `<img>` is a picture or a name is
+                    // a stand on the markup, and a stand belongs to the reader.
+                    html_images: settings::show_html_images(),
                 },
             )
         };

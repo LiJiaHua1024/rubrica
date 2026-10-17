@@ -483,10 +483,18 @@ impl Theme {
         };
         // A raised mark: smaller than its word, and seated near its cap height,
         // which is where a superscript belongs whatever the surrounding size is.
+        // A lowered one is its mirror, set at the same scale and sunk below the
+        // baseline by a fifth of the word's size -- the depth a typed subscript sits
+        // at, and shallow enough to stay clear of the line below's ascenders. A run
+        // wearing both bits is one mis-nested tag rather than two marks, and reads as
+        // raised: an exponent is the more meaningful of the two on the same glyph.
         let mut raise = 0.0;
         if inline.contains(InlineStyle::SUPERSCRIPT) {
             size *= 0.7;
             raise = block * 0.62;
+        } else if inline.contains(InlineStyle::SUBSCRIPT) {
+            size *= 0.7;
+            raise = -block * 0.2;
         }
         let mut weight = match kind {
             BlockKind::Heading(_) => 700,
@@ -685,6 +693,33 @@ mod tests {
         let h = t.resolve(BlockKind::Heading(1), InlineStyle::SUPERSCRIPT);
         assert!(h.size > sup.size * 1.5, "{h:?} vs {sup:?}");
         assert!(h.raise > sup.raise, "a bigger word needs a bigger lift");
+    }
+
+    #[test]
+    fn a_subscript_is_small_sunk_and_the_same_size_as_its_raised_twin() {
+        let t = Theme::default();
+        let body = t.resolve(BlockKind::Paragraph, InlineStyle::EMPTY);
+        let sub = t.resolve(BlockKind::Paragraph, InlineStyle::SUBSCRIPT);
+        let sup = t.resolve(BlockKind::Paragraph, InlineStyle::SUPERSCRIPT);
+        // One scale for both scripts: a reader meeting `H₂O` beside a citation's `¹`
+        // should see two positions of one mark, not two differently sized things.
+        assert!((sub.size - sup.size).abs() < 0.01, "scripts at different sizes");
+        assert!((sub.size - body.size * 0.7).abs() < 0.01, "a lowered mark is 0.7em of its word");
+        assert!(sub.raise < 0.0, "a lowered run must sink below the baseline");
+        assert_eq!(body.raise, 0.0, "only a script run moves off the baseline");
+        // The mark belongs to the word before it, so it wears the word's face and ink.
+        assert_eq!(sub.family, body.family);
+        assert_eq!(sub.color, body.color);
+        assert_eq!(sub.weight, body.weight);
+        // In a heading it scales with the heading instead of collapsing to body.
+        let h = t.resolve(BlockKind::Heading(1), InlineStyle::SUBSCRIPT);
+        assert!(h.size > sub.size * 1.5, "{h:?} vs {sub:?}");
+        assert!(h.raise < sub.raise, "a bigger word needs a bigger sink");
+        // A tag inside a tag is one mis-nested mark rather than two: the flags
+        // together must not shrink the run twice or pull it both ways at once.
+        let both = t.resolve(BlockKind::Paragraph, InlineStyle::SUPERSCRIPT | InlineStyle::SUBSCRIPT);
+        assert_eq!(both.size, sup.size);
+        assert_eq!(both.raise, sup.raise);
     }
 
     #[test]

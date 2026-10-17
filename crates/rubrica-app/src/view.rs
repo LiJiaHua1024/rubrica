@@ -1672,6 +1672,9 @@ pub struct View {
     encoding_guessed: bool,
     keep_line_breaks: bool,
     line_break_override: Option<bool>,
+    /// Whether an `<img>` in a document's markup becomes the figure it names. A
+    /// reader's own switch, remembered for the next document and the next launch.
+    show_html_images: bool,
     ops: Vec<Op>,
     /// Whether [`Self::ops`] is non-decreasing by [`op_top`], which is what lets a
     /// paint binary-search the visible band. Recomputed whenever ops are replaced.
@@ -2630,6 +2633,8 @@ enum Command {
     Reload,
     DefaultLineBreaks(bool),
     DocumentLineBreaks(Option<bool>),
+    /// The reader's HTML image switch: whether an `<img>` becomes the figure it names.
+    HtmlImages(bool),
     SourceView,
     PlainText(Option<bool>),
     TextParagraphs(ParagraphRule),
@@ -2703,6 +2708,9 @@ struct MenuState {
     next: bool,
     keep_line_breaks: bool,
     line_break_override: Option<bool>,
+    /// The HTML image switch, read when the menu was asked for like the other
+    /// remembered preferences above.
+    show_html_images: bool,
     /// The spacebar peek's remembered preference, read when the menu was asked for.
     peek: bool,
     /// The space bar's meaning and the focus rule, from the same place.
@@ -2885,6 +2893,10 @@ fn menu_items(s: &MenuState) -> Vec<MenuRow> {
         check(Command::PlainText(None), i18n::t(s.lang, Key::MenuFormatExt), s.plain_override.is_none()),
         check(Command::PlainText(Some(true)), i18n::t(s.lang, Key::MenuFormatPlain), s.plain_override == Some(true)),
         check(Command::PlainText(Some(false)), i18n::t(s.lang, Key::MenuFormatMarkdown), s.plain_override == Some(false)),
+        // The switch is about the markup's own figures: an `<img>` is drawn unless the
+        // reader asked for the words its alt text carries instead, and Markdown's own
+        // `![]()` figures are not what it turns off.
+        check(Command::HtmlImages(!s.show_html_images), i18n::t(s.lang, Key::MenuHtmlImages), s.show_html_images),
         MenuRow::Gap,
         check(Command::TextParagraphs(ParagraphRule::Auto), i18n::t(s.lang, Key::MenuParagraphsAuto), s.text_options.paragraphs == ParagraphRule::Auto),
         check(Command::TextParagraphs(ParagraphRule::Lines), i18n::t(s.lang, Key::MenuParagraphsLines), s.text_options.paragraphs == ParagraphRule::Lines),
@@ -3254,6 +3266,7 @@ fn new_view(path: Option<PathBuf>, extra: Vec<PathBuf>) -> Result<(Box<View>, cr
         encoding_guessed: false,
         keep_line_breaks: false,
         line_break_override: None,
+        show_html_images: true,
         ops: Vec::new(),
         ops_sorted: true,
         ops_reach: Vec::new(),
@@ -4092,6 +4105,7 @@ impl View {
         // whatever arrives afterwards.
         self.stamp = path.as_deref().and_then(stamp_of);
         self.keep_line_breaks = crate::settings::keep_line_breaks();
+        self.show_html_images = crate::settings::show_html_images();
         let mut preferences = path.as_deref().map(crate::settings::document).unwrap_or_default();
         preferences.text = reading::text_options_for(path.as_deref(), preferences.text);
         let profile = crate::profiles::selected(preferences.plain.unwrap_or_else(|| reading::is_plain(path.as_deref())));
@@ -4204,6 +4218,7 @@ impl View {
         } else if plain { rubrica_doc::plain::parse(&source, preferences.text) }
         else { Document::parse_with(&source, rubrica_doc::ParseOptions {
             keep_line_breaks: preferences.line_breaks.unwrap_or(self.keep_line_breaks),
+            html_images: self.show_html_images,
         }) };
         trace("page-ready");
 
@@ -5898,6 +5913,7 @@ impl View {
             next: self.path.as_deref().and_then(|p| reading::neighbor(p, true)).is_some(),
             keep_line_breaks: self.keep_line_breaks,
             line_break_override: self.line_break_override,
+            show_html_images: self.show_html_images,
             peek: crate::settings::peek_enabled(),
             peek_space: crate::peek::space_mode(),
             peek_focus_close: crate::peek::focus_close(),
@@ -6108,6 +6124,11 @@ impl View {
                 self.line_break_override = keep;
                 self.reparse(hwnd);
             }
+            Command::HtmlImages(show) => {
+                self.show_html_images = show;
+                crate::settings::record_show_html_images(show);
+                self.reparse(hwnd);
+            }
             Command::SourceView => {
                 self.source_view = !self.source_view;
                 self.reparse(hwnd);
@@ -6269,6 +6290,7 @@ impl View {
         }
         Document::parse_with(&self.source, rubrica_doc::ParseOptions {
             keep_line_breaks: self.line_break_override.unwrap_or(self.keep_line_breaks),
+            html_images: self.show_html_images,
         })
     }
 
@@ -9604,6 +9626,7 @@ impl View {
         // a line-break rule changed in the Settings app since the last launch belongs
         // to this document as much as to the one after it.
         self.keep_line_breaks = crate::settings::keep_line_breaks();
+        self.show_html_images = crate::settings::show_html_images();
         let preferences = path.as_deref().map(crate::settings::document).unwrap_or_default();
         self.line_break_override = preferences.line_breaks;
         self.plain_override = preferences.plain;
@@ -11364,7 +11387,7 @@ impl<'a> Objects<'a> {
     ) -> Option<StyleId> {
         let (size, color) = (prose.size, prose.color);
         match &obj.kind {
-            rubrica_doc::ObjectKind::Image { src, .. } => {
+            rubrica_doc::ObjectKind::Image { src, zoom, .. } => {
                 // A missing store means COM or WIC could not be started, which is a
                 // different failure from one bad file and has to be reported as such
                 // rather than passed off as prose.
@@ -11373,7 +11396,7 @@ impl<'a> Objects<'a> {
                     return None;
                 };
                 let path = ImageStore::resolve(self.base_dir, src);
-                let Some((w, h)) = store.fit(&path, column) else {
+                let Some((w, h)) = store.fit_zoomed(&path, column, *zoom) else {
                     // A missing figure keeps measuring nothing, and is reported once.
                     // Swapping in the alt text here would shift every later span
                     // offset, since the block's text and ranges were built already.
@@ -11668,6 +11691,7 @@ pub(crate) fn export_png(
     text_options: TextOptions,
     source_view: bool,
     keep_line_breaks: bool,
+    html_images: bool,
     zoom: Zoom,
     face: Option<usize>,
     measure: Option<usize>,
@@ -11693,7 +11717,7 @@ pub(crate) fn export_png(
     } else if plain {
         reading::parse_plain(source, input_path, text_options)
     } else {
-        Document::parse_with(source, rubrica_doc::ParseOptions { keep_line_breaks })
+        Document::parse_with(source, rubrica_doc::ParseOptions { keep_line_breaks, html_images })
     };
     let mut font = FontEngine::new().map_err(|e| -> Error { format!("DirectWrite: {e}").into() })?;
     if !font.probe() {
@@ -11904,6 +11928,7 @@ pub fn export_pdf(
     text_options: TextOptions,
     source_view: bool,
     keep_line_breaks: bool,
+    html_images: bool,
     zoom: Zoom,
     face: Option<usize>,
     measure: Option<usize>,
@@ -11929,7 +11954,7 @@ pub fn export_pdf(
     } else if plain {
         reading::parse_plain(source, input_path, text_options)
     } else {
-        Document::parse_with(source, rubrica_doc::ParseOptions { keep_line_breaks })
+        Document::parse_with(source, rubrica_doc::ParseOptions { keep_line_breaks, html_images })
     };
     let mut font = FontEngine::new().map_err(|e| -> Error { format!("DirectWrite: {e}").into() })?;
     if !font.probe() {

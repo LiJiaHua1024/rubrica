@@ -284,6 +284,24 @@ pub fn record_line_breaks(keep: bool) {
     write_word(SUBKEY, "KeepLineBreaks", u32::from(keep));
 }
 
+/// Whether an `<img>` in a document's markup becomes the figure it names, or whether
+/// the reader is shown the words its alt text carries instead: a choice of the reader's
+/// own menu, and a missing value means on, since a reader of prose wants its pictures.
+pub fn show_html_images() -> bool {
+    html_images_of(word(SUBKEY, "HtmlImages"))
+}
+
+/// What the stored word means on its own: pictures unless the reader said no, and a
+/// value this build never wrote -- a hand-edited registry, an older build's -- means the
+/// default as well, because a garbage number is not a reader's choice.
+fn html_images_of(stored: Option<u32>) -> bool {
+    stored != Some(0)
+}
+
+pub fn record_show_html_images(show: bool) {
+    write_word(SUBKEY, "HtmlImages", u32::from(show));
+}
+
 /// Whether the reader wants the spacebar peek watching: a choice of the reader's
 /// own menu, honoured again the next time a reader window opens.
 pub fn peek_enabled() -> bool {
@@ -1073,6 +1091,22 @@ mod tests {    use super::*;
         let w = words(Zoom::DESIGN, None, 0, 1);
         assert_eq!(w[1], FOLLOW_SYSTEM);
         assert_eq!(read(Some(w[0]), Some(w[1]), Some(w[2]), Some(w[3])).dark, None);
+    }
+
+    /// The HTML-figures switch, whose absence means on: the one setting here where a
+    /// missing value is a choice of its own rather than "no answer".
+    #[test]
+    fn the_html_images_switch_is_on_until_it_is_turned_off() {
+        assert!(html_images_of(None), "a reader who never chose gets the pictures");
+        assert!(html_images_of(Some(1)));
+        assert!(!html_images_of(Some(0)), "a chosen off is an off");
+        assert!(html_images_of(Some(7)), "a number this build never wrote is no choice at all");
+        // And the choice travels to the registry and back like every other one.
+        let sub = "Software\\Rubrica Test HtmlImages";
+        clear(sub);
+        write_word(sub, "HtmlImages", 0);
+        assert_eq!(word(sub, "HtmlImages"), Some(0), "the off came back as something else");
+        clear(sub);
     }
 
     #[test]
