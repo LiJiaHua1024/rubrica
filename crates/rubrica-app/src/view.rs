@@ -344,7 +344,12 @@ impl Rgb {
 /// text is a little under full contrast: both reduce glare over a long read, and a
 /// reader is read for pages at a time rather than glanced at.
 /// Shared with the peek window, which paints the same paper in its own frame.
-#[derive(Clone, Debug)]
+///
+/// A palette is also what a theme file resolves to, so the twenty-three colours below
+/// are the twenty-three keys such a file may name -- and two palettes that are equal
+/// are equal to the bit, which is what lets a repaint be skipped for a redraw nobody
+/// would see.
+#[derive(Clone, Debug, PartialEq)]
 pub(crate) struct Palette {
     pub(crate) dark: bool,
     pub(crate) bg: Rgb,
@@ -367,11 +372,24 @@ pub(crate) struct Palette {
     /// ink, and one that has to leave the page's own text readable through it: the
     /// band goes under the words, so the ink is the page's against this colour.
     pub(crate) highlight: Rgb,
+    /// The tree panel's own surface, and the ink on it. The six colours from here
+    /// down are the window's furniture: a theme may name them, and a theme that says
+    /// nothing about one gets it from the page it is written for -- which is what
+    /// [`Palette::settle`] is for.
+    pub(crate) sidebar: Rgb,
+    pub(crate) sidebar_text: Rgb,
+    /// An unselected tab's label.
+    pub(crate) tab_text: Rgb,
+    /// The fill under a selected tab's label, and the ink that fill asks for.
+    pub(crate) active_tab: Rgb,
+    pub(crate) on_tab_active: Rgb,
+    /// The one-pixel rule that divides the strips from what they govern.
+    pub(crate) divider: Rgb,
 }
 
 impl Palette {
     pub(crate) fn of(dark: bool) -> Palette {
-        if dark {
+        let mut palette = if dark {
             Palette {
                 dark,
                 bg: Rgb::gray(0.112),
@@ -400,6 +418,13 @@ impl Palette {
                 // reads over it. A full-brightness yellow would be the one place
                 // on the page the eye is dragged to.
                 highlight: Rgb { r: 0.32, g: 0.28, b: 0.09 },
+                // Settled below, from the page's own colours: see `settle`.
+                sidebar: Rgb::gray(0.0),
+                sidebar_text: Rgb::gray(0.0),
+                tab_text: Rgb::gray(0.0),
+                active_tab: Rgb::gray(0.0),
+                on_tab_active: Rgb::gray(0.0),
+                divider: Rgb::gray(0.0),
             }
         } else {
             Palette {
@@ -429,8 +454,33 @@ impl Palette {
                 // black ink keeps its contrast on top of it, and warm enough that it
                 // reads as a mark someone made rather than as a tint of the paper.
                 highlight: Rgb { r: 0.98, g: 0.90, b: 0.42 },
+                // Settled below, from the page's own colours: see `settle`.
+                sidebar: Rgb::gray(0.0),
+                sidebar_text: Rgb::gray(0.0),
+                tab_text: Rgb::gray(0.0),
+                active_tab: Rgb::gray(0.0),
+                on_tab_active: Rgb::gray(0.0),
+                divider: Rgb::gray(0.0),
             }
-        }
+        };
+        palette.settle();
+        palette
+    }
+
+    /// The window's furniture, for a theme that left it out.
+    ///
+    /// Six of the twenty-three colours are not chosen in their own right by most
+    /// themes: a sidebar is the panel colour, a tab's resting label is the quiet ink,
+    /// the selected tab is the accent. Settling them *after* the page's own colours
+    /// are final is what makes a theme of one key work -- a file that names only
+    /// `code_bg` gets a sidebar of that colour, not of the default's.
+    pub(crate) fn settle(&mut self) {
+        self.sidebar = self.code_bg;
+        self.sidebar_text = self.muted;
+        self.tab_text = self.muted;
+        self.active_tab = self.accent;
+        self.on_tab_active = self.on_accent;
+        self.divider = self.tab_inactive;
     }
 
     pub(crate) fn ink(&self, role: ColorRole) -> Rgb {
@@ -451,6 +501,12 @@ impl Palette {
             ColorRole::TabInactive => self.tab_inactive,
             ColorRole::TabHover => self.tab_hover,
             ColorRole::OnAccent => self.on_accent,
+            ColorRole::Sidebar => self.sidebar,
+            ColorRole::SidebarText => self.sidebar_text,
+            ColorRole::TabText => self.tab_text,
+            ColorRole::TabActive => self.active_tab,
+            ColorRole::OnTabActive => self.on_tab_active,
+            ColorRole::Divider => self.divider,
         }
     }
 }
@@ -1728,6 +1784,22 @@ pub struct View {
     /// which is what the appearance poll reports; a manual choice has to outrank that
     /// answer or the next timer tick would undo it.
     dark_override: Option<bool>,
+    /// The reader's own themes: the built-ins and whatever the folder holds, resolved.
+    /// Kept as a shelf rather than rebuilt per paint, and rebuilt whole when the
+    /// folder's signature moves -- a theme file is saved with an editor, and the file
+    /// event is the editor's rather than this window's.
+    themes: crate::themes::Shelf,
+    /// The folder's signature when [`Self::themes`] was last built, which is what the
+    /// document tick compares to decide whether anything has to be read again.
+    themes_stamp: u64,
+    /// What the reader chose for each appearance, light first: the name of a theme, or
+    /// `None` for the built-in default. Read from the registry at start-up and written
+    /// back the moment the menu changes one.
+    theme_slots: [Option<String>; 2],
+    /// A theme named on the command line, which outranks both slots until the reader
+    /// picks something from the menu: `--theme` is an instruction about this window,
+    /// not a change of the reader's mind. Resolved once, at start-up.
+    theme_pin: Option<crate::themes::Resolved>,
     brushes: HashMap<ColorRole, ID2D1SolidColorBrush>,
     tab_format: Option<IDWriteTextFormat>,
     /// Measured tab labels, keyed on the tab list that produced them: hit-testing and
@@ -2636,6 +2708,16 @@ enum Command {
     /// Let the system's own setting decide again, which is the only way back out of a
     /// manual choice once the room's light has changed.
     FollowSystem,
+    /// Draw with one of the reader's themes, for the appearance it is written for, and
+    /// remember the choice in that appearance's slot. The default's own name means the
+    /// slot again is empty: a reader who picked the built-in pair has not chosen a file.
+    ColorTheme(bool, String),
+    /// Write what is on the screen out as a theme file of the reader's own: every
+    /// colour the window draws with, so the copy is a starting point rather than a
+    /// difference from something else.
+    CopyAsMyTheme,
+    /// Make the themes folder if it is not there, and show it.
+    OpenThemesFolder,
     OpenFile,
     ToggleTree,
     OpenRecent(usize),
@@ -2748,6 +2830,9 @@ struct MenuState {
     /// that does nothing when pressed teaches them the menu is not to be believed.
     can_back: bool,
     can_forward: bool,
+    /// The colour themes on offer, which is two submenus' worth of state: the names for
+    /// each appearance, the one in use, and why a slot's name is not the one on screen.
+    themes: ThemeMenu,
     /// The address under the pointer, when a link that leads out is what is under it.
     link: Option<String>,
     selected: bool,
@@ -2779,9 +2864,24 @@ struct MenuState {
     offered: Vec<bool>,
 }
 
+/// What the colour-theme submenu has to say, gathered in one place because the two
+/// appearances are the same question asked twice: what is on offer, what is in use, and
+/// why a slot's own name is not the one being drawn with.
+#[derive(Default)]
+struct ThemeMenu {
+    /// The names on offer, light first, each in the order the shelf holds them: the
+    /// built-ins and then the reader's own files, by name.
+    names: [Vec<String>; 2],
+    /// The name in use for each appearance. A slot that failed is not one of these:
+    /// what is in use is the default it fell back to, and the fault stands beside it as
+    /// a row of its own.
+    current: [String; 2],
+    /// A slot that names a theme this build cannot draw with, and why.
+    fault: [Option<crate::themes::SlotFault>; 2],
+}
+
 /// The menu, in the order it appears and with the groups it is divided into.
-fn menu_items(s: &MenuState) -> Vec<MenuRow> {
-    // A tab in a menu string starts the accelerator column, which Windows sets
+fn menu_items(s: &MenuState) -> Vec<MenuRow> {    // A tab in a menu string starts the accelerator column, which Windows sets
     // right-aligned on its own. Only the rows where the key does exactly what the row
     // says print one: `Ctrl`+`D` picks whichever palette is not on rather than the one it
     // is standing next to, and the bracket keys step the measure rather than settling on
@@ -2858,6 +2958,37 @@ fn menu_items(s: &MenuState) -> Vec<MenuRow> {
         check(Command::Palette(true), i18n::t(s.lang, Key::MenuDark), s.dark == Some(true)),
         check(Command::FollowSystem, i18n::t(s.lang, Key::MenuFollowSystem), s.dark.is_none()),
     ]);
+    // The reader's own themes, one submenu per appearance and both built the same way:
+    // a slot that names something this build does not have leads with the reason, and
+    // then every theme of that appearance, with the one in use checked. The two are
+    // always offered -- a light theme chosen while the window is dark is the answer to
+    // "what happens next time the room is bright", which is a choice worth making
+    // before you need it.
+    let theme_submenu = |slot: usize| {
+        let mut items = Vec::new();
+        if let Some(fault) = s.themes.fault[slot].as_ref() {
+            items.push(row(
+                Command::ColorTheme(slot == 1, String::new()),
+                i18n::slot_fault(s.lang, fault),
+                false,
+            ));
+        }
+        for name in &s.themes.names[slot] {
+            items.push(check(
+                Command::ColorTheme(slot == 1, name.clone()),
+                name.clone(),
+                *name == s.themes.current[slot],
+            ));
+        }
+        items
+    };
+    v.push(MenuRow::Sub { label: i18n::t(s.lang, Key::MenuColourTheme), items: vec![
+        MenuRow::Sub { label: i18n::t(s.lang, Key::MenuLightTheme), items: theme_submenu(0) },
+        MenuRow::Sub { label: i18n::t(s.lang, Key::MenuDarkTheme), items: theme_submenu(1) },
+        MenuRow::Gap,
+        row(Command::CopyAsMyTheme, i18n::t(s.lang, Key::MenuCopyTheme), true),
+        row(Command::OpenThemesFolder, i18n::t(s.lang, Key::MenuOpenThemesFolder), true),
+    ] });
     v.push(MenuRow::Gap);
     v.extend([
         row(Command::ToggleTree, i18n::t(s.lang, Key::MenuWorkspaceTree), true),
@@ -3227,7 +3358,11 @@ impl ResizePreview {
 /// is answered with a frame milliseconds after the process starts, while the
 /// document's settings, read, parse and layout all run afterwards against a window
 /// that is already there.
-fn new_view(path: Option<PathBuf>, extra: Vec<PathBuf>) -> Result<(Box<View>, crate::settings::Settings)> {
+fn new_view(
+    path: Option<PathBuf>,
+    extra: Vec<PathBuf>,
+    start_theme: Option<String>,
+) -> Result<(Box<View>, crate::settings::Settings)> {
     // Must happen before the first window exists, or the process is already
     // bitmap-scaled and text on a secondary high-density monitor is soft.
     unsafe {
@@ -3269,6 +3404,27 @@ fn new_view(path: Option<PathBuf>, extra: Vec<PathBuf>) -> Result<(Box<View>, cr
     // changes it: the numbers come from the face this machine would set a formula in.
     theme.learn_scripts(&font);
     let dark = saved.dark.unwrap_or_else(system_prefers_dark);
+    // The reader's own themes, read before the window exists so the first paint is
+    // already the theme they asked for. A folder that cannot be read is the six
+    // built-ins, which is not a failure: the window opens with what it has.
+    let themes = crate::themes::shelf();
+    let theme_slots = [
+        crate::settings::theme_slot(false),
+        crate::settings::theme_slot(true),
+    ];
+    // A `--theme` on the command line is an instruction about this window rather than a
+    // change of the reader's mind: it is resolved once, it outranks both slots, and
+    // picking anything from the menu puts it down. A word that names nothing is a
+    // window in the reader's own theme, with the reason on stderr: a reader who named a
+    // theme and got a window is better served than one who got a dialog and no window.
+    let theme_pin = start_theme.as_deref().and_then(|word| match crate::themes::open(&themes, word) {
+        Ok(theme) => Some(theme),
+        Err(reason) => {
+            eprintln!("theme: {reason}");
+            None
+        }
+    });
+    let palette = opening_palette(&themes, &theme_slots, theme_pin.as_ref(), dark);
 
     let lang_choice = crate::settings::language();
     let lang = lang_choice.unwrap_or_else(Language::system_language);
@@ -3313,8 +3469,12 @@ fn new_view(path: Option<PathBuf>, extra: Vec<PathBuf>) -> Result<(Box<View>, cr
         page_transition: None,
         page_hot: None,
         page_pressed: None,
-        palette: Palette::of(dark),
+        palette,
         dark_override: saved.dark,
+        themes,
+        themes_stamp: crate::themes::stamp(),
+        theme_slots,
+        theme_pin,
         brushes: HashMap::new(),
         tab_format: None,
         tab_labels: None,
@@ -3399,8 +3559,25 @@ fn new_view(path: Option<PathBuf>, extra: Vec<PathBuf>) -> Result<(Box<View>, cr
     Ok((view, saved))
 }
 
-pub fn run(path: Option<PathBuf>, extra: Vec<PathBuf>) -> Result<()> {
-    let (mut view, saved) = new_view(path, extra)?;
+/// The palette a window starts with, and the one it goes back to when the appearance
+/// flips: the theme `--theme` pinned, and the slot for this appearance otherwise.
+fn opening_palette(
+    themes: &crate::themes::Shelf,
+    slots: &[Option<String>; 2],
+    pin: Option<&crate::themes::Resolved>,
+    dark: bool,
+) -> Palette {
+    if let Some(theme) = pin {
+        // A pinned theme is drawn whichever way the room's light goes: the reader
+        // asked for it by name, and a named theme is a decision rather than a mode.
+        return theme.palette.clone();
+    }
+    let appearance = crate::themes::Appearance::of_dark(dark);
+    crate::themes::pick(themes, appearance, slots[usize::from(dark)].as_deref()).0.palette
+}
+
+pub fn run(path: Option<PathBuf>, extra: Vec<PathBuf>, start_theme: Option<String>) -> Result<()> {
+    let (mut view, saved) = new_view(path, extra, start_theme)?;
     const CLASS: &str = "Rubrica.Main";
     unsafe {
         let hinst = GetModuleHandleW(None)?;
@@ -4359,7 +4536,7 @@ impl View {
     /// and every glyph run of every frame, and a fixed list is checked in nanoseconds.
     fn ensure_brushes(&mut self) {
         let Some(rt) = self.target.clone() else { return };
-        const ROLES: [ColorRole; 18] = [
+        const ROLES: [ColorRole; 24] = [
             ColorRole::Text,
             ColorRole::Muted,
             ColorRole::Accent,
@@ -4378,6 +4555,12 @@ impl View {
             ColorRole::TabInactive,
             ColorRole::TabHover,
             ColorRole::OnAccent,
+            ColorRole::Sidebar,
+            ColorRole::SidebarText,
+            ColorRole::TabText,
+            ColorRole::TabActive,
+            ColorRole::OnTabActive,
+            ColorRole::Divider,
         ];
         for role in ROLES {
             if self.brushes.contains_key(&role) {
@@ -4898,7 +5081,15 @@ impl View {
             }
             WM_TIMER => {
                 match wp.0 {
-                    DOCUMENT_TIMER => self.reload_if_written(hwnd),
+                    DOCUMENT_TIMER => {
+                        self.reload_if_written(hwnd);
+                        // The reader's own theme files are watched by the same beat: a
+                        // theme is saved with an editor, which has no way to tell this
+                        // window, and the folder's signature is the cheapest way to
+                        // notice that does not leave a handle open on a folder nobody
+                        // has looked at in months.
+                        self.refresh_themes(hwnd);
+                    }
                     CARET_TIMER => {
                         // A beat only means something while a caret stands on the page
                         // and nothing covers it; otherwise the phase flips in the dark
@@ -5915,8 +6106,7 @@ impl View {
             lang: self.lang,
             lang_choice: self.lang_choice,
             profiles: crate::profiles::names(),
-            profile: self.profile.clone(),
-            source_view: self.source_view,
+            profile: self.profile.clone(),            source_view: self.source_view,
             plain_override: self.plain_override,
             text_options: self.text_options,
             chapter_titles: self
@@ -5962,6 +6152,7 @@ impl View {
             peek_click_close: crate::peek::click_close(),
             can_back: self.history.leads(true),
             can_forward: self.history.leads(false),
+            themes: self.theme_menu(),
             link: self.pointer_link(pt.x as f32, pt.y as f32),
             selected: self.selection.is_some_and(|s| s.from != s.to),
             dark: self.dark_override,
@@ -6093,6 +6284,31 @@ impl View {
                 let dark = system_prefers_dark();
                 if self.set_dark(dark, hwnd) {
                     let _ = unsafe { InvalidateRect(Some(hwnd), None, false) };
+                }
+            }
+            Command::ColorTheme(dark, name) => {
+                // The built-in default's own name is not a theme anybody chose: it is
+                // what the slot says when it is empty, so picking it empties the slot.
+                let chosen = (name != crate::themes::Appearance::of_dark(dark).default_name())
+                    .then_some(name);
+                self.theme_slots[usize::from(dark)] = chosen.clone();
+                crate::settings::record_theme_slot(dark, chosen.as_deref());
+                // A pick from the menu is the reader changing their mind, which is what
+                // puts down a theme pinned on the command line.
+                self.theme_pin = None;
+                let now = self.dark_override.unwrap_or_else(system_prefers_dark);
+                if self.set_dark(now, hwnd) {
+                    let _ = unsafe { InvalidateRect(Some(hwnd), None, false) };
+                }
+            }
+            Command::CopyAsMyTheme => self.copy_as_my_theme(hwnd),
+            Command::OpenThemesFolder => {
+                if let Some(folder) = crate::themes::dir() {
+                    if let Err(error) = std::fs::create_dir_all(&folder) {
+                        show_error(hwnd, &format!("{}: {error}", folder.display()));
+                    } else {
+                        open_url(&folder.to_string_lossy());
+                    }
                 }
             }
             Command::OpenFile => {
@@ -6312,6 +6528,59 @@ impl View {
             self.theme.face,
             self.theme.measure,
         );
+    }
+
+    /// What the colour-theme submenus say about this window: what is on offer for each
+    /// appearance, what is in use, and why a slot's name is not it.
+    fn theme_menu(&self) -> ThemeMenu {
+        let mut menu = ThemeMenu::default();
+        for theme in &self.themes.themes {
+            menu.names[usize::from(theme.appearance.is_dark())].push(theme.name.clone());
+        }
+        for (slot, dark) in [false, true].into_iter().enumerate() {
+            let appearance = crate::themes::Appearance::of_dark(dark);
+            // A theme pinned on the command line is what is on screen, wherever it came
+            // from: it is named as the one in use, and the slot behind it waits.
+            if let Some(pin) = self.theme_pin.as_ref().filter(|pin| pin.appearance == appearance) {
+                menu.current[slot] = pin.name.clone();
+                continue;
+            }
+            let (theme, fault) =
+                crate::themes::pick(&self.themes, appearance, self.theme_slots[slot].as_deref());
+            menu.current[slot] = theme.name;
+            menu.fault[slot] = fault;
+        }
+        menu
+    }
+
+    /// Write the theme on the screen out as a file of the reader's own, and point this
+    /// appearance's slot at it.
+    ///
+    /// What is copied is what is *drawn* -- a pinned theme, the slot's theme, or the
+    /// built-in pair -- so the file the reader opens is the window they were looking at.
+    /// The slot moves to the copy at the same time, and the copy is what the window
+    /// keeps drawing with: it is every colour, so nothing about the screen changes, and
+    /// the reader's next edit to the file is the only thing that will.
+    fn copy_as_my_theme(&mut self, hwnd: HWND) {
+        let Some(folder) = crate::themes::dir() else { return };
+        let dark = self.dark_override.unwrap_or_else(system_prefers_dark);
+        let theme = match self.theme_pin.clone() {
+            Some(theme) => theme,
+            None => {
+                let appearance = crate::themes::Appearance::of_dark(dark);
+                crate::themes::pick(&self.themes, appearance, self.theme_slots[usize::from(dark)].as_deref()).0
+            }
+        };
+        match crate::themes::copy_into(&folder, &self.themes, &theme) {
+            Ok((_, name)) => {
+                self.themes_stamp = crate::themes::stamp();
+                self.themes = crate::themes::shelf();
+                self.theme_slots[usize::from(dark)] = Some(name.clone());
+                crate::settings::record_theme_slot(dark, Some(&name));
+                self.theme_pin = None;
+            }
+            Err(reason) => show_error(hwnd, &reason),
+        }
     }
 
     fn parse_source(&self) -> Document {
@@ -6783,12 +7052,28 @@ impl View {
     /// poll asks on every tick, and a tick whose answer is already on screen must not
     /// cost a repaint.
     fn set_dark(&mut self, dark: bool, hwnd: HWND) -> bool {
-        if dark == self.palette.dark {
+        let palette = self.palette_for(dark);
+        self.set_palette(palette, hwnd)
+    }
+
+    /// The palette one appearance draws with: the pinned theme, the reader's own slot
+    /// for that appearance, or the built-in default the slot falls back to.
+    fn palette_for(&self, dark: bool) -> Palette {
+        opening_palette(&self.themes, &self.theme_slots, self.theme_pin.as_ref(), dark)
+    }
+
+    /// Draw with this palette, and say whether anything changed.
+    ///
+    /// Whole palettes are compared rather than appearances: a theme is a colour the
+    /// reader picked, and a tick whose answer is already on screen must not cost a
+    /// repaint -- nor may a theme change that only moved a colour the page never draws
+    /// with. The brushes hold the old inks, keyed by role rather than by palette, so
+    /// they have to go; the layout is ink-independent and needs no work.
+    fn set_palette(&mut self, palette: Palette, hwnd: HWND) -> bool {
+        if palette == self.palette {
             return false;
         }
-        self.palette = Palette::of(dark);
-        // The brushes hold the old inks, keyed by role rather than by palette, so they
-        // have to go; the layout is ink-independent and needs no work.
+        self.palette = palette;
         self.brushes.clear();
         self.sel_brush = None;
         self.hit_brush = None;
@@ -6805,6 +7090,26 @@ impl View {
         }
         unsafe { self.apply_dark_titlebar(hwnd) };
         true
+    }
+
+    /// Read the theme folder again, and draw with what it now holds.
+    ///
+    /// The folder is watched by the document tick, which runs once in three quarters of
+    /// a second: saving a theme file in an editor is the editor's event and not this
+    /// window's, and this is the cheapest way to hear about it that does not leave a
+    /// handle open on a folder the reader may not have. The signature is compared
+    /// first, so a folder nobody is writing to costs a listing and never a parse.
+    fn refresh_themes(&mut self, hwnd: HWND) {
+        let stamp = crate::themes::stamp();
+        if stamp == self.themes_stamp {
+            return;
+        }
+        self.themes_stamp = stamp;
+        self.themes = crate::themes::shelf();
+        let dark = self.dark_override.unwrap_or_else(system_prefers_dark);
+        if self.set_dark(dark, hwnd) {
+            let _ = unsafe { InvalidateRect(Some(hwnd), None, false) };
+        }
     }
 
     /// The decoder the figures on this page are drawn through, made once.
@@ -8819,8 +9124,8 @@ impl View {
 
     unsafe fn draw_tree_panel(&mut self, target: &ID2D1RenderTarget) {
         if !self.tree_visible { return; }
-        let surface = self.brushes.get(&ColorRole::Surface).cloned();
-        let muted = self.brushes.get(&ColorRole::Muted).cloned();
+        let surface = self.brushes.get(&ColorRole::Sidebar).cloned();
+        let muted = self.brushes.get(&ColorRole::SidebarText).cloned();
         if let Some(brush) = surface.as_ref() {
             let rect = D2D_RECT_F { left: 0.0, top: TOPBAR_H, right: self.tree_width, bottom: self.client_h };
             target.FillRectangle(&rect, brush);
@@ -8847,16 +9152,20 @@ impl View {
         let strip = self.brushes.get(&ColorRole::TabStrip).cloned();
         let pills = self.brushes.get(&ColorRole::TabInactive).cloned();
         let hover = self.brushes.get(&ColorRole::TabHover).cloned();
-        let accent = self.brushes.get(&ColorRole::Accent).cloned();
-        let on_accent = self.brushes.get(&ColorRole::OnAccent).cloned();
-        let muted = self.brushes.get(&ColorRole::Muted).cloned();
+        let accent = self.brushes.get(&ColorRole::TabActive).cloned();
+        let on_accent = self.brushes.get(&ColorRole::OnTabActive).cloned();
+        let muted = self.brushes.get(&ColorRole::TabText).cloned();
+        let divider = self.brushes.get(&ColorRole::Divider).cloned();
         if let Some(brush) = strip.as_ref() {
             let rect = D2D_RECT_F { left: 0.0, top: 0.0, right: self.client_w, bottom: TOPBAR_H };
             target.FillRectangle(&rect, brush);
         }
         // The hairline between the strip and everything it governs. With it the tabs are
-        // chrome resting over a page; without it they are paint on the page.
-        if let Some(brush) = pills.as_ref() {
+        // chrome resting over a page; without it they are paint on the page. Its own
+        // colour, because a theme may want the strips quiet and the rule that divides
+        // them not to be -- and by default it is the resting pill, which is what the
+        // window drew before it had a name for it.
+        if let Some(brush) = divider.as_ref() {
             let rect = D2D_RECT_F { left: 0.0, top: TOPBAR_H - 1.0, right: self.client_w, bottom: TOPBAR_H };
             target.FillRectangle(&rect, brush);
         }
@@ -8954,7 +9263,7 @@ impl View {
     ) {
         let hover = self.brushes.get(&ColorRole::TabHover).cloned();
         let resting = self.brushes.get(&ColorRole::TabInactive).cloned();
-        let muted = self.brushes.get(&ColorRole::Muted).cloned();
+        let muted = self.brushes.get(&ColorRole::TabText).cloned();
         let pill_top = (TOPBAR_H - TAB_PILL_H) * 0.5;
         let pill = D2D1_ROUNDED_RECT {
             rect: D2D_RECT_F { left, top: pill_top, right: left + width, bottom: pill_top + TAB_PILL_H },
@@ -9046,7 +9355,7 @@ impl View {
         }
         let top = self.client_h - status_h;
         let strip = self.brushes.get(&ColorRole::TabStrip).cloned();
-        let hairline = self.brushes.get(&ColorRole::TabInactive).cloned();
+        let hairline = self.brushes.get(&ColorRole::Divider).cloned();
         let muted = self.brushes.get(&ColorRole::Muted).cloned();
         if let Some(brush) = strip.as_ref() {
             let rect = D2D_RECT_F { left: 0.0, top, right: self.client_w, bottom: self.client_h };
@@ -11853,7 +12162,7 @@ pub(crate) fn export_png(
     output: &Path,
     width: f32,
     scale: f32,
-    dark: bool,
+    palette: &Palette,
     plain: bool,
     text_options: TextOptions,
     source_view: bool,
@@ -11917,7 +12226,7 @@ pub(crate) fn export_png(
     if pixel_width as u64 * pixel_height as u64 > 100_000_000 {
         return Err("export image is too large; reduce --export-width or --export-scale".into());
     }
-    unsafe { write_png(&page, output, pixel_width, pixel_height, dark, store.as_ref()) }
+    unsafe { write_png(&page, output, pixel_width, pixel_height, palette, store.as_ref()) }
 }
 
 /// Paint a [`Page`] into a bitmap and write it out.
@@ -11943,7 +12252,7 @@ unsafe fn write_png(
     output: &Path,
     width: u32,
     height: u32,
-    dark: bool,
+    palette: &Palette,
     images: Option<&ImageStore>,
 ) -> Result<()> {
     let wic: IWICImagingFactory = CoCreateInstance(
@@ -11974,7 +12283,6 @@ unsafe fn write_png(
     };
     let target = factory.CreateWicBitmapRenderTarget(&bitmap, &props)?;
     target.BeginDraw();
-    let palette = Palette::of(dark);
     let bg = d2d(palette.bg);
     target.Clear(Some(&bg));
     let mut brushes: HashMap<ColorRole, ID2D1SolidColorBrush> = HashMap::new();
@@ -12094,7 +12402,7 @@ pub fn export_pdf(
     output: &Path,
     width: Pt,
     height: Pt,
-    dark: bool,
+    palette: &Palette,
     plain: bool,
     text_options: TextOptions,
     source_view: bool,
@@ -12150,7 +12458,7 @@ pub fn export_pdf(
         &mut objects,
         hyphenator.as_ref(),
     );
-    write_pdf(&page, &font, output, width, height, dark)
+    write_pdf(&page, &font, output, width, height, palette)
 }
 
 #[cfg(feature = "pdf")]
@@ -12167,8 +12475,8 @@ fn pdf_filled_rect(x: f32, y: f32, width: f32, height: f32) -> PdfRect {
 }
 
 #[cfg(feature = "pdf")]
-fn pdf_color(role: ColorRole, dark: bool) -> PdfColor {
-    pdf_rgb(Palette::of(dark).ink(role))
+fn pdf_color(role: ColorRole, palette: &Palette) -> PdfColor {
+    pdf_rgb(palette.ink(role))
 }
 
 #[cfg(feature = "pdf")]
@@ -12466,7 +12774,7 @@ fn pdf_emit_runs(
     top: Pt,
     content_height: Pt,
     height: Pt,
-    dark: bool,
+    palette: &Palette,
 ) {
     for run in runs {
         if run.glyphs.is_empty() {
@@ -12493,7 +12801,7 @@ fn pdf_emit_runs(
             fonts.insert(run.face_index, id.clone());
             id
         };
-        ops.push(PdfOp::SetFillColor { col: pdf_color(run.color, dark) });
+        ops.push(PdfOp::SetFillColor { col: pdf_color(run.color, palette) });
         ops.push(PdfOp::SetFont {
             font: PdfFontHandle::External(font_id),
             size: printpdf::Pt(run.em),
@@ -12547,7 +12855,7 @@ fn pdf_emit_runs(
 /// figure it is handed, so a relationship curve filed there would come out with a
 /// chord from its end back to its start that the scene never drew.
 #[cfg(feature = "pdf")]
-fn pdf_shape_ops(ops: &mut Vec<PdfOp>, shape: &crate::diagram::DiagramShape, height: Pt, dark: bool) {
+fn pdf_shape_ops(ops: &mut Vec<PdfOp>, shape: &crate::diagram::DiagramShape, height: Pt, palette: &Palette) {
     let point = |bezier: bool, p: rubrica_mermaid::Point| PdfLinePoint {
         p: pdf_point(p.x, height - p.y),
         bezier,
@@ -12578,12 +12886,12 @@ fn pdf_shape_ops(ops: &mut Vec<PdfOp>, shape: &crate::diagram::DiagramShape, hei
         return;
     }
     if let Some((width, role)) = shape.stroke {
-        ops.push(PdfOp::SetOutlineColor { col: pdf_color(role, dark) });
+        ops.push(PdfOp::SetOutlineColor { col: pdf_color(role, palette) });
         ops.push(PdfOp::SetOutlineThickness { pt: printpdf::Pt(width) });
     }
     if filled {
         if let Some(role) = shape.fill {
-            ops.push(PdfOp::SetFillColor { col: pdf_color(role, dark) });
+            ops.push(PdfOp::SetFillColor { col: pdf_color(role, palette) });
         }
     }
     if shape.path.closed {
@@ -12620,7 +12928,7 @@ fn write_pdf(
     output: &Path,
     width: Pt,
     height: Pt,
-    dark: bool,
+    palette: &Palette,
 ) -> Result<()> {
     if !width.is_finite() || !height.is_finite() || width <= 0.0 || height <= 0.0 {
         return Err("PDF page size must be positive".into());
@@ -12631,7 +12939,6 @@ fn write_pdf(
     let mut fonts: HashMap<usize, PdfFontId> = HashMap::new();
     let mut missing_font_faces = Vec::new();
     let mut images: HashMap<PathBuf, (printpdf::XObjectId, usize, usize)> = HashMap::new();
-    let palette = Palette::of(dark);
     for (page_index, top) in page_starts.iter().copied().enumerate() {
         let body_height = page_starts
             .get(page_index + 1)
@@ -12665,7 +12972,7 @@ fn write_pdf(
                 )
                 .replace("{n}", &note.number.to_string());
                 let marker_y = content_shift + 12.0;
-                ops.push(PdfOp::SetFillColor { col: pdf_color(ColorRole::Muted, dark) });
+                ops.push(PdfOp::SetFillColor { col: pdf_color(ColorRole::Muted, palette) });
                 ops.push(PdfOp::SetFont {
                     font: PdfFontHandle::Builtin(BuiltinFont::Helvetica),
                     size: printpdf::Pt(9.0),
@@ -12749,14 +13056,14 @@ fn write_pdf(
                     }
                     let clipped0 = y0.max(0.0);
                     let clipped1 = y1.min(content_height);
-                    ops.push(PdfOp::SetFillColor { col: pdf_color(*color, dark) });
+                    ops.push(PdfOp::SetFillColor { col: pdf_color(*color, palette) });
                     ops.push(PdfOp::DrawRectangle {
                         rectangle: pdf_filled_rect(*x, height - clipped1, *w, clipped1 - clipped0),
                     });
                 }
                 Op::Line { x0, y0, x1, y1, thickness, color } => {
                     let Some([(ax, ay), (bx, by)]) = clip_pdf_line(*x0, *y0, *x1, *y1, top, content_height) else { continue };
-                    ops.push(PdfOp::SetOutlineColor { col: pdf_color(*color, dark) });
+                    ops.push(PdfOp::SetOutlineColor { col: pdf_color(*color, palette) });
                     ops.push(PdfOp::SetOutlineThickness { pt: printpdf::Pt(*thickness) });
                     ops.push(PdfOp::DrawLine {
                         line: printpdf::Line {
@@ -12810,18 +13117,18 @@ fn write_pdf(
                 }
                 Op::Runs(runs) => pdf_emit_runs(
                     &mut ops, runs, &mut fonts, &mut missing_font_faces, &mut pdf, font, top,
-                    content_height, height, dark,
+                    content_height, height, palette,
                 ),
                 Op::Diagram { top: dtop, bottom: dbottom, shapes, runs, .. } => {
                     if *dbottom - top <= 0.0 || *dtop - top >= content_height {
                         continue;
                     }
                     for shape in shapes {
-                        pdf_shape_ops(&mut ops, shape, height, dark);
+                        pdf_shape_ops(&mut ops, shape, height, palette);
                     }
                     pdf_emit_runs(
                         &mut ops, runs, &mut fonts, &mut missing_font_faces, &mut pdf, font, top,
-                        content_height, height, dark,
+                        content_height, height, palette,
                     );
                 }
             }
@@ -13495,7 +13802,7 @@ mod tests {
 
     impl ResizeView {
         fn new(source: &str) -> Self {
-            let (mut view, _) = new_view(None, Vec::new()).expect("reader state");
+            let (mut view, _) = new_view(None, Vec::new(), None).expect("reader state");
             view.theme = Theme::default();
             assert!(view.font.probe());
             unsafe {
@@ -16778,8 +17085,20 @@ mod document_interaction_tests {
             };
             (hi + 0.05) / (lo + 0.05)
         }
-        for palette in [Palette::of(false), Palette::of(true)] {
-            let which = if palette.dark { "night" } else { "day" };
+        // Every built-in theme, and the pair a fresh reader gets with them: a theme that
+        // ships with the reader is held to the same bar as the one it falls back to,
+        // because a built-in that failed it would fail on the machine of every reader
+        // who chose it.
+        let mut palettes: Vec<(String, Palette)> = vec![
+            ("day".to_string(), Palette::of(false)),
+            ("night".to_string(), Palette::of(true)),
+        ];
+        palettes.extend(
+            crate::themes::built_ins()
+                .into_iter()
+                .map(|theme| (theme.name, theme.palette)),
+        );
+        for (which, palette) in palettes {
             // Words on the page.
             assert!(
                 ratio(&palette.text, &palette.bg) >= 4.5,
@@ -16831,6 +17150,24 @@ mod document_interaction_tests {
                 ratio(&palette.highlight, &palette.bg) >= 1.15,
                 "{which} highlighter against the page {:.2}",
                 ratio(&palette.highlight, &palette.bg),
+            );
+            // The window's own furniture carries words too: the sidebar's list of
+            // files, the label on a tab. A reader reads those exactly as they read the
+            // page, and a theme that ships with the reader is measured the same way.
+            assert!(
+                ratio(&palette.sidebar_text, &palette.sidebar) >= 4.5,
+                "{which} sidebar text {:.2}",
+                ratio(&palette.sidebar_text, &palette.sidebar),
+            );
+            assert!(
+                ratio(&palette.tab_text, &palette.tab_strip) >= 4.5,
+                "{which} tab text {:.2}",
+                ratio(&palette.tab_text, &palette.tab_strip),
+            );
+            assert!(
+                ratio(&palette.on_tab_active, &palette.active_tab) >= 4.5,
+                "{which} active tab text {:.2}",
+                ratio(&palette.on_tab_active, &palette.active_tab),
             );
         }
     }

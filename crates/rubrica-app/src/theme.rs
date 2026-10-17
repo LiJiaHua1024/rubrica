@@ -155,6 +155,20 @@ pub enum ColorRole {
     /// on the accent would be chosen for the page's sake; this one is chosen for the
     /// accent's, which is a different question -- what can be read on that fill.
     OnAccent,
+    /// The tree panel's own surface, and the ink on it. The six roles from here down
+    /// are the window's furniture: a theme may name them, and one that says nothing
+    /// gets them from the page's own colours -- the panel's colour for the sidebar,
+    /// the quiet ink for its words -- so a theme of one key is still a whole window.
+    Sidebar,
+    SidebarText,
+    /// An unselected tab's label.
+    TabText,
+    /// The fill under a selected tab's label, and the ink that fill asks for: the
+    /// page's accent and its pairing, unless the theme has its own window in mind.
+    TabActive,
+    OnTabActive,
+    /// The one-pixel rule that divides a strip from what it governs.
+    Divider,
 }
 
 /// The reader's size preference, as a step on a ladder rather than a free ratio.

@@ -199,6 +199,84 @@ recent documents, and the workspace tree.
 
 Preferences live in `HKCU\Software\Rubrica`.
 
+## Colour themes
+
+Light and dark each draw with a built-in pair: `Default Light` and `Default Dark`, the
+page as it has always been set. Four more ship alongside them — `Mono Light` and
+`Mono Dark`, a page with no hue in it at all, and `Solarized Light` and `Solarized
+Dark`, after the published palette of that name. Solarized's quiet inks are a step
+deeper than published and its selected tab a step further from the page, because the
+published pair is a low-contrast design and this reader holds every word on the page
+to a 4.5:1 bar; the hues are the homage, the depth is the bar.
+
+The menu's **Colour theme** submenu is where a choice is made. It holds two slots,
+**Light theme** and **Dark theme**: each lists the themes of its own appearance with
+the one in use ticked, a pick is remembered across restarts, and choosing the built-in
+default is how a slot is emptied. `Ctrl+D` still moves between the two appearances. A
+remembered name that has gone missing — its file deleted, or replaced by a theme for
+the other appearance — falls back to the built-in default and its row says why, rather
+than drawing a page in colours nobody chose.
+
+**The reader's own themes** are TOML files in `%APPDATA%\Rubrica\themes`.
+**Open Themes Folder** makes the folder if it is not there and opens it, and
+**Copy as My Theme…** writes the theme on screen into it as a file of its own — every
+colour spelled out, so it is a starting point rather than a reference to what it was
+copied from. A theme file is noticed when it is saved: the folder is watched, and a
+file added or edited changes the menu and the page within the second, no restart.
+
+A theme file says what it is and what it changes:
+
+```toml
+[meta]
+name = "My Page"              # required; the name the menu shows
+appearance = "light"          # required; "light" or "dark"
+# based_on = "Mono Light"     # optional: everything left out comes from this theme
+
+[colors]                      # the page and the inks on it
+bg = "#fbfbf9"
+accent = "#1f5b9e"
+highlight = "#fbe6a4"
+
+[chrome]                      # the window's furniture; may be left out entirely
+sidebar = "#efefe9"
+```
+
+The fourteen `[colors]` keys are `bg`, `text`, `muted`, `accent`, `code_bg`,
+`page_surface`, `page_shadow`, `on_accent`, `keyword`, `string`, `comment`, `number`,
+`ty` and `highlight`; the nine `[chrome]` keys are `sidebar`, `sidebar_text`,
+`tab_strip`, `tab_text`, `active_tab`, `active_tab_text`, `tab_inactive`, `tab_hover`
+and `divider`. Colours are `#rgb` or `#rrggbb` in quotes. A theme is a layer rather
+than a palette: a key it leaves out comes from `based_on`, that theme's own `based_on`
+before it, and past the end of the chain — eight themes at most — from the built-in
+default of the appearance; a `based_on` naming a theme of the other appearance is
+refused whole. Most themes leave all of `[chrome]` out: the sidebar is the code
+panel's colour, the resting tab label the quiet ink, the selected tab the accent and
+the rules the strip's edge — all settled from the page's own colours — and the strip's
+three tones stand as the built-in pair's until a theme says otherwise.
+
+A file that cannot be a theme is set aside whole and never half-drawn — no `name`, an
+`appearance` that is neither `light` nor `dark`, not UTF-8, over 64 KiB, a name that
+is a built-in's or another file's — and the reason is kept for the listing. One key
+that is not a colour costs only that key: the rest of the file still says what it
+says, and the listing names the key that was passed over.
+
+The same themes are available to headless runs:
+
+```
+rubrica-app --list-themes                         # what is installed, and what was not read
+rubrica-app --theme "Mono Dark" --report document.md
+rubrica-app --export-png page.png --theme my-page.toml document.md
+```
+
+`--theme` takes a name (case is not information) or a path to a `.toml` anywhere.
+`--list-themes` prints the built-ins, every file read, every file set aside with its
+reason and both slots, and exits without opening a window. In the window a `--theme`
+that cannot be used is reported on the console and the default pair draws; a report or
+an export refuses instead, because a file that is not the theme that was asked for is
+worse than no file. A `--report` run whose theme came from a slot or from `--theme`
+prints one `theme` line saying what was drawn with; a page nobody gave a theme to
+reports exactly as it always did.
+
 ## The spacebar peek
 
 `rubrica-app --peek` runs a small background service (a tray icon, no window) that adds

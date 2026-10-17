@@ -321,6 +321,22 @@ pub fn record_show_highlights(show: bool) {
     write_word(SUBKEY, "Highlights", u32::from(show));
 }
 
+/// The colour theme the reader chose for one appearance, where `false` is light and
+/// `true` is dark: a theme's name, or `None` when the slot holds nothing and the
+/// built-in default pair is drawing. The name is not checked here -- whether this build
+/// has a theme by that name is known where the theme is read, and a name that is not
+/// installed falls back with the reason said, rather than refusing to open a page.
+pub fn theme_slot(dark: bool) -> Option<String> {
+    text(SUBKEY, if dark { "ThemeDark" } else { "ThemeLight" })
+}
+
+/// Write down one theme slot. The built-in default is written as an empty string rather
+/// than deleted: the value is a memory of a choice, and the menu reads an empty memory
+/// and no memory alike, but only one of them can be got back from the registry.
+pub fn record_theme_slot(dark: bool, name: Option<&str>) {
+    write_text(SUBKEY, if dark { "ThemeDark" } else { "ThemeLight" }, name.unwrap_or(""));
+}
+
 /// Whether the reader wants the spacebar peek watching: a choice of the reader's
 /// own menu, honoured again the next time a reader window opens.
 pub fn peek_enabled() -> bool {

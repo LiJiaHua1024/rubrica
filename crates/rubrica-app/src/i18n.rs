@@ -194,6 +194,18 @@ pub enum Key {
     MenuHtmlImages,
     MenuHighlights,
 
+    MenuColourTheme,
+    MenuLightTheme,
+    MenuDarkTheme,
+    MenuCopyTheme,
+    MenuOpenThemesFolder,
+    /// A saved slot naming a theme this build does not have, with the name in place of
+    /// `{name}`.
+    ThemeMissing,
+    /// A saved slot naming a theme installed for the other appearance, with the name in
+    /// place of `{name}`.
+    ThemeWrongAppearance,
+
     MenuExternalEditor,
     MenuOpenInEditor,
     MenuChooseEditor,
@@ -350,6 +362,14 @@ fn translate_en(key: Key) -> &'static str {
         Key::MenuHtmlImages => "Show HTML image tags",
         Key::MenuHighlights => "Show ==text== as a highlight",
 
+        Key::MenuColourTheme => "Colour theme",
+        Key::MenuLightTheme => "Light theme",
+        Key::MenuDarkTheme => "Dark theme",
+        Key::MenuCopyTheme => "Copy as My Theme\u{2026}",
+        Key::MenuOpenThemesFolder => "Open Themes Folder",
+        Key::ThemeMissing => "`{name}` is not installed",
+        Key::ThemeWrongAppearance => "`{name}` is a theme for the other appearance",
+
         Key::MenuExternalEditor => "External editor",
         Key::MenuOpenInEditor => "Open in Editor",
         Key::MenuChooseEditor => "Choose Editor\u{2026}",
@@ -489,6 +509,14 @@ fn translate_zh_cn(key: Key) -> &'static str {
         Key::MenuReadSource => "阅读源码",
         Key::MenuHtmlImages => "显示 HTML 图片标签",
         Key::MenuHighlights => "将 ==文字== 显示为荧光标记",
+
+        Key::MenuColourTheme => "配色主题",
+        Key::MenuLightTheme => "浅色主题",
+        Key::MenuDarkTheme => "深色主题",
+        Key::MenuCopyTheme => "复制为我的主题…",
+        Key::MenuOpenThemesFolder => "打开主题文件夹",
+        Key::ThemeMissing => "`{name}` 未安装",
+        Key::ThemeWrongAppearance => "`{name}` 属于另一种外观",
 
         Key::MenuExternalEditor => "外部编辑器",
         Key::MenuOpenInEditor => "在编辑器中打开",
@@ -630,6 +658,14 @@ fn translate_zh_tw(key: Key) -> &'static str {
         Key::MenuHtmlImages => "顯示 HTML 圖片標籤",
         Key::MenuHighlights => "將 ==文字== 顯示為螢光標記",
 
+        Key::MenuColourTheme => "配色主題",
+        Key::MenuLightTheme => "淺色主題",
+        Key::MenuDarkTheme => "深色主題",
+        Key::MenuCopyTheme => "複製為我的主題…",
+        Key::MenuOpenThemesFolder => "開啟主題資料夾",
+        Key::ThemeMissing => "`{name}` 未安裝",
+        Key::ThemeWrongAppearance => "`{name}` 屬於另一種外觀",
+
         Key::MenuExternalEditor => "外部編輯器",
         Key::MenuOpenInEditor => "在編輯器中開啟",
         Key::MenuChooseEditor => "選擇編輯器…",
@@ -769,6 +805,14 @@ fn translate_ja(key: Key) -> &'static str {
         Key::MenuReadSource => "ソースを表示",
         Key::MenuHtmlImages => "HTML 画像タグを表示",
         Key::MenuHighlights => "==テキスト== を蛍光マーカーで表示",
+
+        Key::MenuColourTheme => "配色テーマ",
+        Key::MenuLightTheme => "ライトテーマ",
+        Key::MenuDarkTheme => "ダークテーマ",
+        Key::MenuCopyTheme => "マイテーマとしてコピー\u{2026}",
+        Key::MenuOpenThemesFolder => "テーマフォルダーを開く",
+        Key::ThemeMissing => "`{name}` はインストールされていません",
+        Key::ThemeWrongAppearance => "`{name}` はもう一方の外観のテーマです",
 
         Key::MenuExternalEditor => "外部エディタ",
         Key::MenuOpenInEditor => "エディタで開く",
@@ -910,6 +954,14 @@ fn translate_ko(key: Key) -> &'static str {
         Key::MenuHtmlImages => "HTML 이미지 태그 표시",
         Key::MenuHighlights => "==텍스트== 를 형광펜으로 표시",
 
+        Key::MenuColourTheme => "색상 테마",
+        Key::MenuLightTheme => "밝은 테마",
+        Key::MenuDarkTheme => "어두운 테마",
+        Key::MenuCopyTheme => "내 테마로 복사…",
+        Key::MenuOpenThemesFolder => "테마 폴더 열기",
+        Key::ThemeMissing => "`{name}` 이(가) 설치되어 있지 않습니다",
+        Key::ThemeWrongAppearance => "`{name}` 은(는) 다른 모양의 테마입니다",
+
         Key::MenuExternalEditor => "외부 편집기",
         Key::MenuOpenInEditor => "편집기에서 열기",
         Key::MenuChooseEditor => "편집기 선택\u{2026}",
@@ -1049,6 +1101,14 @@ fn translate_fr(key: Key) -> &'static str {
         Key::MenuReadSource => "Afficher la source",
         Key::MenuHtmlImages => "Afficher les balises d'image HTML",
         Key::MenuHighlights => "Afficher ==texte== en surligné",
+
+        Key::MenuColourTheme => "Thème de couleurs",
+        Key::MenuLightTheme => "Thème clair",
+        Key::MenuDarkTheme => "Thème sombre",
+        Key::MenuCopyTheme => "Copier comme mon thème\u{2026}",
+        Key::MenuOpenThemesFolder => "Ouvrir le dossier des thèmes",
+        Key::ThemeMissing => "`{name}` n'est pas installé",
+        Key::ThemeWrongAppearance => "`{name}` est un thème pour l'autre apparence",
 
         Key::MenuExternalEditor => "Éditeur externe",
         Key::MenuOpenInEditor => "Ouvrir dans l'éditeur",
@@ -1190,6 +1250,14 @@ fn translate_de(key: Key) -> &'static str {
         Key::MenuHtmlImages => "HTML-Bildtags anzeigen",
         Key::MenuHighlights => "==Text== hervorgehoben anzeigen",
 
+        Key::MenuColourTheme => "Farbschema",
+        Key::MenuLightTheme => "Helles Schema",
+        Key::MenuDarkTheme => "Dunkles Schema",
+        Key::MenuCopyTheme => "Als mein Schema kopieren\u{2026}",
+        Key::MenuOpenThemesFolder => "Schemaordner öffnen",
+        Key::ThemeMissing => "`{name}` ist nicht installiert",
+        Key::ThemeWrongAppearance => "`{name}` gehört zum anderen Erscheinungsbild",
+
         Key::MenuExternalEditor => "Externer Editor",
         Key::MenuOpenInEditor => "Im Editor öffnen",
         Key::MenuChooseEditor => "Editor auswählen\u{2026}",
@@ -1329,6 +1397,14 @@ fn translate_es(key: Key) -> &'static str {
         Key::MenuReadSource => "Ver código fuente",
         Key::MenuHtmlImages => "Mostrar etiquetas de imagen HTML",
         Key::MenuHighlights => "Mostrar ==texto== resaltado",
+
+        Key::MenuColourTheme => "Tema de color",
+        Key::MenuLightTheme => "Tema claro",
+        Key::MenuDarkTheme => "Tema oscuro",
+        Key::MenuCopyTheme => "Copiar como mi tema\u{2026}",
+        Key::MenuOpenThemesFolder => "Abrir la carpeta de temas",
+        Key::ThemeMissing => "`{name}` no está instalado",
+        Key::ThemeWrongAppearance => "`{name}` es un tema para la otra apariencia",
 
         Key::MenuExternalEditor => "Editor externo",
         Key::MenuOpenInEditor => "Abrir en el editor",
@@ -1470,6 +1546,14 @@ fn translate_ru(key: Key) -> &'static str {
         Key::MenuHtmlImages => "Показывать теги изображений HTML",
         Key::MenuHighlights => "Показывать ==текст== как выделение",
 
+        Key::MenuColourTheme => "Цветовая тема",
+        Key::MenuLightTheme => "Светлая тема",
+        Key::MenuDarkTheme => "Темная тема",
+        Key::MenuCopyTheme => "Скопировать как мою тему\u{2026}",
+        Key::MenuOpenThemesFolder => "Открыть папку тем",
+        Key::ThemeMissing => "`{name}` не установлена",
+        Key::ThemeWrongAppearance => "`{name}` — тема для другого оформления",
+
         Key::MenuExternalEditor => "Внешний редактор",
         Key::MenuOpenInEditor => "Открыть в редакторе",
         Key::MenuChooseEditor => "Выбрать редактор\u{2026}",
@@ -1610,6 +1694,14 @@ fn translate_it(key: Key) -> &'static str {
         Key::MenuHtmlImages => "Mostra tag immagine HTML",
         Key::MenuHighlights => "Mostra ==testo== evidenziato",
 
+        Key::MenuColourTheme => "Tema colori",
+        Key::MenuLightTheme => "Tema chiaro",
+        Key::MenuDarkTheme => "Tema scuro",
+        Key::MenuCopyTheme => "Copia come mio tema\u{2026}",
+        Key::MenuOpenThemesFolder => "Apri la cartella dei temi",
+        Key::ThemeMissing => "`{name}` non è installato",
+        Key::ThemeWrongAppearance => "`{name}` è un tema per l'altro aspetto",
+
         Key::MenuExternalEditor => "Editor esterno",
         Key::MenuOpenInEditor => "Apri nell'editor",
         Key::MenuChooseEditor => "Scegli editor\u{2026}",
@@ -1749,6 +1841,14 @@ fn translate_pt(key: Key) -> &'static str {
         Key::MenuReadSource => "Exibir código-fonte",
         Key::MenuHtmlImages => "Mostrar tags de imagem HTML",
         Key::MenuHighlights => "Mostrar ==texto== realçado",
+
+        Key::MenuColourTheme => "Tema de cores",
+        Key::MenuLightTheme => "Tema claro",
+        Key::MenuDarkTheme => "Tema escuro",
+        Key::MenuCopyTheme => "Copiar como meu tema\u{2026}",
+        Key::MenuOpenThemesFolder => "Abrir a pasta de temas",
+        Key::ThemeMissing => "`{name}` não está instalado",
+        Key::ThemeWrongAppearance => "`{name}` é um tema para a outra aparência",
 
         Key::MenuExternalEditor => "Editor externo",
         Key::MenuOpenInEditor => "Abrir no editor",
@@ -2112,6 +2212,17 @@ pub fn status_item_key(item: u32) -> Key {
 /// so every language spaces the number the way it should.
 pub fn status_reading_time(lang: Language, minutes: usize) -> String {
     t(lang, Key::StatusReadingTimeValue).replace("{n}", &minutes.to_string())
+}
+
+/// Why a saved theme slot is not the theme that is being drawn with, in the reader's own
+/// language and with the slot's own name in place of `{name}`.
+pub fn slot_fault(lang: Language, fault: &crate::themes::SlotFault) -> String {
+    match fault {
+        crate::themes::SlotFault::Missing(name) => t(lang, Key::ThemeMissing).replace("{name}", name),
+        crate::themes::SlotFault::WrongAppearance(name) => {
+            t(lang, Key::ThemeWrongAppearance).replace("{name}", name)
+        }
+    }
 }
 
 pub fn error_font_required(lang: Language, role_label: &str) -> String {

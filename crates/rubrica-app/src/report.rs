@@ -51,6 +51,11 @@ pub struct Options {
     pub plain: Option<bool>,
     pub text_options: rubrica_doc::plain::TextOptions,
     pub profile: Option<String>,
+    /// What the report says about the colour theme in effect, when one was asked for:
+    /// `--theme`, or a saved slot naming something. `None` on a machine that is drawing
+    /// with the built-in default, and a run with nothing to say says nothing, so the
+    /// report of a page nobody gave a theme to is the same report it always was.
+    pub theme: Option<String>,
 }
 
 pub fn report(source: &str, path: Option<&str>, o: &Options) -> Result<()> {
@@ -71,6 +76,7 @@ pub fn report(source: &str, path: Option<&str>, o: &Options) -> Result<()> {
         plain,
         text_options,
         profile,
+        theme: theme_line,
     } = o.clone();
     let mut font =
         FontEngine::new().map_err(|e| -> Error { format!("DirectWrite: {e}").into() })?;
@@ -222,6 +228,13 @@ pub fn report(source: &str, path: Option<&str>, o: &Options) -> Result<()> {
         column_pt,
         column_pt / theme.base
     );
+    // The colour theme, when one was asked for by name or remembered in a slot. A
+    // report a page set in the built-in default prints no line at all: the theme of
+    // such a run is the absence of a choice, and saying so would put a line in every
+    // report ever taken.
+    if let Some(colour) = theme_line.as_deref() {
+        println!("theme      : {colour}");
+    }
     println!(
         "blocks     : {}   lines: {}   height {:.0}pt",
         doc.blocks.len(),

@@ -28,6 +28,7 @@ mod sample;
 mod settings;
 mod tables;
 mod theme;
+mod themes;
 mod tree;
 mod view;
 
@@ -66,6 +67,17 @@ fn main() -> Result<()> {
         // window with it; two of these are one too many, and it knows that.
         return peek::daemon();
     }
+    if has_flag(&argv, "--list-themes") {
+        // What this machine has to draw with, the reader's own files included, and what
+        // each appearance is set to: the answer to "why does it look like that", with
+        // no window and no wall clock spent on one.
+        let shelf = themes::shelf();
+        let slots = [settings::theme_slot(false), settings::theme_slot(true)];
+        for line in themes::describe(&shelf, slots) {
+            println!("{line}");
+        }
+        return Ok(());
+    }
     if has_flag(&argv, "--export-png") {
         let output = text_flag(&argv, "--export-png").ok_or("--export-png needs an output path")?;
         let width = flag(&argv, "--export-width").unwrap_or(1080.0);
@@ -84,13 +96,20 @@ fn main() -> Result<()> {
         let zoom = theme::Zoom::nearest_percent(flag(&argv, "--zoom").unwrap_or(100.0));
         let face = flag(&argv, "--face").map(|v| v as usize);
         let measure = flag(&argv, "--measure").map(|v| v as usize);
+        // The theme the reader asked for by name or by path, answered strictly: a
+        // headless run that cannot draw with the theme it was told to has no window to
+        // explain itself in, and a file that is not the theme asked for is worse than
+        // no file.
+        let dark = has_flag(&argv, "--dark");
+        let word = text_flag(&argv, "--theme").map(lossy);
+        let colour = themes::headless(word.as_deref(), dark, dark)?;
         return view::export_png(
             &source,
             path.as_deref(),
             Path::new(output),
             width,
             scale,
-            has_flag(&argv, "--dark"),
+            &colour.palette,
             plain.unwrap_or_else(|| reading::is_plain(path.as_deref())),
             prefs.text,
             has_flag(&argv, "--source") || prefs.source,
@@ -127,13 +146,17 @@ fn main() -> Result<()> {
         let zoom = theme::Zoom::nearest_percent(flag(&argv, "--zoom").unwrap_or(100.0));
         let face = flag(&argv, "--face").map(|v| v as usize);
         let measure = flag(&argv, "--measure").map(|v| v as usize);
+        // Strict for the same reason the PNG export is: the PDF is the whole product.
+        let dark = has_flag(&argv, "--dark");
+        let word = text_flag(&argv, "--theme").map(lossy);
+        let colour = themes::headless(word.as_deref(), dark, dark)?;
         return view::export_pdf(
             &source,
             path.as_deref(),
             Path::new(output),
             width,
             height,
-            has_flag(&argv, "--dark"),
+            &colour.palette,
             plain.unwrap_or_else(|| reading::is_plain(path.as_deref())),
             prefs.text,
             has_flag(&argv, "--source") || prefs.source,
@@ -179,6 +202,12 @@ fn main() -> Result<()> {
         let show_highlights = !has_flag(&argv, "--no-highlights") && settings::show_highlights();
         let source_view = has_flag(&argv, "--source") || preferences.source;
         let hyphenate = !has_flag(&argv, "--no-hyphenate");
+        // The theme in effect, said in one line -- but only when there is one: a report
+        // is compared line for line between builds, and a machine drawing with the
+        // built-in default has no theme to tell about.
+        let dark = has_flag(&argv, "--dark");
+        let word = text_flag(&argv, "--theme").map(lossy);
+        let colour = themes::headless(word.as_deref(), dark, dark)?;
         let options = report::Options {
             width,
             dpi,
@@ -194,6 +223,7 @@ fn main() -> Result<()> {
             plain,
             text_options: preferences.text,
             profile,
+            theme: colour.asked.then(|| themes::report_line(&colour)),
         };
         return report::report(&source, shown, &options);
     }
@@ -225,7 +255,7 @@ fn main() -> Result<()> {
         let mut named = paths.into_iter();
         (named.next(), named.collect())
     };
-    if let Err(e) = view::run(path, extra) {
+    if let Err(e) = view::run(path, extra, text_flag(&argv, "--theme").map(lossy)) {
         view::startup_error(&[e.to_string()]);
         std::process::exit(1);
     }
@@ -289,10 +319,10 @@ fn has_flag(argv: &[OsString], name: &str) -> bool {
 /// `--width` and friends. A double-click names one; a multi-selection "open with" names
 /// several, and each of them is wanted.
 fn positionals(argv: &[OsString]) -> Vec<PathBuf> {
-    const TAKES_VALUE: [&str; 12] = [
+    const TAKES_VALUE: [&str; 13] = [
         "--width", "--dpi", "--zoom", "--face", "--measure", "--profile",
         "--export-png", "--export-width", "--export-scale", "--export-pdf",
-        "--pdf-width", "--pdf-height",
+        "--pdf-width", "--pdf-height", "--theme",
     ];
     let mut skip_next = false;
     let mut flags_done = false;

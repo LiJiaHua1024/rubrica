@@ -1400,6 +1400,10 @@ struct Peek {
     rt: Option<ID2D1RenderTarget>,
     palette: Palette,
     dark: bool,
+    /// The reader's themes, so a preview is drawn in what the window would draw with.
+    /// Rebuilt at a reveal only when the folder's signature says a file moved.
+    themes: crate::themes::Shelf,
+    themes_stamp: u64,
     brushes: HashMap<ColorRole, ID2D1SolidColorBrush>,
     font: Option<crate::font::FontEngine>,
     hyphenator: Option<&'static hyphen::Hyphenator>,
@@ -1472,6 +1476,8 @@ impl Peek {
                 rt: None,
                 palette: Palette::of(false),
                 dark: false,
+                themes: crate::themes::shelf(),
+                themes_stamp: crate::themes::stamp(),
                 brushes: HashMap::new(),
                 font: None,
                 hyphenator: None,
@@ -1629,13 +1635,28 @@ impl Peek {
             )
         };
 
-        // The appearance is read fresh at each reveal: the reader may have changed
-        // its mind, or Windows its palette, while the service sat invisible.
+        // The appearance and the colour theme are read fresh at each reveal: the reader
+        // may have changed their mind, or Windows its palette, or saved a theme file,
+        // while the service sat invisible. The folder is compared by its signature
+        // first, so a reveal costs a listing and never a parse unless a file moved.
         let saved = settings::load();
         let dark = saved.dark.unwrap_or_else(system_prefers_dark);
-        if dark != self.dark {
+        let stamp = crate::themes::stamp();
+        if stamp != self.themes_stamp {
+            self.themes_stamp = stamp;
+            self.themes = crate::themes::shelf();
+        }
+        let slot = crate::themes::slot_name(settings::theme_slot(dark));
+        let palette = crate::themes::pick(
+            &self.themes,
+            crate::themes::Appearance::of_dark(dark),
+            slot.as_deref(),
+        )
+        .0
+        .palette;
+        if palette != self.palette {
             self.dark = dark;
-            self.palette = Palette::of(dark);
+            self.palette = palette;
             self.brushes.clear();
             unsafe { self.apply_dark_mode() };
         }
