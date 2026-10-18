@@ -89,7 +89,7 @@ use windows::Win32::UI::WindowsAndMessaging::{
     CreateWindowExW, DefWindowProcW, DestroyMenu, DestroyWindow, DispatchMessageW,
     GWLP_USERDATA, GetCaretBlinkTime, GetClientRect, GetCursorPos, GetSystemMetrics, GetWindowLongPtrW, GetMessageW, GetWindowPlacement,
     HCURSOR, HMENU, HWND_TOP, HTCLIENT, HTCAPTION, HTBOTTOM, HTBOTTOMLEFT, HTBOTTOMRIGHT, HTLEFT, HTRIGHT,
-    HTTOP, HTTOPLEFT, HTTOPRIGHT, IDC_ARROW, IDC_HAND, IsZoomed, KillTimer, LoadCursorW, MF_CHECKED,
+    HTTOP, HTTOPLEFT, HTTOPRIGHT, IDC_ARROW, IDC_HAND, IsIconic, IsZoomed, KillTimer, LoadCursorW, MF_CHECKED,
     MF_GRAYED, MF_POPUP, MF_SEPARATOR, MF_STRING, MSG, PostMessageW, PostQuitMessage,
     RegisterClassExW, SetCursor, SetForegroundWindow, SetWindowTextW, SM_CXPADDEDBORDER, SM_CXSIZEFRAME,
     SW_MAXIMIZE, SW_MINIMIZE, SW_SHOWNORMAL, SetTimer,
@@ -1795,6 +1795,18 @@ pub struct View {
     hwnd: HWND,
     reading_mode: ReadingMode,
     page_starts: Vec<Pt>,
+    /// The place the reader is standing in, as the last relayout left them: the character
+    /// they were reading, and the offset that relayout snapped them to.
+    ///
+    /// A page stack stands the reader on a page's first line, which is the offset a whole
+    /// page needs -- and the next relayout must not take its bearing from *that* offset,
+    /// because the reader's own place is then gone: in a wrapping whose lines are shorter,
+    /// the line holding their character begins before it, so looking the place up from the
+    /// snapped offset names a character from the line above, and standing on that one is a
+    /// line -- and sometimes a page -- further back than the reader ever was. Kept beside
+    /// the offset it belongs to, so the place outlives the snap; and only while that offset
+    /// is still the one the relayout left, which is what makes a stale pair harmless.
+    page_place: Option<(Pt, usize)>,
     page_transition: Option<PageTransition>,
     page_hot: Option<PageButton>,
     page_pressed: Option<PageButton>,
@@ -2207,6 +2219,7 @@ struct TabPage {
     ops: Vec<Op>,
     reading_mode: ReadingMode,
     page_starts: Vec<Pt>,
+    page_place: Option<(Pt, usize)>,
     sel_index: Vec<SelLine>,
     hotspots: Vec<Hot>,
     note_tops: Vec<Pt>,
@@ -2248,6 +2261,7 @@ impl TabPage {
             ops: Vec::new(),
             reading_mode: ReadingMode::Scroll,
             page_starts: Vec::new(),
+            page_place: None,
             sel_index: Vec::new(),
             hotspots: Vec::new(),
             note_tops: Vec::new(),
@@ -3509,6 +3523,7 @@ fn new_view(
         hwnd: HWND(std::ptr::null_mut()),
         reading_mode: ReadingMode::Scroll,
         page_starts: Vec::new(),
+        page_place: None,
         page_transition: None,
         page_hot: None,
         page_pressed: None,
@@ -3822,8 +3837,18 @@ pub(crate) fn face_drawable(font: &FontEngine, f: &TextFace) -> bool {
 ///
 /// `k` is the points-to-pixels scale, since a scroll offset is in points and the lines
 /// are painted in pixels.
+///
+/// The comparison is made with the same tolerance [`page_index_at`] reads a page's edge
+/// with, and for the same reason: the line that ends *at* the top edge is above it, and
+/// the arithmetic that put it there leaves a hair of its own. A page's first line starts
+/// exactly where the page does, so the line before it ends exactly there -- which is the
+/// one case a reader stands on all day, and the one a tolerance-free read gets wrong. It
+/// answers with the line *above* theirs, and the place found again through
+/// [`scroll_for_anchor`] is that line's top: a line further back, and for a reader on a
+/// page's first line, the page before theirs. That is a reader who minimises the window
+/// and brings it back standing a page behind where they were.
 fn anchor_at(sel: &[SelLine], scroll: f32, k: f32) -> Option<usize> {
-    let top = scroll * k;
+    let top = scroll * k + 0.01;
     let mut seen = 0usize;
     for line in sel {
         // The first line still reaching into the window. One that ends exactly at the
@@ -4739,7 +4764,16 @@ impl View {
                 let new_zoomed = IsZoomed(hwnd).as_bool();
                 let zoom_changed = self.zoomed != new_zoomed;
                 self.zoomed = new_zoomed;
-                if w == 0 || h == 0 {
+                // A minimised window is not a window with a small page in it. `WM_SIZE`
+                // for one carries the iconic rect -- a couple of hundred pixels -- and a
+                // page laid out for that is a page nobody sees, typeset at the cost of the
+                // whole document. It is also a page the reader comes back behind: a page
+                // stack stands them on the first line of the page it draws, and a line of
+                // the icon-sized wrapping holds a word or two, so the character that snap
+                // names is one from before the line they were on -- and the page holding
+                // that character is the page before theirs. The size that matters arrives
+                // with the restore, and it is the only one laid out.
+                if w == 0 || h == 0 || IsIconic(hwnd).as_bool() {
                     if zoom_changed {
                         let _ = InvalidateRect(Some(hwnd), None, false);
                     }
@@ -4756,7 +4790,7 @@ impl View {
                     return LRESULT(0);
                 }
                 let anchor = if self.resize_pending { self.resize_anchor } else {
-                    self.pending_anchor.or_else(|| anchor_at(&self.sel_index, self.scroll, scale_of(self.dpi)))
+                    self.pending_anchor.or_else(|| self.page_place_at())
                 };
                 if self.size_move_active && !dpi_changed && !self.resize_pending {
                     self.resize_preview = Some(self.capture_resize_preview());
@@ -6984,22 +7018,34 @@ impl View {
         // not exist yet, and `begin_layout_job` cleared the index it was measured
         // against. Hand the place to the job the way a start-up does, so the
         // Finished batch stands the reader back where they were -- without it the
-        // `scroll_for_anchor` below asks an empty index and the page opens at the
-        // top. An anchor-less call leaves any pending place alone rather than
-        // cancelling it: a resize mid-drag measures against a half-built index.
+        // place below is looked up in an empty index and the page opens at the top.
+        // An anchor-less call leaves any pending place alone rather than cancelling
+        // it: a resize mid-drag measures against a half-built index.
         if self.layout_job.is_some() {
             if anchor.is_some() {
                 self.pending_anchor = anchor;
             }
             return;
         }
+        match anchor {
+            Some(a) => self.stand_on(a),
+            None => self.snap_to_page(),
+        }
+    }
+
+    /// Stand the reader on `anchor` -- the character they were reading -- and file the place
+    /// a window change stands them back on as that same character, rather than as whatever
+    /// the wrapping it was just found in answers for the offset. The two differ for a reader
+    /// whose page begins with a line of a narrower wrapping: the line holding their character
+    /// starts before it, so the offset's own answer is a character from the line above, and
+    /// standing on that one is a line -- and sometimes a page -- further back than they were.
+    fn stand_on(&mut self, anchor: usize) {
         let k = scale_of(self.dpi);
-        if let Some(a) = anchor {
-            if let Some(scroll) = scroll_for_anchor(&self.sel_index, a, k) {
-                self.scroll = scroll;
-            }
+        if let Some(scroll) = scroll_for_anchor(&self.sel_index, anchor, k) {
+            self.scroll = scroll;
         }
         self.snap_to_page();
+        self.page_place = Some((self.scroll, anchor));
     }
 
     fn relayout_keeping_anchor(&mut self) {
@@ -7027,11 +7073,7 @@ impl View {
             self.pending_anchor = Some(anchor);
             return;
         }
-        let k = scale_of(self.dpi);
-        if let Some(scroll) = scroll_for_anchor(&self.sel_index, anchor, k) {
-            self.scroll = scroll;
-        }
-        self.snap_to_page();
+        self.stand_on(anchor);
     }
 
     /// Write down where the reader is standing, for the next window on this page.
@@ -7062,12 +7104,35 @@ impl View {
 
     fn snap_to_page(&mut self) {
         if self.reading_mode == ReadingMode::Stack && !self.page_starts.is_empty() {
+            // The place the snap is about to move off, which is the reader's own: a page's
+            // first line is where the stack shows them, not where they were reading.
+            let place = anchor_at(&self.sel_index, self.scroll, scale_of(self.dpi));
             let index = self.current_page_index();
             if let Some(top) = self.page_start(index) {
                 self.scroll = top;
+                self.page_place = place.map(|anchor| (top, anchor));
             }
+        } else {
+            // A page that scrolls has no stack to snap to, and its offset is the place.
+            self.page_place = None;
         }
         self.clamp_scroll();
+    }
+
+    /// The character at the top of the reader's page: the place the last relayout filed,
+    /// while the offset is still the one that relayout left, and the offset's own answer
+    /// otherwise.
+    ///
+    /// The offset is the check rather than a second source of truth. Every way of moving the
+    /// reader either ends in [`Self::snap_to_page`] or [`Self::stand_on`], which file a fresh
+    /// pair, or leaves the offset somewhere the pair does not name -- a page turned, a
+    /// document opened, an offset clamped to a shorter page -- where the reader's place is
+    /// what the offset says it is and the pair is put aside.
+    fn page_place_at(&self) -> Option<usize> {
+        match self.page_place {
+            Some((at, anchor)) if (at - self.scroll).abs() < 0.01 => Some(anchor),
+            _ => anchor_at(&self.sel_index, self.scroll, scale_of(self.dpi)),
+        }
     }
 
     /// A relayout can leave the offset past the end of a document that has just grown.
@@ -9728,6 +9793,7 @@ impl View {
         std::mem::swap(&mut page.layout_job, &mut self.layout_job);
         std::mem::swap(&mut page.content_h, &mut self.content_h);
         std::mem::swap(&mut page.scroll, &mut self.scroll);
+        std::mem::swap(&mut page.page_place, &mut self.page_place);
         std::mem::swap(&mut page.stamp, &mut self.stamp);
         std::mem::swap(&mut page.path, &mut self.path);
         std::mem::swap(&mut page.profile, &mut self.profile);
@@ -14156,6 +14222,63 @@ mod tests {
         window.resize(1800, 900);
         assert_eq!(window.0.layout_epoch, epoch + 2, "a nonmodal resize must apply its wrapping immediately");
         assert!(!window.0.resize_pending);
+    }
+
+    /// Sixty paragraphs of Chinese: a document with pages to walk, in the script the reader
+    /// who reported the page walking back was reading.
+    fn chinese_pages() -> String {
+        format!("{}\n\n", "中文段落用来验证翻页模式下的阅读位置是否会在窗口最小化并还原之后自动回退一页。".repeat(3)).repeat(60)
+    }
+
+    /// A reader's own report: the window is minimised from the task bar button and brought
+    /// back, and the page number walks one page back. A minimise is a `WM_SIZE` carrying the
+    /// iconic rect -- not no size at all -- and a page laid out for that is a whole document
+    /// typeset for nobody, standing the reader on a line a word or two wide.
+    #[test]
+    fn a_minimised_window_is_not_laid_out_for_its_iconic_rect() {
+        let mut window = ResizeView::new(&chinese_pages());
+        assert!(!layout_needs_worker(&window.0.doc), "this must stay a window-thread layout");
+        window.0.reading_mode = ReadingMode::Stack;
+        window.0.relayout();
+        window.0.scroll = window.0.page_start(2).expect("a third page");
+        let (page, scroll) = (window.0.current_page_index(), window.0.scroll);
+        let starts = window.0.page_starts.clone();
+        let epoch = window.0.layout_epoch;
+        // The window is already minimised when the iconic rect arrives, and the size it had
+        // arrives with the restore -- the only size this page is laid out for.
+        unsafe { let _ = ShowWindow(window.0.hwnd, SW_MINIMIZE); }
+        window.resize(160, 28);
+        assert_eq!(window.0.layout_epoch, epoch, "a minimised window has no page to lay out");
+        assert_eq!(window.0.page_starts, starts, "the icon-sized wrapping must not replace the reader's");
+        assert_eq!(window.0.scroll, scroll);
+        unsafe { let _ = ShowWindow(window.0.hwnd, SW_SHOWNORMAL); }
+        window.resize(1800, 900);
+        assert_eq!(window.0.current_page_index(), page, "a restore is not a page turn");
+        assert_eq!(window.0.scroll, scroll);
+    }
+
+    /// A window change that ends where it began leaves the reader where they were: the
+    /// place a relayout stands them back on is the line at the top of their page, and a
+    /// page's first line begins exactly where the page does -- the one offset a
+    /// tolerance-free read of the top edge gets wrong.
+    #[test]
+    fn a_resize_that_returns_the_size_leaves_the_reader_on_their_page() {
+        let mut window = ResizeView::new(&chinese_pages());
+        assert!(!layout_needs_worker(&window.0.doc), "this must stay a window-thread layout");
+        window.0.reading_mode = ReadingMode::Stack;
+        window.0.relayout();
+        window.0.scroll = window.0.page_start(2).expect("a third page");
+        let (page, scroll) = (window.0.current_page_index(), window.0.scroll);
+        // The height first, which changes the pages and not the wrapping, and then the
+        // width, which changes both.
+        window.resize(1800, 700);
+        window.resize(1800, 900);
+        assert_eq!(window.0.current_page_index(), page, "the page a height ends on is the page it began on");
+        assert_eq!(window.0.scroll, scroll);
+        window.resize(1200, 900);
+        window.resize(1800, 900);
+        assert_eq!(window.0.current_page_index(), page, "the page a width ends on is the page it began on");
+        assert_eq!(window.0.scroll, scroll);
     }
 
     #[test]
