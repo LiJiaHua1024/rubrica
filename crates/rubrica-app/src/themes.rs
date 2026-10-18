@@ -1785,7 +1785,7 @@ wat = "#ffffff"  # not a key
         assert_eq!(stale.fault, Some(SlotFault::Missing("Gone".to_string())));
         assert_eq!(
             report_line(&stale),
-            format!("Default Dark (built-in); `Gone` is not installed"),
+            "Default Dark (built-in); `Gone` is not installed".to_string(),
         );
         let wrong = headless_in(&shelf, None, true, false, slot("Mono Light")).expect("a wrong slot");
         assert!(report_line(&wrong).contains("`Mono Light` is a light theme"), "{}", report_line(&wrong));
