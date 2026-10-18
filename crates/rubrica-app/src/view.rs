@@ -4789,6 +4789,34 @@ impl View {
                     }
                     return LRESULT(0);
                 }
+                // A window's height is not a measure the text is wrapped to: the wrapping
+                // answers to the width, and the pages are what a height makes of it. A
+                // resize that changes only the height therefore has nothing to lay out
+                // again -- a whole document typeset to arrive at the same lines -- and one
+                // thing to re-paginate. Done from the wrapping already in hand, it costs a
+                // pass over the lines rather than the document, and leaves the reader's
+                // offset exactly where it was.
+                if self.started && !dpi_changed && new_w == self.client_w
+                    && !self.size_move_active && !self.resize_pending && self.layout_job.is_none()
+                {
+                    self.client_h = new_h;
+                    if let Some(t) = &self.hwnd_target {
+                        let _ = t.Resize(&D2D_SIZE_U { width: w, height: h });
+                    }
+                    // A page turn in flight is aimed at a page start of the pagination this
+                    // one replaces, so it goes with it.
+                    self.page_transition = None;
+                    self.page_starts = reader_page_starts(
+                        &self.sel_index,
+                        &self.anchor_tops,
+                        self.content_h,
+                        self.stack_page_height(),
+                        scale_of(self.dpi),
+                    );
+                    self.clamp_scroll();
+                    let _ = InvalidateRect(Some(hwnd), None, false);
+                    return LRESULT(0);
+                }
                 let anchor = if self.resize_pending { self.resize_anchor } else {
                     self.pending_anchor.or_else(|| self.page_place_at())
                 };
@@ -14278,6 +14306,35 @@ mod tests {
         window.resize(1200, 900);
         window.resize(1800, 900);
         assert_eq!(window.0.current_page_index(), page, "the page a width ends on is the page it began on");
+        assert_eq!(window.0.scroll, scroll);
+    }
+
+    /// A window's height is not a measure the text is wrapped to, so a resize that changes
+    /// only the height re-paginates the page in hand rather than laying the document out
+    /// again -- and leaves the reader's offset exactly where it was.
+    #[test]
+    fn a_height_only_resize_repaginates_without_laying_the_page_out_again() {
+        let mut window = ResizeView::new(&chinese_pages());
+        assert!(!layout_needs_worker(&window.0.doc), "this must stay a window-thread layout");
+        window.0.reading_mode = ReadingMode::Stack;
+        window.0.relayout();
+        window.0.scroll = window.0.page_start(2).expect("a third page");
+        let (page, scroll) = (window.0.current_page_index(), window.0.scroll);
+        let (epoch, lines) = (window.0.layout_epoch, window.0.sel_version);
+        let starts = window.0.page_starts.clone();
+        window.resize(1800, 700);
+        assert_eq!(window.0.layout_epoch, epoch, "a height must not start a layout");
+        assert_eq!(window.0.sel_version, lines, "a height must not rebuild the page's lines");
+        assert_ne!(window.0.page_starts, starts, "a shorter window has shorter pages");
+        assert_eq!(window.0.scroll, scroll, "a height does not move the offset the reader is reading at");
+        assert_eq!(window.0.current_page_index(), page, "the page holding their place is still the page");
+        // Thirty-two steps of a height drag, which the wrapping never answers to.
+        let started = std::time::Instant::now();
+        for step in 0..32 {
+            window.resize(1800, 620 + step * 8);
+        }
+        eprintln!("32 height-only resize messages: {:?}", started.elapsed());
+        assert_eq!(window.0.sel_version, lines);
         assert_eq!(window.0.scroll, scroll);
     }
 
