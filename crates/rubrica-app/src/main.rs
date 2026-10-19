@@ -32,6 +32,7 @@ mod theme;
 mod themes;
 mod tree;
 mod view;
+mod viewer;
 
 use std::ffi::{OsStr, OsString};
 use std::path::{Path, PathBuf};

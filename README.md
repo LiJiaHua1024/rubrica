@@ -201,6 +201,19 @@ runs take `--code-ladder design|ladder` and `--code-language none|corner`, both 
 to the design every page was drawn with (the hand-picked five, and no label); a `--report`
 carries a `code ladder` or `code label` line only when the other design was asked for.
 
+A figure opens when it is clicked. The page's measure is the right size for prose and the
+wrong size for a screenshot, so the picture is shown over the whole window, at fit to
+begin with: the wheel zooms about the pointer — the pixel under the cursor is the pixel
+that stays under it — a drag pans, `0` shows the figure at its own size (one image pixel
+to one CSS pixel), `F` fits it again, and `Esc` or a click on the backdrop around it puts
+it away. A figure with no backdrop left to click is put away with `Esc`, or by dragging it
+back into view. An animated GIF plays while it is up, each frame held for the delay its
+own bytes state and never for less than a twentieth of a second; an *optimized* GIF, whose
+frames are stored as the rectangles that changed rather than as whole pictures, is shown
+as its first frame, because compositing those is a decoder's work and a slideshow of
+fragments is worse than a still. A `--report` names the frames of an animated figure on
+its line, and says `partial` where the file is one this build will not play.
+
 A page's letters have a setting of their own, and a narrow column has two. The
 **Typography** form — the menu's *Typography ▸ Edit / Save Preset…* — carries the tracking
 every run is set with (the letter spacing, in ems), the *Ragged below* width that says when
@@ -231,6 +244,7 @@ no longer set with.
 | `Esc` | give up the selection, the search, the page's marking |
 | `Apps` / `Shift+F10` | the menu, without a mouse |
 | mouse wheel | scroll the page · `Ctrl` zooms · `Shift` pans a table wider than the window |
+| click a figure | show it over the whole window: wheel zooms at the pointer · drag pans · `0` actual size · `F` fit · `+` `-` zoom · `Esc` puts it away |
 
 Preferences live in `HKCU\Software\Rubrica`.
 

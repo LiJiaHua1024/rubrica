@@ -118,6 +118,7 @@ use crate::math::MathStore;
 use crate::tree::{self, Entry as TreeEntry, EntryKind as TreeEntryKind};
 use rubrica_workspace::{DocumentRef, FileRef, Tab, TabId, TabKind, Workspace};
 use crate::theme::{ColorRole, Leading, Measure, Role, TableLines, TextFace, Theme, Zoom};
+use crate::viewer::{self, Viewer};
 use crate::{Error, Result};
 
 /// The character drawn at a discretionary break, and the range to shape it from.
@@ -259,6 +260,13 @@ const PAGE_TICK_MS: u32 = 16;
 /// is a flicker rather than an answer.
 const NOTE_DELAY_MS: u32 = 250;
 const NOTE_TIMER: usize = 0x5144;
+/// The beat an animated figure is shown on.
+///
+/// Armed with the delay of the frame it is about to leave rather than with a fixed
+/// tick, and only while a figure with more than one frame is up: an animation is a file
+/// asking to be played, and a reader looking at a photograph must not be paying for a
+/// timer that fires sixty times a second to find nothing to do.
+const GIF_TIMER: usize = 0x5145;
 /// The space between a citation and the bubble it opened, and the air inside the
 /// bubble's own edge.
 const BUBBLE_GAP: f32 = 8.0;
@@ -1105,7 +1113,15 @@ pub enum WideKind {
 
 #[derive(Clone, Debug, PartialEq)]
 pub enum Preview {
-    Image(PathBuf),
+    /// A figure, over the whole window, at whatever scale and offset the reader has
+    /// brought it to. See [`crate::viewer`] for the arithmetic and [`View::open_viewer`]
+    /// for the gesture that gets here.
+    ///
+    /// The figure's own size is settled when it opens and kept with the view, so that
+    /// every question about it -- where it is drawn, whether a click landed on it, how
+    /// far a zoom has to travel -- is answered about one figure even if its file has been
+    /// deleted or rewritten in the meantime.
+    Image { path: PathBuf, view: Viewer, figure: (f32, f32) },
     Formula(crate::math::FormulaKey),
 }
 
@@ -3954,6 +3970,7 @@ pub fn run(path: Option<PathBuf>, extra: Vec<PathBuf>, start_theme: Option<Strin
         let _ = KillTimer(Some(hwnd), DOCUMENT_TIMER);
         let _ = KillTimer(Some(hwnd), CARET_TIMER);
         let _ = KillTimer(Some(hwnd), PAGE_TIMER);
+        let _ = KillTimer(Some(hwnd), GIF_TIMER);
         // `view` is dropped here; the pointer stored in GWLP_USERDATA dies with it.
     }
     Ok(())
@@ -4335,9 +4352,9 @@ unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM)
             // dispatcher: `WM_TIMER` keeps arriving at a `GWLP_USERDATA` that no longer
             // names a `View` -- the appearance poll reading a freed palette, the caret
             // beat flipping a freed flag, the page tick indexing a freed list. Timers die
-            // with their window on their own, but these five are named in five places and
-            // this is the one moment all five are known.
-            for timer in [APPEARANCE_TIMER, DOCUMENT_TIMER, CARET_TIMER, PAGE_TIMER, NOTE_TIMER] {
+            // with their window on their own, but these six are named in six places and
+            // this is the one moment all six are known.
+            for timer in [APPEARANCE_TIMER, DOCUMENT_TIMER, CARET_TIMER, PAGE_TIMER, NOTE_TIMER, GIF_TIMER] {
                 let _ = KillTimer(Some(hwnd), timer);
             }
             // The frame goes with the place for the same reason: the usual way to close a
@@ -5092,6 +5109,11 @@ impl View {
             }
             WM_MOUSEWHEEL => {
                 let ticks = ((wp.0 >> 16) & 0xFFFF) as i16 as f32;
+                // A figure is up: the wheel is its magnifier, and the page behind it is
+                // not the reader's business until it is gone.
+                if self.zoom_viewer(ticks, hwnd) {
+                    return LRESULT(0);
+                }
                 if held(VK_SHIFT) {
                     let mut pt = POINT::default();
                     let _ = GetCursorPos(&mut pt);
@@ -5122,6 +5144,12 @@ impl View {
                 LRESULT(0)
             }
             WM_KEYDOWN => {
+                // A figure is up and answers the handful of keys that belong to looking
+                // at it; every other key is the window's, so the reader can still close
+                // a tab or switch one from inside the viewer.
+                if self.key_viewer(wp.0 as u32, hwnd) {
+                    return LRESULT(0);
+                }
                 let step = self.theme.base * self.theme.body_leading.latin;
                 let ctrl = held(VK_CONTROL);
                 let shift = held(VK_SHIFT);
@@ -5406,6 +5434,10 @@ impl View {
                         }
                     }
                     PAGE_TIMER => self.tick_page_transition(hwnd),
+                    // Armed only while a figure with more than one frame is up, so a
+                    // reader looking at a photograph is not paying for a beat that finds
+                    // nothing to do.
+                    GIF_TIMER => self.tick_animation(hwnd),
                     // Armed only while a pointer rests on a citation, so the common
                     // reader -- who is reading, not hovering -- is not paying for a
                     // beat they never asked for.
@@ -5503,6 +5535,28 @@ impl View {
                 // the release; a press anywhere else belongs to the text.
                 let x = ((lp.0 & 0xFFFF) as i16) as f32;
                 let y = ((lp.0 >> 16) as i16) as f32;
+                // A figure is up, and it owns the press: on the figure it starts the
+                // drag that pans it, and on the backdrop around the figure it is the
+                // reader saying they are done looking -- the gesture the fit-only
+                // preview this replaces gave to every press, kept for the one place
+                // where there is still something to press.
+                //
+                // Asked before the strip and the tree, not after: the backdrop is drawn
+                // over both of them, so a control under it is a control the reader cannot
+                // see, and a click that closed a tab nobody could read would be an act on
+                // an invisible thing. The window's own frame is outside this: dragging it
+                // by the caption and `Alt`+`F4` are settled before the client area is
+                // asked about anything.
+                if let Some((_, figure, _)) = self.viewer_now() {
+                    let over = matches!(self.preview.as_ref(), Some(Preview::Image { view, .. }) if view.covers(figure, x, y));
+                    if over {
+                        self.press_at = Some((x, y));
+                        let _ = SetCapture(hwnd);
+                        return LRESULT(0);
+                    }
+                    self.close_preview(hwnd);
+                    return LRESULT(0);
+                }
                 // The strip answers for its own presses, and keeps the page's: a close
                 // zone first, then a pill, and a press on neither is a press on nothing
                 // at all.
@@ -5689,7 +5743,9 @@ impl View {
                 // left the page owes the page no note either. This one is a question
                 // rather than an answer, so it repaints only when the note changes.
                 self.hover_note(x, y, hwnd);
-                if self.tree_dragging && held(VK_LBUTTON) {
+                if self.pan_viewer(x, y, hwnd) {
+                    // The figure is being dragged, and the page under it is not.
+                } else if self.tree_dragging && held(VK_LBUTTON) {
                     self.tree_width = x.clamp(TREE_MIN_W, TREE_MAX_W);
                     self.layout_epoch += 1;
                     self.relayout_keeping_anchor();
@@ -6087,6 +6143,18 @@ impl View {
     /// note the reader has walked away from goes at once rather than at the end of a
     /// wait -- the wait is for a note to arrive, not for the last one to leave.
     fn hover_note(&mut self, x: f32, y: f32, hwnd: HWND) {
+        // A figure over the window is a page the reader cannot read: the words under the
+        // pointer are behind the picture, and a note that opened for one of them would
+        // float over the figure instead of over the sentence it came from. The wait is
+        // given up rather than kept, so that closing the figure does not open the note
+        // the reader rested on before it.
+        if matches!(self.preview.as_ref(), Some(Preview::Image { .. })) {
+            if self.note_hover.take().is_some() | self.note_bubble.take().is_some() {
+                let _ = unsafe { KillTimer(Some(hwnd), NOTE_TIMER) };
+                let _ = unsafe { InvalidateRect(Some(hwnd), None, false) };
+            }
+            return;
+        }
         let over = self.cite_at(x, y);
         let held = self.on_note_bubble(x, y);
         let was = self.note_hover.map(|h| h.note);
@@ -6171,6 +6239,187 @@ impl View {
             // and the very reason the hand came -- is the region's to answer for.
             x >= left && x <= left + r.content_w && y >= r.y && y <= r.y + r.h
         })
+    }
+
+    /// A figure's natural size in the units the window draws in.
+    ///
+    /// The store answers in points, which is the unit a figure's own size is stated in,
+    /// and the viewer works in device independent pixels, which is the unit every other
+    /// coordinate in this file is written in. One conversion, in one place, so that a
+    /// figure cannot be measured in one unit and drawn in another.
+    fn figure_dip(&self, path: &Path) -> Option<(f32, f32)> {
+        let (w, h) = self.images.as_ref()?.natural_size(path)?;
+        let k = scale_of(self.dpi);
+        Some((w * k, h * k))
+    }
+
+    /// The box the viewer draws in: the whole window, less the margin a figure keeps so
+    /// that there is a backdrop left to click.
+    fn viewer_panel(&self) -> viewer::Rect {
+        viewer::panel_of((self.client_w, self.client_h))
+    }
+
+    /// The figure the viewer is showing, its size, and the panel it is drawn in -- the
+    /// three answers every viewer gesture needs, or `None` when no figure is up.
+    fn viewer_now(&self) -> Option<(PathBuf, (f32, f32), viewer::Rect)> {
+        let Preview::Image { path, figure, .. } = self.preview.as_ref()? else { return None };
+        Some((path.clone(), *figure, self.viewer_panel()))
+    }
+
+    /// Put a figure up in the viewer, at fit. `drawn` is the box the reader clicked on
+    /// the page, which stands in for a figure whose file cannot be measured any more.
+    ///
+    /// The size is asked of the file here and once, rather than at every gesture: the
+    /// reader has just pointed at a figure, and everything that follows -- the zoom about
+    /// the pointer, the drag, the hit test that decides whether a click landed on the
+    /// figure or on the backdrop that closes it -- has to be answered about that same
+    /// figure, whether or not the file is still there to be measured. A file that has
+    /// gone is an empty box of the size the reader clicked, which can still be put away.
+    fn open_viewer(&mut self, path: PathBuf, drawn: (f32, f32), hwnd: HWND) {
+        let figure = self.figure_dip(&path).unwrap_or(drawn);
+        let panel = self.viewer_panel();
+        self.preview = Some(Preview::Image { path, view: Viewer::fit(figure, panel, now_ms()), figure });
+        // A note the pointer was resting on belongs to the page, and the page is behind
+        // the figure now: its wait is given up here rather than left to fire over the
+        // picture a moment after the reader asked to see it.
+        self.note_hover = None;
+        if self.note_bubble.take().is_some() {
+            let _ = unsafe { KillTimer(Some(hwnd), NOTE_TIMER) };
+        }
+        // A figure with more than one frame starts playing the moment it is up.
+        self.arm_animation(hwnd);
+        let _ = unsafe { InvalidateRect(Some(hwnd), None, false) };
+    }
+
+    /// Put a new viewer state up, keeping the figure it belongs to.
+    fn set_viewer(&mut self, view: Viewer, hwnd: HWND) {
+        let Some(Preview::Image { path, figure, .. }) = self.preview.take() else { return };
+        self.preview = Some(Preview::Image { path, view, figure });
+        let _ = unsafe { InvalidateRect(Some(hwnd), None, false) };
+    }
+
+    /// The wheel, while a figure is up: a notch is a step of zoom, anchored where the
+    /// pointer is. Answers whether the viewer took the message.
+    ///
+    /// The whole wheel goes to the figure rather than only its plain roll, because the
+    /// figure is what the reader is looking at: `Ctrl`'s document zoom and `Shift`'s
+    /// table pan both belong to a page that is not on screen.
+    fn zoom_viewer(&mut self, ticks: f32, hwnd: HWND) -> bool {
+        let Some((_, figure, panel)) = self.viewer_now() else { return false };
+        if !ticks.is_finite() || ticks == 0.0 {
+            return true;
+        }
+        let Some(Preview::Image { view, .. }) = self.preview.as_ref() else { return false };
+        let view = *view;
+        // The pointer, in the window's own coordinates: the wheel message carries screen
+        // coordinates, and the anchor has to be where the reader is looking.
+        let mut pt = POINT::default();
+        let _ = unsafe { GetCursorPos(&mut pt) };
+        let _ = unsafe { ScreenToClient(hwnd, &mut pt) };
+        let anchor = (pt.x as f32, pt.y as f32);
+        self.set_viewer(view.zoomed(viewer::ZOOM_STEP.powf(ticks), anchor, figure, panel), hwnd);
+        true
+    }
+
+    /// The keys a figure answers while it is up: `Escape` puts it away, `0` shows it at
+    /// its own size, `F` fits it again, and `+`/`-` (with or without `Ctrl`) zoom about
+    /// the middle of the window. Answers whether the viewer took the key.
+    ///
+    /// A modal overlay answers its own keys: the reader is looking at a picture, and a
+    /// `Ctrl` chord that quietly re-laid-out the page behind it would be a change they
+    /// cannot see. Every other key falls through to the window, so `Ctrl`+`W` and
+    /// `Ctrl`+`Tab` keep working from inside the viewer.
+    fn key_viewer(&mut self, key: u32, hwnd: HWND) -> bool {
+        let Some((_, figure, panel)) = self.viewer_now() else { return false };
+        let Some(Preview::Image { view, .. }) = self.preview.as_ref() else { return false };
+        let view = *view;
+        let middle = (panel.0 + panel.2 * 0.5, panel.1 + panel.3 * 0.5);
+        let next = match key {
+            k if k == VK_ESCAPE.0 as u32 => None,
+            k if k == VK_0.0 as u32 || k == VK_NUMPAD0.0 as u32 => Some(Viewer::actual(figure, panel, now_ms())),
+            k if k == VK_F.0 as u32 => Some(Viewer::fit(figure, panel, now_ms())),
+            k if k == VK_OEM_PLUS.0 as u32 || k == VK_ADD.0 as u32 => {
+                Some(view.zoomed(viewer::ZOOM_STEP, middle, figure, panel))
+            }
+            k if k == VK_OEM_MINUS.0 as u32 || k == VK_SUBTRACT.0 as u32 => {
+                Some(view.zoomed(1.0 / viewer::ZOOM_STEP, middle, figure, panel))
+            }
+            _ => return false,
+        };
+        match next {
+            Some(view) => self.set_viewer(view, hwnd),
+            None => self.close_preview(hwnd),
+        }
+        true
+    }
+
+    /// A drag over a figure pans it, and answers whether there was a figure to pan.
+    ///
+    /// The press that starts the drag is the one [`View::press_at`] already remembers:
+    /// a press on a figure never reaches the text path, so the two never contend for it.
+    fn pan_viewer(&mut self, x: f32, y: f32, hwnd: HWND) -> bool {
+        let Some((_, figure, panel)) = self.viewer_now() else { return false };
+        let Some((px, py)) = self.press_at else { return false };
+        let Some(Preview::Image { view, .. }) = self.preview.as_ref() else { return false };
+        let view = *view;
+        self.set_viewer(view.panned(x - px, y - py, figure, panel), hwnd);
+        self.press_at = Some((x, y));
+        true
+    }
+
+    /// The frames of the figure on screen, when it has more than one and every frame is
+    /// the whole picture.
+    ///
+    /// A partial animation is deliberately answered as a still one. Playing it would
+    /// mean compositing each frame over the last by the disposal method it names, which
+    /// is a decoder's work rather than a viewer's -- and showing the fragments
+    /// uncomposited would be worse than showing the first frame, which is what this
+    /// reader has always done.
+    fn animated_now(&self) -> Option<(PathBuf, crate::images::Frames)> {
+        let Preview::Image { path, .. } = self.preview.as_ref()? else { return None };
+        let frames = self.images.as_ref()?.frames(path)?;
+        frames.full.then(|| (path.clone(), frames))
+    }
+
+    /// Put the overlay away, whatever it is showing, and stop the clock it started.
+    fn close_preview(&mut self, hwnd: HWND) {
+        if self.preview.take().is_some() {
+            let _ = unsafe { KillTimer(Some(hwnd), GIF_TIMER) };
+            let _ = unsafe { InvalidateRect(Some(hwnd), None, false) };
+        }
+    }
+
+    /// Start an animation: show its first frame from now, and arm the beat that moves it
+    /// on.
+    fn arm_animation(&mut self, hwnd: HWND) {
+        let _ = unsafe { KillTimer(Some(hwnd), GIF_TIMER) };
+        let Some((_, frames)) = self.animated_now() else { return };
+        let Some(Preview::Image { view, .. }) = self.preview.as_ref() else { return };
+        let view = view.showing(0, now_ms());
+        self.set_viewer(view, hwnd);
+        let first = frames.delays_ms.first().copied().unwrap_or(viewer::DEFAULT_FRAME_MS);
+        let _ = unsafe { SetTimer(Some(hwnd), GIF_TIMER, viewer::frame_ms(first), None) };
+    }
+
+    /// One beat of an animation: the frame the clock says is due, and the beat after it.
+    ///
+    /// The timer is re-armed from the frame now on screen rather than from the one it
+    /// was armed for, so a file whose delays differ plays at the pace it states instead
+    /// of at the pace of its first frame.
+    fn tick_animation(&mut self, hwnd: HWND) {
+        let Some((_, frames)) = self.animated_now() else {
+            let _ = unsafe { KillTimer(Some(hwnd), GIF_TIMER) };
+            return;
+        };
+        let Some(Preview::Image { view, .. }) = self.preview.as_ref() else { return };
+        let view = *view;
+        let now = now_ms();
+        let due = viewer::frame_at(&frames.delays_ms, now.wrapping_sub(view.since));
+        if due != view.frame {
+            self.set_viewer(view.showing(due, now), hwnd);
+        }
+        let next = frames.delays_ms.get(due).copied().unwrap_or(viewer::DEFAULT_FRAME_MS);
+        let _ = unsafe { SetTimer(Some(hwnd), GIF_TIMER, viewer::frame_ms(next), None) };
     }
 
     /// The place in the page's text under a pointer position given in client pixels,
@@ -6323,7 +6572,7 @@ impl View {
             HotKind::Wide(index) => {
                 let Some(region) = self.wide_regions.get(index).cloned() else { return };
                 match region.kind {
-                    WideKind::Image(path) => self.preview = Some(Preview::Image(path)),
+                    WideKind::Image(path) => self.open_viewer(path, (region.content_w, region.h), hwnd),
                     WideKind::Formula(key) => self.preview = Some(Preview::Formula(key)),
                     WideKind::Table => {
                         self.wide_active = Some(index);
@@ -10186,7 +10435,9 @@ impl View {
         self.page_hot = None;
         self.page_pressed = None;
         let _ = unsafe { KillTimer(Some(hwnd), PAGE_TIMER) };
-        self.preview = None;
+        // A figure on screen belongs to the page that was showing it, and its clock goes
+        // with it: an animation left armed would keep beating over the new page.
+        self.close_preview(hwnd);
         self.wide_active = None;
         self.wide_offset = 0.0;
         self.selection = None;
@@ -11112,22 +11363,24 @@ impl View {
             target.FillRectangle(&panel, &brush);
         }
         match preview {
-            Preview::Image(path) => {
-                let Some((w, h)) = self.images.as_ref().and_then(|s| s.natural_size(&path)) else { return };
-                let k = scale_of(self.dpi);
-                let avail_w = (panel.right - panel.left - 32.0) / k;
-                let avail_h = (panel.bottom - panel.top - 32.0) / k;
-                let scale = (avail_w / w.max(1.0)).min(avail_h / h.max(1.0));
-                let dw = w * scale * k;
-                let dh = h * scale * k;
-                let r = D2D_RECT_F {
-                    left: panel.left + (panel.right - panel.left - dw) * 0.5,
-                    top: panel.top + (panel.bottom - panel.top - dh) * 0.5,
-                    right: panel.left + (panel.right - panel.left + dw) * 0.5,
-                    bottom: panel.top + (panel.bottom - panel.top + dh) * 0.5,
+            Preview::Image { path, view, figure } => {
+                // The figure takes the whole window. The panel the formula keeps is a
+                // dialog around a thing that is one line tall; a figure is the reason
+                // the reader clicked, and what they asked for is the picture and nothing
+                // else -- the overlay this viewer answers to, in the only size a window
+                // can give it.
+                let backdrop = D2D_RECT_F {
+                    left: 0.0,
+                    top: 0.0,
+                    right: self.client_w,
+                    bottom: self.client_h,
                 };
-                if let (Some(store), Some(bmp)) = (self.images.as_ref(), self.images.as_ref().and_then(|s| s.bitmap(target, &path))) {
-                    let _ = store;
+                if let Some(brush) = self.brushes.get(&ColorRole::Surface).cloned() {
+                    target.FillRectangle(&backdrop, &brush);
+                }
+                let (x, y, w, h) = view.rect(figure);
+                let r = D2D_RECT_F { left: x, top: y, right: x + w, bottom: y + h };
+                if let Some(bmp) = self.images.as_ref().and_then(|s| s.bitmap_frame(target, &path, view.frame)) {
                     target.DrawBitmap(&bmp, Some(&r), 1.0, D2D1_BITMAP_INTERPOLATION_MODE_LINEAR, None);
                 }
             }

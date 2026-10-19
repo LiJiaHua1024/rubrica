@@ -690,9 +690,19 @@ pub fn report(source: &str, path: Option<&str>, o: &Options) -> Result<()> {
                 Some(z) => format!(", zoom {z}%"),
                 None => String::new(),
             };
+            // An animated figure is a different thing on the page from a still one: it
+            // moves, it holds a timer, and whether this reader plays it at all depends on
+            // whether every frame is the whole picture. The count is printed only where
+            // there is an animation, so a page of stills reads exactly as it did.
+            let frames = store.as_ref().and_then(|s| s.frames(&path));
+            let animation = match &frames {
+                Some(f) if f.count > 1 && f.full => format!(", {} frames", f.count),
+                Some(f) if f.count > 1 => format!(", {} frames, partial", f.count),
+                _ => String::new(),
+            };
             placed.push(match size {
-                Some((w, h)) => format!("{src}{note}: {w:.1} x {h:.1}pt"),
-                None => format!("{src}{note}: not measured"),
+                Some((w, h)) => format!("{src}{note}{animation}: {w:.1} x {h:.1}pt"),
+                None => format!("{src}{note}{animation}: not measured"),
             });
         }
         println!(

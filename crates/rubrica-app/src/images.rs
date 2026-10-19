@@ -16,6 +16,7 @@
 
 use std::cell::RefCell;
 use std::collections::HashMap;
+use std::io::Read;
 use std::os::windows::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
@@ -56,12 +57,148 @@ type Stamp = (u64, Option<SystemTime>, u64);
 /// A natural size, held against the state of the file it was read from.
 type CachedSize = (Stamp, Option<(Pt, Pt)>);
 
-/// A bitmap, held against the file it was decoded from and the DPI it was made for.
+/// A bitmap, held against the file it was decoded from, the frame of it, and the DPI it
+/// was made for.
 ///
 /// The file's state is the value rather than part of the key: keyed by it, every
 /// regeneration of a figure left the previous bitmap behind for the rest of the
 /// session -- one per rebuild, each as large as the size cap allows.
-type CachedBitmap = (PathBuf, (u32, u32));
+type CachedBitmap = (PathBuf, usize, (u32, u32));
+
+/// A frame's timing, held against the state of the file it was read from.
+type CachedFrames = (Stamp, Option<Frames>);
+
+/// The most a file may weigh and still be read for its frame timings.
+///
+/// A figure's frames are counted by walking the file, which means holding it: past this
+/// size the figure is shown as its first frame, which costs nothing and is what this
+/// reader did before it could animate at all.
+const MAX_ANIMATION_BYTES: u64 = 8 * 1024 * 1024;
+
+/// How many frames a figure has, how long each is held, and whether every one of them is
+/// the whole picture.
+///
+/// Only an animated GIF answers this at all. The delays are read from the file's own
+/// graphic control extensions rather than through WIC's metadata query reader: a GIF's
+/// timing is part of the GIF, it is four bytes of a file this reader is holding open
+/// anyway, and the alternative is another Windows API surface and a `PROPVARIANT` for
+/// two little-endian numbers.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Frames {
+    pub count: usize,
+    /// Each frame's delay in milliseconds, in the order the frames appear.
+    pub delays_ms: Vec<u32>,
+    /// Whether every frame is the full canvas.
+    ///
+    /// An optimized GIF stores each frame as the rectangle that changed, and drawing
+    /// those one after another -- rather than compositing each over the last by the
+    /// disposal method it names -- would show the reader a slideshow of fragments. Those
+    /// files are shown as their first frame instead: the honest answer for a file this
+    /// build cannot play, and the answer it gave before it could play any.
+    pub full: bool,
+}
+
+/// The frames a GIF's own bytes describe, or `None` when they describe a still picture.
+///
+/// A walk over the block structure rather than a decode: the only things wanted are the
+/// frame count, each frame's rectangle, and the delay in front of it, and all three are
+/// stated in the clear at the head of each block. Anything this walk does not recognize
+/// ends it, and an ended walk is a still figure.
+pub fn parse_gif(bytes: &[u8]) -> Option<Frames> {
+    if bytes.len() < 13 || &bytes[..3] != b"GIF" {
+        return None;
+    }
+    let (screen_w, screen_h) = (u16le(bytes, 6)?, u16le(bytes, 8)?);
+    // The screen descriptor's flags say whether a global colour table follows, and how
+    // wide its entries are: three bytes each, `2^(n+1)` of them.
+    let flags = *bytes.get(10)?;
+    let mut at = 13 + if flags & 0x80 != 0 { 3 * (1usize << ((flags & 0x07) + 1)) } else { 0 };
+    let mut delays: Vec<u32> = Vec::new();
+    let mut delay = 0u32;
+    let mut full = true;
+    while at < bytes.len() {
+        match *bytes.get(at)? {
+            // An extension: a label, then blocks whose sizes are stated.
+            0x21 => {
+                let label = *bytes.get(at + 1)?;
+                at += 2;
+                if label == 0xF9 {
+                    // Graphic control: the block size, the flags, the delay in
+                    // hundredths of a second, the transparent index, then the terminator.
+                    let size = usize::from(*bytes.get(at)?);
+                    if size >= 4 {
+                        delay = u32::from(u16le(bytes, at + 2)?) * 10;
+                    }
+                    at += 1 + size;
+                } else if label == 0x01 {
+                    // Plain text: a twelve byte fixed header before its own blocks.
+                    at += 12;
+                }
+                at = skip_blocks(bytes, at)?;
+            }
+            // An image descriptor, which is one frame.
+            0x2C => {
+                let (left, top) = (u16le(bytes, at + 1)?, u16le(bytes, at + 3)?);
+                let (w, h) = (u16le(bytes, at + 5)?, u16le(bytes, at + 7)?);
+                let packed = *bytes.get(at + 9)?;
+                at += 10;
+                if packed & 0x80 != 0 {
+                    at += 3 * (1usize << ((packed & 0x07) + 1));
+                }
+                if left != 0 || top != 0 || w != screen_w || h != screen_h {
+                    full = false;
+                }
+                delays.push(delay);
+                delay = 0;
+                // The LZW minimum code size, then the compressed data in blocks.
+                at += 1;
+                at = skip_blocks(bytes, at)?;
+            }
+            0x3B => break,
+            _ => return None,
+        }
+    }
+    if delays.len() <= 1 {
+        return None;
+    }
+    Some(Frames { count: delays.len(), delays_ms: delays, full })
+}
+
+/// The frames of a GIF on disk, or `None` for anything else.
+///
+/// The file's own magic is asked first and the rest is read only if it answers: a page
+/// of screenshots and photographs is the common case, and a whole file held in memory to
+/// find out that it is not an animation is a cost paid on every figure of every report.
+fn read_gif(path: &Path) -> Option<Frames> {
+    let mut file = std::fs::File::open(path).ok()?;
+    let mut magic = [0u8; 6];
+    file.read_exact(&mut magic).ok()?;
+    if &magic[..3] != b"GIF" || file.metadata().ok()?.len() > MAX_ANIMATION_BYTES {
+        return None;
+    }
+    let mut bytes = magic.to_vec();
+    file.read_to_end(&mut bytes).ok()?;
+    parse_gif(&bytes)
+}
+
+/// Step over a chain of GIF sub-blocks: each states its own size, and a zero ends it.
+fn skip_blocks(bytes: &[u8], mut at: usize) -> Option<usize> {
+    loop {
+        let size = usize::from(*bytes.get(at)?);
+        at += 1;
+        if size == 0 {
+            return Some(at);
+        }
+        at = at.checked_add(size)?;
+        if at > bytes.len() {
+            return None;
+        }
+    }
+}
+
+fn u16le(bytes: &[u8], at: usize) -> Option<u16> {
+    Some(u16::from_le_bytes([*bytes.get(at)?, *bytes.get(at + 1)?]))
+}
 
 /// The state of the file behind `path`, or `None` when there is no file there at all.
 ///
@@ -117,6 +254,8 @@ pub struct ImageStore {
     /// the file they came from or the target's DPI, which `WM_DPICHANGED` changes in
     /// place rather than by making a new target.
     bitmaps: RefCell<HashMap<CachedBitmap, (Stamp, ID2D1Bitmap)>>,
+    /// Frame timings per path, held against the state of the file like a size is.
+    frames: RefCell<HashMap<PathBuf, CachedFrames>>,
 }
 
 impl ImageStore {
@@ -127,6 +266,7 @@ impl ImageStore {
             wic,
             sizes: RefCell::new(HashMap::new()),
             bitmaps: RefCell::new(HashMap::new()),
+            frames: RefCell::new(HashMap::new()),
         })
     }
 
@@ -172,7 +312,18 @@ impl ImageStore {
     /// alpha composites correctly. Built on first use, then cached against the file it
     /// came from and the target it was made for.
     pub fn bitmap(&self, target: &ID2D1RenderTarget, path: &Path) -> Option<ID2D1Bitmap> {
-        let key = (path.to_path_buf(), target_dpi(target));
+        self.bitmap_frame(target, path, 0)
+    }
+
+    /// The GPU bitmap of one frame of a figure.
+    ///
+    /// One entry per frame rather than one per figure: an animation shows every frame,
+    /// and a cache that held only the first would decode the whole file again on every
+    /// beat of the timer. A frame index past the end of the file is answered with
+    /// nothing, which is what a figure whose file was replaced under a running animation
+    /// gets -- and the caller falls back to the first frame.
+    pub fn bitmap_frame(&self, target: &ID2D1RenderTarget, path: &Path, index: usize) -> Option<ID2D1Bitmap> {
+        let key = (path.to_path_buf(), index, target_dpi(target));
         let file = stamp(path)?;
         if let Some((at, hit)) = self.bitmaps.borrow().get(&key) {
             if *at == file {
@@ -180,7 +331,7 @@ impl ImageStore {
             }
         }
         let made = (|| {
-            let frame = self.first_frame(path)?;
+            let frame = self.frame(path, index)?;
             Self::size_of(&frame)?;
             let converter: IWICFormatConverter = unsafe { self.wic.CreateFormatConverter().ok()? };
             unsafe {
@@ -206,6 +357,23 @@ impl ImageStore {
         made
     }
 
+    /// The frames of an animated figure, or `None` when the file is a still picture.
+    ///
+    /// Read once per version of the file, like a size, and for the same reason: the
+    /// paint path asks on every beat of the animation's timer, and a file read per beat
+    /// is a file read dozens of times a second.
+    pub fn frames(&self, path: &Path) -> Option<Frames> {
+        let stamp = stamp(path)?;
+        if let Some(hit) = self.frames.borrow().get(path) {
+            if hit.0 == stamp {
+                return hit.1.clone();
+            }
+        }
+        let read = read_gif(path);
+        self.frames.borrow_mut().insert(path.to_path_buf(), (stamp, read.clone()));
+        read
+    }
+
     /// The pixel size of a frame, if this reader will decode a figure that size at all.
     ///
     /// The size is read from the header, which costs nothing, while the decode asks the
@@ -223,6 +391,11 @@ impl ImageStore {
     }
 
     fn first_frame(&self, path: &Path) -> Option<IWICBitmapFrameDecode> {
+        self.frame(path, 0)
+    }
+
+    /// One frame of the file, by index.
+    fn frame(&self, path: &Path, index: usize) -> Option<IWICBitmapFrameDecode> {
         let wide: Vec<u16> = path.as_os_str().encode_wide().chain(std::iter::once(0)).collect();
         let decoder = unsafe {
             self.wic
@@ -234,7 +407,7 @@ impl ImageStore {
                 )
                 .ok()?
         };
-        unsafe { decoder.GetFrame(0).ok() }
+        unsafe { decoder.GetFrame(index as u32).ok() }
     }
 
     /// Resolve a Markdown target against the document's own directory.
@@ -393,5 +566,107 @@ mod tests {
         assert!(!decodable(65_536, 65_536));
         assert!(!decodable(0, 100));
         assert!(!decodable(100, 0));
+    }
+
+    /// The fixture's own bytes, read the way the window reads them: three frames at the
+    /// delays the encoder was told to write, every one of them the full canvas. This is
+    /// the walk against a real encoder's output rather than against bytes this file
+    /// wrote for itself -- Pillow's GIF writer is what a reader's own figures come from.
+    #[test]
+    fn the_animation_fixture_states_three_full_frames_at_its_own_delays() {
+        let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../fixtures/html-anim.gif");
+        let frames = read_gif(&path).expect("the fixture is an animation");
+        assert_eq!(frames.count, 3);
+        assert_eq!(frames.delays_ms, vec![200, 500, 100]);
+        assert!(frames.full, "the fixture stores whole frames");
+    }
+
+    /// A GIF's bytes as an encoder writes them: a screen descriptor, one graphic
+    /// control extension and one image descriptor per frame, and a trailer. `rect` is
+    /// the rectangle each frame is stored in -- the full canvas for an unoptimized
+    /// animation, a corner of it for an optimized one.
+    fn gif(delays: &[u16], rect: (u16, u16, u16, u16)) -> Vec<u8> {
+        let (l, t, w, h) = rect;
+        let mut out = b"GIF89a".to_vec();
+        out.extend_from_slice(&[10, 0, 10, 0, 0x00, 0, 0]);
+        for delay in delays {
+            out.extend_from_slice(&[0x21, 0xF9, 4, 0, *delay as u8, (*delay >> 8) as u8, 0, 0]);
+            out.push(0x2C);
+            for field in [l, t, w, h] {
+                out.extend_from_slice(&field.to_le_bytes());
+            }
+            out.push(0x00);
+            out.extend_from_slice(&[2, 0x02, 0x44, 0x01, 0x00]);
+        }
+        out.push(0x3B);
+        out
+    }
+
+    /// The delays are hundredths of a second in the file and milliseconds here, and a
+    /// still picture is not an animation.
+    #[test]
+    fn an_animated_gif_states_its_frames_and_a_still_one_states_nothing() {
+        let frames = parse_gif(&gif(&[10, 25, 3], (0, 0, 10, 10))).expect("three frames");
+        assert_eq!(frames.count, 3);
+        assert_eq!(frames.delays_ms, vec![100, 250, 30]);
+        assert!(frames.full, "every frame is the whole canvas");
+        assert_eq!(parse_gif(&gif(&[10], (0, 0, 10, 10))), None, "one frame is not an animation");
+        assert_eq!(parse_gif(b"not a gif at all, but long enough"), None);
+        assert_eq!(parse_gif(b"GIF89a"), None, "a header with no screen descriptor");
+    }
+
+    /// An optimized GIF stores each frame as the rectangle that changed, and this build
+    /// cannot composite those: the frames are counted and the file is marked, so the
+    /// caller can show the first frame instead of a slideshow of fragments.
+    #[test]
+    fn a_frame_that_is_only_a_corner_marks_the_animation_as_partial() {
+        let frames = parse_gif(&gif(&[10, 10], (1, 1, 4, 4))).expect("two frames");
+        assert_eq!(frames.count, 2);
+        assert!(!frames.full);
+        // The canvas is the screen descriptor's, so a frame as large as the screen but
+        // placed off its origin is partial too.
+        let offset = parse_gif(&gif(&[10, 10], (2, 0, 10, 10))).expect("two frames");
+        assert!(!offset.full);
+    }
+
+    /// A GIF whose blocks this walk does not recognize is a still picture rather than a
+    /// guess: the reader shows its first frame, which is what it did before it could
+    /// animate anything.
+    #[test]
+    fn an_unknown_block_ends_the_walk_and_the_figure_is_still() {
+        let mut bytes = gif(&[10, 10], (0, 0, 10, 10));
+        bytes[13] = 0x99;
+        assert_eq!(parse_gif(&bytes), None);
+        // A truncated file is the same answer, and never a panic: the walk stops where
+        // the bytes do.
+        let full = gif(&[10, 10], (0, 0, 10, 10));
+        for cut in 13..full.len() {
+            let _ = parse_gif(&full[..cut]);
+        }
+    }
+
+    /// A global colour table sits between the screen descriptor and the first block, and
+    /// a frame may carry a local one: both are skipped by the size their flags state, so
+    /// neither is mistaken for the frame after it.
+    #[test]
+    fn colour_tables_are_stepped_over_rather_than_read() {
+        let mut bytes = b"GIF89a".to_vec();
+        // A 10 by 10 screen with a global table of 2 entries: flags bit 7 set, size 0.
+        bytes.extend_from_slice(&[10, 0, 10, 0, 0x80, 0, 0]);
+        bytes.extend_from_slice(&[0, 0, 0, 255, 255, 255]);
+        for _ in 0..2 {
+            bytes.extend_from_slice(&[0x21, 0xF9, 4, 0, 10, 0, 0, 0]);
+            bytes.push(0x2C);
+            // Left, top, width, height: the whole 10 by 10 canvas.
+            bytes.extend_from_slice(&[0, 0, 0, 0, 10, 0, 10, 0]);
+            // A local table of 2 entries, then the compressed data.
+            bytes.push(0x80);
+            bytes.extend_from_slice(&[0u8; 6]);
+            bytes.extend_from_slice(&[2, 0x02, 0x44, 0x01, 0x00]);
+        }
+        bytes.push(0x3B);
+        let frames = parse_gif(&bytes).expect("two frames behind two colour tables");
+        assert_eq!(frames.delays_ms, vec![100, 100]);
+        assert!(frames.full);
     }
 }
