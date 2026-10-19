@@ -273,6 +273,14 @@ const NOTE_TIMER: usize = 0x5144;
 /// asking to be played, and a reader looking at a photograph must not be paying for a
 /// timer that fires sixty times a second to find nothing to do.
 const GIF_TIMER: usize = 0x5145;
+/// The beat that keeps a drag scrolling while it is held against an edge of the page.
+/// Armed when the pointer enters one of the two bands and killed the moment it leaves, so
+/// a window nobody is dragging a selection in is not paying for a timer.
+const EDGE_TIMER: usize = 0x5146;
+/// How long that beat is, in milliseconds. Short enough that a pointer held still at the
+/// edge keeps the page moving, long enough that even the fastest step of
+/// [`edge_scroll_step`] reads as a scroll rather than as a jump.
+const EDGE_TICK_MS: u32 = 30;
 /// The space between a citation and the bubble it opened, and the air inside the
 /// bubble's own edge.
 const BUBBLE_GAP: f32 = 8.0;
@@ -2123,6 +2131,10 @@ pub struct View {
     /// Where the button went down in the text, which is the end of a selection that
     /// has not been dragged yet and the point a double click expands from.
     press_caret: Option<Caret>,
+    /// The pointer a held drag is against an edge with, in client pixels, while the beat
+    /// that keeps that drag scrolling is armed. `None` is a drag nowhere near an edge, and
+    /// is what the beat is killed on; see [`edge_scroll_step`].
+    edge_at: Option<(f32, f32)>,
     /// Where the reader has put the caret, by a click or an arrow. While it is set the
     /// arrow keys belong to it rather than to the scroll, which is what every text
     /// surface on this system does and the reason `Escape` has to give it back.
@@ -3820,6 +3832,7 @@ fn new_view(
         cell_anchor: None,
         selection: None,
         press_caret: None,
+        edge_at: None,
         caret: None,
         caret_on: true,
         sel_brush: None,
@@ -4034,6 +4047,7 @@ pub fn run(path: Option<PathBuf>, extra: Vec<PathBuf>, start_theme: Option<Strin
         let _ = KillTimer(Some(hwnd), CARET_TIMER);
         let _ = KillTimer(Some(hwnd), PAGE_TIMER);
         let _ = KillTimer(Some(hwnd), GIF_TIMER);
+        let _ = KillTimer(Some(hwnd), EDGE_TIMER);
         // `view` is dropped here; the pointer stored in GWLP_USERDATA dies with it.
     }
     Ok(())
@@ -4268,25 +4282,30 @@ fn is_written(seen: Option<Stamp>, now: Option<Stamp>) -> bool {
 /// The step a drag held against an edge of the page takes, or `None` for a pointer that
 /// is not against one.
 ///
-/// The bands are bounded by the *content* area rather than by the whole client, and
-/// `bottom` is [`View::content_bottom`] -- the client less the status bar. A selection
-/// dragged up over the tab strip or down into the bar is a pointer over chrome, not
-/// over text, and a page that scrolled under it would slide the line the reader is
-/// marking through their feet while the pointer never touched it. The same is true of
-/// the band's outer half in the other direction: a pointer below the status bar's top
-/// edge is on the bar, and the bar is not the foot of anything the reader can see.
+/// The bands begin at the *content* area rather than at the whole client, and `bottom` is
+/// [`View::content_bottom`] -- the client less the status bar. Inside the text, in the
+/// twenty points next to one of those two lines, the step is the same six this has always
+/// taken: a reader marking a line they can see must not have the page slide out from
+/// under it faster than they asked for.
 ///
-/// The band is narrow and the step small because this is asked of every pointer message
-/// while the button is down near an edge, including the ones that do not move: too fast
-/// reads as a page flipping under a stationary cursor.
+/// Past the line the step grows with the overshoot, by a quarter of a point per point, up
+/// to four times the base. A pointer dragged over the tab strip, down into the status bar
+/// or clean out of the window is a reader asking for the far end of the document, and one
+/// held a hair past the edge and one held a screen past it are not the same request. The
+/// window's own head and foot are therefore in the band, which they were not before: the
+/// capture keeps reporting a pointer that has left the window, and a drag that has left
+/// the window is the plainest "keep going" this surface is ever given.
 fn edge_scroll_step(y: f32, bottom: f32) -> Option<Pt> {
     const EDGE: f32 = 20.0;
     const STEP: Pt = 6.0;
-    if y < TOPBAR_H || y > bottom { return None; }
+    const RAMP: Pt = 0.25;
+    const CAP: Pt = 24.0;
     if y < TOPBAR_H + EDGE {
-        Some(-STEP)
+        let over = (TOPBAR_H - y).max(0.0);
+        Some(-(STEP + over * RAMP).min(CAP))
     } else if y > bottom - EDGE {
-        Some(STEP)
+        let over = (y - bottom).max(0.0);
+        Some((STEP + over * RAMP).min(CAP))
     } else {
         None
     }
@@ -4415,9 +4434,9 @@ unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM)
             // dispatcher: `WM_TIMER` keeps arriving at a `GWLP_USERDATA` that no longer
             // names a `View` -- the appearance poll reading a freed palette, the caret
             // beat flipping a freed flag, the page tick indexing a freed list. Timers die
-            // with their window on their own, but these six are named in six places and
-            // this is the one moment all six are known.
-            for timer in [APPEARANCE_TIMER, DOCUMENT_TIMER, CARET_TIMER, PAGE_TIMER, NOTE_TIMER, GIF_TIMER] {
+            // with their window on their own, but these seven are named in seven places and
+            // this is the one moment all seven are known.
+            for timer in [APPEARANCE_TIMER, DOCUMENT_TIMER, CARET_TIMER, PAGE_TIMER, NOTE_TIMER, GIF_TIMER, EDGE_TIMER] {
                 let _ = KillTimer(Some(hwnd), timer);
             }
             // The frame goes with the place for the same reason: the usual way to close a
@@ -5578,6 +5597,10 @@ impl View {
                     // reader looking at a photograph is not paying for a beat that finds
                     // nothing to do.
                     GIF_TIMER => self.tick_animation(hwnd),
+                    // Armed only while a drag is held against an edge of the page, so a
+                    // window nobody is dragging a selection in is not paying for a beat
+                    // that finds nothing to do.
+                    EDGE_TIMER => self.tick_edge(hwnd),
                     // Armed only while a pointer rests on a citation, so the common
                     // reader -- who is reading, not hovering -- is not paying for a
                     // beat they never asked for.
@@ -5920,7 +5943,7 @@ impl View {
                 } else if self.dragging {
                     self.scroll_to_thumb(y);
                     let _ = InvalidateRect(Some(hwnd), None, false);
-                } else if let Some(from) = self.press_caret {
+                } else if self.press_caret.is_some() {
                     // A button that has travelled since it went down in the text is no
                     // longer aiming at a place: it is drawing a selection, and it goes on
                     // drawing one until it comes up. The slop is what keeps a click on a
@@ -5929,24 +5952,8 @@ impl View {
                         .press_at
                         .is_some_and(|(px, py)| (x - px).abs() > DRAG_SLOP || (y - py).abs() > DRAG_SLOP);
                     if dragged {
-                        self.auto_scroll(y, hwnd);
-                        if let Some((grid, row, col)) = self.cell_anchor {
-                            // The rectangle grows to the cell the pointer has reached. A
-                            // pointer that has left the grid leaves the rectangle where it
-                            // was: a drag that runs off the edge of a table has marked the
-                            // cells it covered, and reading the row it is over now would
-                            // move the far corner to a cell the reader never crossed.
-                            if let Some((_, r, c)) = self.cell_under(x, y).filter(|(at, _, _)| *at == grid) {
-                                self.cell_rect = Some(crate::cells::CellRect {
-                                    grid,
-                                    anchor: self.cell_rect.map_or((row, col), |rect| rect.anchor),
-                                    head: (r, c),
-                                });
-                            }
-                        } else {
-                            let to = self.caret_under(x, y);
-                            self.selection = Some(Selection { from, to });
-                        }
+                        self.auto_scroll(x, y, hwnd);
+                        self.drag_to(x, y);
                         let _ = InvalidateRect(Some(hwnd), None, false);
                     }
                 }
@@ -5963,6 +5970,10 @@ impl View {
                 // keeps the capture after a plain click takes the mouse away from the
                 // rest of the desktop, thumb drags being the only case it is meant for.
                 let _ = ReleaseCapture();
+                // The drag is over whatever the button was doing, so the beat that was
+                // scrolling for it is over too; a page still moving under a pointer that
+                // has let go is the one thing this must never do.
+                self.stop_edge(hwnd);
                 self.dragging = false;
                 self.tree_dragging = false;
                 let page_button = self.page_pressed.take();
@@ -6063,6 +6074,10 @@ impl View {
                 {
                     let _ = InvalidateRect(Some(hwnd), None, false);
                 }
+                // A selection drag is on the same terms: the pointer's position stops
+                // arriving with the capture, so the beat that was scrolling for it has
+                // nothing left to steer by.
+                self.stop_edge(hwnd);
                 LRESULT(0)
             }
             WM_MBUTTONDOWN => {
@@ -6636,20 +6651,87 @@ impl View {
         crate::cells::grid_of(&self.cells, at)
     }
 
-    /// Scroll the page when a drag is held against its top or bottom edge, so a
-    /// selection longer than the viewport can be finished without letting go.
+    /// Scroll the page when a drag is held against its top or bottom edge, and keep it
+    /// scrolling while the pointer stays there, so a selection longer than the viewport
+    /// can be finished without letting go.
     ///
-    /// The bands are the page's own, so a drag held over the tab strip or the status bar
-    /// does not scroll a page it is nowhere near; see [`edge_scroll_step`].
-    fn auto_scroll(&mut self, y: f32, _hwnd: HWND) {
-        if self.reading_mode == ReadingMode::Stack {
-            // A page turn clears the transient drag state; letting edge auto-scroll start
-            // one half way through a selection would turn the next pointer message into a
-            // document-start caret. Cross-page selection is a separate gesture for now.
+    /// The bands begin at the page's own two lines and run outwards from them; see
+    /// [`edge_scroll_step`]. The first step is taken here, on the message that brought the
+    /// pointer to the edge, so the page answers the drag at once; the beat armed with it
+    /// takes the rest, and that is what keeps a page moving under a pointer that has
+    /// stopped moving.
+    fn auto_scroll(&mut self, x: f32, y: f32, hwnd: HWND) {
+        match self.edge_step(y) {
+            Some(step) => {
+                if self.edge_at.is_none() {
+                    let _ = unsafe { SetTimer(Some(hwnd), EDGE_TIMER, EDGE_TICK_MS, None) };
+                }
+                self.edge_at = Some((x, y));
+                self.scroll_by(step);
+            }
+            None => self.stop_edge(hwnd),
+        }
+    }
+
+    /// The step a held pointer at `y` is asking for, if any. Stack mode answers `None`
+    /// whatever the pointer is doing: a page turn clears the transient drag state, and
+    /// letting an edge start one half way through a selection would turn the next pointer
+    /// message into a document-start caret. Cross-page selection is a separate gesture.
+    fn edge_step(&self, y: f32) -> Option<Pt> {
+        if self.reading_mode == ReadingMode::Stack { return None; }
+        edge_scroll_step(y, self.content_bottom())
+    }
+
+    /// Stop the beat that keeps a held drag scrolling, if it is running.
+    fn stop_edge(&mut self, hwnd: HWND) {
+        if self.edge_at.take().is_some() {
+            let _ = unsafe { KillTimer(Some(hwnd), EDGE_TIMER) };
+        }
+    }
+
+    /// One beat of a held drag: the pointer has not moved, and the page goes on moving
+    /// under it. The selection follows the text the pointer is standing on, so a drag
+    /// finished at the foot of the page has marked what went past it rather than only what
+    /// was under it when the button came down.
+    ///
+    /// The beat stops itself if the drag it was armed for is gone -- a button released
+    /// outside the window, a relayout that cleared the selection -- because the one thing
+    /// worse than a page that will not scroll is a page that will not stop.
+    fn tick_edge(&mut self, hwnd: HWND) {
+        let Some((x, y)) = self.edge_at else { return };
+        if self.press_caret.is_none() || !held(VK_LBUTTON) {
+            self.stop_edge(hwnd);
             return;
         }
-        if let Some(step) = edge_scroll_step(y, self.content_bottom()) {
-            self.scroll_by(step);
+        match self.edge_step(y) {
+            Some(step) => {
+                self.scroll_by(step);
+                self.drag_to(x, y);
+                let _ = unsafe { InvalidateRect(Some(hwnd), None, false) };
+            }
+            None => self.stop_edge(hwnd),
+        }
+    }
+
+    /// Extend the drag in progress to the point under the pointer: the caret the page has
+    /// there now, or the cell the rectangle has reached.
+    fn drag_to(&mut self, x: f32, y: f32) {
+        let Some(from) = self.press_caret else { return };
+        if let Some((grid, row, col)) = self.cell_anchor {
+            // The rectangle grows to the cell the pointer has reached. A pointer that has
+            // left the grid leaves the rectangle where it was: a drag that runs off the
+            // edge of a table has marked the cells it covered, and reading the row it is
+            // over now would move the far corner to a cell the reader never crossed.
+            if let Some((_, r, c)) = self.cell_under(x, y).filter(|(at, _, _)| *at == grid) {
+                self.cell_rect = Some(crate::cells::CellRect {
+                    grid,
+                    anchor: self.cell_rect.map_or((row, col), |rect| rect.anchor),
+                    head: (r, c),
+                });
+            }
+        } else {
+            let to = self.caret_under(x, y);
+            self.selection = Some(Selection { from, to });
         }
     }
 
@@ -15674,24 +15756,17 @@ mod tests {
     /// past the content rather than at it.
     const THUMB_BASE: f32 = 12.0;
 
-    /// The two bands a held drag listens in, which are the page's own and not the
-    /// window's. The page runs from under the tab strip to above the status bar, and
-    /// everything outside that belongs to the window rather than to the text.
+    /// The two bands a held drag listens in: the page's own two lines, and everything
+    /// outside them, where the step grows with how far past the line the pointer has been
+    /// taken. The page runs from under the tab strip to above the status bar; a pointer
+    /// past either line is a reader asking for the end of the document, and the window's
+    /// own head and foot are the outermost two of those positions.
     #[test]
-    fn an_edge_drag_scrolls_only_where_the_page_is() {
+    fn an_edge_drag_scrolls_the_faster_the_further_past_the_edge_it_is() {
         let client = 600.0;
         // With the status bar on, the page stops `STATUS_H` short of the foot -- the same
         // arithmetic `View::content_bottom` does.
         let bottom = client - STATUS_H;
-
-        // Over the tab strip: a pointer there is on the window's own furniture, and the
-        // page under it did not move.
-        assert_eq!(edge_scroll_step(0.0, bottom), None);
-        assert_eq!(edge_scroll_step(TOPBAR_H - 1.0, bottom), None);
-        // And over the status bar, all the way down and past the foot: unticking the last
-        // item used to hand the bar's whole band to the page.
-        assert_eq!(edge_scroll_step(bottom + 1.0, bottom), None);
-        assert_eq!(edge_scroll_step(client, bottom), None);
 
         // The bands themselves, at the page's own two edges -- which is the whole reason
         // a selection longer than the window can be finished without letting go.
@@ -15700,10 +15775,46 @@ mod tests {
         assert_eq!(edge_scroll_step(bottom, bottom), Some(6.0));
         assert_eq!(edge_scroll_step(bottom - 19.0, bottom), Some(6.0));
 
+        // Over the tab strip, into the status bar and out of the window: still scrolling,
+        // and faster the further out it is -- a quarter of a point per point, four times
+        // the base at the cap. The window's own top edge (y = 0) and its foot (y = client)
+        // are both in the band, which is what a drag that has run off the page asks for.
+        assert_eq!(edge_scroll_step(TOPBAR_H - 10.0, bottom), Some(-8.5));
+        assert_eq!(edge_scroll_step(0.0, bottom), Some(-16.0));
+        assert_eq!(edge_scroll_step(-40.0, bottom), Some(-24.0));
+        assert_eq!(edge_scroll_step(bottom + 10.0, bottom), Some(8.5));
+        assert_eq!(edge_scroll_step(client, bottom), Some(12.0));
+        assert_eq!(edge_scroll_step(client + 200.0, bottom), Some(24.0));
+
         // And the middle of the page, where a drag is only being made.
         assert_eq!(edge_scroll_step(TOPBAR_H + 20.0, bottom), None);
         assert_eq!(edge_scroll_step(bottom - 20.0, bottom), None);
         assert_eq!(edge_scroll_step((TOPBAR_H + bottom) / 2.0, bottom), None);
+    }
+
+    /// The step never falls as the pointer is taken further past either line, and never
+    /// passes the cap however far out it is taken: a drag that has left the window is a
+    /// request for speed, not for a page that scrolls by the mile.
+    #[test]
+    fn an_edge_drag_speeds_up_and_then_stops_speeding_up() {
+        let bottom = 600.0 - STATUS_H;
+
+        let mut last = 0.0;
+        for step in 0..80 {
+            let Some(now) = edge_scroll_step(bottom + step as f32, bottom) else { continue };
+            assert!(now >= last, "the step fell {step} points past the foot");
+            assert!(now <= 24.0, "the step passed the cap {step} points past the foot");
+            last = now;
+        }
+        assert_eq!(last, 24.0, "a pointer held well past the foot never reached the cap");
+
+        let mut last = 0.0;
+        for step in 0..80 {
+            let Some(now) = edge_scroll_step(TOPBAR_H - step as f32, bottom) else { continue };
+            assert!(-now >= last, "the step fell {step} points above the head");
+            last = -now;
+        }
+        assert_eq!(last, 24.0, "a pointer held well above the head never reached the cap");
     }
 
     #[test]

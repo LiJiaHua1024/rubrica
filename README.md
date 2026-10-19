@@ -176,6 +176,13 @@ chapter window, with `Ctrl+Alt+Up/Down` for chapter navigation. `Ctrl+3` switche
 source view, `Ctrl+4` switches between continuous scrolling and the page stack, and
 `Ctrl+Shift+O` opens the file in an editor at the current source position.
 
+Dragging a selection to the top or bottom of the page scrolls it on, and keeps it scrolling
+while the pointer stays there: the twenty points next to the page's own edge move at a steady
+six points a beat, and past that edge -- over the tab strip, into the status bar, or clean out
+of the window -- the further the pointer is taken the faster the page goes, up to four times
+the base. A selection longer than the window is finished without letting go, and the text that
+scrolls past is what gets marked.
+
 Right-click opens the menu: navigation, copy, select all, select table, find, the contents,
 zoom, the installed reading faces, the measure, the theme, the text-reading switches (plain
 text or Markdown, **Show HTML image tags**, **Show `==text==` as a highlight**, **Table
