@@ -69,6 +69,10 @@ pub struct Options {
     /// with the built-in default, and a run with nothing to say says nothing, so the
     /// report of a page nobody gave a theme to is the same report it always was.
     pub theme: Option<String>,
+    /// Which grid cells to read back as the fields a spreadsheet pastes, in the form the
+    /// command line takes them: `all`, `2`, or `2:B2:D3`. `None` -- the default -- prints
+    /// nothing, so the report of a page nobody selected a table on is the report it was.
+    pub table_select: Option<String>,
 }
 
 pub fn report(source: &str, path: Option<&str>, o: &Options) -> Result<()> {
@@ -93,6 +97,7 @@ pub fn report(source: &str, path: Option<&str>, o: &Options) -> Result<()> {
         text_options,
         profile,
         theme: theme_line,
+        table_select,
     } = o.clone();
     let mut font =
         FontEngine::new().map_err(|e| -> Error { format!("DirectWrite: {e}").into() })?;
@@ -937,6 +942,18 @@ pub fn report(source: &str, path: Option<&str>, o: &Options) -> Result<()> {
         let objects: usize = page.sel.iter().map(|l| l.copies.len()).sum();
         let placeholders = copied.chars().filter(|c| *c == '\u{fffc}').count();
         println!("  copy source: {objects} object(s) restored, {placeholders} unresolved placeholder(s)");
+    }
+    // A grid read back the way a copy of it hands it over, one field per cell and one
+    // line per row -- the same text the clipboard would get, so the numbers above and
+    // the fields below can be set against each other. The whole-page census says how
+    // many tabs a page has; this says which fields they separate, and a field that
+    // holds a tab or a break of its own is quoted rather than left to split the row.
+    if let Some(asked) = table_select.as_deref() {
+        let spec = crate::cells::parse_spec(asked).map_err(|e| -> Error { e.into() })?;
+        let grids = crate::cells::grids(&page.cells);
+        let (what, fields) = crate::cells::selection(&grids, spec).map_err(|e| -> Error { e.into() })?;
+        println!("table select : {what}");
+        print!("{fields}");
     }
     Ok(())
 }

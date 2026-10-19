@@ -174,10 +174,24 @@ chapter window, with `Ctrl+Alt+Up/Down` for chapter navigation. `Ctrl+3` switche
 source view, `Ctrl+4` switches between continuous scrolling and the page stack, and
 `Ctrl+Shift+O` opens the file in an editor at the current source position.
 
-Right-click opens the menu: navigation, copy, select all, find, the contents, zoom, the
-installed reading faces, the measure, the theme, the text-reading switches (plain text
-or Markdown, **Show HTML image tags**, **Show `==text==` as a highlight**, **Table
+Right-click opens the menu: navigation, copy, select all, select table, find, the contents,
+zoom, the installed reading faces, the measure, the theme, the text-reading switches (plain
+text or Markdown, **Show HTML image tags**, **Show `==text==` as a highlight**, **Table
 lines**, **Inline code**), open tabs, recent documents, and the workspace tree.
+
+A table is copied as a table rather than as a run of prose. A press inside a grid marks the
+cell it landed on, a drag across one marks the rectangle of cells between the two, and
+`Ctrl+C` puts them on the clipboard as tab-separated fields, one line per row, with a field
+that holds a tab, a line break or a quote wrapped in quotes so the shape survives; a cell
+that wraps in the column is still one field, and a `<br>` in a cell is still a break inside
+one. `Ctrl+Shift+A` (or the menu's **Select Table**) marks the whole grid the caret is in,
+which is the only way to take a table taller than the window. Any other way of marking text
+— an arrow key, `Ctrl+A`, a click in the prose — puts the cells away. The headless runs take
+`--table-select all`, `--table-select N`, or `--table-select N:B2:D3`, and print the fields
+under a `table select` line; a spec that names no table, row or column is refused with the
+count the page has, and the switch is read on the report's own page, so it is written with
+`--report` (a run that asks for a table without one is told so rather than opening a
+window).
 
 A page's own furniture has two more choices, and both are drawn rather than measured: a
 table can be ruled as the full grid or as the printed table's three rules (a rule above,

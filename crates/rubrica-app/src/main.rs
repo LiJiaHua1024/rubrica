@@ -7,6 +7,7 @@
 
 #![windows_subsystem = "windows"]
 
+mod cells;
 mod clipboard;
 mod diagram;
 mod font;
@@ -182,6 +183,14 @@ fn main() -> Result<()> {
             !has_flag(&argv, "--no-hyphenate"),
         );
     }
+    // The table selection is read on the report's own page, so a run that asked for one
+    // without asking for a report has nothing to print it on -- and, left to fall
+    // through, would open a window instead: a reader who typed a table number would get
+    // a reader window and no fields. Answered here rather than at the dispatch below,
+    // which is where every other unrecognised flag ends up.
+    if has_flag(&argv, "--table-select") && !has_flag(&argv, "--report") {
+        return Err("--table-select reads a table on the report's own page: add --report".into());
+    }
     if has_flag(&argv, "--report") {
         let width = positive("--width", flag(&argv, "--width").unwrap_or(1080.0))?;
         let dpi = positive("--dpi", flag(&argv, "--dpi").unwrap_or(96.0))?;
@@ -238,6 +247,7 @@ fn main() -> Result<()> {
             text_options: preferences.text,
             profile,
             theme: colour.asked.then(|| themes::report_line(&colour)),
+            table_select: text_flag(&argv, "--table-select").map(lossy),
         };
         return report::report(&source, shown, &options);
     }
@@ -333,12 +343,12 @@ fn has_flag(argv: &[OsString], name: &str) -> bool {
 /// `--width` and friends. A double-click names one; a multi-selection "open with" names
 /// several, and each of them is wanted.
 fn positionals(argv: &[OsString]) -> Vec<PathBuf> {
-    const TAKES_VALUE: [&str; 22] = [
+    const TAKES_VALUE: [&str; 23] = [
         "--width", "--dpi", "--zoom", "--face", "--measure", "--profile",
         "--export-png", "--export-width", "--export-scale", "--export-pdf",
         "--pdf-width", "--pdf-height", "--theme", "--tables", "--inline-code",
         "--marker-inset", "--list-marker-gap", "--list-bullet-size", "--quote-bar-gap",
-        "--narrow-align", "--code-ladder", "--code-language",
+        "--narrow-align", "--code-ladder", "--code-language", "--table-select",
     ];
     let mut skip_next = false;
     let mut flags_done = false;

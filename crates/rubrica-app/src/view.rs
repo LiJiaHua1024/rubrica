@@ -1902,6 +1902,9 @@ pub struct Page {
     pub(crate) note_spans: Vec<NoteSpan>,
     #[cfg_attr(not(feature = "pdf"), allow(dead_code))]
     pub(crate) math_texts: Vec<MathTextFragment>,
+    /// Every grid cell the page drew, in the order it drew them: what a click in a table
+    /// is answered from and what a copy of one is read back as. See [`crate::cells`].
+    pub cells: Vec<crate::cells::CellBox>,
     /// How many inline-code capsules the page laid down, which is the number a report
     /// sets against the code spans it read: a capsule is one box per line a span
     /// crosses, so the count is never fewer than the spans and says which mark the
@@ -2098,6 +2101,16 @@ pub struct View {
     note_bubble: Option<NoteBubble>,
     /// The page's text, character by character, as the current layout drew it.
     sel_index: Vec<SelLine>,
+    /// Every grid cell the page drew, in the order it drew them: what a click in a table
+    /// is answered from and what a copy of one is read back as. See [`crate::cells`].
+    cells: Vec<crate::cells::CellBox>,
+    /// The cells a drag inside a grid has marked, if the reader is marking cells rather
+    /// than characters. Set in place of the character selection, never beside it: the
+    /// two would disagree about what is marked and about what a copy hands over.
+    cell_rect: Option<crate::cells::CellRect>,
+    /// The grid and cell a drag inside a table started from, kept while the button is
+    /// down so the rectangle can be rebuilt from wherever the pointer has reached.
+    cell_anchor: Option<(usize, usize, usize)>,
     /// What the reader has dragged out, if anything. Cleared by a relayout, whose
     /// rewrapped lines would otherwise leave a selection pointing at other words.
     selection: Option<Selection>,
@@ -2912,6 +2925,8 @@ enum Command {
     Heading(usize),
     Copy,
     SelectAll,
+    /// Mark the whole grid the caret stands in, so that a table can be copied whole.
+    SelectTable,
     /// Put the bar on the window that a phrase is typed into.
     Find,
     OpenUrl(String),
@@ -3071,6 +3086,10 @@ struct MenuState {
     /// The address under the pointer, when a link that leads out is what is under it.
     link: Option<String>,
     selected: bool,
+    /// Whether the caret is standing in a table, which is what a `Select Table` row is
+    /// shown for: the gesture is about the grid under the caret, and a page with no grid
+    /// under it has nothing for the row to mark.
+    in_table: bool,
     /// `None` while the system's setting is the one deciding.
     dark: Option<bool>,
     /// Whether this page came from a file, which is what makes reading it again a
@@ -3125,8 +3144,12 @@ fn menu_items(s: &MenuState) -> Vec<MenuRow> {    // A tab in a menu string star
         row(Command::GoBack, format!("{}\tCtrl+Z\tAlt+\u{2190}", i18n::t(s.lang, Key::MenuBack)), s.can_back),
         row(Command::GoForward, format!("{}\tCtrl+Shift+Z\tAlt+\u{2192}", i18n::t(s.lang, Key::MenuForward)), s.can_forward),
         MenuRow::Gap,
-        row(Command::Copy, format!("{}\tCtrl+C", i18n::t(s.lang, Key::MenuCopy)), s.selected),
+        row(Command::Copy, format!("{}\tCtrl+C", i18n::t(s.lang, Key::MenuCopy)), s.selected || s.in_table),
         row(Command::SelectAll, format!("{}\tCtrl+A", i18n::t(s.lang, Key::MenuSelectAll)), s.text),
+        // Beside `Select All` because that is the choice it is the other half of: on a
+        // table, every cell is a table rather than a page of prose, and the two keys are
+        // one press apart.
+        row(Command::SelectTable, format!("{}\tCtrl+Shift+A", i18n::t(s.lang, Key::MenuSelectTable)), s.in_table),
         // The one item on this menu a reader needs on a page too long to read at once,
         // and lit by the same question as `Select All`: is there any text here at all.
         row(Command::Find, format!("{}\tCtrl+F", i18n::t(s.lang, Key::MenuFind)), s.text),
@@ -3758,6 +3781,9 @@ fn new_view(
         note_tops: Vec::new(),
         anchor_tops: Vec::new(),
         sel_index: Vec::new(),
+        cells: Vec::new(),
+        cell_rect: None,
+        cell_anchor: None,
         selection: None,
         press_caret: None,
         caret: None,
@@ -5199,9 +5225,11 @@ impl View {
                     k if k == VK_ESCAPE.0 as u32 => {
                         if self.preview.take().is_some() {
                             let _ = unsafe { InvalidateRect(Some(hwnd), None, false) };
-                        } else if self.caret.is_some() || self.selection.is_some() {
+                        } else if self.caret.is_some() || self.selection.is_some() || self.cell_rect.is_some() {
                             self.caret = None;
                             self.selection = None;
+                            self.cell_rect = None;
+                            self.cell_anchor = None;
                         } else {
                             // The road the title bar's own close button takes, and
                             // for the same reason the start-up failure path takes it:
@@ -5271,6 +5299,15 @@ impl View {
                     // it would throw away what the reader put there from somewhere else,
                     // to no purpose: an empty selection is not an edit.
                     k if k == VK_C.0 as u32 && ctrl => self.copy_selection(hwnd),
+                    // The table's own take-everything, one key away from the document's:
+                    // a reader with the caret in a grid who wants the grid has nowhere
+                    // else to ask for it. Outside a table the key is the page's, as it
+                    // was before there was a table to ask about.
+                    k if k == VK_A.0 as u32 && ctrl && shift => {
+                        if !self.select_table() {
+                            self.select_all();
+                        }
+                    }
                     k if k == VK_A.0 as u32 && ctrl => self.select_all(),
                     k if k == VK_F.0 as u32 && ctrl => self.open_find(hwnd),
                     // `F3` is the same key the box answers to while it has the keyboard, so
@@ -5636,11 +5673,37 @@ impl View {
                     self.pressed = Some(i);
                 } else {
                     let c = self.caret_under(x, y);
+                    // A press inside a table marks cells rather than characters. The cell
+                    // under the pointer is the unit a spreadsheet reads, and the drag that
+                    // follows is a rectangle of cells rather than the run of drawn lines
+                    // the pointer crossed -- which for a table is the wrong shape twice
+                    // over, since a row is drawn a cell at a time and a wrapped cell is
+                    // more than one line. A double click is left to the word it expands
+                    // to, which is what a reader aiming at one word in a cell means.
+                    let hit = if msg == WM_LBUTTONDBLCLK { None } else { self.cell_under(x, y) };
+                    if let Some((grid, row, col)) = hit {
+                        // `Shift` extends the rectangle from the corner it was dragged
+                        // from, the way it extends a character selection from the end the
+                        // caret is not on; a grid of its own starts a new rectangle.
+                        let anchor = if held(VK_SHIFT) {
+                            self.cell_rect.filter(|r| r.grid == grid).map_or((row, col), |r| r.anchor)
+                        } else {
+                            (row, col)
+                        };
+                        self.cell_rect = Some(crate::cells::CellRect { grid, anchor, head: (row, col) });
+                    } else {
+                        self.cell_rect = None;
+                    }
+                    self.cell_anchor = hit;
                     // The second click of a pair expands the place the first one landed
                     // on into a word. A press that pages the document instead would make
                     // that pair scroll away halfway through, which is why the click in
                     // empty prose is no longer a page turn.
-                    self.selection = if msg == WM_LBUTTONDBLCLK {
+                    self.selection = if hit.is_some() {
+                        // The grid's own marks are its cells, and a character range beside
+                        // them would disagree with them about what a copy hands over.
+                        None
+                    } else if msg == WM_LBUTTONDBLCLK {
                         let w = word_at(&self.sel_index, c);
                         (w.from != w.to).then_some(w)
                     } else if held(VK_SHIFT) {
@@ -5764,8 +5827,23 @@ impl View {
                         .is_some_and(|(px, py)| (x - px).abs() > DRAG_SLOP || (y - py).abs() > DRAG_SLOP);
                     if dragged {
                         self.auto_scroll(y, hwnd);
-                        let to = self.caret_under(x, y);
-                        self.selection = Some(Selection { from, to });
+                        if let Some((grid, row, col)) = self.cell_anchor {
+                            // The rectangle grows to the cell the pointer has reached. A
+                            // pointer that has left the grid leaves the rectangle where it
+                            // was: a drag that runs off the edge of a table has marked the
+                            // cells it covered, and reading the row it is over now would
+                            // move the far corner to a cell the reader never crossed.
+                            if let Some((_, r, c)) = self.cell_under(x, y).filter(|(at, _, _)| *at == grid) {
+                                self.cell_rect = Some(crate::cells::CellRect {
+                                    grid,
+                                    anchor: self.cell_rect.map_or((row, col), |rect| rect.anchor),
+                                    head: (r, c),
+                                });
+                            }
+                        } else {
+                            let to = self.caret_under(x, y);
+                            self.selection = Some(Selection { from, to });
+                        }
                         let _ = InvalidateRect(Some(hwnd), None, false);
                     }
                 }
@@ -6430,6 +6508,31 @@ impl View {
         caret_at(&self.sel_index, x - shift, y)
     }
 
+    /// The cell under a pointer position given in client pixels, as the grid it belongs
+    /// to and the cell's own row and column in that grid.
+    ///
+    /// The translation is the one [`View::caret_under`] makes, and for the same reason:
+    /// the two answer about the same point, and a click that is a cell for one and a
+    /// character for the other would mark both. A table wide enough to be panned is hit
+    /// at the coordinates its cells were laid out at rather than at the ones it is drawn
+    /// at, which is where its prose is hit too.
+    fn cell_under(&self, x: f32, y: f32) -> Option<(usize, usize, usize)> {
+        let (x, y) = self.page_point(x, y)?;
+        let at = crate::cells::cell_at(&self.cells, x, y)?;
+        crate::cells::grid_of(&self.cells, at)
+    }
+
+    /// The grid the caret stands in, and the cell it is nearest, or nothing when the
+    /// caret is not in a table. The caret is a place in the drawn lines, so the question
+    /// is asked of the line it is on: the cell under a point inside that line is the
+    /// cell the caret is in.
+    fn cell_at_caret(&self) -> Option<(usize, usize, usize)> {
+        let line = self.sel_index.get(self.caret?.line)?;
+        let x = line.xs.first().copied().unwrap_or(0.0) + 1.0;
+        let at = crate::cells::cell_at(&self.cells, x, line.y + line.h * 0.5)?;
+        crate::cells::grid_of(&self.cells, at)
+    }
+
     /// Scroll the page when a drag is held against its top or bottom edge, so a
     /// selection longer than the viewport can be finished without letting go.
     ///
@@ -6456,7 +6559,30 @@ impl View {
             from: Caret { line: 0, ch: 0 },
             to: Caret { line: self.sel_index.len() - 1, ch: last.chars.len() },
         });
+        self.cell_rect = None;
+        self.cell_anchor = None;
         self.press_caret = None;
+    }
+
+    /// Mark the whole grid the caret stands in, so that a table can be copied without
+    /// dragging across it. Answers whether there was one, which is what the menu row is
+    /// shown for.
+    ///
+    /// The rectangle is the grid's own extent rather than a drag's: from its first cell
+    /// to its last, which is the same thing a reader would get by dragging corner to
+    /// corner and the only way to mark a table taller than the window.
+    fn select_table(&mut self) -> bool {
+        let Some((grid, _, _)) = self.cell_at_caret() else { return false };
+        let Some(span) = crate::cells::grid_at(&self.cells, grid) else { return false };
+        self.cell_rect = Some(crate::cells::CellRect {
+            grid,
+            anchor: (0, 0),
+            head: (span.rows.saturating_sub(1), span.cols.saturating_sub(1)),
+        });
+        self.selection = None;
+        self.cell_anchor = None;
+        self.press_caret = None;
+        true
     }
 
     /// Take the caret one motion away, holding or dropping the selection as `Shift` says.
@@ -6482,6 +6608,10 @@ impl View {
         let to = next_caret(&self.sel_index, focus, m);
         self.caret = Some(to);
         self.selection = (to != anchor).then_some(Selection { from: anchor, to });
+        // An arrow key is a reader moving through the text, which is the one thing a
+        // marked rectangle of cells is not: the marks go with the keys.
+        self.cell_rect = None;
+        self.cell_anchor = None;
         self.scroll_to_caret(to);
     }
 
@@ -6711,7 +6841,8 @@ impl View {
             can_forward: self.history.leads(false),
             themes: self.theme_menu(),
             link: self.pointer_link(pt.x as f32, pt.y as f32),
-            selected: self.selection.is_some_and(|s| s.from != s.to),
+            selected: self.selection.is_some_and(|s| s.from != s.to) || self.cell_rect.is_some(),
+            in_table: self.cell_at_caret().is_some(),
             dark: self.dark_override,
             from_file: self.path.is_some(),
             text: !self.sel_index.is_empty(),
@@ -6806,6 +6937,9 @@ impl View {
             Command::Heading(i) => self.jump_to(self.anchor_tops.get(i).copied(), hwnd),
             Command::Copy => self.copy_selection(hwnd),
             Command::SelectAll => self.select_all(),
+            Command::SelectTable => {
+                self.select_table();
+            }
             Command::Find => unsafe { self.open_find(hwnd) },
             Command::OpenUrl(u) => open_url(&u),
             Command::CopyUrl(u) => {
@@ -7566,7 +7700,21 @@ impl View {
 
     /// Put what the reader has marked on the clipboard. A copy with nothing marked leaves
     /// the clipboard alone.
+    ///
+    /// A marked rectangle of cells is copied as the grid it is: one line per row and a tab
+    /// between the fields, which is what a spreadsheet pastes as a table rather than as a
+    /// column of words. The whole document's own shortcut is not diverted here -- a grid
+    /// selection is what the reader made, and it is the only thing marked.
     fn copy_selection(&self, hwnd: HWND) {
+        if let Some(rect) = self.cell_rect {
+            let Some(text) = crate::cells::rect_text(&self.cells, rect.grid, &rect.rect()) else {
+                return;
+            };
+            if let Err(e) = clipboard::copy_text(hwnd, &text) {
+                eprintln!("clipboard: {e}");
+            }
+            return;
+        }
         let Some(s) = self.selection else { return };
         let ordered = s.ordered();
         let all = ordered.from == (Caret { line: 0, ch: 0 }) && self.sel_index.last().is_some_and(|l|
@@ -7857,6 +8005,9 @@ impl View {
         self.ops_sorted = true;
         self.ops_reach.clear();
         self.sel_index.clear();
+        self.cells.clear();
+        self.cell_rect = None;
+        self.cell_anchor = None;
         self.sel_version += 1;
         self.hotspots.clear();
         self.wide_regions.clear();
@@ -7951,6 +8102,10 @@ impl View {
                     self.ops_sorted = ordered;
                     self.sel_version += 1;
                     self.sel_index.extend(chunk.sel);
+                    // The cells ride with the lines they were filed against: a batch that
+                    // carried a table's lines and not its boxes would leave a grid whose
+                    // columns answer clicks with the columns of the batch before it.
+                    self.cells.extend(chunk.cells);
                     self.hotspots.extend(chunk.hots);
                     self.wide_regions.extend(chunk.wide);
                     // The search is asked of the page that is *now* here, once per
@@ -8102,9 +8257,12 @@ impl View {
         // the words they named are elsewhere, and holding on to the range would show
         // the reader ink they never dragged over.
         self.selection = None;
+        self.cell_rect = None;
+        self.cell_anchor = None;
         self.press_caret = None;
         self.caret = None;
         self.sel_index = page.sel;
+        self.cells = page.cells;
         self.sel_version += 1;
         // The hits are pairs of places in lines that have just been broken apart and
         // joined up again, so the query has to be asked of the new page. Nothing is
@@ -8495,6 +8653,10 @@ struct Out<'a> {
     table_spans: &'a mut Vec<TableSpan>,
     note_spans: &'a mut Vec<NoteSpan>,
     math_texts: &'a mut Vec<MathTextFragment>,
+    /// Every grid cell this layout has drawn, in the order it drew them, which is what a
+    /// click in a table is answered from and what a copy of one is read back as. See
+    /// [`crate::cells`].
+    cells: &'a mut Vec<crate::cells::CellBox>,
     /// How many inline-code capsules the page has drawn, counted where they are laid
     /// down. The number a report compares against the code spans it read: a span with
     /// no boxes behind it is a capsule the reader never sees.
@@ -9096,7 +9258,7 @@ fn layout_block(
     out: &mut Out<'_>,
     mut y: Pt,
 ) -> Pt {
-    let Out { ops, hots, sel, hyphens, wide, table_headers, table_spans, note_spans, math_texts, capsules_drawn } = out;
+    let Out { ops, hots, sel, hyphens, wide, table_headers, table_spans, note_spans, math_texts, cells, capsules_drawn } = out;
     let Ctx { theme, styles, math, k, .. } = *ctx;
     let Blk { b, text, spans, base, left, column, hyphenation, size, hang, actions, .. } = *blk;
     let leading = &blk.leading;
@@ -9114,7 +9276,7 @@ fn layout_block(
         return y + theme.base * 0.6;
     }
     if let Some(t) = blk.table {
-        return layout_table(font, ctx, blk, t, &mut Out { ops, hots, sel, hyphens, wide, table_headers, table_spans, note_spans, math_texts, capsules_drawn }, y);
+        return layout_table(font, ctx, blk, t, &mut Out { ops, hots, sel, hyphens, wide, table_headers, table_spans, note_spans, math_texts, cells, capsules_drawn }, y);
     }
     // A fence this build drew is a figure: it takes the whole column, its words are
     // measured by the diagram's own layout rather than by the code grid, and it reports
@@ -11524,6 +11686,10 @@ impl View {
         let (mut hots, mut sel, mut wide) = (Vec::new(), Vec::new(), Vec::new());
         let (mut headers, mut spans) = (Vec::new(), Vec::new());
         let (mut note_spans, mut math_texts) = (Vec::new(), Vec::new());
+        // A bubble's cells are filed like everything else it lays out and then dropped
+        // with it: the same table is laid out again for the page, and the page's own
+        // copy is the one a reader can select.
+        let mut cells: Vec<crate::cells::CellBox> = Vec::new();
         let mut breaks = HyphenCount::default();
         let mut capsules_drawn = 0usize;
         // This note's own marker width, hung for all of its blocks: the page takes the
@@ -11568,6 +11734,7 @@ impl View {
                     table_spans: &mut spans,
                     note_spans: &mut note_spans,
                     math_texts: &mut math_texts,
+                    cells: &mut cells,
                     capsules_drawn: &mut capsules_drawn,
                 },
                 y,
@@ -11885,6 +12052,22 @@ impl View {
                 }
             }
         }
+        // A marked rectangle of cells is marked cell by cell, the way a spreadsheet marks
+        // one: the band across a row would run through the columns either side of it, and
+        // through whatever prose stands beside the table. The shift a bidi line's
+        // selection needs is not applied here -- a cell's box is where the column is,
+        // whichever way its own text runs.
+        if let Some(rect) = self.cell_rect {
+            if let (Some(brush), Some(span)) = (self.sel_brush.clone(), crate::cells::grid_at(&self.cells, rect.grid)) {
+                for (x, y, w, h) in crate::cells::rects(&self.cells, &span, &rect.rect()) {
+                    if y + h < top || y > bottom {
+                        continue;
+                    }
+                    let r = D2D_RECT_F { left: x, top: y - up, right: x + w, bottom: y + h - up };
+                    target.FillRectangle(&r, &brush);
+                }
+            }
+        }
         if self.selection.is_none() && self.caret_on && self.preview.is_none() {
             if let (Some(c), Some(brush)) = (self.caret, self.brushes.get(&ColorRole::Text).cloned()) {
                 if let Some((x, y, w, h)) = caret_rect(&self.sel_index, c) {
@@ -11961,7 +12144,7 @@ fn layout_table(
     out: &mut Out<'_>,
     mut y: Pt,
 ) -> Pt {
-    let Out { ops, hots, sel, hyphens, wide, table_headers, table_spans, note_spans: _, math_texts, capsules_drawn } = out;
+    let Out { ops, hots, sel, hyphens, wide, table_headers, table_spans, note_spans: _, math_texts, cells: boxes_out, capsules_drawn } = out;
     let Ctx { theme, styles, client_pt, k, math, wide_limit, .. } = *ctx;
     let Blk { left: block_left, column, .. } = *blk;
     let size = theme.base;
@@ -12068,7 +12251,7 @@ fn layout_table(
         block_left
     };
 
-    let mut paint_row = |cells: &[PreparedCell], top: Pt, head: bool, ops: &mut Vec<Op>, hots: &mut Vec<Hot>, sel: &mut Vec<SelLine>| -> Pt {
+    let mut paint_row = |cells: &[PreparedCell], top: Pt, head: bool, row: usize, ops: &mut Vec<Op>, hots: &mut Vec<Hot>, sel: &mut Vec<SelLine>, boxes: &mut Vec<crate::cells::CellBox>| -> Pt {
         // Where this row's own ops begin, which is where its highlighter bands go:
         // filed there rather than beside the cell that owns each one, because a band
         // reaches above the baseline of the cell laid out before it, and the list's
@@ -12110,6 +12293,21 @@ fn layout_table(
         let mut x = left;
         for (i, c) in cells.iter().enumerate().take(cols) {
             let inner = inner_of(widths[i]);
+            // The cell as a spreadsheet reads it: the whole of its column by the whole of
+            // its row, not the ink's own extent, so a click in the empty half of a short
+            // cell still means that cell, and a selection marks the box a reader aimed
+            // at. The text is the cell's own rather than the lines' concatenation, so a
+            // cell that wraps stays one field and a break the author wrote stays a break.
+            boxes.push(crate::cells::CellBox {
+                head,
+                row,
+                col: i,
+                x: x * k,
+                y: top * k,
+                w: widths[i] * k,
+                h: row_h * k,
+                text: crate::cells::copy_text(&c.text, &c.objects),
+            });
             let (para, plan) = set_cell(font, c, &spacing, inner);
             // A cell is its own piece of text to copy: two of them that sit side by
             // side are columns, so the one on the right is a tab away from the last.
@@ -12450,7 +12648,7 @@ fn layout_table(
         color: if booktabs { ColorRole::Muted } else { ColorRole::Faint },
     });
 
-    let head_h = paint_row(&t.head, y, true, ops, hots, sel);
+    let head_h = paint_row(&t.head, y, true, 0, ops, hots, sel, boxes_out);
     y += head_h;
     // The header's rule is the one line a grid cannot do without, so it is the darkest
     // of them; the rules between rows only have to say where a row ends, and are drawn
@@ -12496,8 +12694,8 @@ fn layout_table(
             });
         }
     }
-    for r in &t.rows {
-        let row_h = paint_row(r, y, false, ops, hots, sel);
+    for (r, row) in t.rows.iter().enumerate() {
+        let row_h = paint_row(row, y, false, r, ops, hots, sel, boxes_out);
         y += row_h;
         row_bottoms.push(y);
         // A cell that wraps has no other ending. Without a rule under each row, the
@@ -14247,6 +14445,8 @@ pub struct LayoutChunk {
     pub table_spans: Vec<TableSpan>,
     pub note_spans: Vec<NoteSpan>,
     pub math_texts: Vec<MathTextFragment>,
+    /// The grid cells this batch drew, in the order it drew them.
+    pub cells: Vec<crate::cells::CellBox>,
     /// Capsules laid down since the last batch, counted rather than listed: the
     /// boxes themselves are ordinary rects in `ops`, so the number rides alongside
     /// the ink it belongs to and a sink adds the two up the same way.
@@ -14293,6 +14493,7 @@ struct PageSink {
     table_spans: Vec<TableSpan>,
     note_spans: Vec<NoteSpan>,
     math_texts: Vec<MathTextFragment>,
+    cells: Vec<crate::cells::CellBox>,
     capsules_drawn: usize,
     finals: Option<LayoutFinals>,
 }
@@ -14307,6 +14508,7 @@ impl LayoutSink for PageSink {
         self.table_spans.extend(chunk.table_spans);
         self.note_spans.extend(chunk.note_spans);
         self.math_texts.extend(chunk.math_texts);
+        self.cells.extend(chunk.cells);
         self.capsules_drawn += chunk.capsules_drawn;
         true
     }
@@ -14334,6 +14536,7 @@ pub fn build_ops(
         table_spans: Vec::new(),
         note_spans: Vec::new(),
         math_texts: Vec::new(),
+        cells: Vec::new(),
         capsules_drawn: 0,
         finals: None,
     };
@@ -14364,6 +14567,7 @@ pub fn build_ops(
         table_spans: sink.table_spans,
         note_spans: sink.note_spans,
         math_texts: sink.math_texts,
+        cells: sink.cells,
         capsules_drawn: sink.capsules_drawn,
     }
 }
@@ -14476,6 +14680,9 @@ pub fn build_in_chunks(
     let mut headers_emitted: usize = 0;
     let mut note_spans: Vec<NoteSpan> = Vec::new();
     let mut math_texts: Vec<MathTextFragment> = Vec::new();
+    // The grid cells this window has drawn, which leave with the batch that drew them
+    // the way every other index-carrying list here does.
+    let mut cells: Vec<crate::cells::CellBox> = Vec::new();
     // Capsules this window has drawn. The boxes are ordinary rects and leave with
     // `ops`; the count rides with them so the page can set it against the code spans
     // it read, which is the report's evidence that the capsules are the spans' own.
@@ -14617,6 +14824,7 @@ pub fn build_in_chunks(
                     table_spans: std::mem::take(&mut table_spans),
                     note_spans: std::mem::take(&mut note_spans),
                     math_texts: std::mem::take(&mut math_texts),
+                    cells: std::mem::take(&mut cells),
                     capsules_drawn: std::mem::take(&mut capsules_drawn),
                     y,
                     blocks,
@@ -14738,7 +14946,7 @@ pub fn build_in_chunks(
                     hang: if b.list.is_some() { level } else { 0.0 },
                     actions: &p.actions,
                 },
-                &mut Out { ops: &mut ops, hots: &mut hots, sel: &mut sel, hyphens: &mut breaks, wide: &mut wide, table_headers: &mut table_headers, table_spans: &mut table_spans, note_spans: &mut note_spans, math_texts: &mut math_texts, capsules_drawn: &mut capsules_drawn },
+                &mut Out { ops: &mut ops, hots: &mut hots, sel: &mut sel, hyphens: &mut breaks, wide: &mut wide, table_headers: &mut table_headers, table_spans: &mut table_spans, note_spans: &mut note_spans, math_texts: &mut math_texts, cells: &mut cells, capsules_drawn: &mut capsules_drawn },
                 y,
             );
         }
@@ -14811,7 +15019,7 @@ pub fn build_in_chunks(
                         hang: note_hang,
                         actions: &p.actions,
                     },
-                    &mut Out { ops: &mut ops, hots: &mut hots, sel: &mut sel, hyphens: &mut breaks, wide: &mut wide, table_headers: &mut table_headers, table_spans: &mut table_spans, note_spans: &mut note_spans, math_texts: &mut math_texts, capsules_drawn: &mut capsules_drawn },
+                    &mut Out { ops: &mut ops, hots: &mut hots, sel: &mut sel, hyphens: &mut breaks, wide: &mut wide, table_headers: &mut table_headers, table_spans: &mut table_spans, note_spans: &mut note_spans, math_texts: &mut math_texts, cells: &mut cells, capsules_drawn: &mut capsules_drawn },
                     y,
                 );
             }
@@ -15678,6 +15886,7 @@ mod tests {
             table_spans: Vec::new(),
             note_spans: Vec::new(),
             math_texts: Vec::new(),
+            cells: Vec::new(),
             capsules_drawn: 0,
         };
         let starts = pdf_page_starts(&page, 800.0);
@@ -15729,6 +15938,7 @@ mod tests {
             table_spans: Vec::new(),
             note_spans: Vec::new(),
             math_texts: Vec::new(),
+            cells: Vec::new(),
             capsules_drawn: 0,
         };
         let starts = pdf_page_starts(&page, 800.0);
@@ -15771,6 +15981,7 @@ mod tests {
             table_spans: Vec::new(),
             note_spans: Vec::new(),
             math_texts: Vec::new(),
+            cells: Vec::new(),
             capsules_drawn: 0,
         };
         assert_eq!(
@@ -16655,6 +16866,15 @@ mod tests {
         assert_eq!(got[2], (Command::Copy, false, false));
         // A page with text can have it all taken, even with nothing marked yet.
         assert_eq!(got[3], (Command::SelectAll, true, false));
+        // And a page whose caret is in no table has nothing for the table's own row to
+        // mark, so the row is shown dim rather than offering a key that does nothing.
+        assert_eq!(got[4], (Command::SelectTable, false, false));
+        let mut in_a_table = state(false, None, None, false, true);
+        in_a_table.in_table = true;
+        assert_eq!(rows(&in_a_table)[4], (Command::SelectTable, true, false));
+        // Which is also what lights the copy: a marked grid is something to copy even
+        // with no character of the page's own text marked.
+        assert_eq!(rows(&in_a_table)[2], (Command::Copy, true, false));
         assert!(
             !got.iter().any(|(c, _, _)| matches!(c, Command::OpenUrl(_) | Command::CopyUrl(_))),
             "no link under the pointer means no item about one"
@@ -16857,6 +17077,7 @@ mod tests {
             (&Command::GoForward, "Forward\tCtrl+Shift+Z\tAlt+\u{2192}"),
             (&Command::Copy, "Copy\tCtrl+C"),
             (&Command::SelectAll, "Select All\tCtrl+A"),
+            (&Command::SelectTable, "Select Table\tCtrl+Shift+A"),
             (&Command::Find, "Find in Document\tCtrl+F"),
             (&Command::ZoomIn, "Increase Text\tCtrl++"),
             (&Command::ZoomOut, "Decrease Text\tCtrl+-"),
@@ -16871,7 +17092,7 @@ mod tests {
         // Nothing else may claim one. `Ctrl`+`D` picks whichever palette is not on the
         // screen rather than the row it would be printed on, and the bracket keys step
         // the measure instead of settling on the rung they are next to.
-        assert_eq!(got.iter().filter(|(_, l)| l.contains('\t')).count(), 11);
+        assert_eq!(got.iter().filter(|(_, l)| l.contains('\t')).count(), 12);
     }
 
     #[test]
