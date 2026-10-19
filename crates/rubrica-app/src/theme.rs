@@ -322,6 +322,37 @@ pub enum TableLines {
     Booktabs,
 }
 
+/// The four layout numbers a caller may set on top of whatever the page already has.
+///
+/// `None` is "leave it": a page drawn from a preset that already carries a marker gap
+/// keeps it when the command line says nothing, which is why these are not the numbers
+/// themselves. The design's own values live on [`Theme`]; this is only the layer the
+/// command line writes through.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct LayoutOverrides {
+    pub marker_inset_em: Option<Pt>,
+    pub list_marker_gap_em: Option<Pt>,
+    pub list_bullet_size: Option<f32>,
+    pub quote_bar_gap_em: Option<Pt>,
+}
+
+impl LayoutOverrides {
+    pub fn apply(&self, t: &mut Theme) {
+        if let Some(value) = self.marker_inset_em {
+            t.marker_inset_em = value;
+        }
+        if let Some(value) = self.list_marker_gap_em {
+            t.list_marker_gap_em = value;
+        }
+        if let Some(value) = self.list_bullet_size {
+            t.list_bullet_size = value;
+        }
+        if let Some(value) = self.quote_bar_gap_em {
+            t.quote_bar_gap_em = value;
+        }
+    }
+}
+
 /// How a script is set against the word it belongs to: the fraction of the word's
 /// size one is set at, and how far a raised one is lifted and a lowered one sunk,
 /// as fractions of the word's own size.
@@ -384,6 +415,29 @@ pub struct Theme {
     pub quote_indent_em: Pt,
     pub list_indent_em: Pt,
     pub definition_indent_em: Pt,
+    /// How far a quotation's bar stands to the left of the column it marks, in ems of
+    /// the body size. Half an em is the design's own number, and the bar has been drawn
+    /// there since the first page: the bar sits out in the margin, where it is over
+    /// nothing, rather than in the measure the words were fitted to.
+    pub quote_bar_gap_em: Pt,
+    /// Extra air between a list's marker and the words of its item, in ems of the item's
+    /// own size. Zero is the design's number: the marker ends with a word space, and the
+    /// space it leaves is the air the author of the page already had.
+    ///
+    /// The marker leads the item's paragraph, so this is an advance inside that
+    /// paragraph rather than a position the painter picks -- see the marker's own
+    /// layout in `view`, which is the only place it can be spent.
+    pub list_marker_gap_em: Pt,
+    /// The least width a list marker's gutter may have, in ems: the distance from an
+    /// item's left edge to the column its words are set at. Zero means the marker's own
+    /// measured width and nothing more, which is what every page has always done; a
+    /// larger number keeps the words of a list off the marker even when the marker is a
+    /// narrow one, and is clamped by the marker when the marker is wider than it.
+    pub marker_inset_em: Pt,
+    /// The size a list's marker is set at, as a multiple of the item's prose size. One
+    /// is the design's number: a marker is prose, and a bullet drawn at its own size
+    /// beside the words it introduces is the shape the page was designed around.
+    pub list_bullet_size: f32,
     /// Fraction of the available margin space a wide table may borrow, 0..=1.
     pub wide_table_factor: f32,
     /// The reader's size preference, applied to [`Theme::base`] by [`Theme::set_zoom`].
@@ -443,6 +497,13 @@ impl Default for Theme {
             quote_indent_em: 1.2,
             list_indent_em: 1.6,
             definition_indent_em: 1.5,
+            // The four numbers a typography preset can move without moving the page a
+            // reader who never opened one is reading: each default is the number the
+            // design had written into the layout by hand.
+            quote_bar_gap_em: Self::DESIGN_QUOTE_BAR_GAP_EM,
+            list_marker_gap_em: Self::DESIGN_LIST_MARKER_GAP_EM,
+            marker_inset_em: Self::DESIGN_MARKER_INSET_EM,
+            list_bullet_size: Self::DESIGN_LIST_BULLET_SIZE,
             wide_table_factor: 1.0,
             zoom: Zoom::DESIGN,
             face: 0,
@@ -462,6 +523,24 @@ impl Theme {
     /// is always this number times the zoom and never a step off the last press, so
     /// `Ctrl`+`0` lands exactly here however far the reader had wandered.
     pub const DESIGN_BASE: Pt = 13.5;
+
+    /// The four layout numbers the design was drawn with. Named rather than written
+    /// twice, because a report has to be able to say whether a page is still the
+    /// design's own -- and because a default that drifted away from the number the
+    /// layout used to carry by hand would be a page nobody asked for.
+    pub const DESIGN_QUOTE_BAR_GAP_EM: Pt = 0.5;
+    pub const DESIGN_LIST_MARKER_GAP_EM: Pt = 0.0;
+    pub const DESIGN_MARKER_INSET_EM: Pt = 0.0;
+    pub const DESIGN_LIST_BULLET_SIZE: f32 = 1.0;
+
+    /// Whether every one of the four layout numbers is still the design's own, which is
+    /// the state every page was in before a preset could move them.
+    pub fn layout_is_the_design(&self) -> bool {
+        self.quote_bar_gap_em == Self::DESIGN_QUOTE_BAR_GAP_EM
+            && self.list_marker_gap_em == Self::DESIGN_LIST_MARKER_GAP_EM
+            && self.marker_inset_em == Self::DESIGN_MARKER_INSET_EM
+            && self.list_bullet_size == Self::DESIGN_LIST_BULLET_SIZE
+    }
 
     /// Read the page at a new size.
     ///

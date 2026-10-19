@@ -1823,6 +1823,13 @@ pub struct View {
     /// The folder's signature when [`Self::themes`] was last built, which is what the
     /// document tick compares to decide whether anything has to be read again.
     themes_stamp: u64,
+    /// The typography presets this machine has: the built-ins, the ones the form saved,
+    /// and the reader's own files. Kept for the same reason the themes are -- a document
+    /// is set with a preset bound to the kind of document it is, and a preset file saved
+    /// in an editor is the editor's event, not this window's.
+    presets: crate::presets::Shelf,
+    /// The preset folder's signature when [`Self::presets`] was last built.
+    presets_stamp: u64,
     /// What the reader chose for each appearance, light first: the name of a theme, or
     /// `None` for the built-in default. Read from the registry at start-up and written
     /// back the moment the menu changes one.
@@ -3465,6 +3472,9 @@ fn new_view(
     // already the theme they asked for. A folder that cannot be read is the six
     // built-ins, which is not a failure: the window opens with what it has.
     let themes = crate::themes::shelf();
+    // The presets, read before the window exists for the same reason: the first page is
+    // already set the way the reader asked for, binding and all.
+    let presets = crate::presets::shelf();
     let theme_slots = [
         crate::settings::theme_slot(false),
         crate::settings::theme_slot(true),
@@ -3531,6 +3541,8 @@ fn new_view(
         dark_override: saved.dark,
         themes,
         themes_stamp: crate::themes::stamp(),
+        presets,
+        presets_stamp: crate::presets::stamp(),
         theme_slots,
         theme_pin,
         brushes: HashMap::new(),
@@ -4386,20 +4398,32 @@ impl View {
         self.keep_line_breaks = crate::settings::keep_line_breaks();
         self.show_html_images = crate::settings::show_html_images();
         self.show_highlights = crate::settings::show_highlights();
-        // The two drawing switches are the theme's own: the painter asks the theme
-        // which rules a table draws and whether a code span wears a capsule, so a
-        // remembered choice has to be on the theme before the first layout runs.
-        self.theme.set_table_lines(crate::settings::table_lines());
-        self.theme.set_code_capsule(crate::settings::code_capsule());
         let mut preferences = path.as_deref().map(crate::settings::document).unwrap_or_default();
         preferences.text = reading::text_options_for(path.as_deref(), preferences.text);
-        let profile = crate::profiles::selected(preferences.plain.unwrap_or_else(|| reading::is_plain(path.as_deref())));
-        if profile != "Default" { crate::profiles::load(&profile).apply(&mut self.theme); }
+        // The preset this document is set with -- a file bound to the kind of document it
+        // is, a preset the form saved, or the design's own page -- comes first, so that
+        // the reader's own two switches below are the last word on a table's rules and a
+        // code span's capsule.
+        let profile = self
+            .preset_for_document(preferences.plain)
+            .map(|preset| preset.name)
+            .unwrap_or_else(|| "Default".to_string());
+        if profile != "Default" {
+            self.apply_preset(&profile);
+        } else {
+            self.profile = profile;
+        }
+        // The two drawing switches are the theme's own: the painter asks the theme
+        // which rules a table draws and whether a code span wears a capsule, so a
+        // remembered choice has to be on the theme before the first layout runs. They
+        // come after the preset for the reason the command line's own two do: a preset
+        // may have an opinion about them, and the reader's switch is the later word.
+        self.theme.set_table_lines(crate::settings::table_lines());
+        self.theme.set_code_capsule(crate::settings::code_capsule());
         // A profile may name another formula face, and the script geometry follows
         // the face: without this a page's `x^2^` would keep the size of the face the
         // last profile named.
         self.theme.learn_scripts(&self.font);
-        self.profile = profile;
         let plain = preferences.plain.unwrap_or_else(|| reading::is_plain(path.as_deref()));
         let can_window = plain && !preferences.source && path.as_deref().is_some_and(|p| {
             preferences.text.chapters && reading::can_window_text(p, preferences.encoding)
@@ -5199,6 +5223,10 @@ impl View {
                         // notice that does not leave a handle open on a folder nobody
                         // has looked at in months.
                         self.refresh_themes(hwnd);
+                        // The reader's own preset files are watched by the same beat, for
+                        // the same reason: saving one is the editor's event, and the
+                        // folder's signature is the cheapest way to hear about it.
+                        self.refresh_presets(hwnd);
                     }
                     CARET_TIMER => {
                         // A beat only means something while a caret stands on the page
@@ -6215,7 +6243,7 @@ impl View {
         let state = MenuState {
             lang: self.lang,
             lang_choice: self.lang_choice,
-            profiles: crate::profiles::names(),
+            profiles: self.presets.presets.iter().map(|preset| preset.name.clone()).collect(),
             profile: self.profile.clone(),            source_view: self.source_view,
             plain_override: self.plain_override,
             text_options: self.text_options,
@@ -6842,11 +6870,14 @@ impl View {
                 }
             }
         }
-        let profile = crate::profiles::selected(self.plain_override.unwrap_or_else(|| reading::is_plain(self.path.as_deref())));
-        if profile != self.profile {
-            crate::profiles::load(&profile).apply(&mut self.theme);
-            self.theme.learn_scripts(&self.font);
-            self.profile = profile;
+        // The preset the document is set with, asked again: the reader may have bound the
+        // kind of document it is, or saved the preset it was using, since it was opened.
+        let wanted = self
+            .preset_for_document(None)
+            .map(|preset| preset.name)
+            .unwrap_or_else(|| "Default".to_string());
+        if wanted != self.profile {
+            self.apply_preset(&wanted);
         }
         self.refresh_chapter_index(None);
         if self.lazy_text && plain && self.text_options.chapters && self.chapter_index.is_none() {
@@ -6971,9 +7002,9 @@ impl View {
     }
 
     fn apply_profile(&mut self, name: String, hwnd: HWND) {
-        crate::profiles::load(&name).apply(&mut self.theme);
-        self.theme.learn_scripts(&self.font);
-        self.profile = name;
+        // The window's own shelf, not the registry alone: the reader may be choosing a
+        // preset they wrote as a file, which the menu offers alongside the saved ones.
+        self.apply_preset(&name);
         self.relayout_in_place(hwnd);
         self.remember();
     }
@@ -7271,6 +7302,61 @@ impl View {
         if self.set_dark(dark, hwnd) {
             let _ = unsafe { InvalidateRect(Some(hwnd), None, false) };
         }
+    }
+
+    /// The preset the document now showing is set with: one bound to the kind of document
+    /// it is, or the one this reader remembers for that kind.
+    ///
+    /// `plain` is what the document's own settings say about it, if anything; a `.txt`
+    /// file is plain text whatever anybody said, and a document with no path at all --
+    /// the window on an empty page -- is the page this reader already is, and has nothing
+    /// to be set with.
+    fn preset_for_document(&self, plain: Option<bool>) -> Option<crate::presets::Preset> {
+        let path = self.path.clone()?;
+        let plain = plain
+            .or(self.plain_override)
+            .unwrap_or_else(|| reading::is_plain(Some(&path)));
+        crate::presets::for_path_in(&self.presets, &path, &crate::profiles::selected(plain))
+    }
+
+    /// Draw with a preset: the page's own numbers and the two switches it has an opinion
+    /// about, then the reader's own two switches, which are the more explicit word about
+    /// a table's rules and a code span's capsule.
+    fn apply_preset(&mut self, name: &str) {
+        if let Some(preset) = self.presets.find(name).cloned() {
+            preset.apply(&mut self.theme);
+        }
+        self.theme.set_table_lines(crate::settings::table_lines());
+        self.theme.set_code_capsule(crate::settings::code_capsule());
+        self.theme.learn_scripts(&self.font);
+        self.profile = name.to_string();
+    }
+
+    /// Read the preset folder again, and draw with what it now holds.
+    ///
+    /// The same beat that watches the reader's theme files watches these: a preset is
+    /// saved with an editor, which has no way to tell this window. What is re-read is the
+    /// preset *in effect* -- the file behind it may be the one that was just saved -- and
+    /// when it has gone, the document's own answer is asked for again, which may be a
+    /// binding or a memory.
+    fn refresh_presets(&mut self, hwnd: HWND) {
+        let stamp = crate::presets::stamp();
+        if stamp == self.presets_stamp {
+            return;
+        }
+        self.presets_stamp = stamp;
+        self.presets = crate::presets::shelf();
+        let name = if self.presets.find(&self.profile).is_some() {
+            Some(self.profile.clone())
+        } else {
+            self.preset_for_document(None).map(|preset| preset.name)
+        };
+        let Some(name) = name else { return };
+        if self.presets.find(&name).is_none() {
+            return;
+        }
+        self.apply_preset(&name);
+        self.relayout_in_place(hwnd);
     }
 
     /// The decoder the figures on this page are drawn through, made once.
@@ -8979,9 +9065,9 @@ fn layout_block(
         // nothing, and this is the order the list has to be in for the page to find the
         // band in front of the reader by asking half of it.
         ops.insert(block_at, Op::Line {
-            x0: (left - theme.base * 0.5) * k,
+            x0: (left - theme.quote_bar_gap_em * theme.base) * k,
             y0: panel_top * k,
-            x1: (left - theme.base * 0.5) * k,
+            x1: (left - theme.quote_bar_gap_em * theme.base) * k,
             y1: panel_bottom * k,
             thickness: theme.base * 0.07 * k,
             color: ColorRole::Muted,
@@ -10303,11 +10389,12 @@ impl View {
             // one gets the listing it would have asked for on opening the panel.
             self.refresh_tree();
         }
-        let profile = crate::profiles::selected(self.plain_override.unwrap_or_else(|| reading::is_plain(self.path.as_deref())));
-        if profile != self.profile {
-            crate::profiles::load(&profile).apply(&mut self.theme);
-            self.theme.learn_scripts(&self.font);
-            self.profile = profile;
+        let wanted = self
+            .preset_for_document(None)
+            .map(|preset| preset.name)
+            .unwrap_or_else(|| "Default".to_string());
+        if wanted != self.profile {
+            self.apply_preset(&wanted);
         }
         self.refresh_chapter_index(index);
         self.chapter = self
@@ -10895,6 +10982,7 @@ impl View {
                     let set = Setting {
                         marker: if i == 0 { format!("{}. ", note.number) } else { String::new() },
                         size: Some(theme.note_body_size(b.kind)),
+                        list: false,
                     };
                     (b, prepare_block(font, theme, &mut styles, &mut objects, b, &set, measure))
                 })
@@ -12229,6 +12317,77 @@ impl<'a> Objects<'a> {
 struct Setting {
     marker: String,
     size: Option<Pt>,
+    /// Whether `marker` belongs to a list item rather than to a footnote. A list's
+    /// marker answers to the three layout numbers a typography preset may move; a
+    /// note's number is apparatus, set at the note's own size, and a reader who asked
+    /// for smaller bullets did not ask for smaller citation marks.
+    list: bool,
+}
+
+/// The spans that set one block's marker, and the gutter they leave for it.
+///
+/// The marker leads the item's own paragraph, so the air between it and the words is an
+/// advance *inside* that paragraph rather than a position the painter picks. What the
+/// marker ends with is an ASCII space, which the paragraph core folds into a word-space
+/// glue of its own recipe -- the space glyph's advance is never seen -- so the only way
+/// to widen the marker's prefix by an exact amount is to spend it on the marker's ink:
+/// its last glyph carries `extra / size` of tracking, which the shaper adds to that one
+/// glyph's advance and to nothing else.
+///
+/// `gutter` is the distance from the item's left edge to the column its words are set
+/// at: the marker's own measured width plus `list_marker_gap`, and never less than
+/// `marker_inset`. With both numbers at their defaults there is no extra to spend, so
+/// this makes the one `shape_runs` call, in the one style, that the marker has always
+/// been measured by.
+fn marker_spans(
+    font: &FontEngine,
+    theme: &Theme,
+    styles: &mut Vec<AppStyle>,
+    marker: &str,
+    prose: crate::theme::ResolvedStyle,
+    list: bool,
+) -> (Vec<StyleSpan>, Pt) {
+    let shift = marker.len();
+    let mut style = prose.clone();
+    if list {
+        style.size *= theme.list_bullet_size;
+    }
+    let id = intern(styles, &theme.fonts.fallback, style.clone());
+    let natural: Pt = {
+        let st = &styles[id.0 as usize];
+        font.shape_runs(marker, 0..shift, &st.face, st.size, st.tracking)
+            .iter()
+            .map(|run| run.width())
+            .sum()
+    };
+    // Both numbers are ems of the item's own prose, not of the marker: a reader who
+    // asked for a smaller bullet did not also ask for a smaller gap.
+    let (gap, inset) = if list {
+        (theme.list_marker_gap_em * prose.size, theme.marker_inset_em * prose.size)
+    } else {
+        (0.0, 0.0)
+    };
+    let gutter = (natural + gap).max(inset);
+    let extra = gutter - natural;
+    // The last glyph that is not the marker's own trailing air. Everything after it is
+    // whitespace, which the paragraph core will not let carry an advance.
+    let ink_end = marker.trim_end().len();
+    let last = marker[..ink_end].char_indices().next_back().map(|(i, _)| i);
+    let Some(last) = last.filter(|_| extra > 0.0) else {
+        return (vec![StyleSpan { range: 0..shift, style: id }], natural);
+    };
+    let mut wide = style;
+    wide.tracking += extra / wide.size;
+    let wide = intern(styles, &theme.fonts.fallback, wide);
+    let mut spans = Vec::with_capacity(3);
+    if last > 0 {
+        spans.push(StyleSpan { range: 0..last, style: id });
+    }
+    spans.push(StyleSpan { range: last..ink_end, style: wide });
+    if ink_end < shift {
+        spans.push(StyleSpan { range: ink_end..shift, style: id });
+    }
+    (spans, gutter)
 }
 
 /// Read one block ready for layout: its marker in front of the text, and every
@@ -12256,20 +12415,22 @@ fn prepare_block(
     let shift = set.marker.len();
     let mut text = set.marker.clone();
     text.push_str(&b.text);
-    let mut spans: Vec<StyleSpan> = Vec::with_capacity(b.spans.len() + 1);
+    let mut spans: Vec<StyleSpan> = Vec::with_capacity(b.spans.len() + 2);
     let mut hang = 0.0;
     if shift > 0 {
-        let id = intern(styles, &theme.fonts.fallback, r(BlockKind::Paragraph, InlineStyle::EMPTY));
-        spans.push(StyleSpan { range: 0..shift, style: id });
-        // Shaped through the same entry point the body is shaped by, so the measure the
-        // lines below give up is exactly the width the marker takes up here -- which is
-        // what makes a `☐` and a `10.` each clear their own space rather than a guess.
-        let st = &styles[id.0 as usize];
-        hang = font
-            .shape_runs(&text, 0..shift, &st.face, st.size, st.tracking)
-            .iter()
-            .map(|r| r.width())
-            .sum();
+        // The marker's gutter, and the spans that spend the extra air a preset asked
+        // for. Both come from one place so the width the marker is measured at and the
+        // spans it is set in cannot disagree.
+        let (marker_spans, gutter) = marker_spans(
+            font,
+            theme,
+            styles,
+            &set.marker,
+            r(BlockKind::Paragraph, InlineStyle::EMPTY),
+            set.list,
+        );
+        spans.extend(marker_spans);
+        hang = gutter;
     }
     let base = intern(styles, &theme.fonts.fallback, r(b.kind, InlineStyle::EMPTY));
     for s in &b.spans {
@@ -12485,6 +12646,7 @@ pub(crate) fn export_png(
     show_highlights: bool,
     table_lines: TableLines,
     code_capsule: bool,
+    layout: crate::theme::LayoutOverrides,
     zoom: Zoom,
     face: Option<usize>,
     measure: Option<usize>,
@@ -12496,7 +12658,10 @@ pub(crate) fn export_png(
     }
     let mut theme = Theme::default();
     if let Some(name) = profile {
-        crate::profiles::load(name).apply(&mut theme);
+        // The preset layer, not the registry alone: a name may be a file the reader
+        // wrote, and a preset's own two switches are applied here, before the switches
+        // this export was asked for by name.
+        crate::presets::apply(name, &mut theme);
     }
     if let Some(face) = face.filter(|i| TextFace::ALL.get(*i).is_some()) {
         theme.set_face(face);
@@ -12509,6 +12674,8 @@ pub(crate) fn export_png(
     // the page is laid out identically whether they are on or off.
     theme.set_table_lines(table_lines);
     theme.set_code_capsule(code_capsule);
+    // And the four layout numbers, on top of whatever the profile carried.
+    layout.apply(&mut theme);
     let doc = if source_view {
         Document::source(source)
     } else if plain {
@@ -12731,6 +12898,7 @@ pub fn export_pdf(
     show_highlights: bool,
     table_lines: TableLines,
     code_capsule: bool,
+    layout: crate::theme::LayoutOverrides,
     zoom: Zoom,
     face: Option<usize>,
     measure: Option<usize>,
@@ -12743,7 +12911,9 @@ pub fn export_pdf(
     let mut theme = Theme::default();
     theme.set_zoom(zoom);
     if let Some(name) = profile {
-        crate::profiles::load(name).apply(&mut theme);
+        // The same preset layer the PNG export draws with, so the two files a reader
+        // exports are set the same way.
+        crate::presets::apply(name, &mut theme);
     }
     if let Some(face) = face.filter(|i| TextFace::ALL.get(*i).is_some()) {
         theme.set_face(face);
@@ -12756,6 +12926,8 @@ pub fn export_pdf(
     // same with them on or off.
     theme.set_table_lines(table_lines);
     theme.set_code_capsule(code_capsule);
+    // And the four layout numbers, on top of whatever the profile carried.
+    layout.apply(&mut theme);
     let doc = if source_view {
         Document::source(source)
     } else if plain {
@@ -13723,17 +13895,14 @@ fn level_hangs(
         let width = match known {
             Some(w) => w,
             None => {
-                let id = intern(
+                let (_, w) = marker_spans(
+                    font,
+                    theme,
                     styles,
-                    &theme.fonts.fallback,
+                    &marker,
                     theme.resolve(BlockKind::Paragraph, InlineStyle::EMPTY),
+                    true,
                 );
-                let st = &styles[id.0 as usize];
-                let w: Pt = font
-                    .shape_runs(&marker, 0..marker.len(), &st.face, st.size, st.tracking)
-                    .iter()
-                    .map(|run| run.width())
-                    .sum();
                 measured.insert(marker.clone(), w);
                 w
             }
@@ -13839,6 +14008,7 @@ pub fn build_in_chunks(
                     let set = Setting {
                         marker: if i == 0 { format!("{}. ", note.number) } else { String::new() },
                         size: Some(theme.note_body_size(nb.kind)),
+                        list: false,
                     };
                     prepare_block(font, theme, &mut styles, objects, nb, &set, column)
                 })
@@ -13954,7 +14124,7 @@ pub fn build_in_chunks(
         // only ever appended to.
         let mut prepared: Vec<Prepared> = Vec::with_capacity(window.len());
         for b in window {
-            let set = Setting { marker: marker_for(b), size: None };
+            let set = Setting { marker: marker_for(b), size: None, list: true };
             prepared.push(prepare_block(font, theme, &mut styles, objects, b, &set, column));
         }
         font.begin_layout(
@@ -14274,12 +14444,21 @@ mod tests {
         let epoch = window.0.layout_epoch;
         // The window is already minimised when the iconic rect arrives, and the size it had
         // arrives with the restore -- the only size this page is laid out for.
-        unsafe { let _ = ShowWindow(window.0.hwnd, SW_MINIMIZE); }
+        //
+        // `SW_SHOWMINNOACTIVE` and not `SW_MINIMIZE`: both minimise, but the plain verb
+        // also makes the window active, and a test that activates a window takes the
+        // foreground from whatever the reader is doing -- a full-screen game drops to the
+        // task bar (2026-10-19, the reader was in one). Nothing here may be changed to a
+        // verb that shows or activates: this window exists to be laid out, not to be used.
+        use windows::Win32::UI::WindowsAndMessaging::{SW_SHOWMINNOACTIVE, SW_SHOWNOACTIVATE};
+        unsafe { let _ = ShowWindow(window.0.hwnd, SW_SHOWMINNOACTIVE); }
         window.resize(160, 28);
         assert_eq!(window.0.layout_epoch, epoch, "a minimised window has no page to lay out");
         assert_eq!(window.0.page_starts, starts, "the icon-sized wrapping must not replace the reader's");
         assert_eq!(window.0.scroll, scroll);
-        unsafe { let _ = ShowWindow(window.0.hwnd, SW_SHOWNORMAL); }
+        // And `SW_SHOWNOACTIVATE` to restore it, for the same reason: it is shown again
+        // without being made active.
+        unsafe { let _ = ShowWindow(window.0.hwnd, SW_SHOWNOACTIVATE); }
         window.resize(1800, 900);
         assert_eq!(window.0.current_page_index(), page, "a restore is not a page turn");
         assert_eq!(window.0.scroll, scroll);
@@ -17754,7 +17933,7 @@ mod document_interaction_tests {
         assert_eq!(bubble_cut(&[200.0], 120.0, 12.0), (0, Some(108.0)));
         assert_eq!(bubble_cut(&[], 120.0, 12.0), (0, None));
     }
-
+
     /// Every ink the window draws is drawn on a surface of its own palette, and a
     /// reader has to be able to read it there. The WCAG AA bar for body text is
     /// 4.5:1; the inks that only have to be found -- a scrollbar thumb -- are not
@@ -17879,5 +18058,200 @@ mod document_interaction_tests {
         let mut with_null = [0u16; 8];
         with_null[..2].copy_from_slice(&[b'a' as u16, b'b' as u16]);
         assert_eq!(View::dropped_path(&with_null, 3), "ab");
+    }
+
+}
+
+/// The four layout numbers a typography preset may move: what each one does to the page,
+/// and what the page does when nobody has moved it. Kept apart from the tests above
+/// because every one of them is about a number the design wrote into the layout by hand
+/// and a preset can now take over.
+#[cfg(test)]
+mod layout_tests {
+    use super::*;
+
+    /// The scale the report and the window both lay a page out at.
+    const DPI: f32 = 96.0;
+
+    /// The marker's gutter and the spans it is set in are two statements about one
+    /// width, and they have to agree: the gutter is what the lines under the marker give
+    /// up, the spans are what the first line spends. Asked of the helper itself, because
+    /// the two numbers it returns are the whole of the mechanism.
+    fn marker_width(font: &FontEngine, styles: &[AppStyle], marker: &str, spans: &[StyleSpan]) -> f32 {
+        spans
+            .iter()
+            .map(|s| {
+                let st = &styles[s.style.0 as usize];
+                font.shape_runs(marker, s.range.clone(), &st.face, st.size, st.tracking)
+                    .iter()
+                    .map(|run| run.width())
+                    .sum::<f32>()
+            })
+            .sum()
+    }
+
+    /// A preset's marker numbers, and what each one does to the one place a list's
+    /// geometry is decided: the gutter the item's words are set at.
+    ///
+    /// The design's own numbers are the interesting case: with both of the air numbers
+    /// at zero the marker is one span, measured by the one call it has always been
+    /// measured by, and its gutter is exactly that width. A gap widens the gutter by the
+    /// gap and spends it on the marker's ink -- the trailing space is glue and cannot
+    /// hold an advance -- and an inset is a floor under the gutter, never a narrowing.
+    #[test]
+    fn a_preset_moves_the_marker_gutter_and_never_the_designs_own() {
+        let Ok(font) = FontEngine::new() else { return };
+        if !font.probe() {
+            return;
+        }
+        let marker = "\u{2022} ";
+        let prose = Theme::default().resolve(BlockKind::Paragraph, InlineStyle::EMPTY);
+        let size = prose.size;
+        let ask = |theme: &Theme, list: bool| {
+            let mut styles: Vec<AppStyle> = Vec::new();
+            let (spans, gutter) = marker_spans(&font, theme, &mut styles, marker, prose.clone(), list);
+            (marker_width(&font, &styles, marker, &spans), gutter, spans, styles)
+        };
+
+        let design = Theme::default();
+        let (width, gutter, spans, _) = ask(&design, true);
+        assert_eq!(spans.len(), 1, "the design's marker is one span");
+        assert!((width - gutter).abs() < 0.01, "gutter {gutter} is not the marker's width {width}");
+        assert_eq!(spans[0].range, 0..marker.len());
+
+        // Half an em of air between the marker and the words: the gutter grows by
+        // exactly that, the marker is no longer one span, and the spans still measure
+        // what the gutter says.
+        let gap = Theme { list_marker_gap_em: 0.5, ..Theme::default() };
+        let (width, wide, spans, styles) = ask(&gap, true);
+        assert!(spans.len() > 1, "the extra air was never spent on the marker's ink");
+        assert!((wide - gutter - 0.5 * size).abs() < 0.02, "gutter {wide} is not {gutter} + half an em");
+        assert!((width - wide).abs() < 0.01, "the spans measure {width}, the gutter says {wide}");
+        // The air is on the marker's last ink glyph and nowhere else: every other span
+        // keeps the tracking the design's own marker had.
+        let base = Theme::default().resolve(BlockKind::Paragraph, InlineStyle::EMPTY).tracking;
+        let ink_end = marker.trim_end().len();
+        let mut spent = false;
+        for s in &spans {
+            let tracking = styles[s.style.0 as usize].tracking;
+            if s.range.start < ink_end && s.range.end <= ink_end {
+                assert!(tracking > base, "the marker's ink carries no extra air");
+                spent = true;
+            } else {
+                assert_eq!(tracking, base, "the air was spent outside the marker's ink");
+            }
+        }
+        assert!(spent, "no span covers the marker's ink");
+
+        // An inset is a floor. Above the marker's own width it is the gutter; below it,
+        // nothing at all moves -- which is what makes the design's own zero free.
+        let floor = Theme { marker_inset_em: 3.0, ..Theme::default() };
+        let (_, wide, spans, _) = ask(&floor, true);
+        assert!((wide - 3.0 * size).abs() < 0.02, "an inset of three em left a gutter of {wide}");
+        assert!(spans.len() > 1, "the inset was never spent");
+        let small = Theme { marker_inset_em: 0.05, ..Theme::default() };
+        let (_, narrow, spans, _) = ask(&small, true);
+        assert!((narrow - gutter).abs() < 0.001, "an inset under the marker's own width moved it");
+        assert_eq!(spans.len(), 1);
+
+        // A bullet's own size: the marker is set at that multiple of the prose, and the
+        // gutter follows the glyphs rather than a number worked out beside them.
+        let big = Theme { list_bullet_size: 1.5, ..Theme::default() };
+        let (width, wide, big_spans, big_styles) = ask(&big, true);
+        assert!(wide > gutter && width > gutter, "a bigger bullet left the same gutter");
+        let marker_size = big_spans
+            .iter()
+            .map(|s| big_styles[s.style.0 as usize].size)
+            .fold(0.0f32, f32::max);
+        assert!((marker_size - 1.5 * size).abs() < 0.01, "the marker is set at {marker_size}, not 1.5 em");
+
+        // A note's number is apparatus rather than a list's marker, and none of the
+        // three numbers reaches it: the same call with `list` false is the design's own
+        // marker whatever the theme says.
+        let all = Theme {
+            list_marker_gap_em: 1.0,
+            marker_inset_em: 4.0,
+            list_bullet_size: 2.0,
+            ..Theme::default()
+        };
+        let (width, narrow, spans, _) = ask(&all, false);
+        assert_eq!(spans.len(), 1);
+        assert!((width - narrow).abs() < 0.01);
+        assert!((narrow - gutter).abs() < 0.001, "a note's number moved: {narrow} vs {gutter}");
+    }
+
+    /// A quotation's bar is drawn out in the margin, and how far out is the one number
+    /// the design wrote into the painter: half an em. A preset moves that distance and
+    /// nothing else about the bar -- not its thickness, not its ink, not where it starts
+    /// or stops -- and a page drawn with the number it already had is the same page.
+    #[test]
+    fn a_quotation_bar_stands_further_out_without_changing_anything_else() {
+        let Ok(mut font) = FontEngine::new() else { return };
+        if !font.probe() {
+            return;
+        }
+        let doc = Document::parse("> Quoted words that run on for a while.\n");
+        let bar = |font: &mut FontEngine, theme: &Theme| {
+            let mut math = crate::math::MathStore::new();
+            let mut diagrams = crate::diagram::DiagramStore::new();
+            let mut objects = Objects::new(None, None, &mut math, &mut diagrams);
+            let page = build_ops(font, theme, &doc, 700.0, DPI, &mut objects, None);
+            page.ops
+                .iter()
+                .find_map(|op| match op {
+                    Op::Line { x0, y0, x1, y1, thickness, color } => {
+                        Some((*x0, *y0, *x1, *y1, *thickness, *color))
+                    }
+                    _ => None,
+                })
+                .expect("a quotation draws its bar")
+        };
+        let design = Theme::default();
+        let base = design.base;
+        let (x, y0, x1, y1, thickness, color) = bar(&mut font, &design);
+        assert_eq!(color, ColorRole::Muted);
+        assert!((thickness - base * 0.07 * (DPI / 72.0)).abs() < 0.01, "thickness moved");
+
+        let wide = Theme { quote_bar_gap_em: 1.0, ..Theme::default() };
+        let (wx, wy0, wx1, wy1, wthickness, wcolor) = bar(&mut font, &wide);
+        let k = DPI / 72.0;
+        assert!(
+            (x - wx - (1.0 - Theme::DESIGN_QUOTE_BAR_GAP_EM) * base * k).abs() < 0.01,
+            "the bar moved from {x} to {wx}, not by half an em",
+        );
+        assert_eq!((y0, y1, wcolor), (wy0, wy1, color), "only the bar's distance may move");
+        // A bar is vertical: its two ends stand the same distance out, in either build.
+        assert_eq!(x, x1);
+        assert_eq!(wx, wx1);
+        assert_eq!(wthickness, thickness);
+
+        // And the design's own number is where the bar has always been drawn.
+        let same = Theme { quote_bar_gap_em: Theme::DESIGN_QUOTE_BAR_GAP_EM, ..Theme::default() };
+        let (sx, ..) = bar(&mut font, &same);
+        assert_eq!(sx, x);
+    }
+
+    /// The four numbers a preset may move are the design's own until someone moves them,
+    /// and a caller that says nothing about one leaves it alone -- which is what lets a
+    /// command line stand on top of a profile without erasing it.
+    #[test]
+    fn the_layout_numbers_start_where_the_layout_was_drawn() {
+        let theme = Theme::default();
+        assert!(theme.layout_is_the_design());
+        assert_eq!(theme.quote_bar_gap_em, 0.5);
+        assert_eq!(theme.marker_inset_em, 0.0);
+        assert_eq!(theme.list_marker_gap_em, 0.0);
+        assert_eq!(theme.list_bullet_size, 1.0);
+
+        let mut moved = theme.clone();
+        let overrides = crate::theme::LayoutOverrides {
+            list_marker_gap_em: Some(0.5),
+            ..Default::default()
+        };
+        overrides.apply(&mut moved);
+        assert_eq!(moved.list_marker_gap_em, 0.5);
+        assert_eq!(moved.marker_inset_em, 0.0, "a number nobody named was moved");
+        assert_eq!(moved.quote_bar_gap_em, 0.5);
+        assert!(!moved.layout_is_the_design());
     }
 }

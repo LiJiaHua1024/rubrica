@@ -2112,92 +2112,103 @@ pub fn font_label(lang: Language, index: usize) -> &'static str {
     list.get(index).copied().unwrap_or("")
 }
 
-pub const NUMBER_LABELS_EN: [&str; 17] = [
+pub const NUMBER_LABELS_EN: [&str; 21] = [
     "Size (pt)", "Latin body leading", "Asian body leading", "Tracking (em)",
     "Paragraph gap", "First indent (em)", "Column (em)", "Ragged below (em)",
     "Punctuation compression", "Hanging punctuation (em)", "Latin heading leading",
     "Asian heading leading", "Heading gap", "Code gap", "Quote indent (em)",
     "List indent (em)", "Definition indent (em)",
+    "Marker inset (em)", "List marker gap (em)", "Bullet size", "Quote bar gap (em)",
 ];
 
-pub const NUMBER_LABELS_ZH_CN: [&str; 17] = [
+pub const NUMBER_LABELS_ZH_CN: [&str; 21] = [
     "字号 (pt)", "西文正文行距", "东亚正文行距", "字距 (em)",
     "段落间距", "首行缩进 (em)", "栏宽 (em)", "非对齐阈值 (em)",
     "标点挤压", "标点外挂 (em)", "西文标题行距",
     "东亚标题行距", "标题间距", "代码间距", "引用缩进 (em)",
     "列表缩进 (em)", "定义缩进 (em)",
+    "标记槽下限 (em)", "列表标记间隙 (em)", "项目符号字号", "引用竖条间距 (em)",
 ];
 
-pub const NUMBER_LABELS_ZH_TW: [&str; 17] = [
+pub const NUMBER_LABELS_ZH_TW: [&str; 21] = [
     "字級 (pt)", "西文本文行距", "東亞本文行距", "字距 (em)",
     "段落間距", "首行縮排 (em)", "欄寬 (em)", "非齊行閾值 (em)",
     "標點擠壓", "標點凸出 (em)", "西文標題行距",
     "東亞標題行距", "標題間距", "代碼間距", "引用縮排 (em)",
     "清單縮排 (em)", "定義縮排 (em)",
+    "標記槽下限 (em)", "清單標記間隙 (em)", "項目符號字級", "引用豎條間距 (em)",
 ];
 
-pub const NUMBER_LABELS_JA: [&str; 17] = [
+pub const NUMBER_LABELS_JA: [&str; 21] = [
     "サイズ (pt)", "欧文本文行送り", "和文本文行送り", "字送り (em)",
     "段落間隔", "字下げ (em)", "段組幅 (em)", "不揃い閾値 (em)",
     "約物詰め", "ぶら下げ (em)", "欧文見出し行送り",
     "和文見出し行送り", "見出し間隔", "コード間隔", "引用インデント (em)",
     "リストインデント (em)", "定義インデント (em)",
+    "マーカー余白の下限 (em)", "リストマーカー間隔 (em)", "ビュレットサイズ", "引用バー間隔 (em)",
 ];
 
-pub const NUMBER_LABELS_KO: [&str; 17] = [
+pub const NUMBER_LABELS_KO: [&str; 21] = [
     "크기 (pt)", "로마자 본문 줄간격", "동아시아 본문 줄간격", "자간 (em)",
     "단락 간격", "첫 줄 들여쓰기 (em)", "단 너비 (em)", "들쭉날쭉 기준 (em)",
     "문장부호 압축", "문장부호 돌출 (em)", "로마자 제목 줄간격",
     "동아시아 제목 줄간격", "제목 간격", "코드 간격", "인용 들여쓰기 (em)",
     "목록 들여쓰기 (em)", "정의 들여쓰기 (em)",
+    "마커 홈 최소 (em)", "목록 마커 간격 (em)", "글머리표 크기", "인용 막대 간격 (em)",
 ];
 
-pub const NUMBER_LABELS_FR: [&str; 17] = [
+pub const NUMBER_LABELS_FR: [&str; 21] = [
     "Taille (pt)", "Interligne corps latin", "Interligne corps asiatique", "Approche (em)",
     "Espacement paragraphe", "Alinéa 1ère ligne (em)", "Colonne (em)", "Seuil justification (em)",
     "Compression ponctuation", "Ponctuation suspendue (em)", "Interligne titres latins",
     "Interligne titres asiatiques", "Espacement titre", "Espacement code", "Retrait citation (em)",
     "Retrait liste (em)", "Retrait définition (em)",
+    "Retrait min. marqueur (em)", "Écart marqueur liste (em)", "Taille de puce", "Écart barre citation (em)",
 ];
 
-pub const NUMBER_LABELS_DE: [&str; 17] = [
+pub const NUMBER_LABELS_DE: [&str; 21] = [
     "Schriftgröße (pt)", "Zeilenabstand lat. Fließtext", "Zeilenabstand asiat. Fließtext", "Laufweite (em)",
     "Absatzabstand", "Erstzeileneinzug (em)", "Spaltenbreite (em)", "Flattersatz-Schwelle (em)",
     "Interpunktionskompression", "Hängende Interpunktion (em)", "Zeilenabstand lat. Überschrift",
     "Zeilenabstand asiat. Überschrift", "Überschriftabstand", "Code-Abstand", "Zitateinzug (em)",
     "Listeneinzug (em)", "Definitionseinzug (em)",
+    "Markierung Mindestabstand (em)", "Listenmarkierung Abstand (em)", "Aufzählungsgröße", "Zitatbalken-Abstand (em)",
 ];
 
-pub const NUMBER_LABELS_ES: [&str; 17] = [
+pub const NUMBER_LABELS_ES: [&str; 21] = [
     "Tamaño (pt)", "Interlineado cuerpo latino", "Interlineado cuerpo asiático", "Espaciado (em)",
     "Espacio de párrafo", "Sangría 1ª línea (em)", "Columna (em)", "Umbral justificación (em)",
     "Compresión de puntuación", "Puntuación colgante (em)", "Interlineado títulos latinos",
     "Interlineado títulos asiáticos", "Espacio de título", "Espacio de código", "Sangría de cita (em)",
     "Sangría de lista (em)", "Sangría de definición (em)",
+    "Inset de viñeta (em)", "Espacio marcador lista (em)", "Tamaño de viñeta", "Espacio barra de cita (em)",
 ];
 
-pub const NUMBER_LABELS_RU: [&str; 17] = [
+pub const NUMBER_LABELS_RU: [&str; 21] = [
     "Размер (pt)", "Интерлиньяж латинского текста", "Интерлиньяж азиатского текста", "Трекинг (em)",
     "Отступ абзаца", "Красная строка (em)", "Колонка (em)", "Порог неровности (em)",
     "Сжатие пунктуации", "Висячая пунктуация (em)", "Интерлиньяж латинских заголовков",
     "Интерлиньяж азиатских заголовков", "Отступ заголовка", "Отступ кода", "Отступ цитаты (em)",
     "Отступ списка (em)", "Отступ определения (em)",
+    "Отступ маркера (em)", "Зазор маркера списка (em)", "Размер маркера", "Зазор полосы цитаты (em)",
 ];
 
-pub const NUMBER_LABELS_IT: [&str; 17] = [
+pub const NUMBER_LABELS_IT: [&str; 21] = [
     "Dimensione (pt)", "Interlinea testo latino", "Interlinea testo asiatico", "Crenatura (em)",
     "Spazio paragrafo", "Rientro prima riga (em)", "Colonna (em)", "Soglia allineamento (em)",
     "Compressione punteggiatura", "Punteggiatura sporgente (em)", "Interlinea titoli latini",
     "Interlinea titoli asiatici", "Spazio titolo", "Spazio codice", "Rientro citazione (em)",
     "Rientro elenco (em)", "Rientro definizione (em)",
+    "Rientro indicatore (em)", "Spazio indicatore elenco (em)", "Dimensione punto elenco", "Spazio barra citazione (em)",
 ];
 
-pub const NUMBER_LABELS_PT: [&str; 17] = [
+pub const NUMBER_LABELS_PT: [&str; 21] = [
     "Tamanho (pt)", "Entrelinha corpo latino", "Entrelinha corpo asiático", "Espaçamento (em)",
     "Espaço de parágrafo", "Recuo da 1ª linha (em)", "Coluna (em)", "Limite justificação (em)",
     "Compressão de pontuação", "Pontuação suspensa (em)", "Entrelinha títulos latinos",
     "Entrelinha títulos asiáticos", "Espaço de título", "Espaço de código", "Recuo de citação (em)",
     "Recuo de lista (em)", "Recuo de definição (em)",
+    "Inset do marcador (em)", "Espaço marcador de lista (em)", "Tamanho do marcador", "Espaço barra de citação (em)",
 ];
 
 pub fn number_label(lang: Language, index: usize) -> &'static str {

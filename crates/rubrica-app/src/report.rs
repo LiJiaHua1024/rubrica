@@ -12,7 +12,7 @@
 use std::collections::BTreeMap;
 
 use crate::font::FontEngine;
-use crate::theme::{ColorRole, Measure, TableLines, TextFace, Theme, Zoom};
+use crate::theme::{ColorRole, LayoutOverrides, Measure, TableLines, TextFace, Theme, Zoom};
 use crate::view::build_ops;
 use crate::{Error, Result};
 
@@ -56,6 +56,10 @@ pub struct Options {
     /// colour, which is how every page was drawn before the switch, so the
     /// `inline code` line stands only when capsules were asked for.
     pub code_capsule: bool,
+    /// The four layout numbers the command line asked for, on top of whatever the
+    /// profile carries. All `None` -- the design's own page -- prints no `layout` line
+    /// at all, so a report of a page nobody moved is the report it always was.
+    pub layout: LayoutOverrides,
     pub source_view: bool,
     pub plain: Option<bool>,
     pub text_options: rubrica_doc::plain::TextOptions,
@@ -83,6 +87,7 @@ pub fn report(source: &str, path: Option<&str>, o: &Options) -> Result<()> {
         show_highlights,
         table_lines,
         code_capsule,
+        layout,
         source_view,
         plain,
         text_options,
@@ -97,7 +102,10 @@ pub fn report(source: &str, path: Option<&str>, o: &Options) -> Result<()> {
     let mut theme = Theme::default();
     theme.set_zoom(zoom);
     if let Some(name) = profile.as_deref() {
-        crate::profiles::load(name).apply(&mut theme);
+        // The preset layer, not the registry alone: a name may be a file the reader
+        // wrote, and the flags a preset carries are applied here -- before the command
+        // line's own switches below, which are the more explicit statement.
+        crate::presets::apply(name, &mut theme);
     }
     if TextFace::ALL.get(face).is_some() {
         theme.set_face(face);
@@ -110,6 +118,10 @@ pub fn report(source: &str, path: Option<&str>, o: &Options) -> Result<()> {
     // and the very lines the default drew.
     theme.set_table_lines(table_lines);
     theme.set_code_capsule(code_capsule);
+    // The four layout numbers, last, because a profile may carry its own and the command
+    // line is the more explicit statement: an override is applied on top of whatever the
+    // page already had, and an override nobody gave changes nothing at all.
+    layout.apply(&mut theme);
     // The script geometry is the formula face's, so it is read here -- after the
     // profile and the command line have had their say about which face that is --
     // rather than inside `Theme::default`, which has no font engine to ask.
@@ -562,6 +574,26 @@ pub fn report(source: &str, path: Option<&str>, o: &Options) -> Result<()> {
             "inline code  : {spans} code span(s), {} capsule(s) drawn",
             page.capsules_drawn
         );
+    }
+    // The four numbers a typography preset may move, when they are not the design's own:
+    // a page whose markers hang where they always hung prints no line, so the report of
+    // a reader who never opened a preset is the report it always was. Only the numbers
+    // that actually moved are named, because the line is read to find out what changed.
+    if !theme.layout_is_the_design() {
+        let mut moved: Vec<String> = Vec::new();
+        if theme.marker_inset_em != Theme::DESIGN_MARKER_INSET_EM {
+            moved.push(format!("marker inset {:.2}em", theme.marker_inset_em));
+        }
+        if theme.list_marker_gap_em != Theme::DESIGN_LIST_MARKER_GAP_EM {
+            moved.push(format!("list marker gap {:.2}em", theme.list_marker_gap_em));
+        }
+        if theme.list_bullet_size != Theme::DESIGN_LIST_BULLET_SIZE {
+            moved.push(format!("bullet size {:.2}", theme.list_bullet_size));
+        }
+        if theme.quote_bar_gap_em != Theme::DESIGN_QUOTE_BAR_GAP_EM {
+            moved.push(format!("quote bar gap {:.2}em", theme.quote_bar_gap_em));
+        }
+        println!("layout       : {}", moved.join(", "));
     }
     // Diagrams, counted from the store and the source rather than from the ops: the
     // ops hold what was drawn, and a fence that did not parse has its source on the

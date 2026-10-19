@@ -54,7 +54,7 @@ pub fn show(owner: HWND, theme: &Theme, plain: bool, lang: Language) -> crate::R
         };
         RegisterClassExW(&wc);
         let hwnd = CreateWindowExW(WS_EX_CONTROLPARENT, PCWSTR(class.as_ptr()), PCWSTR(title.as_ptr()),
-            WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU, CW_USEDEFAULT, CW_USEDEFAULT, 900, 820,
+            WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU, CW_USEDEFAULT, CW_USEDEFAULT, 900, 880,
             Some(owner), None, Some(instance.into()), None)?;
         let mut state = Box::new(Form { owner, name: HWND::default(), fields: Vec::new(),
             korean: HWND::default(), bind: HWND::default(), editor_args: HWND::default(), lang });
@@ -85,18 +85,21 @@ pub fn show(owner: HWND, theme: &Theme, plain: bool, lang: Language) -> crate::R
                 state.fields.push(child(hwnd, "EDIT", &value.to_string(), [x + 198, y, 118, 25], 120 + i,
                     WS_BORDER | WS_TABSTOP | WINDOW_STYLE(ES_AUTOHSCROLL as u32))?);
             }
-            state.korean = child(hwnd, "BUTTON", i18n::t(lang, Key::TypoKeepKorean), [18, 640, 330, 26], 130,
+            // The numbers are the profile's own order and its own count, so the rows
+            // this lays out are as many as the table has: the layout numbers a preset
+            // may move are the last four of them, and they stand here like the rest.
+            state.korean = child(hwnd, "BUTTON", i18n::t(lang, Key::TypoKeepKorean), [18, 706, 330, 26], 130,
                 WS_TABSTOP | WINDOW_STYLE(BS_AUTOCHECKBOX as u32))?;
             SendMessageW(state.korean, BM_SETCHECK, Some(WPARAM(usize::from(p.keep_korean_words))), None);
-            state.bind = child(hwnd, "BUTTON", i18n::t(lang, Key::TypoBindTxt), [454, 640, 330, 26], 131,
+            state.bind = child(hwnd, "BUTTON", i18n::t(lang, Key::TypoBindTxt), [454, 706, 330, 26], 131,
                 WS_TABSTOP | WINDOW_STYLE(BS_AUTOCHECKBOX as u32))?;
             SendMessageW(state.bind, BM_SETCHECK, Some(WPARAM(usize::from(plain))), None);
-            label(hwnd, i18n::t(lang, Key::TypoFontNotice), 18, 682, 820)?;
-            label(hwnd, i18n::t(lang, Key::TypoEditorArgs), 18, 716, 250)?;
-            state.editor_args = child(hwnd, "EDIT", &settings::editor_args(), [278, 712, 604, 25], 140,
+            label(hwnd, i18n::t(lang, Key::TypoFontNotice), 18, 748, 820)?;
+            label(hwnd, i18n::t(lang, Key::TypoEditorArgs), 18, 782, 250)?;
+            state.editor_args = child(hwnd, "EDIT", &settings::editor_args(), [278, 778, 604, 25], 140,
                 WS_BORDER | WS_TABSTOP | WINDOW_STYLE(ES_AUTOHSCROLL as u32))?;
-            child(hwnd, "BUTTON", i18n::t(lang, Key::TypoSaveApply), [628, 758, 130, 30], 1, WS_TABSTOP | WINDOW_STYLE(BS_DEFPUSHBUTTON as u32))?;
-            child(hwnd, "BUTTON", i18n::t(lang, Key::TypoCancel), [770, 758, 112, 30], 2, WS_TABSTOP)?;
+            child(hwnd, "BUTTON", i18n::t(lang, Key::TypoSaveApply), [628, 820, 130, 30], 1, WS_TABSTOP | WINDOW_STYLE(BS_DEFPUSHBUTTON as u32))?;
+            child(hwnd, "BUTTON", i18n::t(lang, Key::TypoCancel), [770, 820, 112, 30], 2, WS_TABSTOP)?;
             Ok(())
         })();
         if let Err(error) = build { let _ = DestroyWindow(hwnd); return Err(error.into()); }
@@ -184,6 +187,14 @@ mod tests {
     fn the_form_field_order_matches_the_profile_layout() {
         let p = Profile::default();
         assert_eq!(p.fonts.len(), crate::profiles::FONT_LABELS.len());
-        assert_eq!(p.numbers.len(), 17);
+        assert_eq!(p.numbers.len(), crate::profiles::NUMBER_LABELS.len());
+        // Every field the form draws a label for has a label in every language, and the
+        // two tables are the profile's own order: a number the form laid out but no
+        // language could name would be a blank row with a live edit box on it.
+        for lang in Language::ALL {
+            for i in 0..p.numbers.len() {
+                assert!(!crate::profiles::number_label(i, lang).is_empty(), "number {i} has no label");
+            }
+        }
     }
 }

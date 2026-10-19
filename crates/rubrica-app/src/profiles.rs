@@ -43,7 +43,7 @@ pub const FONT_LABELS: [&str; 19] = [
     "Font fallback",
 ];
 #[allow(dead_code)]
-pub const NUMBER_LABELS: [&str; 17] = [
+pub const NUMBER_LABELS: [&str; 21] = [
     "Size (pt)",
     "Latin body leading",
     "Asian body leading",
@@ -61,8 +61,17 @@ pub const NUMBER_LABELS: [&str; 17] = [
     "Quote indent (em)",
     "List indent (em)",
     "Definition indent (em)",
+    // The four layout numbers a preset can move without moving the page. They are
+    // appended rather than filed beside the indents they belong with, because a
+    // profile's numbers are also its registry keys: `Number0..16` are what every
+    // preset written before this build holds, and a key that moved would be read back
+    // as whatever number now stands in its place.
+    "Marker inset (em)",
+    "List marker gap (em)",
+    "Bullet size",
+    "Quote bar gap (em)",
 ];
-const BOUNDS: [(f32, f32); 17] = [
+const BOUNDS: [(f32, f32); 21] = [
     (6.0, 72.0),
     (1.0, 4.0),
     (1.0, 4.0),
@@ -80,7 +89,22 @@ const BOUNDS: [(f32, f32); 17] = [
     (0.0, 8.0),
     (0.0, 8.0),
     (0.0, 8.0),
+    (0.0, 6.0),
+    (0.0, 4.0),
+    (0.4, 2.5),
+    (0.0, 4.0),
 ];
+
+/// The range the form takes for one number, by slot. Read by the preset files, which
+/// have to say whether a number a reader wrote is one this page can be drawn with --
+/// and told there, by name, rather than at draw time.
+///
+/// A slot past the table takes the whole range: this build cannot produce one, since the
+/// two tables are written side by side, and a key that cannot be ranged is skipped for
+/// being unreadable rather than for indexing past the end of an array.
+pub(crate) fn bounds(index: usize) -> (f32, f32) {
+    BOUNDS.get(index).copied().unwrap_or((f32::MIN, f32::MAX))
+}
 
 /// The old eight-slot order, mapped into the complete role order. `None` means the
 /// legacy slot has no direct equivalent and is ignored.
@@ -93,7 +117,7 @@ const LEGACY_FONT_SLOT: [Option<usize>; 19] = [
 #[derive(Clone, Debug, PartialEq)]
 pub struct Profile {
     pub fonts: [String; 19],
-    pub numbers: [f32; 17],
+    pub numbers: [f32; 21],
     pub keep_korean_words: bool,
 }
 
@@ -145,6 +169,10 @@ impl Profile {
                 t.quote_indent_em,
                 t.list_indent_em,
                 t.definition_indent_em,
+                t.marker_inset_em,
+                t.list_marker_gap_em,
+                t.list_bullet_size,
+                t.quote_bar_gap_em,
             ],
             keep_korean_words: t.keep_korean_words,
         }
@@ -160,7 +188,12 @@ impl Profile {
         p.fonts[7] = "Yu Mincho".into();
         p.fonts[9] = "Batang".into();
         p.fonts[10] = "Batang".into();
-        p.numbers = [14.0, 1.65, 1.9, 0.0, 0.25, 2.0, 32.0, 16.0, 0.5, 0.5, 1.45, 1.6, 1.5, 1.0, 1.2, 1.6, 1.5];
+        p.numbers = [
+            14.0, 1.65, 1.9, 0.0, 0.25, 2.0, 32.0, 16.0, 0.5, 0.5, 1.45, 1.6, 1.5, 1.0, 1.2, 1.6, 1.5,
+            // The four layout numbers stay the design's: a book face is not a different
+            // list, and a reader who wants a wider marker gutter says so by itself.
+            0.0, 0.0, 1.0, 0.5,
+        ];
         p
     }
 
@@ -228,6 +261,10 @@ impl Profile {
         t.quote_indent_em = self.numbers[14];
         t.list_indent_em = self.numbers[15];
         t.definition_indent_em = self.numbers[16];
+        t.marker_inset_em = self.numbers[17];
+        t.list_marker_gap_em = self.numbers[18];
+        t.list_bullet_size = self.numbers[19];
+        t.quote_bar_gap_em = self.numbers[20];
         t.keep_korean_words = self.keep_korean_words;
         t.face = crate::theme::TextFace::ALL
             .iter()
@@ -352,7 +389,10 @@ fn read_selected(plain: bool) -> String {
     let name = if plain { settings::text(ROOT, "PlainText") } else { None }
         .or_else(|| settings::text(ROOT, "Selected"))
         .unwrap_or_else(|| "Default".into());
-    if names().contains(&name) { name } else { "Default".into() }
+    // A preset is a preset whether the form saved it or the reader wrote it as a file:
+    // a name that means one on this machine is kept, and a name that means nothing is
+    // the design's own page rather than a page set with whatever the name once meant.
+    if names().contains(&name) || crate::presets::exists(&name) { name } else { "Default".into() }
 }
 
 pub fn select(name: &str, plain: bool) -> Result<(), String> {

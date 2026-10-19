@@ -288,6 +288,96 @@ worse than no file. A `--report` run whose theme came from a slot or from `--the
 prints one `theme` line saying what was drawn with; a page nobody gave a theme to
 reports exactly as it always did.
 
+## Typography presets
+
+A preset is everything a page is set with: the nineteen font roles, the twenty-one
+numbers and the two drawing switches. The typography form has always been able to write
+one into the registry under a name. **The reader's own presets** are TOML files in
+`%APPDATA%\Rubrica\typography` — the copy that can be opened in an editor, kept beside a
+book, or handed to somebody else.
+
+A preset file says what it is and what it changes:
+
+```toml
+[meta]
+name = "Wide markers"         # required; the name the menu and --profile use
+# based_on = "Book"           # optional: everything left out comes from this preset
+
+[fonts]                       # the nineteen font roles; all optional
+latin_body = "Georgia"
+
+[metrics]                     # the twenty-one numbers; all optional
+size = 15.0
+marker_inset = 1.2
+
+[flags]                       # the drawing switches; all optional
+code_capsule = true
+table_lines = "booktabs"
+
+[bind]                        # the extensions this preset is the one for
+extensions = "txt, log"
+```
+
+The nineteen `[fonts]` keys are `latin_body`, `latin_headings`, `latin_code`,
+`chinese_body`, `chinese_headings`, `chinese_code`, `japanese_body`, `japanese_headings`,
+`japanese_code`, `korean_body`, `korean_headings`, `korean_code`, `latin_emphasis`,
+`chinese_emphasis`, `japanese_emphasis`, `korean_emphasis`, `math`, `math_fallback` and
+`font_fallback`, each a font family in quotes. The twenty-one `[metrics]` keys are `size`
+(in points), `latin_body_leading`, `asian_body_leading`, `tracking`, `paragraph_gap`,
+`first_indent`, `column`, `ragged_below`, `punctuation_compression`,
+`hanging_punctuation`, `latin_heading_leading`, `asian_heading_leading`, `heading_gap`,
+`code_gap`, `quote_indent`, `list_indent`, `definition_indent`, and the four layout
+quantities this build added: `marker_inset` (0–6 em, how far a list's marker hangs),
+`list_marker_gap` (0–4 em, the air between the marker and the words it introduces),
+`list_bullet_size` (0.4–2.5, how large the marker is drawn) and `quote_bar_gap` (0–4 em,
+how far a quotation's bar stands from the column it marks). `[flags]` holds `code_capsule`
+(`true`/`false`), `table_lines` (`"grid"` or `"booktabs"`) and `keep_korean_words`
+(`true`/`false`).
+
+Nothing is refused whole for one line this reader cannot read. A key it does not know, a
+number outside the range the form would take, a switch that is neither `true` nor
+`false`: each is set aside by name, with the reason, and `--list-profiles` prints both,
+while the rest of the file still says what it says — a typo is a line in a listing rather
+than a preset that quietly is not what it says. What a file *must* say is what it is: a
+`[meta] name`. No name, an empty one, one over 80 characters, or one that takes `Default`
+or `Book` — names the reader did not write — is set aside whole with its reason. A file
+whose name is one the form has saved stands in its place, because the file is the copy
+the reader can see and edit.
+
+`based_on` names the preset this one is written over — another file, or a name from the
+form — and a file that names nothing builds on the design's own page, which is what
+`Default` holds. A chain is walked root to leaf and may be eight presets long; a name
+nothing answers to, or a chain that comes back round to where it started, is set aside
+with its reason rather than half-drawn.
+
+`[bind] extensions` is the answer to "what is a `.txt` file set with?": a list of
+extensions, with or without the dot, where case is not information. A document is set
+with the preset bound to the extension it ends with, ahead of the name this reader
+remembers for that kind of document; a `--profile` on the command line is the reader's own
+word and stands over both. A preset file is noticed when it is saved: the folder is
+watched, and a preset added or edited is live within the second in the window, in the
+spacebar peek, and in the next report or export — no restart.
+
+The same presets are available to headless runs:
+
+```
+rubrica-app --list-profiles                         # what is installed, and what was not read
+rubrica-app --profile "Wide markers" --report document.md
+rubrica-app --export-png page.png --profile "Wide markers" document.md
+```
+
+`--list-profiles` prints the built-ins, the presets the form saved, every file read with
+its path and what it is based on and bound to, every file set aside with its reason, and
+the preset in force for each of the two slots, and exits without opening a window.
+`--profile` takes a name (case is not information); in a report or an export a name
+nothing answers to refuses rather than drawing something else, because a page set with a
+preset that was asked for and not found is worse than no page. A report whose preset moved
+one of the four layout numbers prints one `layout` line naming the ones it moved.
+
+The four layout numbers can also be given on the command line, where they need no file at
+all: `--marker-inset`, `--list-marker-gap`, `--list-bullet-size` and `--quote-bar-gap`,
+each taking the range above. A value outside it is refused, exit 1.
+
 ## The spacebar peek
 
 `rubrica-app --peek` runs a small background service (a tray icon, no window) that adds

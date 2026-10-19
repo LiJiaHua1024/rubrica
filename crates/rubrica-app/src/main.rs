@@ -20,6 +20,7 @@ mod instance;
 mod math;
 mod pagination;
 mod peek;
+mod presets;
 mod report;
 mod reading;
 mod profiles;
@@ -78,6 +79,17 @@ fn main() -> Result<()> {
         }
         return Ok(());
     }
+    if has_flag(&argv, "--list-profiles") {
+        // What this machine can set a page with: the built-ins, the presets the form has
+        // saved, the reader's own files, what each was written over and what each is
+        // bound to -- the answer to "why is this page set like that", with no window.
+        let shelf = presets::shelf();
+        let slots = [profiles::selected(true), profiles::selected(false)];
+        for line in presets::describe(&shelf, slots) {
+            println!("{line}");
+        }
+        return Ok(());
+    }
     if has_flag(&argv, "--export-png") {
         let output = text_flag(&argv, "--export-png").ok_or("--export-png needs an output path")?;
         let width = flag(&argv, "--export-width").unwrap_or(1080.0);
@@ -88,11 +100,7 @@ fn main() -> Result<()> {
         let plain = if has_flag(&argv, "--plain") { Some(true) }
             else if has_flag(&argv, "--markdown") { Some(false) }
             else { prefs.plain };
-        let profile = text_flag(&argv, "--profile").map(lossy).or_else(|| {
-            path.as_deref().map(|p| crate::profiles::selected(
-                prefs.plain.unwrap_or_else(|| reading::is_plain(Some(p))),
-            ))
-        });
+        let profile = chosen_profile(&argv, path.as_deref(), plain)?;
         let zoom = theme::Zoom::nearest_percent(flag(&argv, "--zoom").unwrap_or(100.0));
         let face = flag(&argv, "--face").map(|v| v as usize);
         let measure = flag(&argv, "--measure").map(|v| v as usize);
@@ -119,6 +127,7 @@ fn main() -> Result<()> {
             !has_flag(&argv, "--no-highlights") && settings::show_highlights(),
             table_lines(&argv)?,
             code_capsule(&argv)?,
+            layout_overrides(&argv)?,
             zoom,
             face,
             measure,
@@ -140,11 +149,7 @@ fn main() -> Result<()> {
         let plain = if has_flag(&argv, "--plain") { Some(true) }
             else if has_flag(&argv, "--markdown") { Some(false) }
             else { prefs.plain };
-        let profile = text_flag(&argv, "--profile").map(lossy).or_else(|| {
-            path.as_deref().map(|p| crate::profiles::selected(
-                prefs.plain.unwrap_or_else(|| reading::is_plain(Some(p))),
-            ))
-        });
+        let profile = chosen_profile(&argv, path.as_deref(), plain)?;
         let zoom = theme::Zoom::nearest_percent(flag(&argv, "--zoom").unwrap_or(100.0));
         let face = flag(&argv, "--face").map(|v| v as usize);
         let measure = flag(&argv, "--measure").map(|v| v as usize);
@@ -168,6 +173,7 @@ fn main() -> Result<()> {
             !has_flag(&argv, "--no-highlights") && settings::show_highlights(),
             table_lines(&argv)?,
             code_capsule(&argv)?,
+            layout_overrides(&argv)?,
             zoom,
             face,
             measure,
@@ -192,14 +198,7 @@ fn main() -> Result<()> {
         } else {
             preferences.plain
         };
-        let profile = text_flag(&argv, "--profile").map(lossy).or_else(|| {
-            path.as_deref().map(|p| {
-                let prefs = settings::document(p);
-                crate::profiles::selected(
-                    prefs.plain.unwrap_or_else(|| reading::is_plain(Some(p))),
-                )
-            })
-        });
+        let profile = chosen_profile(&argv, path.as_deref(), plain)?;
         let keep_line_breaks = has_flag(&argv, "--keep-line-breaks")
             || preferences.line_breaks.unwrap_or_else(settings::keep_line_breaks);
         let html_images = !has_flag(&argv, "--no-html-images") && settings::show_html_images();
@@ -216,6 +215,9 @@ fn main() -> Result<()> {
         // reader's remembered choice.
         let table_lines = table_lines(&argv)?;
         let code_capsule = code_capsule(&argv)?;
+        // And the four layout numbers, which a profile may also carry: the flags are the
+        // more explicit statement and are applied on top of it.
+        let layout = layout_overrides(&argv)?;
         let options = report::Options {
             width,
             dpi,
@@ -229,6 +231,7 @@ fn main() -> Result<()> {
             show_highlights,
             table_lines,
             code_capsule,
+            layout,
             source_view,
             plain,
             text_options: preferences.text,
@@ -329,10 +332,11 @@ fn has_flag(argv: &[OsString], name: &str) -> bool {
 /// `--width` and friends. A double-click names one; a multi-selection "open with" names
 /// several, and each of them is wanted.
 fn positionals(argv: &[OsString]) -> Vec<PathBuf> {
-    const TAKES_VALUE: [&str; 15] = [
+    const TAKES_VALUE: [&str; 19] = [
         "--width", "--dpi", "--zoom", "--face", "--measure", "--profile",
         "--export-png", "--export-width", "--export-scale", "--export-pdf",
         "--pdf-width", "--pdf-height", "--theme", "--tables", "--inline-code",
+        "--marker-inset", "--list-marker-gap", "--list-bullet-size", "--quote-bar-gap",
     ];
     let mut skip_next = false;
     let mut flags_done = false;
@@ -411,6 +415,68 @@ fn code_capsule(argv: &[OsString]) -> Result<bool> {
     }
 }
 
+/// The typography preset this run sets its page with: the one the reader named, or the
+/// one this kind of document is set with.
+///
+/// A name is answered strictly. A headless run that cannot set the page the way it was
+/// told to has no window to explain itself in, and a page drawn with the design's own
+/// numbers when another preset was asked for is a page that lies about what it is -- so a
+/// word that names nothing here is an error rather than the default. A document is
+/// answered the other way, as it always has been: a binding, or a memory of a choice,
+/// that has gone stale is not worth refusing to draw a page over.
+///
+/// `plain` is what the reader has already said about this document, if anything; a `.txt`
+/// file is plain text whatever the reader said, which is how the one binding this reader
+/// had before preset files existed still means what it meant.
+fn chosen_profile(
+    argv: &[OsString],
+    path: Option<&Path>,
+    plain: Option<bool>,
+) -> Result<Option<String>> {
+    if let Some(word) = text_flag(argv, "--profile") {
+        let name = lossy(word);
+        if !presets::exists(&name) {
+            return Err(format!("no preset here is named `{name}`").into());
+        }
+        return Ok(Some(name));
+    }
+    Ok(path.and_then(|p| presets::for_path(p, plain)).map(|preset| preset.name))
+}
+
+/// The four layout numbers a typography preset can move, from the command line.
+///
+/// These are the numbers that decide where a list's marker hangs, how much air stands
+/// between it and the words, how large it is drawn and how far a quotation's bar stands
+/// from the column it marks. Each is read strictly: a word that is not a number, and a
+/// number outside the range the typography form would accept, is refused rather than
+/// ignored, because a headless run has no window to explain itself in -- and a page
+/// drawn at the design's spacing when the reader asked for another is a page that lies
+/// about what it was asked for.
+fn layout_overrides(argv: &[OsString]) -> Result<theme::LayoutOverrides> {
+    Ok(theme::LayoutOverrides {
+        marker_inset_em: layout_number(argv, "--marker-inset", 0.0, 6.0)?,
+        list_marker_gap_em: layout_number(argv, "--list-marker-gap", 0.0, 4.0)?,
+        list_bullet_size: layout_number(argv, "--list-bullet-size", 0.4, 2.5)?,
+        quote_bar_gap_em: layout_number(argv, "--quote-bar-gap", 0.0, 4.0)?,
+    })
+}
+
+/// One of them, or `None` when the command line did not name it.
+fn layout_number(argv: &[OsString], name: &str, min: f32, max: f32) -> Result<Option<f32>> {
+    let Some(raw) = text_flag(argv, name) else {
+        return Ok(None);
+    };
+    let word = lossy(raw);
+    let value: f32 = word
+        .parse()
+        .map_err(|_| -> Error { format!("{name} wants a number, not `{word}`").into() })?;
+    if value.is_finite() && (min..=max).contains(&value) {
+        Ok(Some(value))
+    } else {
+        Err(format!("{name} wants a number between {min} and {max}, not {word}").into())
+    }
+}
+
 /// A size the report can divide by.
 ///
 /// `k = dpi / 72` and the measure's right edge are both divisors of the numbers the
@@ -476,6 +542,66 @@ mod tests {
             assert!(positive("--dpi", bad).is_err(), "{bad} is not a page size");
             assert!(positive("--width", bad).is_err(), "{bad} is not a page size");
         }
+    }
+
+    /// A layout number is read strictly. The four switches exist so that a page can be
+    /// asked for by name, and a run that quietly drew the design's spacing because
+    /// `--list-marker-gap` was handed a word instead of a number would be a page that
+    /// lies about what it was asked for -- and a headless run has no window to say so in.
+    #[test]
+    fn a_layout_number_is_a_number_or_nothing_at_all() {
+        let absent = line(&["rubrica", "--report", "a.md"]);
+        assert_eq!(layout_number(&absent, "--list-marker-gap", 0.0, 4.0).expect("absent"), None);
+        let given = line(&["rubrica", "--report", "--list-marker-gap", "0.5", "a.md"]);
+        assert_eq!(layout_number(&given, "--list-marker-gap", 0.0, 4.0).expect("read"), Some(0.5));
+        // A word, a NaN, and a number on either side of the range the form would take.
+        for bad in ["nope", "nan", "-1", "9"] {
+            let argv = line(&["rubrica", "--report", "--list-marker-gap", bad, "a.md"]);
+            assert!(
+                layout_number(&argv, "--list-marker-gap", 0.0, 4.0).is_err(),
+                "{bad} was accepted as a marker gap",
+            );
+        }
+    }
+
+    /// A preset named on the command line is answered strictly, and the remembered one
+    /// is not: a headless run that cannot set the page the way it was told to has no
+    /// window to explain itself in, while a memory of a choice that has gone stale is not
+    /// worth refusing to draw a page over. A run that named no preset at all is the run
+    /// this reader has always had.
+    #[test]
+    fn a_named_preset_is_answered_strictly_and_a_remembered_one_is_not() {
+        // The two built-ins are always here, whatever the machine holds.
+        let named = line(&["rubrica", "--report", "--profile", "Book", "a.md"]);
+        assert_eq!(chosen_profile(&named, None, None).expect("Book").as_deref(), Some("Book"));
+        // Case is the way a reader means a name, so it is the way this reader reads one.
+        let named = line(&["rubrica", "--report", "--profile", "book", "a.md"]);
+        assert_eq!(chosen_profile(&named, None, None).expect("book").as_deref(), Some("book"));
+        // A name that means nothing is refused rather than drawn as the default.
+        for bad in ["Nobody At All", ""] {
+            let named = line(&["rubrica", "--report", "--profile", bad, "a.md"]);
+            assert!(chosen_profile(&named, None, None).is_err(), "`{bad}` was taken as a preset");
+        }
+        // No name, no document: nothing to remember, nothing chosen.
+        assert_eq!(chosen_profile(&line(&["rubrica", "--report"]), None, None).expect("none"), None);
+        // A document is set with whatever this machine says: a preset bound to the kind
+        // of document it is, or the one remembered for that kind. Whatever the answer is,
+        // it is a name this machine has -- a name that means nothing would be a page
+        // drawn as the design's own with no word said about it.
+        let path = PathBuf::from("C:/books/notes.txt");
+        let chosen = chosen_profile(&line(&["rubrica", "--report", "notes.txt"]), Some(&path), None)
+            .expect("a document is set with something");
+        let name = chosen.expect("a preset name");
+        assert!(presets::exists(&name), "`{name}` is not a preset this machine has");
+        // A `.txt` file is plain text whatever the reader said about it, and a reader's
+        // own word about the document is what a binding is matched under.
+        let chosen = chosen_profile(
+            &line(&["rubrica", "--report", "--markdown", "notes.txt"]),
+            Some(&path),
+            Some(false),
+        )
+        .expect("a document is set with something");
+        assert!(chosen.is_some_and(|name| presets::exists(&name)));
     }
 
     /// A document is not a flag: a file called `report` is not a command -- there is no

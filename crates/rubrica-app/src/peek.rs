@@ -104,7 +104,7 @@ use crate::view::{
     build_ops, d2d, glyph_origin, pan_offset, paint_run, region_shift, system_prefers_dark, utf16,
     Op, Objects, Palette, WideRegion, WHEEL_STEP,
 };
-use crate::{hyphen, images, instance, profiles, reading, settings};
+use crate::{hyphen, images, instance, reading, settings};
 
 /// Messages the hook posts to the service window. The hook itself never touches
 /// anything slower than a Win32 query, so every decision that costs time is made
@@ -1404,6 +1404,11 @@ struct Peek {
     /// Rebuilt at a reveal only when the folder's signature says a file moved.
     themes: crate::themes::Shelf,
     themes_stamp: u64,
+    /// The reader's typography presets, so a preview is set the way the window would set
+    /// it -- a binding included. Rebuilt at a reveal only when the folder's signature
+    /// says a file moved, which is the same beat the themes are read on.
+    presets: crate::presets::Shelf,
+    presets_stamp: u64,
     brushes: HashMap<ColorRole, ID2D1SolidColorBrush>,
     font: Option<crate::font::FontEngine>,
     hyphenator: Option<&'static hyphen::Hyphenator>,
@@ -1478,6 +1483,8 @@ impl Peek {
                 dark: false,
                 themes: crate::themes::shelf(),
                 themes_stamp: crate::themes::stamp(),
+                presets: crate::presets::shelf(),
+                presets_stamp: crate::presets::stamp(),
                 brushes: HashMap::new(),
                 font: None,
                 hyphenator: None,
@@ -1670,9 +1677,24 @@ impl Peek {
         if let Some(measure) = saved.measure {
             theme.set_measure(measure);
         }
-        let profile = profiles::selected(plain);
-        if profile != "Default" {
-            profiles::load(&profile).apply(&mut theme);
+        // The preset a document of this kind is set with, and the same answer the window
+        // and the exports come to: one bound to the extension the document ends with, or
+        // the one this reader remembers for the kind of document it is. The folder is
+        // compared by its signature first, so a reveal costs a listing and never a parse
+        // unless a file moved -- a preset is saved with an editor, and the editor has no
+        // way to tell this window.
+        let stamp = crate::presets::stamp();
+        if stamp != self.presets_stamp {
+            self.presets_stamp = stamp;
+            self.presets = crate::presets::shelf();
+        }
+        let remembered = crate::profiles::selected(plain);
+        if let Some(preset) = crate::presets::for_path_in(&self.presets, path, &remembered) {
+            // `Default` is the page this window already is, so it is not applied over the
+            // reader's own face and measure -- which is why it is asked for by name.
+            if !preset.name.eq_ignore_ascii_case("Default") {
+                preset.apply(&mut theme);
+            }
         }
         self.theme = theme;
 
