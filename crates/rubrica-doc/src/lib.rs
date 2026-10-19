@@ -1154,6 +1154,70 @@ struct Builder<'a> {
     html: Option<String>,
 }
 
+/// How far a tab advances: to the next multiple of this many characters.
+const TAB_STOP: usize = 4;
+
+/// A piece of a fence with its tabs turned into the spaces a tab stop stands for.
+///
+/// `sources` maps the piece's characters to the bytes they were written at, and every
+/// space a tab becomes names the tab's own byte: the text the reader sees is longer
+/// than the file's, and each of its characters still points at something the author
+/// wrote. `start` is where the piece begins in the block, `column` how many characters
+/// of the line it lands on are already there.
+fn expand_tabs(
+    text: &str,
+    sources: &[SourceSpan],
+    start: usize,
+    column: usize,
+) -> (String, Vec<SourceSpan>) {
+    let mut out = String::with_capacity(text.len());
+    let mut mapped: Vec<SourceSpan> = Vec::with_capacity(sources.len());
+    let mut col = column;
+    // Whether the last span maps one byte of text to one byte of source. A tab breaks
+    // that: its spaces are several characters the file wrote as one, so they are kept
+    // as spans of their own -- each naming the tab's byte -- rather than run together
+    // with the text beside them, where a reader looking up a column would be told the
+    // author wrote a byte they did not.
+    let mut one_to_one = true;
+    for (at, c) in text.char_indices() {
+        let source = sources
+            .iter()
+            .find(|s| s.range.contains(&at))
+            .map_or(0, |s| s.source + (at - s.range.start));
+        let from = out.len();
+        if c == '\t' {
+            let spaces = TAB_STOP - col % TAB_STOP;
+            for _ in 0..spaces {
+                let space = out.len();
+                out.push(' ');
+                mapped.push(SourceSpan { range: start + space..start + space + 1, source });
+            }
+            col += spaces;
+            one_to_one = false;
+            continue;
+        }
+        out.push(c);
+        col = if c == '\n' { 0 } else { col + 1 };
+        let to = out.len();
+        let merged = one_to_one
+            && match mapped.last_mut() {
+                Some(last)
+                    if last.source + last.range.len() == source
+                        && last.range.end == start + from =>
+                {
+                    last.range.end = start + to;
+                    true
+                }
+                _ => false,
+            };
+        if !merged {
+            mapped.push(SourceSpan { range: start + from..start + to, source });
+        }
+        one_to_one = true;
+    }
+    (out, mapped)
+}
+
 impl Builder<'_> {
     fn sources(&self, text: &str, start: usize) -> Vec<SourceSpan> {
         let raw = &self.input[self.event_range.clone()];
@@ -1778,11 +1842,30 @@ impl Builder<'_> {
         // Taken before `cur` is borrowed: the link and the block are both fields of
         // the builder, and a run of text belongs to both.
         let linked = self.link.clone();
-        let sources = self.sources(s, self.cur.as_ref().unwrap().text.len());
+        let code = self.cur.as_ref().is_some_and(|b| b.kind == BlockKind::Code);
+        let start = self.cur.as_ref().map_or(0, |b| b.text.len());
+        let sources = self.sources(s, start);
+        // A fence is a grid, and in one a tab is a tab stop rather than a character:
+        // `a\tb` and `ab\tb` put their `b` in the same column, which is the whole
+        // reason a tab is typed into code. The stop is every four characters, counted
+        // from the start of the line the piece lands on -- the pieces arrive one
+        // `Event::Text` at a time, so the column is read back off the block. Read only
+        // when the piece holds a tab: a document of a hundred thousand lines pays
+        // nothing for a rule about a character none of them has.
+        let (text, sources): (std::borrow::Cow<'_, str>, Vec<SourceSpan>) =
+            if code && s.contains('\t') {
+                let column = self
+                    .cur
+                    .as_ref()
+                    .map_or(0, |b| b.text.rsplit('\n').next().map_or(0, |l| l.chars().count()));
+                let (expanded, mapped) = expand_tabs(s, &sources, start, column);
+                (std::borrow::Cow::Owned(expanded), mapped)
+            } else {
+                (std::borrow::Cow::Borrowed(s), sources)
+            };
         let b = self.cur.as_mut().unwrap();
         b.sources.extend(sources);
-        let start = b.text.len();
-        b.text.push_str(s);
+        b.text.push_str(&text);
         let end = b.text.len();
         match b.spans.last_mut() {
             // Merge adjacent runs of one style: pulldown splits on every escape and
@@ -2910,6 +2993,32 @@ mod source_span_tests {
         let kinds: Vec<_> = doc.blocks.iter().map(|b| b.kind).collect();
         assert_eq!(kinds, vec![BlockKind::Term, BlockKind::Definition]);
         assert_eq!(doc.blocks[1].text, "def");
+    }
+
+    /// A tab in a fence is a tab stop rather than a character: lines a reader lined up
+    /// with tabs end in one column here, which is the promise the fence was written
+    /// under. Prose is not a grid and keeps its tabs.
+    #[test]
+    fn a_tab_in_a_fence_stops_at_the_next_multiple_of_four() {
+        let doc = Document::parse("```\na\tb\nab\tb\nabc\tb\n```\n");
+        assert_eq!(doc.blocks[0].kind, BlockKind::Code);
+        assert_eq!(doc.blocks[0].text, "a   b\nab  b\nabc b");
+        // A tab after a wide character counts characters rather than columns of ink,
+        // and a second tab on a line stops at the next multiple of four again.
+        assert_eq!(
+            Document::parse("```\n中\tend\na\tb\tc\n```\n").blocks[0].text,
+            "中   end\na   b   c"
+        );
+        // An indented block is a fence too.
+        assert_eq!(Document::parse("    x\ty\n").blocks[0].text, "x   y");
+        // Prose keeps the tab it was written with.
+        assert_eq!(Document::parse("a\tb\n").blocks[0].text, "a\tb");
+        // The reader's selection still names the byte the author wrote: both spaces a
+        // tab became point at the tab, not at what follows it.
+        let doc = Document::parse("```\nab\tb\n```\n");
+        let sources: Vec<(std::ops::Range<usize>, usize)> =
+            doc.blocks[0].sources.iter().map(|s| (s.range.clone(), s.source)).collect();
+        assert_eq!(sources, vec![(0..2, 4), (2..3, 6), (3..4, 6), (4..5, 7)]);
     }
 
     /// Each level appended the whole inner alt, so the bytes copied grew with the

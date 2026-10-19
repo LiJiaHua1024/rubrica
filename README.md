@@ -93,8 +93,10 @@ ligatures, emoji, and bidirectional text remain selectable. Page breaks are plan
 ## What it reads
 
 CommonMark and GFM: headings, paragraphs, lists (ordered, nested, task lists), block
-quotes, fenced code with syntax colouring, tables with alignment and rules on every row
-and column, images, links and footnotes, strikethrough, autolinks, Pandoc's `H~2~O` and
+quotes, fenced code with syntax colouring (273 fence names over 56 scanners, and a tab
+inside a fence is a tab stop every four characters), tables with alignment and rules on
+every row and column, images, links and footnotes, strikethrough, autolinks, Pandoc's
+`H~2~O` and
 `x^2^` scripts (the scale and the shift are read from the formula face's `MATH` table,
 so a script, a `<sup>` and a footnote's `¹` are set with one pair of numbers; a mark
 alone, or a run of two or more, is printed as written rather than read as Pandoc's

@@ -512,6 +512,225 @@ const SPECS: &[(&str, &Spec)] = &[
     ("ps1", &SHELL),
     ("pwsh", &SHELL),
     ("ruby", &RUBY),
+    // G9: the names a fence is likely to carry that this build had not met. Most of them
+    // are spellings of a family already here -- a dialect shares its parent's words, and
+    // `mariadb` is set by the SQL scanner rather than by a table of its own -- so what
+    // grew here is the list of names, and only the families above are new scanners.
+    ("aarch64", &ASM),
+    ("ada", &ADA),
+    ("adb", &ADA),
+    ("ads", &ADA),
+    ("ansible", &YAML),
+    ("applescript", &APPLESCRIPT),
+    ("arm", &ASM),
+    ("ash", &SHELL),
+    ("asm", &ASM),
+    ("astro", &HTML),
+    ("atom", &HTML),
+    ("awk", &AWK),
+    ("bazel", &STARLARK),
+    ("bigquery", &SQL),
+    ("bzl", &STARLARK),
+    ("c11", &C),
+    ("c17", &C),
+    ("c99", &C),
+    ("cake", &CS),
+    ("cassandra", &SQL),
+    ("cjs", &JS),
+    ("cl", &LISP),
+    ("clickhouse", &SQL),
+    ("clj", &LISP),
+    ("cljc", &LISP),
+    ("cljs", &LISP),
+    ("clojure", &LISP),
+    ("compose", &YAML),
+    ("conf", &INI),
+    ("containerfile", &SHELL),
+    ("cql", &SQL),
+    ("cr", &CRYSTAL),
+    ("crystal", &CRYSTAL),
+    ("csharp", &CS),
+    ("csx", &CS),
+    ("cts", &JS),
+    ("cu", &C),
+    ("cuh", &C),
+    ("cython", &PY),
+    ("d", &D),
+    ("dash", &SHELL),
+    ("desktop", &INI),
+    ("di", &D),
+    ("dlang", &D),
+    ("docker-compose", &YAML),
+    ("dosbatch", &SHELL),
+    ("dotenv", &INI),
+    ("duckdb", &SQL),
+    ("edn", &LISP),
+    ("editorconfig", &INI),
+    ("el", &LISP),
+    ("elisp", &LISP),
+    ("elixir", &ELIXIR),
+    ("elm", &HASKELL),
+    ("elvish", &SHELL),
+    ("env", &INI),
+    ("erl", &ERLANG),
+    ("erlang", &ERLANG),
+    ("ex", &ELIXIR),
+    ("exs", &ELIXIR),
+    ("f03", &FORTRAN),
+    ("f08", &FORTRAN),
+    ("f90", &FORTRAN),
+    ("f95", &FORTRAN),
+    ("fish", &SHELL),
+    ("for", &FORTRAN),
+    ("fortran", &FORTRAN),
+    ("fs", &FSHARP),
+    ("fsi", &FSHARP),
+    ("fsharp", &FSHARP),
+    ("fsx", &FSHARP),
+    ("gawk", &AWK),
+    ("geojson", &JSON),
+    ("gitconfig", &INI),
+    ("gleam", &GLEAM),
+    ("gql", &GRAPHQL),
+    ("graphql", &GRAPHQL),
+    ("gradle", &GROOVY),
+    ("groovy", &GROOVY),
+    ("gvy", &GROOVY),
+    ("haskell", &HASKELL),
+    ("hcl", &HCL),
+    ("hh", &CPP),
+    ("hjson", &JSONC),
+    ("hql", &SQL),
+    ("hrl", &ERLANG),
+    ("hs", &HASKELL),
+    ("hxx", &CPP),
+    ("inf", &INI),
+    ("ipp", &CPP),
+    ("ipython", &PY),
+    ("jenkinsfile", &GROOVY),
+    ("jl", &JULIA),
+    ("julia", &JULIA),
+    ("ksh", &SHELL),
+    ("ksh93", &SHELL),
+    ("kt", &JAVA),
+    ("kts", &JAVA),
+    ("latex", &LATEX),
+    ("lhs", &HASKELL),
+    ("lisp", &LISP),
+    ("lsp", &LISP),
+    ("ltx", &LATEX),
+    ("luau", &LUA),
+    ("make", &SHELL),
+    ("mariadb", &SQL),
+    ("matlab", &MATLAB),
+    ("mjs", &JS),
+    ("mk", &SHELL),
+    ("mksh", &SHELL),
+    ("ml", &OCAML),
+    ("mli", &OCAML),
+    ("mm", &CPP),
+    ("mts", &JS),
+    ("mysql", &SQL),
+    ("nasm", &ASM),
+    ("ndjson", &JSONC),
+    ("nim", &NIM),
+    ("nimble", &NIM),
+    ("nims", &NIM),
+    ("nix", &NIX),
+    ("npmrc", &INI),
+    ("nse", &LUA),
+    ("nu", &SHELL),
+    ("nushell", &SHELL),
+    ("ocaml", &OCAML),
+    ("octave", &MATLAB),
+    ("odin", &ODIN),
+    ("osascript", &APPLESCRIPT),
+    ("pas", &PASCAL),
+    ("pascal", &PASCAL),
+    ("pcss", &CSS),
+    ("perl", &PERL),
+    ("pgsql", &SQL),
+    ("php3", &PHP),
+    ("php4", &PHP),
+    ("php5", &PHP),
+    ("php7", &PHP),
+    ("phtml", &PHP),
+    ("pl", &PERL),
+    ("playbook", &YAML),
+    ("plist", &HTML),
+    ("plpgsql", &SQL),
+    ("plsql", &SQL),
+    ("pm", &PERL),
+    ("podspec", &RUBY),
+    ("postcss", &CSS),
+    ("postgres", &SQL),
+    ("postgresql", &SQL),
+    ("pp", &PASCAL),
+    ("proto", &PROTO),
+    ("protobuf", &PROTO),
+    ("psd1", &SHELL),
+    ("psm1", &SHELL),
+    ("puppet", &PUPPET),
+    ("py3", &PY),
+    ("pyi", &PY),
+    ("python3", &PY),
+    ("pyx", &PY),
+    ("r", &R),
+    ("racket", &LISP),
+    ("rake", &RUBY),
+    ("redshift", &SQL),
+    ("reg", &INI),
+    ("riscv", &ASM),
+    ("rkt", &LISP),
+    ("rmd", &R),
+    ("rockspec", &LUA),
+    ("rss", &HTML),
+    ("ru", &RUBY),
+    ("sage", &PY),
+    ("scheme", &LISP),
+    ("scm", &LISP),
+    ("service", &INI),
+    ("sh-session", &SHELL),
+    ("shell-session", &SHELL),
+    ("shtml", &HTML),
+    ("snowflake", &SQL),
+    ("sol", &SOLIDITY),
+    ("solidity", &SOLIDITY),
+    ("sqlite", &SQL),
+    ("sqlite3", &SQL),
+    ("starlark", &STARLARK),
+    ("sty", &LATEX),
+    ("sv", &VERILOG),
+    ("svelte", &HTML),
+    ("systemd", &INI),
+    ("systemverilog", &VERILOG),
+    ("tcl", &TCL),
+    ("terraform", &HCL),
+    ("tex", &LATEX),
+    ("tf", &HCL),
+    ("tfvars", &HCL),
+    ("tk", &TCL),
+    ("transactsql", &SQL),
+    ("tsql", &SQL),
+    ("unit", &INI),
+    ("v", &V),
+    ("verilog", &VERILOG),
+    ("vh", &VERILOG),
+    ("vim", &VIM),
+    ("viml", &VIM),
+    ("vlang", &V),
+    ("vue", &HTML),
+    ("wasm", &WAT),
+    ("wat", &WAT),
+    ("wsdl", &HTML),
+    ("xaml", &HTML),
+    ("xhtml", &HTML),
+    ("xonsh", &SHELL),
+    ("xsd", &HTML),
+    ("xsl", &HTML),
+    ("xslt", &HTML),
+    ("zig", &ZIG),
+    ("zon", &ZIG),
 ];
 
 fn spec(lang: &str) -> Option<&'static Spec> {
@@ -781,6 +1000,515 @@ const LUA: Spec = Spec {
 };
 
 const HTML: Spec = Spec { markup: true, ..BASE };
+
+// The rest of the families, and the reason each has a scanner of its own: a language
+// whose comments and strings are not another's cannot be read by another's table. Each
+// keyword list holds the words a reader needs told apart rather than a grammar's whole
+// reserved set -- a short honest list is worth more than a long invented one -- and a
+// language whose case carries no meaning says so, because otherwise `IF` would be
+// painted as a class the author invented.
+const R: Spec = Spec {
+    line: &["#"],
+    quotes: "\"'",
+    capitals: false,
+    keywords: &[
+        "break", "else", "FALSE", "for", "function", "if", "in", "Inf", "library", "NA", "NaN",
+        "next", "NULL", "repeat", "require", "return", "TRUE", "while",
+    ],
+    ..BASE
+};
+
+const JULIA: Spec = Spec {
+    line: &["#"],
+    block: &[("#=", "=#")],
+    quotes: "\"",
+    keywords: &[
+        "abstract", "baremodule", "begin", "break", "catch", "const", "continue", "do", "else",
+        "elseif", "end", "export", "false", "finally", "for", "function", "global", "if", "import",
+        "in", "isa", "let", "local", "macro", "module", "mutable", "nothing", "primitive", "quote",
+        "return", "struct", "true", "try", "using", "where", "while",
+    ],
+    ..BASE
+};
+
+const PERL: Spec = Spec {
+    line: &["#"],
+    quotes: "\"'",
+    capitals: false,
+    dollar: true,
+    keywords: &[
+        "and", "cmp", "continue", "die", "do", "else", "elsif", "eq", "for", "foreach", "ge", "gt",
+        "if", "last", "le", "local", "lt", "my", "ne", "next", "not", "or", "our", "package", "print",
+        "redo", "require", "return", "say", "state", "sub", "unless", "until", "use", "warn", "while",
+    ],
+    ..BASE
+};
+
+const HASKELL: Spec = Spec {
+    line: &["--"],
+    block: &[("{-", "-}")],
+    quotes: "\"",
+    char_lit: true,
+    keywords: &[
+        "as", "case", "class", "data", "default", "deriving", "do", "else", "foreign", "hiding", "if",
+        "import", "in", "infix", "infixl", "infixr", "instance", "let", "module", "newtype", "of",
+        "qualified", "then", "type", "where",
+    ],
+    ..BASE
+};
+
+const OCAML: Spec = Spec {
+    block: &[("(*", "*)")],
+    quotes: "\"",
+    char_lit: true,
+    keywords: &[
+        "and", "as", "assert", "begin", "class", "constraint", "do", "done", "downto", "else", "end",
+        "exception", "external", "false", "for", "fun", "function", "functor", "if", "in", "include",
+        "inherit", "initializer", "lazy", "let", "match", "method", "module", "mutable", "new",
+        "object", "of", "open", "or", "private", "rec", "sig", "struct", "then", "to", "true", "try",
+        "type", "val", "virtual", "when", "while", "with",
+    ],
+    ..BASE
+};
+
+const FSHARP: Spec = Spec {
+    line: &["//"],
+    block: &[("(*", "*)")],
+    quotes: "\"",
+    keywords: &[
+        "abstract", "and", "as", "assert", "base", "begin", "class", "default", "delegate", "do",
+        "done", "downto", "elif", "else", "end", "exception", "extern", "false", "finally", "for",
+        "fun", "function", "if", "in", "inherit", "inline", "interface", "internal", "lazy", "let",
+        "match", "member", "module", "mutable", "namespace", "new", "null", "of", "open", "or",
+        "override", "private", "public", "rec", "return", "static", "struct", "then", "to", "true",
+        "try", "type", "use", "val", "void", "when", "while", "with", "yield",
+    ],
+    ..BASE
+};
+
+const ERLANG: Spec = Spec {
+    line: &["%"],
+    quotes: "\"",
+    char_lit: true,
+    capitals: false,
+    keywords: &[
+        "after", "andalso", "band", "begin", "bnot", "bor", "bsl", "bsr", "bxor", "case", "catch",
+        "cond", "div", "end", "fun", "if", "let", "not", "of", "orelse", "receive", "rem", "throw",
+        "try", "when", "xor",
+    ],
+    ..BASE
+};
+
+const ELIXIR: Spec = Spec {
+    line: &["#"],
+    quotes: "\"",
+    keywords: &[
+        "after", "alias", "and", "case", "catch", "cond", "def", "defdelegate", "defexception",
+        "defimpl", "defmacro", "defmodule", "defp", "defprotocol", "defstruct", "do", "else", "end",
+        "fn", "for", "if", "import", "in", "not", "or", "quote", "raise", "receive", "require",
+        "rescue", "super", "throw", "try", "unless", "unquote", "use", "when", "with",
+    ],
+    ..BASE
+};
+
+const NIM: Spec = Spec {
+    line: &["#"],
+    block: &[("#[", "]#")],
+    quotes: "\"",
+    keywords: &[
+        "and", "as", "block", "break", "case", "const", "continue", "converter", "defer", "discard",
+        "distinct", "div", "do", "elif", "else", "enum", "except", "export", "finally", "for", "from",
+        "func", "if", "import", "in", "include", "interface", "is", "isnot", "iterator", "let",
+        "macro", "method", "mixin", "mod", "nil", "not", "notin", "object", "of", "or", "proc", "ptr",
+        "raise", "ref", "return", "shl", "shr", "static", "template", "try", "tuple", "type", "using",
+        "var", "when", "while", "xor", "yield",
+    ],
+    ..BASE
+};
+
+const ZIG: Spec = Spec {
+    line: &["//"],
+    quotes: "\"",
+    char_lit: true,
+    keywords: &[
+        "align", "allowzero", "and", "anyframe", "anytype", "asm", "async", "await", "break",
+        "callconv", "catch", "comptime", "const", "continue", "defer", "else", "enum", "errdefer",
+        "error", "export", "extern", "fn", "for", "if", "inline", "linksection", "noalias",
+        "nosuspend", "opaque", "or", "orelse", "packed", "pub", "resume", "return", "struct",
+        "suspend", "switch", "test", "threadlocal", "try", "union", "unreachable", "usingnamespace",
+        "var", "volatile", "while",
+    ],
+    ..BASE
+};
+
+const V: Spec = Spec {
+    line: &["//"],
+    block: &[("/*", "*/")],
+    quotes: "\"'",
+    keywords: &[
+        "as", "asm", "assert", "atomic", "break", "const", "continue", "defer", "else", "enum",
+        "false", "fn", "for", "go", "goto", "if", "import", "in", "interface", "is", "isreftype",
+        "lock", "match", "module", "mut", "nil", "none", "or", "pub", "return", "rlock", "select",
+        "shared", "sizeof", "spawn", "static", "struct", "true", "type", "typeof", "union", "unsafe",
+        "volatile", "while",
+    ],
+    ..BASE
+};
+
+const FORTRAN: Spec = Spec {
+    line: &["!"],
+    quotes: "\"'",
+    insensitive: true,
+    capitals: false,
+    keywords: &[
+        "allocate", "allocatable", "call", "case", "character", "close", "common", "complex",
+        "contains", "continue", "cycle", "data", "deallocate", "dimension", "do", "double", "else",
+        "elseif", "end", "enddo", "endif", "entry", "equivalence", "exit", "external", "format",
+        "function", "goto", "if", "implicit", "in", "include", "inout", "integer", "intent",
+        "interface", "intrinsic", "logical", "module", "none", "open", "optional", "parameter",
+        "pointer", "precision", "print", "private", "program", "public", "read", "real", "recursive",
+        "return", "save", "select", "stop", "subroutine", "then", "type", "use", "where", "while",
+        "write",
+    ],
+    ..BASE
+};
+
+const PASCAL: Spec = Spec {
+    line: &["//"],
+    block: &[("{", "}"), ("(*", "*)")],
+    quotes: "'",
+    insensitive: true,
+    capitals: false,
+    keywords: &[
+        "and", "array", "begin", "case", "class", "const", "constructor", "destructor", "div", "do",
+        "downto", "else", "end", "except", "file", "finally", "for", "function", "goto", "if",
+        "implementation", "in", "inherited", "inline", "interface", "label", "mod", "nil", "not",
+        "object", "of", "operator", "or", "packed", "procedure", "program", "property", "raise",
+        "record", "repeat", "set", "shl", "shr", "then", "to", "try", "type", "unit", "until", "uses",
+        "var", "while", "with", "xor",
+    ],
+    ..BASE
+};
+
+const ADA: Spec = Spec {
+    line: &["--"],
+    quotes: "\"",
+    char_lit: true,
+    insensitive: true,
+    capitals: false,
+    keywords: &[
+        "abort", "abs", "abstract", "accept", "access", "aliased", "all", "and", "array", "at",
+        "begin", "body", "case", "constant", "declare", "delay", "delta", "digits", "do", "else",
+        "elsif", "end", "entry", "exception", "exit", "for", "function", "generic", "goto", "if",
+        "in", "interface", "is", "limited", "loop", "mod", "new", "not", "null", "of", "or", "others",
+        "out", "overriding", "package", "pragma", "private", "procedure", "protected", "raise",
+        "range", "record", "rem", "renames", "requeue", "return", "reverse", "select", "separate",
+        "subtype", "tagged", "task", "terminate", "then", "type", "until", "use", "when", "while",
+        "with", "xor",
+    ],
+    ..BASE
+};
+
+const D: Spec = Spec {
+    line: &["//"],
+    block: &[("/*", "*/"), ("/+", "+/")],
+    quotes: "\"`",
+    keywords: &[
+        "abstract", "alias", "align", "asm", "assert", "auto", "body", "break", "case", "cast",
+        "catch", "class", "const", "continue", "debug", "default", "delegate", "delete",
+        "deprecated", "do", "else", "enum", "export", "extern", "false", "final", "finally", "for",
+        "foreach", "foreach_reverse", "function", "goto", "if", "immutable", "import", "in", "inout",
+        "interface", "invariant", "is", "lazy", "mixin", "module", "new", "nothrow", "null", "out",
+        "override", "package", "pragma", "private", "protected", "public", "pure", "ref", "return",
+        "scope", "shared", "static", "struct", "super", "switch", "synchronized", "template", "this",
+        "throw", "true", "try", "typeid", "typeof", "union", "unittest", "version", "while", "with",
+    ],
+    ..BASE
+};
+
+const MATLAB: Spec = Spec {
+    line: &["%"],
+    block: &[("%{", "%}")],
+    quotes: "\"'",
+    capitals: false,
+    keywords: &[
+        "break", "case", "catch", "classdef", "continue", "else", "elseif", "end", "enumeration",
+        "events", "for", "function", "global", "if", "methods", "otherwise", "parfor", "persistent",
+        "properties", "return", "spmd", "switch", "try", "while",
+    ],
+    ..BASE
+};
+
+const TCL: Spec = Spec {
+    line: &["#"],
+    quotes: "\"",
+    capitals: false,
+    dollar: true,
+    keywords: &[
+        "after", "append", "array", "break", "catch", "cd", "close", "concat", "continue", "dict",
+        "else", "elseif", "error", "eval", "exec", "exit", "expr", "file", "for", "foreach", "format",
+        "gets", "global", "if", "incr", "info", "join", "lappend", "lindex", "list", "llength",
+        "lrange", "lsearch", "lsort", "namespace", "open", "package", "proc", "puts", "read",
+        "regexp", "regsub", "rename", "return", "scan", "set", "source", "split", "string", "subst",
+        "switch", "tell", "then", "unset", "uplevel", "upvar", "variable", "vwait", "while",
+    ],
+    ..BASE
+};
+
+const AWK: Spec = Spec {
+    line: &["#"],
+    quotes: "\"",
+    capitals: false,
+    keywords: &[
+        "BEGIN", "END", "break", "close", "continue", "delete", "do", "else", "exit", "fflush",
+        "for", "function", "getline", "gsub", "if", "in", "index", "int", "length", "match", "next",
+        "nextfile", "print", "printf", "return", "split", "sprintf", "sub", "substr", "system",
+        "tolower", "toupper", "while",
+    ],
+    ..BASE
+};
+
+const LISP: Spec = Spec {
+    line: &[";"],
+    block: &[("#|", "|#")],
+    quotes: "\"",
+    capitals: false,
+    keywords: &[
+        "and", "apply", "car", "case", "cdr", "cond", "cons", "defconstant", "defmacro",
+        "defparameter", "defun", "defvar", "do", "dolist", "dotimes", "else", "eval", "funcall",
+        "if", "lambda", "let", "list", "loop", "mapcar", "nil", "not", "or", "progn", "quote",
+        "reduce", "require", "setf", "setq", "t", "unless", "when",
+    ],
+    ..BASE
+};
+
+const HCL: Spec = Spec {
+    line: &["#", "//"],
+    block: &[("/*", "*/")],
+    quotes: "\"",
+    keywords: &[
+        "backend", "check", "data", "dynamic", "false", "for", "for_each", "if", "in", "locals",
+        "module", "null", "output", "provider", "provisioner", "resource", "terraform", "true",
+        "variable",
+    ],
+    ..BASE
+};
+
+const NIX: Spec = Spec {
+    line: &["#"],
+    block: &[("/*", "*/")],
+    quotes: "\"",
+    dollar: true,
+    keywords: &[
+        "assert", "builtins", "derivation", "else", "false", "if", "import", "in", "inherit", "let",
+        "null", "or", "rec", "then", "throw", "true", "with",
+    ],
+    ..BASE
+};
+
+const PROTO: Spec = Spec {
+    line: &["//"],
+    block: &[("/*", "*/")],
+    quotes: "\"",
+    keywords: &[
+        "default", "enum", "extend", "extensions", "false", "import", "map", "message", "oneof",
+        "option", "optional", "package", "public", "repeated", "required", "reserved", "returns",
+        "rpc", "service", "stream", "syntax", "to", "true", "weak",
+    ],
+    ..BASE
+};
+
+const GRAPHQL: Spec = Spec {
+    line: &["#"],
+    quotes: "\"",
+    triples: &["\"\"\""],
+    keywords: &[
+        "directive", "enum", "extend", "false", "fragment", "implements", "input", "interface",
+        "mutation", "null", "on", "query", "repeatable", "scalar", "schema", "subscription", "true",
+        "type", "union",
+    ],
+    ..BASE
+};
+
+const SOLIDITY: Spec = Spec {
+    line: &["//"],
+    block: &[("/*", "*/")],
+    quotes: "\"'",
+    keywords: &[
+        "abstract", "address", "anonymous", "as", "assembly", "break", "calldata", "case", "catch",
+        "constant", "constructor", "continue", "contract", "default", "delete", "do", "else", "emit",
+        "enum", "error", "event", "external", "fallback", "false", "for", "function", "if",
+        "immutable", "import", "indexed", "interface", "internal", "is", "library", "mapping",
+        "memory", "modifier", "new", "override", "payable", "pragma", "private", "public", "pure",
+        "receive", "return", "returns", "revert", "storage", "struct", "true", "try", "type",
+        "unchecked", "using", "view", "virtual", "while",
+    ],
+    ..BASE
+};
+
+const LATEX: Spec = Spec {
+    line: &["%"],
+    capitals: false,
+    keywords: &[
+        "author", "begin", "bibliography", "caption", "cdot", "centering", "chapter", "cite",
+        "documentclass", "emph", "end", "figure", "frac", "hline", "hspace", "include",
+        "includegraphics", "infty", "int", "item", "label", "left", "maketitle", "mathrm",
+        "paragraph", "part", "ref", "renewcommand", "right", "section", "sqrt", "subsection",
+        "subsubsection", "sum", "table", "textbf", "textit", "texttt", "times", "title", "today",
+        "usepackage", "vspace",
+    ],
+    ..BASE
+};
+
+const VIM: Spec = Spec {
+    line: &["\""],
+    quotes: "'",
+    capitals: false,
+    keywords: &[
+        "abort", "augroup", "autocmd", "break", "call", "catch", "command", "continue", "echo",
+        "echom", "else", "elseif", "endfor", "endfunction", "endif", "endtry", "endwhile", "execute",
+        "finally", "finish", "for", "function", "highlight", "if", "in", "let", "map", "nmap",
+        "nnoremap", "normal", "return", "set", "silent", "syntax", "throw", "try", "unlet", "vmap",
+        "while",
+    ],
+    ..BASE
+};
+
+const ASM: Spec = Spec {
+    line: &[";"],
+    quotes: "\"",
+    char_lit: true,
+    insensitive: true,
+    capitals: false,
+    keywords: &[
+        "add", "and", "call", "cmp", "db", "dd", "dec", "div", "dq", "dw", "equ", "global", "imul",
+        "inc", "int", "je", "jg", "jl", "jmp", "jne", "jz", "lea", "mov", "mul", "nop", "not", "or",
+        "pop", "push", "resb", "resd", "resw", "ret", "rol", "ror", "sar", "sbb", "section", "shl",
+        "shr", "sub", "syscall", "test", "xor",
+    ],
+    ..BASE
+};
+
+const VERILOG: Spec = Spec {
+    line: &["//"],
+    block: &[("/*", "*/")],
+    quotes: "\"",
+    keywords: &[
+        "always", "assign", "begin", "bit", "case", "casex", "casez", "default", "else", "end",
+        "endcase", "endfunction", "endgenerate", "endmodule", "endtask", "for", "forever", "function",
+        "generate", "if", "initial", "inout", "input", "integer", "localparam", "logic", "module",
+        "negedge", "output", "parameter", "posedge", "real", "reg", "repeat", "signed", "task",
+        "timescale", "unsigned", "while", "wire",
+    ],
+    ..BASE
+};
+
+const WAT: Spec = Spec {
+    line: &[";;"],
+    block: &[("(;", ";)")],
+    quotes: "\"",
+    capitals: false,
+    keywords: &[
+        "block", "br", "br_if", "br_table", "call", "call_indirect", "data", "drop", "elem", "else",
+        "end", "export", "f32", "f64", "func", "global", "i32", "i64", "if", "import", "local",
+        "loop", "memory", "module", "mut", "param", "result", "return", "select", "start", "table",
+        "type", "v128",
+    ],
+    ..BASE
+};
+
+const STARLARK: Spec = Spec {
+    line: &["#"],
+    quotes: "\"'",
+    triples: &["\"\"\""],
+    keywords: &[
+        "and", "break", "continue", "def", "elif", "else", "for", "if", "in", "lambda", "load",
+        "not", "or", "pass", "return", "while",
+    ],
+    ..BASE
+};
+
+const APPLESCRIPT: Spec = Spec {
+    line: &["--"],
+    block: &[("(*", "*)")],
+    quotes: "\"",
+    insensitive: true,
+    capitals: false,
+    keywords: &[
+        "and", "as", "at", "begin", "by", "considering", "contains", "continue", "copy", "div", "does",
+        "else", "end", "error", "every", "exit", "false", "first", "for", "from", "get", "given",
+        "global", "if", "ignoring", "in", "into", "is", "it", "its", "last", "local", "me", "mod",
+        "my", "not", "of", "on", "onto", "or", "over", "prop", "property", "put", "ref", "repeat",
+        "return", "script", "set", "some", "tell", "then", "to", "transaction", "true", "try",
+        "until", "where", "while", "whose", "with", "without",
+    ],
+    ..BASE
+};
+
+const CRYSTAL: Spec = Spec {
+    line: &["#"],
+    quotes: "\"",
+    keywords: &[
+        "abstract", "alias", "annotation", "as", "asm", "begin", "break", "case", "class", "def",
+        "do", "else", "elsif", "end", "ensure", "enum", "extend", "false", "for", "fun", "if", "in",
+        "include", "is_a", "lib", "macro", "module", "next", "nil", "of", "out", "private",
+        "protected", "require", "rescue", "return", "select", "self", "sizeof", "struct", "super",
+        "then", "true", "type", "typeof", "union", "unless", "until", "verbatim", "when", "while",
+        "with", "yield",
+    ],
+    ..BASE
+};
+
+const GLEAM: Spec = Spec {
+    line: &["//"],
+    quotes: "\"",
+    keywords: &[
+        "as", "assert", "case", "const", "echo", "else", "fn", "if", "import", "let", "opaque",
+        "panic", "pub", "todo", "type", "use",
+    ],
+    ..BASE
+};
+
+const ODIN: Spec = Spec {
+    line: &["//"],
+    block: &[("/*", "*/")],
+    quotes: "\"`",
+    keywords: &[
+        "asm", "auto_cast", "bit_set", "break", "case", "cast", "context", "continue", "defer",
+        "distinct", "do", "dynamic", "else", "enum", "fallthrough", "for", "foreign", "if", "import",
+        "in", "map", "matrix", "not_in", "or_else", "or_return", "package", "proc", "return",
+        "runtime", "soa", "struct", "switch", "transmute", "typeid", "union", "using", "when",
+        "where", "while",
+    ],
+    ..BASE
+};
+
+const PUPPET: Spec = Spec {
+    line: &["#"],
+    quotes: "\"'",
+    dollar: true,
+    keywords: &[
+        "and", "case", "class", "contain", "default", "define", "else", "elsif", "false", "function",
+        "if", "in", "inherits", "include", "node", "not", "or", "realize", "require", "return",
+        "tag", "true", "undef", "unless",
+    ],
+    ..BASE
+};
+
+const GROOVY: Spec = Spec {
+    line: &["//"],
+    block: &[("/*", "*/")],
+    quotes: "\"'",
+    triples: &["\"\"\""],
+    keywords: &[
+        "abstract", "as", "assert", "break", "case", "catch", "class", "const", "continue", "def",
+        "default", "do", "else", "enum", "extends", "false", "final", "finally", "for", "goto", "if",
+        "implements", "import", "in", "instanceof", "interface", "new", "null", "package", "private",
+        "protected", "public", "return", "static", "super", "switch", "synchronized", "this",
+        "throw", "throws", "trait", "true", "try", "var", "while",
+    ],
+    ..BASE
+};
 
 #[cfg(test)]
 mod tests {
@@ -1097,5 +1825,36 @@ mod tests {
             matches!(role, ColorRole::String) && src[r.start..r.end].contains("oops")
         });
         assert!(!has_string, "an unclosed string is not a string: {out:?}");
+    }
+
+    /// A name listed twice is a name whose second entry can never be reached, and the
+    /// count of languages this build reads is written down nowhere else. The names a
+    /// fence may carry are what grew here, so the test also holds the ones a reader of
+    /// this file would expect to find, and the two that are still not read.
+    #[test]
+    fn every_language_is_named_once_and_the_new_names_are_read() {
+        let mut names: Vec<&str> = SPECS.iter().map(|(n, _)| *n).collect();
+        let count = names.len();
+        names.sort_unstable();
+        names.dedup();
+        assert_eq!(names.len(), count, "a name is listed twice");
+        assert!(count >= 273, "the table lost names: {count}");
+        for lang in [
+            "julia", "haskell", "zig", "solidity", "r", "hcl", "latex", "wat", "tcl", "asm",
+            "fortran", "ada", "applescript", "crystal", "odin", "gleam", "puppet", "groovy",
+            "verilog", "lisp", "matlab", "nim", "v", "d", "erlang", "elixir", "fsharp", "ocaml",
+            "perl", "awk", "nix", "proto", "graphql", "starlark", "vim", "kotlin", "mariadb", "vue",
+        ] {
+            assert!(knows(lang), "`{lang}` is not read");
+        }
+        // A language with no table here is set plain, which is the honest page rather
+        // than a guess at one, and `text` is a fence that says so on purpose.
+        assert!(!knows("cobol"));
+        assert!(!knows("brainfuck"));
+        assert!(!knows("text"));
+        // The two names a fixture already carried keep the scanners they had: `html` is
+        // the mark-up scan and `powershell` the shell's, and neither may drift.
+        assert_eq!(spec("html").map(|s| s.markup), Some(true));
+        assert_eq!(spec("powershell").map(|s| s.dollar), Some(true));
     }
 }
