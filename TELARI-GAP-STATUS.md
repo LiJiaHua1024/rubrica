@@ -2,7 +2,7 @@
 
 > 权威差距依据：`TELARI-GAP.md`（2026-10-16 调研，对照 Telari 0.6.3）。第五节"已领先"不计入目标。
 > 本文件是唯一进度权威：会话上下文只是缓存；恢复只看本文件。事件发生（完成子步骤、跑完闸门、换子 agent）时立刻更新，不攒批。
-> 建账：2026-10-16（冷启动）。最近更新：2026-10-17 G6（表格与行内代码样式）master 复核通过并本地提交；恢复区已切至 G7（排版预设可编辑深度）。
+> 建账：2026-10-16（冷启动）。最近更新：2026-10-19 清理模型服务抽风相关记录（§0 增"模型服务已更换"说明、§1 恢复区去掉会话史噪声）；上一次实质性推进：2026-10-17 G6（表格与行内代码样式）master 复核通过并本地提交，恢复区已切至 G7（排版预设可编辑深度）。
 
 ## 0. 用户侧操作（照此执行）
 
@@ -12,6 +12,7 @@
 - 硬约束：绝不 push；一个条目一个提交；不 amend / rebase / reset 已提交历史；不修改 `TELARI-GAP.md` 调研正文。
 - **运行约束（用户 2026-10-17 强调）**：验证一律用无头模式（`--report`、`--report --shapes`、带导出参数的 CLI），**绝不裸启动 GUI 进程**——连 `--version` 这类未识别参数都会把窗口/托盘拉起来；用户可能正在用 Rubrica，托盘单实例会被顶掉。
 - **验证坏值必须带无头动作**（2026-10-17 G6 master 复核发现）：`--tables`/`--inline-code` 等值只在 `--report`/`--export-*` 分支里校验；不带无头动作时 `--tables nope FILE` 会落到 GUI 分派（单实例交接后静默 exit 0）——既测不到 exit 1，也会误拉 GUI。故坏值测试一律写成 `--report --tables nope FILE`（其余带值开关同理）。
+- **模型服务已更换（用户 2026-10-19 告知）**：G6 期间出现的限流 / provider 暂时不可用 / 容量不足类中断不再是预期风险。子 agent 不必为它做任何特殊设计（不做重试风暴、不加退避、不因"可能被限流"而缩小工作粒度）；遇到任何中断一律按常规断点续作处理。
 - 用户未提交的无关改动：`.freebuff/`（未跟踪目录）、`TELARI-GAP.md`（未跟踪，证据基线）——保留不动，已记账。
 
 ## 1. 恢复区（子 agent 运行时由子 agent 实时维护；master 复核后刷新）
@@ -22,8 +23,8 @@
 - 更早条目结论：**G4 `==highlight==` 荧光标记 已完成**（2026-10-17 master 复核：四闸门亲跑全绿——test 256+36+116+117+53+4+7+64+19、clippy 默认+`--features pdf`、release build、`git diff --check`；抽查：after 二进制与 `target/release` md5 同为 `44259aed…`；`highlight.md` 前后数字逐条吻合（后 15/35/1128pt、`highlight: 22 span(s) in 6 block(s) -> 23 band(s) drawn`、复制 1961/29 breaks/2 tabs、RTL 4 chars；前 15/38/1200pt、复制 2049）、`--no-highlights` 输出与 before 逐字节相同；`--shapes` 探针逐位一致（band left=143.61 top=52.45 width=160.38 height=22.50；cell 2 带 left=197.05 width=92.33/83.70 top=54.52/100.42）；全量 21 文件对比仅新 fixture `highlight.md` 自身有差（report/shapes 各 1）、其余 20 个前后逐字节相同、`--source` 21 文件 0 差异；PNG 像素实测亮带 (250,230,107)=15169、暗带 (82,71,23)=15169、`--no-highlights` 双色均 0 → 判定达成，本地提交 `feat: draw ==marks== as a highlight`）。需人工确认项（长 run 字面偏离、链接/上标内 `==` 偏离、明暗观感、cell 行级缓冲、`==x^2^==` 带断两段）已记录。
 - 当前条目内的下一步动作：**为 G7 起子 agent**。G6 已提交（`feat: choose the table rules and the code capsule`），其落点如下，G7 可直接复用：`theme.rs`（`TableLines` + `table_lines`/`code_capsule` + `set_*` + `ResolvedStyle.capsule`）、`view.rs`（两套表线只改画哪些 `Op::Line`；胶囊按 StyleSpan 合并、0.15em pad、`Surface` 色、只画不排版；`TableSpan` 增 left/right/cut 并在 `write_pdf` 切段收口）、`settings.rs`（`TableLines`/`CodeCapsule` 存取 + 纯 `_of` 回退）、`main.rs`（`--tables grid|booktabs`、`--inline-code plain|capsule`，坏值拒绝 exit 1，带无头动作时）、`i18n.rs`（新文案 ×11）、`report.rs`（仅非默认打 `tables`/`inline code` 条件行）、`fixtures/tables.md` + `fixtures/README.md`/`README.md`/`IMPLEMENTATION.md`。
 - 本次接手会话复验（2026-10-17）：四闸门亲跑全绿（test 284+36+116+117+53+4+7+64+19、clippy 默认、clippy `--features pdf`、release、`git diff --check`；无新增 `#[allow]`/`unwrap`/`panic`）；默认 22 fixture ×（report/shapes/source）共 65 份与 before（`a23a8a55…` = HEAD G5）逐字节相同、无新条件行；grid vs booktabs 报告仅差一行；capsule 报告 18 span/19 capsule；坏值 exit 1；默认 PNG 三方相同，胶囊像素 0/1847/1847，表线两风格差 571px；PDF 长表两风格收口线逐页核对吻合。**重要更正**：`target/release/rubrica-app.exe` 的 md5 每次 link 都不同（MSVC PE 链接时间戳，不可复现），台账此前记录的 after md5 不成立；证据一律以输出（report/PNG/PDF）为准，跨会话逐字节稳定。详见 §3-G6「本次接手会话独立复验」条与 §5 置顶。
-- 后台子 agent sessionID：**无**（G6 已由接手会话 #4 `ses_eb747dd99ffeKUAueZqc7LZPpb` 独立复验、master 复核通过并提交；G6 会话史：`ses_eb7dbef28ffed1iYW3SHXukt0P` 两度限流、`ses_eb78084feffekojkTVLZ3QgPux` 遇 provider 短暂不可用、`ses_eb75c40ceffepS5Q6BV4ZxK5bj` 遇"Model serving capacity is currently full"、`ses_eb747dd99ffeKUAueZqc7LZPpb` 接手复核完成。G7 待起新会话）
-- 未提交改动清单：无（G6 已于本文件内记录后提交）。未跟踪项仍只有 `.freebuff/` 与 `TELARI-GAP.md`（保留不动）。
+- 后台子 agent sessionID：**无**（G6 已完成并本地提交；G7 待起新会话）
+- 未提交改动清单：**无**（2026-10-19 的台账清理改动已由 2026-10-19 master 以 `docs:` 提交落盘）。未跟踪项为 `.freebuff/`（目录，内含 `winctl.exe` 等用户工具）与 `TELARI-GAP.md`（证据基线）——保留不动。**更正**：本行曾把 `GOAL-DRIVEN-PROMPT.md` 列为未跟踪项，实测该文件在本目录不存在（2026-10-19 master 全目录搜索零命中）。
 - 已知阻塞：无
 - 基线状态：2026-10-16 `cargo test --workspace --locked` 全绿（冷启动基线，master 亲跑）；G2 收尾复跑 250+36+86+117+53+4+7+64+19、0 失败
 - 分工约定：子 agent 拥有当前条目（§3.x 明细 + 本恢复区 + §5 日志）的写权，实时落盘；master 拥有状态总表（§2）、复核结论与 commit。一次只有一条 `进行中`，同一时刻只有一个写代码的子 agent。
@@ -391,6 +392,9 @@
 - G15 Space 翻页模型差异：**待核实**（差距文档只描述"模型不同"）。核实点：Space 键现行为与页栈语义。
 
 ## 5. 事件日志（倒序，追加）
+
+- 2026-10-19 master（接手 goal-driven 流程）：**建立 G7 基线并起子 agent**。亲跑：`git --no-pager log --oneline -15` HEAD `ddb52f33708faff0443b671c8afb6d6966451ebb`（`ddb52f3`）、工作树仅本文件有改动；`cargo test --workspace --locked` **287+36+116+117+53+4+7+64+19 = 703 通过 / 0 失败**；`cargo clippy --workspace --all-targets --locked -- -D warnings` 与 `cargo clippy -p rubrica-app --all-targets --features pdf --locked -- -D warnings` 均 0 警告；`cargo build --release --locked` 成功（2473472 B）；`git diff --check` 干净。before 基线二进制存 `%TEMP%\opencode\rubrica-before-g7.exe`（md5 `12ee681f54331d5534c2044b23008cbb`，仅作"同一份产物"的标识，不作跨构建不变量）。同时把上一轮的台账清理改动连同 §1 两处更正（`GOAL-DRIVEN-PROMPT.md` 实测不存在；未跟踪项只有 `.freebuff/` 与 `TELARI-GAP.md`）作为 `docs:` 提交落盘。随后为 **G7 排版预设可编辑深度** 起子 agent。
+- 2026-10-19 master（人工触发）：**清理模型服务抽风相关记录**。§0 新增"模型服务已更换（用户 2026-10-19 告知）"条，说明限流 / provider 不可用 / 容量不足类中断不再是预期风险，子 agent 不必为其做特殊设计；§1 恢复区的"后台子 agent sessionID"一行只保留当前状态（G6 已完成并提交；G7 待起新会话），去掉 G6 会话史里的限流与容量类噪声。同日删除过期的 `.qoder\HANDOVER.md`（2026-09-23 快照，其"唯一功能缺口 #40 bidi"早已落地，差距文档第五节已把双向文字列为 Rubrica 领先项；该文件被 gitignore，删除不影响仓库）；其中仍有效的工程约定与验证手法（三条支柱、`--report` 双计数、两条排版不变量、禁止 `cargo fmt`、测试不得构造 `FontEngine`）并入 `GOAL-DRIVEN-PROMPT.md` 的「工程约定与验证手法」节。本条只改台账文字与删一个被忽略的本地文件，未改任何代码、未动 `TELARI-GAP.md`、未 commit、未 push。§5 更早条目中的抽风记录按"倒序，追加"规则保留为历史事实，但不再作为后续排期与风险判断的依据。
 
 - 2026-10-17 master：**G6 复核通过并本地提交** `feat: choose the table rules and the code capsule`（不 push）。四闸门亲跑全绿（test 284+36+116+117+53+4+7+64+19 / 0 失败、clippy 默认、clippy `--features pdf`、`cargo build --release --locked`、`git diff --check`）；亲自复现接手会话证据：默认 22 fixture×3 变体 66 份与 before（`a23a8a55…`）逐字节相同且无 `tables`/`inline code` 条件行、grid vs booktabs 报告/形状仅多 `tables : 3 table(s)…` 一行、`--inline-code capsule` 报 `18 span(s), 19 capsule(s)`、默认 PNG before==after、表线探针 571/179280、胶囊像素 0/1847/1847、`--report --tables nope` 与 `--report --inline-code nope` exit 1；另用保留的 pdf-feature 二进制亲跑 `--pdf-height 300` 26 行长表：grid 首页收口 0.405（y 19.875..20.280）/续页 24.600..25.005 且重画表头与竖线，booktabs 续页 0.675（24.600..25.275）0 竖线、末页三线闭合；读 `view.rs` 确认 booktabs 只决定画哪些 `Op::Line`。**口径更正**：坏值只在**带无头动作**时校验（不带则落 GUI 分派、单实例交接后静默 exit 0）——已写入 §0 "验证坏值必须带无头动作"。**角色说明**：本轮 G6 实现由前几轮（子 agent 中断期间的主会话/接手会话）产出，独立复核由接手子 agent（会话 #4）与 master 各自完成——虽与常态（子 agent 实现、master 复核）相反，但两侧都独立跑过四闸门与证据。恢复区切至 G7（排版预设可编辑深度）。
 
