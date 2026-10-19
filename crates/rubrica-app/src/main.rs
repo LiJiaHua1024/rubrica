@@ -21,6 +21,7 @@ mod instance;
 mod math;
 mod pagination;
 mod peek;
+mod places;
 mod presets;
 mod report;
 mod reading;
@@ -103,6 +104,45 @@ fn main() -> Result<()> {
         }
         let query = tree::Query::of(&text_flag(&argv, "--tree-search").map(lossy).unwrap_or_default());
         for line in tree::describe(&tree::scan(&root, 2), &root, &query) {
+            println!("{line}");
+        }
+        return Ok(());
+    }
+    if has_flag(&argv, "--list-places") || has_flag(&argv, "--start-page") {
+        // The shelf and the folder history as the window reads them, printed with no
+        // window: the rows the menu and the start page are both built from. With
+        // `--start-page` the page itself is printed, which is what the reader would be
+        // looking at, and the same text can be handed to `--report` to be laid out.
+        let places = settings::restored_places();
+        let files: Vec<PathBuf> = settings::workspace()
+            .map(|snapshot| snapshot.recent.iter().map(|file| file.path.clone()).filter(|path| path.is_file()).collect())
+            .unwrap_or_default();
+        let start = places::Start { recent_files: &files, places: &places };
+        if has_flag(&argv, "--start-page") {
+            print!("{}", places::start_page(settings::current_language(), start));
+        } else {
+            for line in places::describe(start) {
+                println!("{line}");
+            }
+        }
+        return Ok(());
+    }
+    if has_flag(&argv, "--favourite-folder") || has_flag(&argv, "--unfavourite-folder") {
+        // Put a folder on the shelf or take it off, from the command line, and print the
+        // lists as they are afterwards. The folder asked about is a real one: a shelf of
+        // names that are not there is not a shelf, and the check happens before anything
+        // is written.
+        let adding = has_flag(&argv, "--favourite-folder");
+        let name = if adding { "--favourite-folder" } else { "--unfavourite-folder" };
+        let asked = PathBuf::from(text_flag(&argv, name).map(lossy).ok_or_else(|| format!("{name} needs a folder"))?);
+        if !asked.is_dir() {
+            return Err(format!("{name} wants a directory, not {}", asked.display()).into());
+        }
+        let mut places = settings::restored_places();
+        let folder = settings::folder_ref(&asked);
+        if adding { places.favourite(folder); } else { places.unfavourite(&folder); }
+        settings::record_places(&places)?;
+        for line in places::describe(places::Start { recent_files: &[], places: &places }) {
             println!("{line}");
         }
         return Ok(());
@@ -319,6 +359,9 @@ fn reopen() -> Option<PathBuf> {
     if let Some(snapshot) = settings::workspace() {
         match snapshot.session.active {
             Some(rubrica_workspace::DocumentRef::Sample) => None,
+            // The start page is made when it is shown, so a session that ended on it has
+            // nothing on disk to come back to: the sample is what is left.
+            Some(rubrica_workspace::DocumentRef::Start) => None,
             Some(rubrica_workspace::DocumentRef::File(file)) if settings::restorable_path(&file.path) => {
                 Some(file.path)
             }
@@ -364,13 +407,13 @@ fn has_flag(argv: &[OsString], name: &str) -> bool {
 /// `--width` and friends. A double-click names one; a multi-selection "open with" names
 /// several, and each of them is wanted.
 fn positionals(argv: &[OsString]) -> Vec<PathBuf> {
-    const TAKES_VALUE: [&str; 25] = [
+    const TAKES_VALUE: [&str; 27] = [
         "--width", "--dpi", "--zoom", "--face", "--measure", "--profile",
         "--export-png", "--export-width", "--export-scale", "--export-pdf",
         "--pdf-width", "--pdf-height", "--theme", "--tables", "--inline-code",
         "--marker-inset", "--list-marker-gap", "--list-bullet-size", "--quote-bar-gap",
         "--narrow-align", "--code-ladder", "--code-language", "--table-select",
-        "--list-tree", "--tree-search",
+        "--list-tree", "--tree-search", "--favourite-folder", "--unfavourite-folder",
     ];
     let mut skip_next = false;
     let mut flags_done = false;

@@ -288,6 +288,20 @@ pub enum Key {
     ErrorCannotReadTxtChapter,
     ErrorChooseAnotherName,
     ErrorTooManyPresets,
+
+    /// The page that lists the folders a reader keeps and the ones they were last in.
+    /// Its own title is also the menu row that opens it.
+    MenuStartPage,
+    /// Put the folder the panel is showing on the shelf.
+    MenuFavouriteFolder,
+    /// Take it off again: the same row, worded for what it will do next.
+    MenuUnfavouriteFolder,
+    /// The submenu label for the folders on the shelf.
+    MenuFavouriteFolders,
+    /// The submenu label for the folders the reader was last in.
+    MenuRecentFolders,
+    /// A group on the start page with nothing in it yet.
+    StartPageEmpty,
 }
 
 pub fn t(lang: Language, key: Key) -> &'static str {
@@ -460,6 +474,13 @@ fn translate_en(key: Key) -> &'static str {
         Key::StatusModified => "Modified",
         Key::StatusFormatPlain => "Plain text",
         Key::StatusReadingTimeValue => "~{n} min",
+
+        Key::MenuStartPage => "Start page",
+        Key::MenuFavouriteFolder => "Favourite this folder",
+        Key::MenuUnfavouriteFolder => "Remove from favourites",
+        Key::MenuFavouriteFolders => "Favourite folders",
+        Key::MenuRecentFolders => "Recent folders",
+        Key::StartPageEmpty => "Nothing here yet.",
     }
 }
 
@@ -617,6 +638,13 @@ fn translate_zh_cn(key: Key) -> &'static str {
         Key::StatusModified => "修改时间",
         Key::StatusFormatPlain => "纯文本",
         Key::StatusReadingTimeValue => "约 {n} 分钟",
+
+        Key::MenuStartPage => "起始页",
+        Key::MenuFavouriteFolder => "收藏此文件夹",
+        Key::MenuUnfavouriteFolder => "取消收藏",
+        Key::MenuFavouriteFolders => "收藏的文件夹",
+        Key::MenuRecentFolders => "最近文件夹",
+        Key::StartPageEmpty => "这里还是空的。",
     }
 }
 
@@ -774,6 +802,13 @@ fn translate_zh_tw(key: Key) -> &'static str {
         Key::StatusModified => "修改時間",
         Key::StatusFormatPlain => "純文字",
         Key::StatusReadingTimeValue => "約 {n} 分鐘",
+
+        Key::MenuStartPage => "起始頁",
+        Key::MenuFavouriteFolder => "收藏此資料夾",
+        Key::MenuUnfavouriteFolder => "取消收藏",
+        Key::MenuFavouriteFolders => "收藏的資料夾",
+        Key::MenuRecentFolders => "最近資料夾",
+        Key::StartPageEmpty => "這裡還是空的。",
     }
 }
 
@@ -931,6 +966,13 @@ fn translate_ja(key: Key) -> &'static str {
         Key::StatusModified => "更新日時",
         Key::StatusFormatPlain => "プレーンテキスト",
         Key::StatusReadingTimeValue => "約 {n} 分",
+
+        Key::MenuStartPage => "スタートページ",
+        Key::MenuFavouriteFolder => "このフォルダーをお気に入りに追加",
+        Key::MenuUnfavouriteFolder => "お気に入りから削除",
+        Key::MenuFavouriteFolders => "お気に入りのフォルダー",
+        Key::MenuRecentFolders => "最近のフォルダー",
+        Key::StartPageEmpty => "まだ何もありません。",
     }
 }
 
@@ -1088,6 +1130,13 @@ fn translate_ko(key: Key) -> &'static str {
         Key::StatusModified => "수정한 날짜",
         Key::StatusFormatPlain => "일반 텍스트",
         Key::StatusReadingTimeValue => "약 {n}분",
+
+        Key::MenuStartPage => "시작 페이지",
+        Key::MenuFavouriteFolder => "이 폴더를 즐겨찾기에 추가",
+        Key::MenuUnfavouriteFolder => "즐겨찾기에서 제거",
+        Key::MenuFavouriteFolders => "즐겨찾는 폴더",
+        Key::MenuRecentFolders => "최근 폴더",
+        Key::StartPageEmpty => "아직 아무것도 없습니다.",
     }
 }
 
@@ -1245,6 +1294,13 @@ fn translate_fr(key: Key) -> &'static str {
         Key::StatusModified => "Modifié",
         Key::StatusFormatPlain => "Texte brut",
         Key::StatusReadingTimeValue => "~{n} min",
+
+        Key::MenuStartPage => "Page d'accueil",
+        Key::MenuFavouriteFolder => "Ajouter ce dossier aux favoris",
+        Key::MenuUnfavouriteFolder => "Retirer des favoris",
+        Key::MenuFavouriteFolders => "Dossiers favoris",
+        Key::MenuRecentFolders => "Dossiers récents",
+        Key::StartPageEmpty => "Rien pour l'instant.",
     }
 }
 
@@ -1402,6 +1458,13 @@ fn translate_de(key: Key) -> &'static str {
         Key::StatusModified => "Geändert",
         Key::StatusFormatPlain => "Nur Text",
         Key::StatusReadingTimeValue => "~{n} Min.",
+
+        Key::MenuStartPage => "Startseite",
+        Key::MenuFavouriteFolder => "Diesen Ordner zu Favoriten hinzufügen",
+        Key::MenuUnfavouriteFolder => "Aus Favoriten entfernen",
+        Key::MenuFavouriteFolders => "Favoriten",
+        Key::MenuRecentFolders => "Zuletzt verwendete Ordner",
+        Key::StartPageEmpty => "Noch nichts hier.",
     }
 }
 
@@ -1559,6 +1622,13 @@ fn translate_es(key: Key) -> &'static str {
         Key::StatusModified => "Modificado",
         Key::StatusFormatPlain => "Texto sin formato",
         Key::StatusReadingTimeValue => "~{n} min",
+
+        Key::MenuStartPage => "Página de inicio",
+        Key::MenuFavouriteFolder => "Añadir esta carpeta a favoritos",
+        Key::MenuUnfavouriteFolder => "Quitar de favoritos",
+        Key::MenuFavouriteFolders => "Carpetas favoritas",
+        Key::MenuRecentFolders => "Carpetas recientes",
+        Key::StartPageEmpty => "Todavía no hay nada.",
     }
 }
 
@@ -1716,6 +1786,13 @@ fn translate_ru(key: Key) -> &'static str {
         Key::StatusModified => "Изменён",
         Key::StatusFormatPlain => "Обычный текст",
         Key::StatusReadingTimeValue => "~{n} мин",
+
+        Key::MenuStartPage => "Начальная страница",
+        Key::MenuFavouriteFolder => "Добавить папку в избранное",
+        Key::MenuUnfavouriteFolder => "Убрать из избранного",
+        Key::MenuFavouriteFolders => "Избранные папки",
+        Key::MenuRecentFolders => "Недавние папки",
+        Key::StartPageEmpty => "Здесь пока ничего нет.",
     }
 }
 
@@ -1873,6 +1950,13 @@ fn translate_it(key: Key) -> &'static str {
         Key::StatusModified => "Modificato",
         Key::StatusFormatPlain => "Testo semplice",
         Key::StatusReadingTimeValue => "~{n} min",
+
+        Key::MenuStartPage => "Pagina iniziale",
+        Key::MenuFavouriteFolder => "Aggiungi questa cartella ai preferiti",
+        Key::MenuUnfavouriteFolder => "Rimuovi dai preferiti",
+        Key::MenuFavouriteFolders => "Cartelle preferite",
+        Key::MenuRecentFolders => "Cartelle recenti",
+        Key::StartPageEmpty => "Ancora niente qui.",
     }
 }
 
@@ -2030,6 +2114,13 @@ fn translate_pt(key: Key) -> &'static str {
         Key::StatusModified => "Modificado",
         Key::StatusFormatPlain => "Texto simples",
         Key::StatusReadingTimeValue => "~{n} min",
+
+        Key::MenuStartPage => "Página inicial",
+        Key::MenuFavouriteFolder => "Adicionar esta pasta aos favoritos",
+        Key::MenuUnfavouriteFolder => "Remover dos favoritos",
+        Key::MenuFavouriteFolders => "Pastas favoritas",
+        Key::MenuRecentFolders => "Pastas recentes",
+        Key::StartPageEmpty => "Ainda não há nada aqui.",
     }
 }
 

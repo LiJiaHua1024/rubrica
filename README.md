@@ -171,7 +171,11 @@ they left. Open documents are available as pinned/preview tabs (`Ctrl+Tab`,
 `Ctrl+W`), with recent files and a resizable docked workspace tree whose own search box
 filters its listing by name or extension -- `txt` finds `reading.txt`, `notes txt` asks for
 both words, `*.md` asks for the extension itself, and `Esc` empties the box; the session is
-restored on the next launch. TXT files keep chapter boundaries and lay out the active
+restored on the next launch. The folder the panel is showing can be kept: **Favourite this
+folder** puts it on a shelf the menu lists beside the folders the reader was last in, and
+the start page (**Start page** in the menu) lists the three groups -- recent documents,
+recent folders and the shelf -- as a page of its own, whose document rows open what they
+name. TXT files keep chapter boundaries and lay out the active
 chapter window, with `Ctrl+Alt+Up/Down` for chapter navigation. `Ctrl+3` switches
 source view, `Ctrl+4` switches between continuous scrolling and the page stack, and
 `Ctrl+Shift+O` opens the file in an editor at the current source position.
@@ -186,7 +190,8 @@ scrolls past is what gets marked.
 Right-click opens the menu: navigation, copy, select all, select table, find, the contents,
 zoom, the installed reading faces, the measure, the theme, the text-reading switches (plain
 text or Markdown, **Show HTML image tags**, **Show `==text==` as a highlight**, **Table
-lines**, **Inline code**), open tabs, recent documents, and the workspace tree.
+lines**, **Inline code**), open tabs, recent documents, recent folders, the favourite
+folders, the start page, and the workspace tree.
 
 A table is copied as a table rather than as a run of prose. A press inside a grid marks the
 cell it landed on, a drag across one marks the rectangle of cells between the two, and
@@ -492,7 +497,7 @@ typesetting) happens off the keystroke, after a posted message.
 | `rubrica-math` | a LaTeX subset to boxes, measured through a `MathMeasure` the caller implements |
 | `rubrica-mermaid` | Mermaid fences to scenes: a parser, a layered layout and shape primitives, with no dependencies at all |
 | `rubrica-app` | the window: Direct2D/DirectWrite painting, selection, hit-testing, themes, settings, workspace navigation, `--report`, PNG/PDF export, and the `--peek` spacebar service |
-| `rubrica-workspace` | tab identity, preview/pinned state, recent files, and versioned session snapshots |
+| `rubrica-workspace` | tab identity, preview/pinned state, recent files and folders, the folder shelf, and versioned session snapshots |
 
 The first three have no dependency on Windows and no dependency on each other's
 internals; `rubrica-mermaid` is portable the same way, and `rubrica-doc` reaches it

@@ -26,6 +26,10 @@ impl FileRef {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum DocumentRef {
     Sample,
+    /// The page that lists the folders the reader keeps and the ones they were last in.
+    /// It is made when it is shown rather than read from anywhere, so the session file
+    /// does not carry it and a restart simply does not have one.
+    Start,
     File(FileRef),
 }
 
@@ -98,6 +102,22 @@ impl TabSet {
         };
         self.items.insert(index, Tab { id, document: DocumentRef::File(file), kind });
         self.active = index;
+        self.trim();
+        (id, true)
+    }
+
+    /// Open the start page, or come back to the one that is already open: it is a page
+    /// like any other in the strip, and a reader who asks for it twice wants one of it.
+    pub fn open_start_page(&mut self) -> (TabId, bool) {
+        if let Some(index) = self.items.iter().position(|tab| tab.document == DocumentRef::Start) {
+            let id = self.items[index].id;
+            self.active = index;
+            return (id, false);
+        }
+        let id = TabId(self.next_id);
+        self.next_id += 1;
+        self.items.push(Tab { id, document: DocumentRef::Start, kind: TabKind::Pinned });
+        self.active = self.items.len() - 1;
         self.trim();
         (id, true)
     }
@@ -220,6 +240,118 @@ impl RecentFiles {
     pub fn clear(&mut self) { self.items.clear(); }
 }
 
+/// How many folders a reader can keep as favourites.
+///
+/// A favourite is a shelf, not a history: it is put there by hand, so the cap is what
+/// keeps a shelf a shelf. A reader who wants more than this is looking for a bookmark
+/// file, which is a different feature.
+pub const MAX_FAVOURITES: usize = 24;
+
+/// How many folders are remembered as recently used, the way documents are.
+pub const MAX_RECENT_FOLDERS: usize = 10;
+
+/// A folder the reader has been to.
+///
+/// Identity is the path, as it is for a file: a folder that moved is a folder the reader
+/// has not been to, and a stale entry that cannot be opened is dropped by the host.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub struct FolderRef {
+    pub path: PathBuf,
+}
+
+impl FolderRef {
+    pub fn new(path: impl Into<PathBuf>) -> Self {
+        Self { path: path.into() }
+    }
+
+    pub fn same_folder(&self, other: &Self) -> bool {
+        self.path == other.path
+    }
+}
+
+/// The folders a reader keeps, and the folders they were last in.
+///
+/// The two lists are deliberately separate and are allowed to overlap: a favourite is a
+/// promise the reader made, a recent folder is a note the program kept, and one must not
+/// quietly edit the other.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Places {
+    favourites: Vec<FolderRef>,
+    recent: Vec<FolderRef>,
+    favourite_limit: usize,
+    recent_limit: usize,
+}
+
+impl Default for Places {
+    fn default() -> Self {
+        Self {
+            favourites: Vec::new(),
+            recent: Vec::new(),
+            favourite_limit: MAX_FAVOURITES,
+            recent_limit: MAX_RECENT_FOLDERS,
+        }
+    }
+}
+
+impl Places {
+    pub fn favourites(&self) -> &[FolderRef] { &self.favourites }
+    pub fn recent(&self) -> &[FolderRef] { &self.recent }
+
+    pub fn is_favourite(&self, folder: &FolderRef) -> bool {
+        self.favourites.iter().any(|item| item.same_folder(folder))
+    }
+
+    /// Put a folder on the shelf, newest first. A folder already there keeps the place
+    /// it had: adding a favourite twice is one intention, not two.
+    pub fn favourite(&mut self, folder: FolderRef) -> bool {
+        if self.is_favourite(&folder) { return false; }
+        self.favourites.insert(0, folder);
+        self.favourites.truncate(self.favourite_limit);
+        true
+    }
+
+    pub fn unfavourite(&mut self, folder: &FolderRef) -> bool {
+        let before = self.favourites.len();
+        self.favourites.retain(|item| !item.same_folder(folder));
+        self.favourites.len() != before
+    }
+
+    /// Add or remove, and say which it did: the menu row is one row whose label depends
+    /// on the answer.
+    pub fn toggle_favourite(&mut self, folder: FolderRef) -> bool {
+        if self.unfavourite(&folder) { return false; }
+        self.favourite(folder);
+        true
+    }
+
+    pub fn touch_recent(&mut self, folder: FolderRef) {
+        self.recent.retain(|item| !item.same_folder(&folder));
+        self.recent.insert(0, folder);
+        self.recent.truncate(self.recent_limit);
+    }
+
+    pub fn forget_recent(&mut self, folder: &FolderRef) -> bool {
+        let before = self.recent.len();
+        self.recent.retain(|item| !item.same_folder(folder));
+        self.recent.len() != before
+    }
+
+    pub fn clear_recent(&mut self) { self.recent.clear(); }
+
+    pub fn clear_favourites(&mut self) { self.favourites.clear(); }
+
+    /// The favourites that are no longer on disk, in the order they are kept.
+    ///
+    /// The state crate does not know what a file system can see, so the host asks the
+    /// question and gets the answer back rather than the crate guessing.
+    pub fn missing<F>(&self, exists: F) -> Vec<FolderRef>
+    where
+        F: Fn(&Path) -> bool,
+    {
+        self.favourites.iter().filter(|item| !exists(&item.path)).cloned().collect()
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SessionTab { pub document: FileRef, pub kind: TabKind }
 
@@ -245,6 +377,8 @@ impl Workspace {
     pub fn close(&mut self, id: TabId) -> bool { self.tabs.close(id) }
     pub fn close_others(&mut self, id: TabId) -> bool { self.tabs.close_others(id) }
     pub fn close_all(&mut self) { self.tabs.close_all() }
+    /// Open the start page, or come back to the one that is already open.
+    pub fn open_start_page(&mut self) -> (TabId, bool) { self.tabs.open_start_page() }
     pub fn pin(&mut self, id: TabId) -> bool { self.tabs.pin(id) }
     pub fn move_tab(&mut self, id: TabId, to: usize) -> bool { self.tabs.move_tab(id, to) }
     pub fn clear_recent(&mut self) { self.recent.clear(); }
@@ -253,7 +387,7 @@ impl Workspace {
     pub fn snapshot(&self) -> WorkspaceSnapshot {
         let tabs = self.tabs.items.iter().filter_map(|tab| match &tab.document {
             DocumentRef::File(file) => Some(SessionTab { document: file.clone(), kind: tab.kind }),
-            DocumentRef::Sample => None,
+            DocumentRef::Sample | DocumentRef::Start => None,
         }).collect();
         WorkspaceSnapshot {
             session: SessionSnapshot {
@@ -313,6 +447,9 @@ impl Workspace {
                 .iter()
                 .position(|tab| matches!(&tab.document, DocumentRef::File(existing) if existing.same_file(&file))),
             Some(DocumentRef::Sample) => sample,
+            // The start page is made rather than remembered, so a session that names it
+            // is a session whose page is gone: the sample is what is left to show.
+            Some(DocumentRef::Start) => None,
             None if !fallback_to_sample => None,
             _ if fallback_to_sample => sample,
             _ => None,
@@ -590,5 +727,121 @@ mod tests {
         // The clamp drops the oldest, so the tab the file marked active is one of
         // the ones that came back and the index still names a tab that exists.
         assert!(restored.tabs.active_index() < restored.tabs.items().len());
+    }
+
+    fn folder(name: &str) -> FolderRef { FolderRef::new(name) }
+
+    #[test]
+    fn a_folder_favourited_twice_is_on_the_shelf_once() {
+        let mut places = Places::default();
+        assert!(places.favourite(folder("a")), "the first one is news");
+        assert!(!places.favourite(folder("a")), "the second is the same intention");
+        assert_eq!(places.favourites().len(), 1);
+        assert!(places.is_favourite(&folder("a")));
+        assert!(!places.is_favourite(&folder("b")));
+    }
+
+    #[test]
+    fn the_shelf_keeps_the_newest_and_stops_at_the_cap() {
+        let mut places = Places::default();
+        for i in 0..(MAX_FAVOURITES + 6) {
+            places.favourite(folder(&i.to_string()));
+        }
+        assert_eq!(places.favourites().len(), MAX_FAVOURITES, "an unbounded shelf came back");
+        assert_eq!(places.favourites()[0].path, Path::new(&(MAX_FAVOURITES + 5).to_string()));
+        assert!(!places.is_favourite(&folder("0")), "the oldest favourite goes first");
+        assert!(places.is_favourite(&folder(&(MAX_FAVOURITES + 6 - MAX_FAVOURITES).to_string())),
+            "the last one the cap still has room for stays");
+    }
+
+    #[test]
+    fn taking_a_folder_off_the_shelf_says_whether_it_was_there() {
+        let mut places = Places::default();
+        places.favourite(folder("a"));
+        assert!(places.unfavourite(&folder("a")));
+        assert!(!places.unfavourite(&folder("a")), "the second removal changes nothing");
+        assert!(!places.unfavourite(&folder("never")), "one that was never there");
+        assert!(places.favourites().is_empty());
+    }
+
+    #[test]
+    fn the_toggle_row_reports_the_state_it_left_behind() {
+        let mut places = Places::default();
+        assert!(places.toggle_favourite(folder("a")), "on");
+        assert!(places.is_favourite(&folder("a")));
+        assert!(!places.toggle_favourite(folder("a")), "off");
+        assert!(!places.is_favourite(&folder("a")));
+    }
+
+    #[test]
+    fn recent_folders_deduplicate_and_stay_bounded() {
+        let mut places = Places::default();
+        for i in 0..(MAX_RECENT_FOLDERS + 2) {
+            places.touch_recent(folder(&i.to_string()));
+        }
+        assert_eq!(places.recent().len(), MAX_RECENT_FOLDERS);
+        places.touch_recent(folder("0"));
+        assert_eq!(places.recent().len(), MAX_RECENT_FOLDERS, "a revisit is not a new folder");
+        assert_eq!(places.recent()[0].path, Path::new("0"), "the one just visited is first");
+    }
+
+    #[test]
+    fn a_favourite_and_a_recent_folder_are_two_lists() {
+        // A favourite is a promise the reader made; a recent folder is a note the
+        // program kept. Neither is allowed to edit the other.
+        let mut places = Places::default();
+        places.favourite(folder("a"));
+        places.touch_recent(folder("a"));
+        assert!(places.forget_recent(&folder("a")));
+        assert!(places.is_favourite(&folder("a")), "forgetting where I was is not unshelving it");
+        places.clear_recent();
+        assert_eq!(places.recent().len(), 0);
+        assert_eq!(places.favourites().len(), 1);
+        places.clear_favourites();
+        assert!(places.favourites().is_empty());
+    }
+
+    #[test]
+    fn the_folders_that_are_gone_are_the_ones_the_host_cannot_see() {
+        let mut places = Places::default();
+        places.favourite(folder("here"));
+        places.favourite(folder("gone"));
+        let missing = places.missing(|path| path == Path::new("here"));
+        assert_eq!(missing.len(), 1);
+        assert_eq!(missing[0].path, Path::new("gone"));
+        assert_eq!(places.favourites().len(), 2, "asking is not the same as removing");
+    }
+
+    #[test]
+    fn a_folder_path_is_its_own_identity() {
+        assert!(folder("a").same_folder(&folder("a")));
+        assert!(!folder("a").same_folder(&folder("A")));
+    }
+
+    #[test]
+    fn the_start_page_is_one_tab_however_often_it_is_asked_for() {
+        let mut workspace = Workspace::default();
+        let (first, opened) = workspace.open_start_page();
+        assert!(opened, "the first ask makes the page");
+        assert_eq!(workspace.tabs.items().len(), 2, "the sample and the page");
+        assert_eq!(workspace.tabs.active().document, DocumentRef::Start);
+        let (again, opened_again) = workspace.open_start_page();
+        assert_eq!(again, first, "the same page, not a second one");
+        assert!(!opened_again);
+        assert_eq!(workspace.tabs.items().len(), 2);
+    }
+
+    #[test]
+    fn a_session_does_not_carry_the_start_page() {
+        // The page is made when it is shown, so there is nothing in it to write down and
+        // nothing to find when the reader comes back: the sample is what is left.
+        let mut workspace = Workspace::default();
+        workspace.open_start_page();
+        let snapshot = workspace.snapshot();
+        assert!(snapshot.session.tabs.is_empty(), "the page is not a document");
+        assert_eq!(snapshot.session.active, Some(DocumentRef::Start));
+        let restored = Workspace::restore(snapshot);
+        assert!(!restored.tabs.items().iter().any(|tab| tab.document == DocumentRef::Start));
+        assert_eq!(restored.tabs.active().document, DocumentRef::Sample);
     }
 }

@@ -25,7 +25,9 @@ use windows::Win32::System::Registry::{
 use crate::i18n::Language;
 use crate::theme::{Measure, TableLines, TextFace, Zoom};
 use crate::view::utf16;
-use rubrica_workspace::{DocumentRef, FileRef, SessionSnapshot, SessionTab, TabKind, Workspace, WorkspaceSnapshot};
+use rubrica_workspace::{
+    DocumentRef, FileRef, FolderRef, Places, SessionSnapshot, SessionTab, TabKind, Workspace, WorkspaceSnapshot,
+};
 
 const SUBKEY: &str = "Software\\Rubrica";
 /// The names the numbers are stored under, in the order [`words`] writes them.
@@ -972,6 +974,7 @@ pub fn encode_workspace(snapshot: &WorkspaceSnapshot) -> Option<Vec<u8>> {
     match &snapshot.session.active {
         None => out.push(0),
         Some(DocumentRef::Sample) => out.push(1),
+        Some(DocumentRef::Start) => out.push(3),
         Some(DocumentRef::File(file)) => {
             out.push(2);
             put_workspace_file(&mut out, file)?;
@@ -1001,6 +1004,7 @@ pub fn decode_workspace(data: &[u8]) -> Option<WorkspaceSnapshot> {
     let active = match active_marker {
         0 => None,
         1 => Some(DocumentRef::Sample),
+        3 => Some(DocumentRef::Start),
         2 => Some(DocumentRef::File(take_workspace_file(&mut input)?)),
         _ => return None,
     };
@@ -1048,9 +1052,99 @@ pub fn restored_workspace() -> Workspace {
     })
 }
 
+const PLACES_KEY: &str = "Places";
+const PLACES_MAGIC: &[u8; 4] = b"RPL1";
+
+/// Encode the folders a reader keeps and the folders they were last in.
+///
+/// A value of its own rather than a longer workspace blob: a reader who upgrades must
+/// not lose the tabs and recent documents they had, and a blob that grew a tail is one
+/// an older build can no longer read at all. Either value can go missing without taking
+/// the other with it.
+pub fn encode_places(places: &Places) -> Option<Vec<u8>> {
+    let mut out = PLACES_MAGIC.to_vec();
+    for list in [places.favourites(), places.recent()] {
+        out.extend_from_slice(&(list.len() as u32).to_le_bytes());
+        for folder in list {
+            put_workspace_path(&mut out, &folder.path);
+        }
+    }
+    Some(out)
+}
+
+pub fn decode_places(data: &[u8]) -> Option<Places> {
+    let mut input = data;
+    if input.get(..4)? != PLACES_MAGIC { return None; }
+    input = &input[4..];
+    let mut lists = Vec::with_capacity(2);
+    for _ in 0..2 {
+        let count = u32::from_le_bytes(input.get(..4)?.try_into().ok()?) as usize;
+        input = &input[4..];
+        let mut folders = Vec::with_capacity(count.min(64));
+        for _ in 0..count {
+            folders.push(FolderRef::new(take_workspace_path(&mut input)?));
+        }
+        lists.push(folders);
+    }
+    if !input.is_empty() { return None; }
+    let recent = lists.pop()?;
+    let favourites = lists.pop()?;
+    let mut places = Places::default();
+    // Written newest first, so rebuilt oldest first: the ordinary operations then apply
+    // the same cap the rest of the state uses, and a hand-edited list that names more
+    // folders than the cap allows keeps the ones a reader would have kept.
+    for folder in favourites.into_iter().rev() { places.favourite(folder); }
+    for folder in recent.into_iter().rev() { places.touch_recent(folder); }
+    Some(places)
+}
+
+pub fn record_places(places: &Places) -> Result<(), String> {
+    let data = encode_places(places).ok_or("the folder list cannot be encoded")?;
+    try_write_binary(SUBKEY, PLACES_KEY, &data)
+}
+
+/// The folder a path names, spelled the way the shelf and the recent list spell it.
+///
+/// Canonical, for the reason a document's record is: Explorer, a relative path on the
+/// command line and the folder the panel is showing must all name one shelf, and a
+/// favourite that a second spelling cannot find is a favourite that was not kept.
+pub fn folder_ref(path: &Path) -> FolderRef {
+    FolderRef::new(path.canonicalize().unwrap_or_else(|_| path.to_path_buf()))
+}
+
+/// The folders a reader keeps, with the ones that are known to be gone left out.
+///
+/// The registry keeps them either way: a favourite on a drive that is not plugged in
+/// comes back when it is, and one that is only unreachable for the moment is kept for
+/// the same reason a remembered document is.
+pub fn restored_places() -> Places {
+    let Some(data) = binary(SUBKEY, PLACES_KEY) else { return Places::default() };
+    let Some(stored) = decode_places(&data) else { return Places::default() };
+    let mut kept = Places::default();
+    // The store is newest first and `favourite` puts each folder at the front, so walk the
+    // stored list oldest first: the shelf then comes back in the order it was left, and a
+    // list longer than the cap drops the oldest rather than the newest. The same shape as
+    // the workspace's own restore.
+    for folder in stored.favourites().iter().rev() {
+        if restorable_folder(&folder.path) { kept.favourite(folder.clone()); }
+    }
+    for folder in stored.recent().iter().rev() {
+        if restorable_folder(&folder.path) { kept.touch_recent(folder.clone()); }
+    }
+    kept
+}
+
+fn restorable_folder(path: &Path) -> bool {
+    match std::fs::metadata(path) {
+        Ok(metadata) => metadata.is_dir(),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
+        // A permission or network error is not proof that the folder is gone.
+        Err(_) => true,
+    }
+}
+
 #[cfg(test)]
 mod tests {    use super::*;
-
     #[test]
     fn document_preferences_round_trip_and_reject_unknown_values() {
         let chosen = DocumentSettings {
@@ -1489,5 +1583,65 @@ mod tests {    use super::*;
             &[0x66, 0x6f, 0x6f, 0xDC00, 0x2e, 0x6d, 0x64],
         ));
         assert_ne!(document_key(&a).0, document_key(&b).0);
+    }
+
+    #[test]
+    fn the_places_blob_round_trips_both_lists_in_order() {
+        let mut places = Places::default();
+        places.favourite(FolderRef::new("C:\\one"));
+        places.favourite(FolderRef::new("C:\\two"));
+        places.touch_recent(FolderRef::new("C:\\two"));
+        places.touch_recent(FolderRef::new("C:\\three"));
+        let data = encode_places(&places).expect("a plain path encodes");
+        assert_eq!(data.get(..4), Some(&b"RPL1"[..]));
+        let back = decode_places(&data).expect("what was written reads back");
+        assert_eq!(back, places, "the two lists and their order survive the trip");
+    }
+
+    /// A path UTF-8 cannot carry is still a path: the shelf is written as UTF-16, so an
+    /// unpaired surrogate in a folder name does not take the reader's favourites with it.
+    #[test]
+    fn a_folder_name_utf8_cannot_carry_round_trips() {
+        use std::os::windows::ffi::OsStringExt as _;
+        let odd = std::path::PathBuf::from(std::ffi::OsString::from_wide(
+            &[0x43, 0x3a, 0x5c, 0x66, 0xD800, 0x6f],
+        ));
+        let mut places = Places::default();
+        places.favourite(FolderRef::new(odd.clone()));
+        let data = encode_places(&places).expect("a wide path encodes");
+        let back = decode_places(&data).expect("and reads back");
+        assert_eq!(back.favourites()[0].path, odd);
+    }
+
+    #[test]
+    fn a_places_blob_that_is_not_ours_is_refused_rather_than_half_read() {
+        let mut places = Places::default();
+        places.favourite(FolderRef::new("C:\\one"));
+        places.touch_recent(FolderRef::new("C:\\two"));
+        let good = encode_places(&places).expect("encodes");
+        let mut wrong_magic = good.clone();
+        wrong_magic[..4].copy_from_slice(b"XXXX");
+        assert_eq!(decode_places(&wrong_magic), None);
+        assert_eq!(decode_places(&[]), None, "an empty value is not an empty shelf");
+        assert_eq!(decode_places(&good[..good.len() - 1]), None, "a truncated path is not a path");
+        assert_eq!(decode_places(&[good.as_slice(), b"tail"].concat()), None, "a tail means a format we do not know");
+    }
+
+    #[test]
+    fn a_places_blob_naming_more_folders_than_the_cap_allows_is_clamped() {
+        // Hand-edited registry data is data, not a promise: the cap is applied on the
+        // way in, newest first, exactly as it is when a reader adds one.
+        let mut out = b"RPL1".to_vec();
+        out.extend_from_slice(&(40u32).to_le_bytes());
+        for i in 0..40u32 {
+            let name = format!("C:\\f{i}");
+            let wide: Vec<u16> = name.encode_utf16().collect();
+            out.extend_from_slice(&(wide.len() as u32).to_le_bytes());
+            for unit in wide { out.extend_from_slice(&unit.to_le_bytes()); }
+        }
+        out.extend_from_slice(&0u32.to_le_bytes());
+        let places = decode_places(&out).expect("a long list still reads");
+        assert_eq!(places.favourites().len(), rubrica_workspace::MAX_FAVOURITES);
+        assert_eq!(places.favourites()[0].path, std::path::Path::new("C:\\f0"));
     }
 }

@@ -116,7 +116,7 @@ use crate::images::ImageStore;
 use crate::diagram::DiagramStore;
 use crate::math::MathStore;
 use crate::tree::{self, Entry as TreeEntry, EntryKind as TreeEntryKind};
-use rubrica_workspace::{DocumentRef, FileRef, Tab, TabId, TabKind, Workspace};
+use rubrica_workspace::{DocumentRef, FileRef, FolderRef, Places, Tab, TabId, TabKind, Workspace};
 use crate::theme::{ColorRole, Leading, Measure, Role, TableLines, TextFace, Theme, Zoom};
 use crate::viewer::{self, Viewer};
 use crate::{Error, Result};
@@ -2197,6 +2197,13 @@ pub struct View {
     /// The directory the entries above were listed from. `None` means they never
     /// were: the panel starts closed and unread, because no reader has asked for it.
     tree_root: Option<PathBuf>,
+    /// The folder above, spelled the way the shelf spells it. Worked out once when the
+    /// listing is read rather than every time a menu is opened: it is the answer to
+    /// "is this folder on the shelf", and that is asked with a file-system call.
+    tree_folder: Option<FolderRef>,
+    /// The folders the reader keeps and the folders they were last in: read from the
+    /// registry when the window is made, and written back whenever either list changes.
+    places: Places,
     tree_visible: bool,
     tree_width: f32,
     tree_dragging: bool,
@@ -3006,6 +3013,15 @@ enum Command {
     OpenFile,
     ToggleTree,
     OpenRecent(usize),
+    /// Open a folder from the reader's shelf in the panel.
+    OpenFolder(usize),
+    /// Open a folder the reader was last in, in the panel.
+    OpenRecentFolder(usize),
+    /// Put the folder the panel is showing on the shelf, or take it off again: one row
+    /// whose label says which of the two it will do.
+    FavouriteFolder,
+    /// Show the page that lists the reader's folders and the documents they were last in.
+    StartPage,
     OpenTree(usize),
     TreeDirectory(usize),
     ActivateTab(TabId),
@@ -3098,6 +3114,14 @@ struct MenuState {
     chapter: usize,
     tabs: Vec<(TabId, String, bool)>,
     recent: Vec<(usize, String)>,
+    /// The folders on the shelf, and the folders the reader was last in, with the index
+    /// each menu row hands back. The paths are shown as a reader reads them.
+    favourites: Vec<(usize, String)>,
+    folders: Vec<(usize, String)>,
+    /// Whether the panel is showing a folder at all, and whether it is on the shelf
+    /// already: the favourite row is one row, and this is what it says.
+    favourite_here: bool,
+    already_favourite: bool,
     tree: Vec<(usize, String, bool)>,
     encoding: Encoding,
     encoding_notice: Option<String>,
@@ -3297,6 +3321,7 @@ fn menu_items(s: &MenuState) -> Vec<MenuRow> {    // A tab in a menu string star
     v.extend([
         row(Command::ToggleTree, i18n::t(s.lang, Key::MenuWorkspaceTree), true),
         row(Command::OpenFile, format!("{}\tCtrl+O", i18n::t(s.lang, Key::MenuOpenFile)), true),
+        row(Command::StartPage, i18n::t(s.lang, Key::MenuStartPage), true),
         row(Command::Reload, format!("{}\tCtrl+R", i18n::t(s.lang, Key::MenuReload)), s.from_file),
     ]);
     if !s.tabs.is_empty() {
@@ -3314,6 +3339,22 @@ fn menu_items(s: &MenuState) -> Vec<MenuRow> {    // A tab in a menu string star
             .map(|(i, path)| row(Command::OpenRecent(*i), path.clone(), true))
             .collect();
         v.push(MenuRow::Sub { label: i18n::t(s.lang, Key::MenuRecentDocuments), items: recent_items });
+    }
+    if !s.favourites.is_empty() {
+        let items = s.favourites.iter()
+            .map(|(i, path)| row(Command::OpenFolder(*i), path.clone(), true))
+            .collect();
+        v.push(MenuRow::Sub { label: i18n::t(s.lang, Key::MenuFavouriteFolders), items });
+    }
+    if !s.folders.is_empty() {
+        let items = s.folders.iter()
+            .map(|(i, path)| row(Command::OpenRecentFolder(*i), path.clone(), true))
+            .collect();
+        v.push(MenuRow::Sub { label: i18n::t(s.lang, Key::MenuRecentFolders), items });
+    }
+    if s.favourite_here {
+        let label = if s.already_favourite { Key::MenuUnfavouriteFolder } else { Key::MenuFavouriteFolder };
+        v.push(row(Command::FavouriteFolder, i18n::t(s.lang, label), true));
     }
     if !s.tree.is_empty() {
         let tree_items = s.tree.iter().map(|(i, name, is_dir)| {
@@ -3858,6 +3899,8 @@ fn new_view(
         tree_query: String::new(),
         search: None,
         tree_root: None,
+        tree_folder: None,
+        places: Places::default(),
         tree_visible: false,
         tree_width: 220.0,
         tree_dragging: false,
@@ -4072,7 +4115,7 @@ pub(crate) fn trace(label: &str) {
 /// The path as it is shown, not as it is named. `canonicalize` answers in the Windows
 /// verbatim form, and a title is copied and read by people, who want the drive letter
 /// they opened and not the machine's spelling of an extended-length path.
-fn display_path(path: &Path) -> String {
+pub(crate) fn display_path(path: &Path) -> String {
     let s = path.as_os_str().to_string_lossy();
     if let Some(rest) = s.strip_prefix(r"\\?\UNC\") {
         return format!(r"\\{rest}");
@@ -4881,6 +4924,9 @@ impl View {
         self.line_break_override = preferences.line_breaks;
         self.reading_mode = if preferences.page_stack { ReadingMode::Stack } else { ReadingMode::Scroll };
         self.workspace = workspace;
+        // The shelf and the folder history are read here rather than in the window's
+        // constructor: both are registry reads, and neither is needed to open a window.
+        self.places = crate::settings::restored_places();
         // The hyphenation dictionary is a process-wide one deserialize away, shared with
         // every later layout and the peek service; the page only ever borrows it.
         self.hyphenator = crate::hyphen::shared();
@@ -6993,6 +7039,7 @@ impl View {
                 .map(|tab| {
                     let title = match &tab.document {
                         DocumentRef::Sample => i18n::t(self.lang, Key::SampleTitle).to_string(),
+                        DocumentRef::Start => i18n::t(self.lang, Key::MenuStartPage).to_string(),
                         DocumentRef::File(file) => file.path.file_name()
                             .map(|name| name.to_string_lossy().into_owned())
                             .unwrap_or_else(|| file.path.to_string_lossy().into_owned()),
@@ -7004,6 +7051,15 @@ impl View {
                 .filter(|(_, file)| file.path.is_file())
                 .map(|(i, file)| (i, display_path(&file.path)))
                 .collect(),
+            favourites: self.places.favourites().iter().enumerate()
+                .map(|(i, folder)| (i, display_path(&folder.path)))
+                .collect(),
+            folders: self.places.recent().iter().enumerate()
+                .map(|(i, folder)| (i, display_path(&folder.path)))
+                .collect(),
+            favourite_here: self.tree_folder.is_some(),
+            already_favourite: self.tree_folder.as_ref()
+                .is_some_and(|folder| self.places.is_favourite(folder)),
             tree: self.tree.iter().enumerate()
                 .map(|(i, entry)| (i, format!("{}{}", "  ".repeat(entry.depth), entry.name), entry.kind == TreeEntryKind::Directory))
                 .collect(),
@@ -7210,6 +7266,25 @@ impl View {
                     self.load_document(&path, hwnd);
                 }
             }
+            Command::OpenFolder(index) => {
+                if let Some(path) = self.places.favourites().get(index).map(|folder| folder.path.clone()) {
+                    self.list_tree(&path);
+                    let _ = unsafe { InvalidateRect(Some(hwnd), None, false) };
+                }
+            }
+            Command::OpenRecentFolder(index) => {
+                if let Some(path) = self.places.recent().get(index).map(|folder| folder.path.clone()) {
+                    self.list_tree(&path);
+                    let _ = unsafe { InvalidateRect(Some(hwnd), None, false) };
+                }
+            }
+            Command::FavouriteFolder => {
+                if let Some(folder) = self.tree_folder.clone() {
+                    self.places.toggle_favourite(folder);
+                    self.remember_places();
+                }
+            }
+            Command::StartPage => self.show_start_page(hwnd),
             Command::OpenTree(index) => {
                 if let Some(path) = self.tree.get(index).map(|entry| entry.path.clone()) {
                     self.load_document(&path, hwnd);
@@ -10210,6 +10285,7 @@ impl View {
     fn tab_title(tab: &Tab) -> String {
         match &tab.document {
             DocumentRef::Sample => "Sample".to_string(),
+            DocumentRef::Start => "Start".to_string(),
             DocumentRef::File(file) => file.path.file_name()
                 .map(|name| name.to_string_lossy().into_owned())
                 .unwrap_or_else(|| file.path.to_string_lossy().into_owned()),
@@ -10969,6 +11045,14 @@ impl View {
                         self.set_page(crate::sample::DOCUMENT.to_string(), None, hwnd);
                         true
                     }
+                    DocumentRef::Start => {
+                        // Built here rather than kept: the page is a view of the two
+                        // lists, and a folder put on the shelf while it is open belongs
+                        // on it the next time it is shown.
+                        let page = self.start_page_text();
+                        self.set_page(page, None, hwnd);
+                        true
+                    }
                 };
                 if loaded {
                     self.remember_reading();
@@ -11162,8 +11246,11 @@ impl View {
         let want = self.path.as_deref().and_then(Path::parent).map(Path::to_path_buf);
         if want != self.tree_root {
             self.tree_root = want.clone();
-            self.tree_all = want.map(|root| tree::scan(&root, 2)).unwrap_or_default();
+            self.tree_all = want.as_deref().map(|root| tree::scan(root, 2)).unwrap_or_default();
             self.apply_tree_query();
+            if let Some(root) = want.as_deref() {
+                self.note_folder(root);
+            }
         }
     }
 
@@ -11181,6 +11268,53 @@ impl View {
         self.tree_root = Some(root.to_path_buf());
         self.tree_all = tree::scan(root, 2);
         self.apply_tree_query();
+        self.note_folder(root);
+    }
+
+    /// Remember a folder the reader has been in, and write the two lists back.
+    ///
+    /// Called where the panel's folder changes rather than where a menu is opened: the
+    /// registry is written when something has actually changed, and a reader who never
+    /// leaves the folder they started in never pays for the write.
+    fn note_folder(&mut self, root: &Path) {
+        let folder = crate::settings::folder_ref(root);
+        self.tree_folder = Some(folder.clone());
+        if self.places.recent().first().is_some_and(|first| first.same_folder(&folder)) {
+            return;
+        }
+        self.places.touch_recent(folder);
+        self.remember_places();
+    }
+
+    /// Write the shelf and the folder history down. A registry that cannot be written is
+    /// not a reason to lose the page: the lists in hand are still what the reader sees.
+    fn remember_places(&mut self) {
+        if let Err(why) = crate::settings::record_places(&self.places) {
+            trace(&format!("places-not-saved: {why}"));
+        }
+    }
+
+    /// Show the start page, opening it in the strip the way a document is opened: a
+    /// reader who asks for it twice comes back to the one that is already there.
+    fn show_start_page(&mut self, hwnd: HWND) {
+        let (id, _) = self.workspace.open_start_page();
+        self.switch_to_tab(id, hwnd);
+    }
+
+    /// The start page as it stands, in the reader's own language.
+    fn start_page_text(&self) -> String {
+        let files: Vec<PathBuf> = self
+            .workspace
+            .recent
+            .items()
+            .iter()
+            .filter(|file| file.path.is_file())
+            .map(|file| file.path.clone())
+            .collect();
+        crate::places::start_page(
+            self.lang,
+            crate::places::Start { recent_files: &files, places: &self.places },
+        )
     }
 
     /// Read a file and make it the page, saying whether that worked.
