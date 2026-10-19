@@ -1,7 +1,8 @@
 //! Typography presets as files the reader can edit.
 //!
 //! A preset is everything a page is set with: the nineteen font roles, the twenty-one
-//! numbers, and the two drawing switches. The typography form has always been able to
+//! numbers, and the switches that decide how those numbers are spent. The typography form
+//! has always been able to
 //! write one, into the registry, under a name. This module adds the other half of the
 //! idea -- a preset as a *file*, in `%APPDATA%\Rubrica\typography`, which the reader can
 //! open in an editor, keep beside a document, or hand to somebody else:
@@ -19,11 +20,13 @@
 //! list_marker_gap = 0.5
 //! list_bullet_size = 1.2
 //! quote_bar_gap = 0.8
+//! ragged_below = 20.0
 //!
 //! [flags]
 //! code_capsule = true
 //! table_lines = "booktabs"
 //! keep_korean_words = true
+//! narrow_ragged = false
 //!
 //! [bind]
 //! extensions = "txt, log"
@@ -518,6 +521,10 @@ struct Layer {
     fonts: [Option<String>; 19],
     numbers: [Option<f32>; 21],
     keep_korean_words: Option<bool>,
+    /// Whether a column narrower than `metrics.ragged_below` is set ragged-right. The
+    /// switch and the width travel together, so a preset that narrows the width without
+    /// saying anything about the switch keeps whatever the page under it decided.
+    narrow_ragged: Option<bool>,
     code_capsule: Option<bool>,
     table_lines: Option<TableLines>,
     extensions: Vec<String>,
@@ -536,6 +543,7 @@ impl Layer {
             fonts: fonts.map(Some),
             numbers: numbers.map(Some),
             keep_korean_words: Some(profile.keep_korean_words),
+            narrow_ragged: Some(profile.narrow_ragged),
             code_capsule: None,
             table_lines: None,
             extensions: Vec::new(),
@@ -551,6 +559,7 @@ impl Layer {
             fonts: std::array::from_fn(|_| None),
             numbers: std::array::from_fn(|_| None),
             keep_korean_words: None,
+            narrow_ragged: None,
             code_capsule: None,
             table_lines: None,
             extensions: Vec::new(),
@@ -572,6 +581,9 @@ impl Layer {
         }
         if let Some(value) = self.keep_korean_words {
             merged.keep_korean_words = Some(value);
+        }
+        if let Some(value) = self.narrow_ragged {
+            merged.narrow_ragged = Some(value);
         }
         if let Some(value) = self.code_capsule {
             merged.code_capsule = Some(value);
@@ -622,6 +634,10 @@ fn resolve(index: usize, layers: &[Layer], by_name: &HashMap<String, usize>) -> 
         fonts: merged.fonts.map(|value| value.unwrap_or_default()),
         numbers: merged.numbers.map(|value| value.unwrap_or_default()),
         keep_korean_words: merged.keep_korean_words.unwrap_or(false),
+        // A chain that says nothing about the switch gets the design's own answer, which
+        // is on: the fallback is what every narrow column was set with before this
+        // switch existed, and a file that never mentions it must not turn it off.
+        narrow_ragged: merged.narrow_ragged.unwrap_or(true),
     };
     // The form's own bounds, applied here rather than at draw time: a preset that cannot
     // be drawn with is a preset this reader cannot use, and the reader is told which one
@@ -713,6 +729,7 @@ fn parse(text: &str, path: &Path) -> Result<Layer, String> {
     let mut fonts: [Option<String>; 19] = std::array::from_fn(|_| None);
     let mut numbers: [Option<f32>; 21] = std::array::from_fn(|_| None);
     let mut keep_korean_words: Option<bool> = None;
+    let mut narrow_ragged: Option<bool> = None;
     let mut code_capsule: Option<bool> = None;
     let mut table_lines: Option<TableLines> = None;
     let mut extensions: Vec<String> = Vec::new();
@@ -815,6 +832,10 @@ fn parse(text: &str, path: &Path) -> Result<Layer, String> {
                     Ok(on) => keep_korean_words = Some(on),
                     Err(reason) => skipped.push(format!("flags.keep_korean_words: {reason}")),
                 },
+                "narrow_ragged" => match bool_value(value) {
+                    Ok(on) => narrow_ragged = Some(on),
+                    Err(reason) => skipped.push(format!("flags.narrow_ragged: {reason}")),
+                },
                 other => skipped.push(format!("flags.{other}: not a key this reader knows")),
             },
             Table::Bind => match key {
@@ -847,6 +868,7 @@ fn parse(text: &str, path: &Path) -> Result<Layer, String> {
     layer.fonts = fonts;
     layer.numbers = numbers;
     layer.keep_korean_words = keep_korean_words;
+    layer.narrow_ragged = narrow_ragged;
     layer.code_capsule = code_capsule;
     layer.table_lines = table_lines;
     layer.extensions = extensions;
@@ -1060,6 +1082,40 @@ mod tests {
         fn drop(&mut self) {
             let _ = std::fs::remove_dir_all(&self.dir);
         }
+    }
+
+    /// The narrow-column switch travels with a preset, like the width it stands beside: a
+    /// file that turns it off carries that to the page, a file that says nothing about it
+    /// leaves the page under it to decide -- which is the design's own answer, on -- and a
+    /// file that writes something that is not a switch is told so by name rather than read
+    /// as the `false` a missing word would give.
+    #[test]
+    fn a_preset_carries_the_narrow_column_switch() {
+        let scratch = Scratch::new("narrow");
+        scratch.write("off.toml", "[meta]\nname = \"Off\"\n\n[flags]\nnarrow_ragged = false\n");
+        scratch.write("quiet.toml", "[meta]\nname = \"Quiet\"\n\n[metrics]\nragged_below = 24.0\n");
+        scratch.write("loud.toml", "[meta]\nname = \"Loud\"\n\n[flags]\nnarrow_ragged = \"yes\"\n");
+
+        assert!(!scratch.preset("Off").profile.narrow_ragged, "the file's switch was not read");
+
+        let quiet = scratch.preset("Quiet");
+        assert!(quiet.profile.narrow_ragged, "a file that said nothing turned the fallback off");
+        assert_eq!(quiet.profile.numbers[7], 24.0, "the width the file names");
+
+        let loud = scratch.preset("Loud");
+        assert!(loud.profile.narrow_ragged, "an unreadable switch was read as off");
+        assert!(
+            loud.skipped.iter().any(|s| s.starts_with("flags.narrow_ragged")),
+            "the bad switch was not reported by name: {:?}",
+            loud.skipped
+        );
+
+        // And the switch reaches the page the preset is applied to, which is what makes a
+        // report able to say that the layout is no longer the design's own.
+        let mut theme = Theme::default();
+        scratch.preset("Off").apply(&mut theme);
+        assert!(!theme.narrow_ragged);
+        assert!(!theme.layout_is_the_design(), "the report would not say what moved");
     }
 
     /// A file the reader wrote is a preset: its numbers are the page's, its faces are

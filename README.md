@@ -188,6 +188,17 @@ the design every page was drawn with before the switches existed (the grid, and 
 code); a `--report` carries a `tables` or `inline code` line only when the other design
 was asked for.
 
+A page's letters have a setting of their own, and a narrow column has two. The
+**Typography** form — the menu's *Typography ▸ Edit / Save Preset…* — carries the tracking
+every run is set with (the letter spacing, in ems), the *Ragged below* width that says when
+a column is too narrow to justify, and the switch that turns that fallback off. A column
+narrower than the width is set to the left margin instead of being stretched, because a few
+words spread across a short measure read worse than a ragged edge; a reader who wants the
+justification at every width unticks the switch. Headless runs take
+`--narrow-align left|justify`, whose default is the design's own answer (`left`), and the
+`layout` line a `--report` carries names whichever of these numbers or switches the page is
+no longer set with.
+
 | Key | |
 | --- | --- |
 | `Ctrl+O` / `Ctrl+R` | open a document · read it again from disk |
@@ -331,8 +342,9 @@ quantities this build added: `marker_inset` (0–6 em, how far a list's marker h
 `list_marker_gap` (0–4 em, the air between the marker and the words it introduces),
 `list_bullet_size` (0.4–2.5, how large the marker is drawn) and `quote_bar_gap` (0–4 em,
 how far a quotation's bar stands from the column it marks). `[flags]` holds `code_capsule`
-(`true`/`false`), `table_lines` (`"grid"` or `"booktabs"`) and `keep_korean_words`
-(`true`/`false`).
+(`true`/`false`), `table_lines` (`"grid"` or `"booktabs"`), `keep_korean_words`
+(`true`/`false`) and `narrow_ragged` (`true`/`false`: the switch that stands beside
+`ragged_below`, saying whether a column narrower than that width is set to the left margin).
 
 Nothing is refused whole for one line this reader cannot read. A key it does not know, a
 number outside the range the form would take, a switch that is neither `true` nor

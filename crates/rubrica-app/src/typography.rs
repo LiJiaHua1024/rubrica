@@ -24,6 +24,7 @@ struct Form {
     fields: Vec<HWND>,
     korean: HWND,
     bind: HWND,
+    narrow: HWND,
     editor_args: HWND,
     lang: Language,
 }
@@ -54,10 +55,11 @@ pub fn show(owner: HWND, theme: &Theme, plain: bool, lang: Language) -> crate::R
         };
         RegisterClassExW(&wc);
         let hwnd = CreateWindowExW(WS_EX_CONTROLPARENT, PCWSTR(class.as_ptr()), PCWSTR(title.as_ptr()),
-            WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU, CW_USEDEFAULT, CW_USEDEFAULT, 900, 880,
+            WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU, CW_USEDEFAULT, CW_USEDEFAULT, 900, 960,
             Some(owner), None, Some(instance.into()), None)?;
         let mut state = Box::new(Form { owner, name: HWND::default(), fields: Vec::new(),
-            korean: HWND::default(), bind: HWND::default(), editor_args: HWND::default(), lang });
+            korean: HWND::default(), bind: HWND::default(), narrow: HWND::default(),
+            editor_args: HWND::default(), lang });
         let build = (|| -> windows::core::Result<()> {
             label(hwnd, i18n::t(lang, Key::TypoPresetName), 18, 16, 150)?;
             let selected = profiles::selected(plain);
@@ -94,12 +96,18 @@ pub fn show(owner: HWND, theme: &Theme, plain: bool, lang: Language) -> crate::R
             state.bind = child(hwnd, "BUTTON", i18n::t(lang, Key::TypoBindTxt), [454, 706, 330, 26], 131,
                 WS_TABSTOP | WINDOW_STYLE(BS_AUTOCHECKBOX as u32))?;
             SendMessageW(state.bind, BM_SETCHECK, Some(WPARAM(usize::from(plain))), None);
-            label(hwnd, i18n::t(lang, Key::TypoFontNotice), 18, 748, 820)?;
-            label(hwnd, i18n::t(lang, Key::TypoEditorArgs), 18, 782, 250)?;
-            state.editor_args = child(hwnd, "EDIT", &settings::editor_args(), [278, 778, 604, 25], 140,
+            // The switch that stands beside `Ragged below (em)` above, in the form rather
+            // than only on the command line, because Telari keeps the width and the
+            // switch together in the layout pane and this is the pane this reader has.
+            state.narrow = child(hwnd, "BUTTON", i18n::t(lang, Key::TypoNarrowRagged), [18, 740, 330, 26], 132,
+                WS_TABSTOP | WINDOW_STYLE(BS_AUTOCHECKBOX as u32))?;
+            SendMessageW(state.narrow, BM_SETCHECK, Some(WPARAM(usize::from(p.narrow_ragged))), None);
+            label(hwnd, i18n::t(lang, Key::TypoFontNotice), 18, 782, 820)?;
+            label(hwnd, i18n::t(lang, Key::TypoEditorArgs), 18, 816, 250)?;
+            state.editor_args = child(hwnd, "EDIT", &settings::editor_args(), [278, 812, 604, 25], 140,
                 WS_BORDER | WS_TABSTOP | WINDOW_STYLE(ES_AUTOHSCROLL as u32))?;
-            child(hwnd, "BUTTON", i18n::t(lang, Key::TypoSaveApply), [628, 820, 130, 30], 1, WS_TABSTOP | WINDOW_STYLE(BS_DEFPUSHBUTTON as u32))?;
-            child(hwnd, "BUTTON", i18n::t(lang, Key::TypoCancel), [770, 820, 112, 30], 2, WS_TABSTOP)?;
+            child(hwnd, "BUTTON", i18n::t(lang, Key::TypoSaveApply), [628, 856, 130, 30], 1, WS_TABSTOP | WINDOW_STYLE(BS_DEFPUSHBUTTON as u32))?;
+            child(hwnd, "BUTTON", i18n::t(lang, Key::TypoCancel), [770, 856, 112, 30], 2, WS_TABSTOP)?;
             Ok(())
         })();
         if let Err(error) = build { let _ = DestroyWindow(hwnd); return Err(error.into()); }
@@ -143,6 +151,7 @@ unsafe extern "system" fn proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> 
                     *value = text(state.fields[i + FONT_LABELS.len()]).parse().unwrap_or(f32::NAN);
                 }
                 p.keep_korean_words = unsafe { SendMessageW(state.korean, BM_GETCHECK, None, None) }.0 == 1;
+                p.narrow_ragged = unsafe { SendMessageW(state.narrow, BM_GETCHECK, None, None) }.0 == 1;
                 settings::record_editor_args(&text(state.editor_args));
                 let name = text(state.name);
                 match profiles::save_with_lang(&name, &p, state.lang) {

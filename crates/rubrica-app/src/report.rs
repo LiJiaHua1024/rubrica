@@ -575,10 +575,11 @@ pub fn report(source: &str, path: Option<&str>, o: &Options) -> Result<()> {
             page.capsules_drawn
         );
     }
-    // The four numbers a typography preset may move, when they are not the design's own:
-    // a page whose markers hang where they always hung prints no line, so the report of
-    // a reader who never opened a preset is the report it always was. Only the numbers
-    // that actually moved are named, because the line is read to find out what changed.
+    // The numbers a typography preset may move, and the one switch that stands with
+    // them, when they are not the design's own: a page whose markers hang where they
+    // always hung prints no line, so the report of a reader who never opened a preset is
+    // the report it always was. Only the ones that actually moved are named, because the
+    // line is read to find out what changed.
     if !theme.layout_is_the_design() {
         let mut moved: Vec<String> = Vec::new();
         if theme.marker_inset_em != Theme::DESIGN_MARKER_INSET_EM {
@@ -592,6 +593,9 @@ pub fn report(source: &str, path: Option<&str>, o: &Options) -> Result<()> {
         }
         if theme.quote_bar_gap_em != Theme::DESIGN_QUOTE_BAR_GAP_EM {
             moved.push(format!("quote bar gap {:.2}em", theme.quote_bar_gap_em));
+        }
+        if !theme.narrow_ragged {
+            moved.push("narrow columns justified".to_string());
         }
         println!("layout       : {}", moved.join(", "));
     }

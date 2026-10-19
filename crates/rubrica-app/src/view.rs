@@ -8603,6 +8603,18 @@ fn layout_diagram_error(
 }
 
 /// Typeset one block into the display list and return the new document y.
+/// Whether a block is set ragged-right.
+///
+/// A block that asks for it always is: a heading or a fence is not the prose the solver
+/// justifies. Everything else asks the column -- narrower than the width the page stops
+/// justifying at, with the fallback switched on, the line goes to the left margin rather
+/// than being stretched across a measure that cannot hold a paragraph. Both halves of
+/// that are the page's own numbers, so this is a question asked of a [`Theme`] rather
+/// than a rule written here.
+fn set_ragged(own: bool, theme: &Theme, size: f32, column: f32) -> bool {
+    own || (theme.narrow_ragged && column < size * theme.ragged_below_em)
+}
+
 fn layout_block(
     font: &mut FontEngine,
     ctx: &Ctx<'_>,
@@ -8685,7 +8697,7 @@ fn layout_block(
     spacing.keep_korean_words = grid == 0.0 && theme.keep_korean_words;
     spacing.punctuation_compression = theme.punctuation_compression;
     let mut opts = BreakOptions::new(column);
-    opts.ragged = b.ragged() || column < size * theme.ragged_below_em;
+    opts.ragged = set_ragged(b.ragged(), theme, size, column);
     // A heading that will not fit hangs, and that is the end of it: hyphenating a
     // heading is an error, and a reader widens the window. A line of code has nowhere
     // to hang *to* -- there is no horizontal scroll -- so the characters past the
@@ -18231,9 +18243,34 @@ mod layout_tests {
         assert_eq!(sx, x);
     }
 
-    /// The four numbers a preset may move are the design's own until someone moves them,
-    /// and a caller that says nothing about one leaves it alone -- which is what lets a
-    /// command line stand on top of a profile without erasing it.
+    /// The narrow-column fallback is a width and a switch, and neither is the other: a
+    /// column narrower than the width the page carries falls back to the left margin,
+    /// unless the reader has turned that off -- and a wide column is justified either way.
+    /// A block that asks to be ragged is ragged at any width, switch or no switch.
+    #[test]
+    fn a_narrow_column_falls_back_unless_the_switch_is_off() {
+        let theme = Theme::default();
+        let size = Theme::DESIGN_BASE;
+        let narrow = 10.0 * size;
+        let wide = 36.0 * size;
+        assert!(set_ragged(false, &theme, size, narrow), "a ten-em column was justified");
+        assert!(!set_ragged(false, &theme, size, wide), "a thirty-six-em column fell back");
+
+        let off = Theme { narrow_ragged: false, ..Theme::default() };
+        assert!(!set_ragged(false, &off, size, narrow), "the switch did not turn the fallback off");
+        assert!(set_ragged(true, &off, size, wide), "a fence lost its own raggedness");
+
+        // The width is the page's number, not this function's: a page that stops at eight
+        // ems justifies the ten-em column the design's own sixteen would have fallen back.
+        let tight = Theme { ragged_below_em: 8.0, ..Theme::default() };
+        assert!(!set_ragged(false, &tight, size, narrow), "the width the page carries was ignored");
+        assert!(set_ragged(false, &tight, size, 6.0 * size), "six ems is inside eight");
+    }
+
+    /// The layout numbers a preset may move, and the narrow-column switch that stands
+    /// beside them, are the design's own until someone moves them, and a caller that says
+    /// nothing about one leaves it alone -- which is what lets a command line stand on top
+    /// of a profile without erasing it.
     #[test]
     fn the_layout_numbers_start_where_the_layout_was_drawn() {
         let theme = Theme::default();
@@ -18242,6 +18279,7 @@ mod layout_tests {
         assert_eq!(theme.marker_inset_em, 0.0);
         assert_eq!(theme.list_marker_gap_em, 0.0);
         assert_eq!(theme.list_bullet_size, 1.0);
+        assert!(theme.narrow_ragged, "the design justifies a narrow column");
 
         let mut moved = theme.clone();
         let overrides = crate::theme::LayoutOverrides {
@@ -18252,6 +18290,15 @@ mod layout_tests {
         assert_eq!(moved.list_marker_gap_em, 0.5);
         assert_eq!(moved.marker_inset_em, 0.0, "a number nobody named was moved");
         assert_eq!(moved.quote_bar_gap_em, 0.5);
+        assert!(moved.narrow_ragged, "a switch nobody named was moved");
         assert!(!moved.layout_is_the_design());
+
+        // The switch alone takes the page off the design's own layout, which is what makes
+        // the report say so: `--narrow-align justify` is the command line that turns it off.
+        let mut off = theme.clone();
+        crate::theme::LayoutOverrides { narrow_ragged: Some(false), ..Default::default() }
+            .apply(&mut off);
+        assert!(!off.narrow_ragged);
+        assert!(!off.layout_is_the_design(), "the switch is not part of what a report names");
     }
 }

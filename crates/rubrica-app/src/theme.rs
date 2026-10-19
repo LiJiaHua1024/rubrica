@@ -322,7 +322,8 @@ pub enum TableLines {
     Booktabs,
 }
 
-/// The four layout numbers a caller may set on top of whatever the page already has.
+/// The layout numbers, and the one switch that belongs with them, a caller may set on
+/// top of whatever the page already has.
 ///
 /// `None` is "leave it": a page drawn from a preset that already carries a marker gap
 /// keeps it when the command line says nothing, which is why these are not the numbers
@@ -334,6 +335,7 @@ pub struct LayoutOverrides {
     pub list_marker_gap_em: Option<Pt>,
     pub list_bullet_size: Option<f32>,
     pub quote_bar_gap_em: Option<Pt>,
+    pub narrow_ragged: Option<bool>,
 }
 
 impl LayoutOverrides {
@@ -349,6 +351,9 @@ impl LayoutOverrides {
         }
         if let Some(value) = self.quote_bar_gap_em {
             t.quote_bar_gap_em = value;
+        }
+        if let Some(on) = self.narrow_ragged {
+            t.narrow_ragged = on;
         }
     }
 }
@@ -412,6 +417,15 @@ pub struct Theme {
     pub hanging_punctuation_em: Pt,
     /// Stop justifying short columns where stretching overwhelms word spacing.
     pub ragged_below_em: Pt,
+    /// Whether a column narrower than [`Theme::ragged_below_em`] is set ragged-right.
+    ///
+    /// The switch that belongs beside the width, and the reason it is a switch as well
+    /// as a number: a reader who wants the fallback gone at every width says so here,
+    /// rather than by setting the width to zero -- which is a width, and reads as one.
+    /// On is the design's own behaviour: every narrow column this reader has ever set
+    /// fell back to the left margin, and a page that stopped doing it would be a change
+    /// nobody asked for.
+    pub narrow_ragged: bool,
     pub quote_indent_em: Pt,
     pub list_indent_em: Pt,
     pub definition_indent_em: Pt,
@@ -494,6 +508,7 @@ impl Default for Theme {
             punctuation_compression: 0.5,
             hanging_punctuation_em: 0.0,
             ragged_below_em: 16.0,
+            narrow_ragged: true,
             quote_indent_em: 1.2,
             list_indent_em: 1.6,
             definition_indent_em: 1.5,
@@ -533,13 +548,15 @@ impl Theme {
     pub const DESIGN_MARKER_INSET_EM: Pt = 0.0;
     pub const DESIGN_LIST_BULLET_SIZE: f32 = 1.0;
 
-    /// Whether every one of the four layout numbers is still the design's own, which is
-    /// the state every page was in before a preset could move them.
+    /// Whether every one of the layout numbers, and the narrow-column switch that stands
+    /// beside them, is still the design's own -- the state every page was in before a
+    /// preset or a command line could move them.
     pub fn layout_is_the_design(&self) -> bool {
         self.quote_bar_gap_em == Self::DESIGN_QUOTE_BAR_GAP_EM
             && self.list_marker_gap_em == Self::DESIGN_LIST_MARKER_GAP_EM
             && self.marker_inset_em == Self::DESIGN_MARKER_INSET_EM
             && self.list_bullet_size == Self::DESIGN_LIST_BULLET_SIZE
+            && self.narrow_ragged
     }
 
     /// Read the page at a new size.

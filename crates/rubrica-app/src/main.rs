@@ -332,11 +332,12 @@ fn has_flag(argv: &[OsString], name: &str) -> bool {
 /// `--width` and friends. A double-click names one; a multi-selection "open with" names
 /// several, and each of them is wanted.
 fn positionals(argv: &[OsString]) -> Vec<PathBuf> {
-    const TAKES_VALUE: [&str; 19] = [
+    const TAKES_VALUE: [&str; 20] = [
         "--width", "--dpi", "--zoom", "--face", "--measure", "--profile",
         "--export-png", "--export-width", "--export-scale", "--export-pdf",
         "--pdf-width", "--pdf-height", "--theme", "--tables", "--inline-code",
         "--marker-inset", "--list-marker-gap", "--list-bullet-size", "--quote-bar-gap",
+        "--narrow-align",
     ];
     let mut skip_next = false;
     let mut flags_done = false;
@@ -415,6 +416,24 @@ fn code_capsule(argv: &[OsString]) -> Result<bool> {
     }
 }
 
+/// How a column narrower than the page's `ragged_below` width is set, from
+/// `--narrow-align`.
+///
+/// Telari's switch, spelled as the choice it makes rather than as the word the layout
+/// uses inside: `left` is the design's own answer -- a narrow column falls back to the
+/// left margin rather than being stretched -- and `justify` keeps it justified like every
+/// other column. Nothing on the command line leaves whatever the page already carries,
+/// which is the preset's own answer. Refused rather than guessed at, for the reason
+/// `--tables` is.
+fn narrow_align(argv: &[OsString]) -> Result<Option<bool>> {
+    match text_flag(argv, "--narrow-align").map(lossy).as_deref() {
+        None => Ok(None),
+        Some("left") => Ok(Some(true)),
+        Some("justify") => Ok(Some(false)),
+        Some(other) => Err(format!("--narrow-align wants `left` or `justify`, not `{other}`").into()),
+    }
+}
+
 /// The typography preset this run sets its page with: the one the reader named, or the
 /// one this kind of document is set with.
 ///
@@ -458,6 +477,7 @@ fn layout_overrides(argv: &[OsString]) -> Result<theme::LayoutOverrides> {
         list_marker_gap_em: layout_number(argv, "--list-marker-gap", 0.0, 4.0)?,
         list_bullet_size: layout_number(argv, "--list-bullet-size", 0.4, 2.5)?,
         quote_bar_gap_em: layout_number(argv, "--quote-bar-gap", 0.0, 4.0)?,
+        narrow_ragged: narrow_align(argv)?,
     })
 }
 

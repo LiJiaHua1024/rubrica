@@ -119,6 +119,10 @@ pub struct Profile {
     pub fonts: [String; 19],
     pub numbers: [f32; 21],
     pub keep_korean_words: bool,
+    /// Whether a column narrower than `numbers[7]` is set ragged-right. A preset carries
+    /// it because it is a decision about how the page is set, like the width it works
+    /// with: a page of tables wants it, a page of narrow poetry does not.
+    pub narrow_ragged: bool,
 }
 
 impl Default for Profile {
@@ -175,6 +179,7 @@ impl Profile {
                 t.quote_bar_gap_em,
             ],
             keep_korean_words: t.keep_korean_words,
+            narrow_ragged: t.narrow_ragged,
         }
     }
 
@@ -266,6 +271,7 @@ impl Profile {
         t.list_bullet_size = self.numbers[19];
         t.quote_bar_gap_em = self.numbers[20];
         t.keep_korean_words = self.keep_korean_words;
+        t.narrow_ragged = self.narrow_ragged;
         t.face = crate::theme::TextFace::ALL
             .iter()
             .position(|f| f.body == self.fonts[0] && f.heading == self.fonts[1])
@@ -337,6 +343,9 @@ fn read_profile(name: &str) -> Profile {
         }
     }
     p.keep_korean_words = batch.word("KeepKoreanWords") != Some(0);
+    // A preset saved before this switch existed has no word of its own here, and reads as
+    // the design's own answer rather than as the `false` a missing word would give.
+    p.narrow_ragged = batch.word("NarrowRagged") != Some(0);
     if p.validate().is_ok() { p } else { Profile::default() }
 }
 
@@ -377,6 +386,7 @@ fn write_profile(name: &str, p: &Profile, lang: Language) -> Result<(), String> 
         settings::try_write_text(&sub, &format!("Number{i}"), &value.to_string())?;
     }
     settings::try_write_word(&sub, "KeepKoreanWords", u32::from(p.keep_korean_words))?;
+    settings::try_write_word(&sub, "NarrowRagged", u32::from(p.narrow_ragged))?;
     settings::try_write_text(ROOT, "Names", &names[2..].join("\n"))?;
     Ok(())
 }
