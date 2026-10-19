@@ -180,6 +180,14 @@ chapter window, with `Ctrl+Alt+Up/Down` for chapter navigation. `Ctrl+3` switche
 source view, `Ctrl+4` switches between continuous scrolling and the page stack, and
 `Ctrl+Shift+O` opens the file in an editor at the current source position.
 
+`Space` turns the page on and `Shift+Space` turns it back, in either reading mode, and a
+held key walks on through the document. Both modes turn by the same pages: a page opens on
+a line's own top -- never halfway through a line -- and its last line ends on a line's own
+bottom, so the foot of a page never cuts one in half. The two lines the reader has just
+read stand again at the top of the page they land on, which is the handhold a page turn is
+for. On a system with animations switched off (Ease of Access), the page stack goes
+straight to the page instead of gliding to it.
+
 Dragging a selection to the top or bottom of the page scrolls it on, and keeps it scrolling
 while the pointer stays there: the twenty points next to the page's own edge move at a steady
 six points a beat, and past that edge -- over the tab strip, into the status bar, or clean out
@@ -206,6 +214,13 @@ under a `table select` line; a spec that names no table, row or column is refuse
 count the page has, and the switch is read on the report's own page, so it is written with
 `--report` (a run that asks for a table without one is told so rather than opening a
 window).
+
+The reader's own pages can be measured the same way. `--report --page-stops 570` prints
+where each page of a 570-point window would open, the lines it would hold, the bottom of
+its last line and the step from the page before, under a `page stops` line, with the counts
+that say whether a page turn is line-aligned (`page opens`, `page feet`) and whether the two
+lines of overlap are there (`page share`); a height that is missing, not a number, zero,
+negative, NaN or infinite is refused, and so is the switch without `--report`.
 
 A page's own furniture has two more choices, and both are drawn rather than measured: a
 table can be ruled as the full grid or as the printed table's three rules (a rule above,
@@ -265,7 +280,7 @@ no longer set with.
 | `Ctrl` + `[` `]` | the measure: two margins moving apart, and together |
 | `+` `-` `0` | zoom in · out · actual size |
 | `←↑↓→` `Home` `End` | move the caret · with no caret, first/last page in page-stack mode |
-| `PgUp` `PgDn` | previous/next page · previous/next screen in continuous mode |
+| `PgUp` `PgDn` / `Space` | previous/next page, in either mode · `Shift+Space` turns back |
 | `Shift` + arrows / `Home` / `End` | extend the selection |
 | `Alt` + `←` `→` | back and forward through where you have been |
 | `Enter` | step to the next find match |

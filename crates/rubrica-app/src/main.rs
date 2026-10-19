@@ -246,6 +246,10 @@ fn main() -> Result<()> {
     if has_flag(&argv, "--table-select") && !has_flag(&argv, "--report") {
         return Err("--table-select reads a table on the report's own page: add --report".into());
     }
+    // And the pagination is read on the report's own page for the same reason.
+    if has_flag(&argv, "--page-stops") && !has_flag(&argv, "--report") {
+        return Err("--page-stops measures the reader's pages on the report's own page: add --report".into());
+    }
     // The same reasoning for the sidebar's query: it filters the listing `--list-tree`
     // prints, so a run that asked for one without the other has no listing to filter --
     // and, left to fall through, would open a window instead.
@@ -309,6 +313,7 @@ fn main() -> Result<()> {
             profile,
             theme: colour.asked.then(|| themes::report_line(&colour)),
             table_select: text_flag(&argv, "--table-select").map(lossy),
+            page_stops: page_stops(&argv)?,
         };
         return report::report(&source, shown, &options);
     }
@@ -407,13 +412,14 @@ fn has_flag(argv: &[OsString], name: &str) -> bool {
 /// `--width` and friends. A double-click names one; a multi-selection "open with" names
 /// several, and each of them is wanted.
 fn positionals(argv: &[OsString]) -> Vec<PathBuf> {
-    const TAKES_VALUE: [&str; 27] = [
+    const TAKES_VALUE: [&str; 28] = [
         "--width", "--dpi", "--zoom", "--face", "--measure", "--profile",
         "--export-png", "--export-width", "--export-scale", "--export-pdf",
         "--pdf-width", "--pdf-height", "--theme", "--tables", "--inline-code",
         "--marker-inset", "--list-marker-gap", "--list-bullet-size", "--quote-bar-gap",
         "--narrow-align", "--code-ladder", "--code-language", "--table-select",
         "--list-tree", "--tree-search", "--favourite-folder", "--unfavourite-folder",
+        "--page-stops",
     ];
     let mut skip_next = false;
     let mut flags_done = false;
@@ -538,6 +544,29 @@ fn code_language(argv: &[OsString]) -> Result<Option<bool>> {
             Err(format!("--code-language wants `none` or `corner`, not `{other}`").into())
         }
     }
+}
+
+/// The page height `--page-stops` measures the reader's own pagination at, in points.
+///
+/// A height that is not a positive number is refused rather than guessed at, for the
+/// reason `--tables` refuses a word it does not know: a pagination measured at a height
+/// nobody asked for is a page of numbers about nothing, and a report is read as evidence.
+/// The flag without a value is refused too -- `--page-stops` is a measurement, and a
+/// measurement of nothing is not the default measurement.
+fn page_stops(argv: &[OsString]) -> Result<Option<f32>> {
+    if !has_flag(argv, "--page-stops") {
+        return Ok(None);
+    }
+    let asked = text_flag(argv, "--page-stops")
+        .map(lossy)
+        .ok_or_else(|| -> Error { "--page-stops wants a page height in points".into() })?;
+    let height: f32 = asked.parse().map_err(|_| -> Error {
+        format!("--page-stops wants a page height in points, not `{asked}`").into()
+    })?;
+    if !height.is_finite() || height <= 0.0 {
+        return Err(format!("--page-stops wants a page height above zero, not `{asked}`").into());
+    }
+    Ok(Some(height))
 }
 
 /// The typography preset this run sets its page with: the one the reader named, or the

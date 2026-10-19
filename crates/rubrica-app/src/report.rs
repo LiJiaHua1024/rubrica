@@ -7,7 +7,7 @@
 //! what is actually painted rather than what a second implementation would have
 //! produced -- and it never touches the desktop.
 //!
-//! Run: `rubrica-app --report [file.md] [--width 1080] [--dpi 96] [--zoom 120] [--face 1] [--measure 0] [--shapes] [--no-html-images] [--no-highlights]`
+//! Run: `rubrica-app --report [file.md] [--width 1080] [--dpi 96] [--zoom 120] [--face 1] [--measure 0] [--shapes] [--no-html-images] [--no-highlights] [--page-stops 570]`
 
 use std::collections::BTreeMap;
 
@@ -73,6 +73,11 @@ pub struct Options {
     /// command line takes them: `all`, `2`, or `2:B2:D3`. `None` -- the default -- prints
     /// nothing, so the report of a page nobody selected a table on is the report it was.
     pub table_select: Option<String>,
+    /// The page height, in points, to measure the reader's own pagination at: where each
+    /// page opens, which lines it holds, and where its last line ends. `None` -- the
+    /// default -- prints nothing, so the report of a page nobody asked about the pages of
+    /// is the report it was.
+    pub page_stops: Option<f32>,
 }
 
 pub fn report(source: &str, path: Option<&str>, o: &Options) -> Result<()> {
@@ -98,6 +103,7 @@ pub fn report(source: &str, path: Option<&str>, o: &Options) -> Result<()> {
         profile,
         theme: theme_line,
         table_select,
+        page_stops,
     } = o.clone();
     let mut font =
         FontEngine::new().map_err(|e| -> Error { format!("DirectWrite: {e}").into() })?;
@@ -954,6 +960,65 @@ pub fn report(source: &str, path: Option<&str>, o: &Options) -> Result<()> {
         let (what, fields) = crate::cells::selection(&grids, spec).map_err(|e| -> Error { e.into() })?;
         println!("table select : {what}");
         print!("{fields}");
+    }
+    // Where the reader's own pages stand at the height a window of that size would give
+    // them: the same walk the page stack, the page counter and a press of the space bar
+    // all read. Printed as the numbers they are -- the stops, the lines each page holds,
+    // and the step between one page and the next -- because the properties a page turn
+    // is judged by are all of them arithmetic: a stop on a line's own top, no page
+    // ending on half a line, and two lines carried over from the page before.
+    if let Some(page_height) = page_stops {
+        let pages = crate::view::reader_pages(&page.sel, &page.anchor_tops, height, page_height, k);
+        println!(
+            "page stops  : {} page(s) of {page_height}pt, {} line(s) of overlap",
+            pages.len(),
+            crate::view::PAGE_OVERLAP_LINES
+        );
+        let mut previous = 0.0;
+        for (index, stop) in pages.iter().enumerate() {
+            let step = if index == 0 { 0.0 } else { stop.top - previous };
+            println!(
+                "  [{index:>3}] top {:>9.2}pt  lines {:>6}..{:<6} foot {:>9.2}pt  step {step:>8.2}pt",
+                stop.top, stop.first, stop.last, stop.foot
+            );
+            previous = stop.top;
+        }
+        let steps: Vec<f32> = pages.windows(2).map(|pair| pair[1].top - pair[0].top).collect();
+        let min = steps.iter().copied().fold(f32::INFINITY, f32::min);
+        let max = steps.iter().copied().fold(0.0, f32::max);
+        let opens = pages
+            .iter()
+            .skip(1)
+            .filter(|stop| page.sel.iter().any(|line| (line.y / k - stop.top).abs() < 0.01))
+            .count();
+        let feet = pages
+            .iter()
+            .filter(|stop| {
+                page.sel.iter().any(|line| ((line.y + line.h) / k - stop.foot).abs() < 0.01)
+            })
+            .count();
+        let inside = pages
+            .iter()
+            .filter(|stop| stop.foot <= stop.top + page_height + 0.01)
+            .count();
+        let shared = pages
+            .windows(2)
+            .filter(|pair| pair[0].last.saturating_sub(pair[1].first) == crate::view::PAGE_OVERLAP_LINES)
+            .count();
+        println!("page step   : min {min:.2}pt, max {max:.2}pt over {} step(s)", steps.len());
+        // The first page opens at the document's own top rather than on a line, which is
+        // what every page before it would have done: there is no line above the first.
+        println!(
+            "page opens  : {opens} of {} page(s) after the first on a line's own top; the first at the document's own top {:.2}pt",
+            pages.len().saturating_sub(1),
+            pages.first().map_or(0.0, |stop| stop.top)
+        );
+        println!("page feet   : {feet} of {} page(s) on a line's own bottom, {inside} inside their own height", pages.len());
+        println!(
+            "page share  : {shared} of {} boundary(ies) carry {} line(s) over",
+            steps.len(),
+            crate::view::PAGE_OVERLAP_LINES
+        );
     }
     Ok(())
 }

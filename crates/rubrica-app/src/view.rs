@@ -73,7 +73,7 @@ use windows::Win32::UI::Input::KeyboardAndMouse::{
 };
 use windows::Win32::System::SystemInformation::GetTickCount;
 use windows::Win32::System::Time::{FileTimeToSystemTime, SystemTimeToTzSpecificLocalTime};
-use windows::Win32::UI::Input::KeyboardAndMouse::{VK_DOWN, VK_ESCAPE, VK_NEXT, VK_PRIOR};
+use windows::Win32::UI::Input::KeyboardAndMouse::{VK_DOWN, VK_ESCAPE, VK_NEXT, VK_PRIOR, VK_SPACE};
 use windows::Win32::UI::Input::KeyboardAndMouse::{
     VK_0, VK_A, VK_ADD, VK_C, VK_D, VK_END, VK_F, VK_F3, VK_HOME, VK_LEFT, VK_MENU, VK_NUMPAD0,
     VK_OEM_4, VK_OEM_6, VK_OEM_MINUS, VK_OEM_PLUS, VK_R, VK_RETURN, VK_RIGHT, VK_SHIFT,
@@ -255,6 +255,14 @@ const PAGE_STACK_PEEK: f32 = 10.0;
 const PAGE_FOOTER_H: f32 = 30.0;
 const PAGE_BUTTON_W: f32 = 30.0;
 const PAGE_TRANSITION_MS: u128 = 200;
+/// How soon after a page turn a held space bar may turn another.
+///
+/// Windows sends the repeats itself, at the delay and the rate the reader set in their
+/// own keyboard settings, which is the right pace to inherit -- a reader who wants a
+/// faster walk has already said so there. This is the floor under that rate: thirty
+/// turns a second is a blur of pages rather than a reader walking through them, and a
+/// fifth of a second a page is as fast as a page can be read at all.
+const PAGE_HOLD_MS: u128 = 200;
 const PAGE_TIMER: usize = 0x5143;
 const PAGE_TICK_MS: u32 = 16;
 /// How long a pointer has to rest on a citation before its note opens.
@@ -2009,6 +2017,14 @@ pub struct View {
     /// is still the one the relayout left, which is what makes a stale pair harmless.
     page_place: Option<(Pt, usize)>,
     page_transition: Option<PageTransition>,
+    /// When the last press of the space bar turned a page, so the repeats a held key
+    /// sends can be answered at a reading pace rather than at the keyboard's own.
+    page_turn_at: Option<Instant>,
+    /// Whether the page turn being made was asked for by a held key. A held key is a
+    /// reader walking through a document, not watching one page become the next, so the
+    /// turn it asks for goes straight there; the flag is taken by the turn that reads
+    /// it, so the next press is answered on its own terms.
+    page_held: bool,
     page_hot: Option<PageButton>,
     page_pressed: Option<PageButton>,
     palette: Palette,
@@ -3829,6 +3845,8 @@ fn new_view(
         page_starts: Vec::new(),
         page_place: None,
         page_transition: None,
+        page_turn_at: None,
+        page_held: false,
         page_hot: None,
         page_pressed: None,
         palette,
@@ -4233,6 +4251,31 @@ pub(crate) fn system_prefers_dark() -> bool {
         )
     };
     r.is_ok() && value == 0
+}
+
+/// Whether the reader's system asks for animations.
+///
+/// `SPI_GETCLIENTAREAANIMATION` is the setting Windows itself reads before it animates
+/// anything inside a window, and the one the "Show animations in Windows" box in Ease of
+/// Access writes. A system that says no is asking for the destination rather than the
+/// journey, and a page turn is the one place this reader has a journey to offer -- so it
+/// is the one place the answer has to be asked for. A query that fails answers yes: the
+/// setting is a courtesy to the reader, and a reader who never asked for it is not owed
+/// a page that cannot turn.
+fn animations_on() -> bool {
+    use windows::Win32::UI::WindowsAndMessaging::{
+        SystemParametersInfoW, SPI_GETCLIENTAREAANIMATION, SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS,
+    };
+    let mut on: i32 = 1;
+    let asked = unsafe {
+        SystemParametersInfoW(
+            SPI_GETCLIENTAREAANIMATION,
+            0,
+            Some(&mut on as *mut i32 as *mut core::ffi::c_void),
+            SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS(0),
+        )
+    };
+    asked.is_ok() && on != 0
 }
 
 /// The work area of every screen there is, in physical pixels.
@@ -5376,6 +5419,17 @@ impl View {
                     return LRESULT(0);
                 }
                 match wp.0 as u32 {
+                    // The page turn every reader of every reader already has in their
+                    // fingers, and the one Telari's reader was reported to miss. A held
+                    // key sends its own repeats -- the same bit the chords above read --
+                    // and they are answered at a reading pace; `Shift` walks back the
+                    // way it came. `Ctrl` and `Alt` keep their own meanings: the window
+                    // menu is `Alt`+`Space`, and it is not this window's to take.
+                    k if k == VK_SPACE.0 as u32 && !ctrl && !held(VK_MENU) => {
+                        let repeating = lp.0 & (1 << 30) != 0;
+                        self.space_page(if shift { -1 } else { 1 }, repeating, Instant::now(), hwnd);
+                        return LRESULT(0);
+                    }
                     k if k == VK_PRIOR.0 as u32 => self.page_command(-1, hwnd),
                     k if k == VK_NEXT.0 as u32 => self.page_command(1, hwnd),
                     // The way back out of a caret the reader has clicked into: while the
@@ -6184,7 +6238,29 @@ impl View {
         if self.reading_mode == ReadingMode::Stack {
             self.turn_page(delta, hwnd);
         } else {
-            self.scroll_by(delta as Pt * self.page_height());
+            // A page in continuous scroll is the page the page stack and the page
+            // counter mean: it opens on a line's own top, two lines inside the page the
+            // reader is on, and it ends on a line's own bottom. A screenful of scroll
+            // instead lands wherever the arithmetic falls -- mid-line, with the last
+            // line of the page before cut in half at the top of the window and nothing
+            // of it carried over.
+            //
+            // A stop the window cannot reach is not a page the reader can stand on: the
+            // walk ends at the last one that is, so a press near the end of a document
+            // leaves them at the end of it rather than counting pages that never move.
+            let view_h = (self.content_bottom() - TOPBAR_H).max(1.0) / scale_of(self.dpi);
+            let end = max_scroll_of(self.content_h, self.theme.base, view_h);
+            let last = page_index_at(&self.page_starts, end);
+            let from = self.current_page_index().min(last);
+            let to = (from as isize + delta as isize).clamp(0, last as isize) as usize;
+            if to == from {
+                return;
+            }
+            if let Some(top) = self.page_start(to) {
+                self.scroll = top.min(end);
+                self.clamp_scroll();
+                self.remember_reading();
+            }
         }
     }
 
@@ -6207,6 +6283,18 @@ impl View {
         self.caret = None;
         self.wide_active = None;
         self.wide_offset = 0.0;
+        // A held key is a reader walking through a document rather than watching one page
+        // become the next, and a system that asked for no animations is asking for the
+        // same thing; both get the page itself rather than two hundred milliseconds of
+        // one page becoming another. The flag is taken here, so the next press is
+        // answered on its own terms.
+        let straight = self.page_held || !animations_on();
+        if straight {
+            self.scroll = to;
+            self.remember_reading();
+            let _ = unsafe { InvalidateRect(Some(hwnd), None, false) };
+            return;
+        }
         self.page_transition = Some(PageTransition {
             to,
             from_index,
@@ -6216,6 +6304,32 @@ impl View {
         });
         let _ = unsafe { SetTimer(Some(hwnd), PAGE_TIMER, PAGE_TICK_MS, None) };
         let _ = unsafe { InvalidateRect(Some(hwnd), None, false) };
+    }
+
+    /// A press of the space bar: the page on, or -- with `Shift` -- the page back.
+    ///
+    /// A key held down sends its own repeats, at the delay and the rate the reader set
+    /// in their own keyboard settings, and those are the pace to inherit: a reader who
+    /// wants a faster walk has already said so there. [`PAGE_HOLD_MS`] is the floor
+    /// under that rate, because thirty turns a second is a blur of pages rather than a
+    /// reader walking through them. The first press is never held back.
+    ///
+    /// The turn goes through the menu's own command, so the key and the row it repeats
+    /// cannot drift apart, and it is marked as a held key's turn: a reader holding the
+    /// key down is walking through the document, not watching one page become the next.
+    fn space_page(&mut self, delta: i32, repeat: bool, now: Instant, hwnd: HWND) {
+        if repeat {
+            let since = self.page_turn_at.map_or(PAGE_HOLD_MS, |last| now.duration_since(last).as_millis());
+            if since < PAGE_HOLD_MS {
+                return;
+            }
+        }
+        self.page_turn_at = Some(now);
+        self.page_held = repeat;
+        self.apply_command(if delta > 0 { Command::NextPage } else { Command::PreviousPage }, hwnd);
+        // The turn has been made and has read the flag; the next press answers for
+        // itself rather than for this one.
+        self.page_held = false;
     }
 
     fn tick_page_transition(&mut self, hwnd: HWND) {
@@ -10116,12 +10230,6 @@ impl View {
     /// be laid out under the bar or scrolled past it.
     fn content_bottom(&self) -> f32 {
         (self.client_h - self.status_h()).max(TOPBAR_H + 1.0)
-    }
-
-    /// Client-space height of one text page, in points: most of a window, so a reader
-    /// keeps a little of the previous screen as a place to come back to.
-    fn page_height(&self) -> Pt {
-        (self.content_bottom() - TOPBAR_H).max(1.0) / scale_of(self.dpi) * 0.85
     }
 
     fn page_stack_layout(&self) -> PageStackLayout {
@@ -14290,8 +14398,13 @@ fn clip_pdf_line(x0: f32, y0: f32, x1: f32, y1: f32, top: f32, height: f32) -> O
 
 #[cfg(feature = "pdf")]
 fn pdf_page_starts(page: &Page, page_height: Pt) -> Vec<Pt> {
-    page_starts_with_overhead(&page.sel, &page.anchor_tops, page.height, page_height, 1.0,
+    // No overlap: a printed page whose text ran twice would be a fault rather than the
+    // courtesy it is on screen.
+    page_stops(&page.sel, &page.anchor_tops, page.height, page_height, 1.0, 0,
         |top| pdf_continuation_height(page, top, page_height))
+        .into_iter()
+        .map(|stop| stop.top)
+        .collect()
 }
 
 #[cfg(feature = "pdf")]
@@ -14310,78 +14423,152 @@ fn pdf_continuation_height(page: &Page, top: Pt, height: Pt) -> Pt {
     used
 }
 
+/// One page of the reader's own pagination: where it opens, the lines it shows, and
+/// where the last of them ends.
+///
+/// The three are the page's whole geometry, and the page stack, the page counter and a
+/// press of the space bar all read the same three. A page opens on a line's own top and
+/// its last line ends on a line's own bottom, so no line is ever left half-shown at the
+/// foot of a page: the line that would have been cut moves whole to the page after.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) struct PageStop {
+    /// The top of the first line the page shows, in points.
+    pub(crate) top: Pt,
+    /// The lines it shows, as `first..last` into the selection's own lines. A page that
+    /// carries an overlap shares its first lines with the page before it, so one line
+    /// belongs to two pages rather than to one.
+    pub(crate) first: usize,
+    pub(crate) last: usize,
+    /// Where the last line it shows ends, in points.
+    pub(crate) foot: Pt,
+}
+
+/// How many of its own last lines a page keeps for the page after it.
+///
+/// The handhold a reader pressing on is asking for: the last thing they read standing
+/// at the top of what they read next, so a page turn never loses the thread. The PDF
+/// writer keeps none -- a printed sheet whose text ran twice would be a fault rather
+/// than a courtesy -- which is why this is the reader's own number and not the walk's.
+pub(crate) const PAGE_OVERLAP_LINES: usize = 2;
+
 /// Line-safe page starts shared by the PDF writer and the on-screen page stack.
 ///
 /// `Page::sel` is measured in DIPs at the live render target, while the document
 /// heights and heading anchors are points. `scale` is the one conversion between those
 /// two spaces; passing `1.0` keeps the PDF path at its 72dpi coordinate system.
 fn reader_page_starts(sel: &[SelLine], anchors: &[Pt], height: Pt, page_height: Pt, scale: Pt) -> Vec<Pt> {
-    page_starts_with_overhead(sel, anchors, height, page_height, scale, |_| 0.0)
+    reader_pages(sel, anchors, height, page_height, scale)
+        .into_iter()
+        .map(|stop| stop.top)
+        .collect()
 }
 
-fn page_starts_with_overhead(sel: &[SelLine], anchors: &[Pt], height: Pt, page_height: Pt, scale: Pt,
-    overhead: impl Fn(Pt) -> Pt) -> Vec<Pt>
+/// The reader's own pages, with the two lines of overlap a page turn is for.
+pub(crate) fn reader_pages(sel: &[SelLine], anchors: &[Pt], height: Pt, page_height: Pt, scale: Pt)
+    -> Vec<PageStop>
+{
+    page_stops(sel, anchors, height, page_height, scale, PAGE_OVERLAP_LINES, |_| 0.0)
+}
+
+/// Where the pages of a document stand, in points.
+///
+/// `overlap` is how many of the lines a page ends with the page after it begins with.
+/// `overhead` is what a page spends before its own text -- a repeated table header, the
+/// room a note takes -- measured against the top that page opens at, which is why it is
+/// asked per page rather than once.
+fn page_stops(sel: &[SelLine], anchors: &[Pt], height: Pt, page_height: Pt, scale: Pt,
+    overlap: usize, overhead: impl Fn(Pt) -> Pt) -> Vec<PageStop>
 {
     if !page_height.is_finite() || page_height <= 0.0 || !scale.is_finite() || scale <= 0.0 {
-        return vec![0.0];
+        return vec![PageStop { top: 0.0, first: 0, last: 0, foot: 0.0 }];
     }
     let capacity = |top| (page_height - overhead(top)).max(page_height.min(1.0)).min(page_height);
+    // A line's own two edges in points, which is the space the page starts are in. An
+    // index off the end answers with the document's height, so the walk never has to
+    // ask whether there is a line there.
+    let top_of = |index: usize| sel.get(index).map_or(height, |line| line.y / scale);
+    let bottom_of = |index: usize| sel.get(index).map_or(height, |line| (line.y + line.h) / scale);
     if sel.is_empty() {
-        let mut starts = vec![0.0];
-        while *starts.last().unwrap() + capacity(*starts.last().unwrap()) < height {
-            let next = *starts.last().unwrap() + capacity(*starts.last().unwrap());
-            if next <= *starts.last().unwrap() { break; }
-            starts.push(next);
+        // A page of nothing still pages: the walk is the window's own height, in
+        // screens, so a reader of a document with no lines can still turn a page.
+        let mut stops = vec![PageStop { top: 0.0, first: 0, last: 0, foot: capacity(0.0) }];
+        loop {
+            let top = stops[stops.len() - 1].top;
+            let next = top + capacity(top);
+            if next <= top || next >= height {
+                break;
+            }
+            stops.push(PageStop { top: next, first: 0, last: 0, foot: next + capacity(next) });
         }
-        return starts;
+        return stops;
     }
-    let mut starts = vec![0.0];
-    let mut limit = capacity(0.0);
-    for line in sel {
-        let y = line.y / scale;
-        let height = line.h / scale;
-        if y + height <= limit + 0.01 {
-            continue;
+    let mut stops: Vec<PageStop> = Vec::new();
+    let mut first = 0usize;
+    let mut top = 0.0;
+    loop {
+        let limit = top + capacity(top);
+        // The lines this page can hold whole: the first one that does not fit ends it.
+        let mut last = first;
+        while last < sel.len() && bottom_of(last) <= limit + 0.01 {
+            last += 1;
         }
-        let previous = *starts.last().unwrap_or(&0.0);
-        if height > capacity(y) + 0.01 {
-            if y > previous + 0.01 {
-                starts.push(y);
+        if last == first {
+            // One line taller than a page. There is no line boundary inside it to break
+            // on and no two lines to carry over, so it is walked through a screen at a
+            // time: the page in hand shows its head and the pages after it its middle,
+            // and nothing of it is left unshown. The rule the page stack always had.
+            let mut edge = top_of(first).max(top);
+            loop {
+                let room = capacity(edge);
+                stops.push(PageStop {
+                    top: edge,
+                    first,
+                    last: first + 1,
+                    foot: (edge + room).min(bottom_of(first)),
+                });
+                let next = edge + room;
+                if next <= edge || next >= bottom_of(first) - 0.01 {
+                    break;
+                }
+                edge = next;
             }
-            limit = *starts.last().unwrap() + capacity(*starts.last().unwrap());
-            while limit < y + height - 0.01 {
-                let next = limit;
-                starts.push(next);
-                limit = next + capacity(next);
-                if limit <= next { break; }
+            first += 1;
+            top = edge;
+            if first >= sel.len() {
+                break;
             }
             continue;
         }
-        if y <= previous + 0.01 {
-            continue;
+        stops.push(PageStop { top, first, last, foot: bottom_of(last - 1) });
+        if last >= sel.len() {
+            break;
         }
+        // The next page opens `overlap` lines before the one that did not fit -- and
+        // never at or before this page's own first line, so a page whose whole content
+        // is one or two lines still turns rather than standing still.
+        let mut next = last.saturating_sub(overlap).max(first + 1);
         // A heading is kept with the lines that follow it. If the first line that
         // crosses the nominal boundary is a heading (or follows one closely), move the
         // break back to that heading instead of leaving it as the last line on a page.
-        let heading = anchors
-            .iter()
-            .copied()
-            .find(|top| *top >= previous && *top < y && y - *top <= height * 2.0);
-        // `previous` is itself an anchor whenever the last break landed on a heading --
-        // either the heading branch took `start = heading` or `start = y` was a heading
-        // line's top, which is exactly the anchor recorded for it. A candidate that
-        // lands back on `previous` therefore moves the break nowhere, and taking it
-        // still fails the test below, so nothing is pushed and `limit` never advances:
-        // the lines between the old limit and the next start are drawn on no page at
-        // all. A heading that is already the page's first line keeps the page; the
-        // break has to land strictly beyond it.
-        let start = heading.filter(|top| *top > previous + 0.01).unwrap_or(y);
-        if start > previous + 0.01 {
-            starts.push(start);
-            limit = start + capacity(start);
+        let dropped = top_of(last);
+        let dropped_height = bottom_of(last) - dropped;
+        let heading = anchors.iter().copied().find(|anchor| {
+            *anchor > top + 0.01 && *anchor < dropped - 0.01 && dropped - *anchor <= dropped_height * 2.0
+        });
+        if let Some(anchor) = heading {
+            if let Some(index) = (first..last).find(|index| (top_of(*index) - anchor).abs() < 0.01) {
+                next = next.min(index).max(first + 1);
+            }
         }
+        // A page that cannot move on is the end of the walk: the lines that are left
+        // stand on the page already built.
+        if top_of(next) <= top + 0.01 {
+            break;
+        }
+        first = next;
+        top = top_of(next);
     }
-    starts
+    stops
 }
 
 #[cfg(feature = "pdf")]
@@ -15860,13 +16047,19 @@ mod tests {
             line
         }).collect();
         let overhead = |top| if top > 0.0 { 20.0 } else { 0.0 };
-        let starts = page_starts_with_overhead(&lines, &[], 300.0, 80.0, 1.0, overhead);
+        let starts_of = |sel: &[SelLine], height: Pt| -> Vec<Pt> {
+            page_stops(sel, &[], height, 80.0, 1.0, 0, overhead)
+                .into_iter()
+                .map(|stop| stop.top)
+                .collect()
+        };
+        let starts = starts_of(&lines, 300.0);
         assert_eq!(starts, [0.0, 80.0, 140.0, 200.0, 260.0]);
         for line in &lines {
             let containing = starts.iter().filter(|&&top| top <= line.y && line.y + line.h <= top + 80.0 - overhead(top)).count();
             assert_eq!(containing, 1, "row at {}: {starts:?}", line.y);
         }
-        assert_eq!(page_starts_with_overhead(&[], &[], 200.0, 80.0, 1.0, overhead), [0.0, 80.0, 140.0]);
+        assert_eq!(starts_of(&[], 200.0), [0.0, 80.0, 140.0]);
     }
 
     #[test]
@@ -16488,8 +16681,10 @@ mod tests {
     #[test]
     fn a_line_a_page_owns_is_inside_the_band_that_page_draws() {
         // Twenty lines of thirty pixels on a four-hundred pixel page: a page takes
-        // every line that fits and the next one starts where the first line that will
-        // not fit stands, so the last line a page owns ends on the page's own floor.
+        // every line that fits and the next one opens two lines above the first line
+        // that will not fit -- the reader's own overlap -- so the last line a page owns
+        // ends on the page's own floor and the two lines before it stand again at the
+        // top of the page after.
         let line = |y: f32| SelLine {
             source_map: Vec::new(), source: None,
             y,
@@ -16501,8 +16696,17 @@ mod tests {
             ends: Vec::new(),
         };
         let sel: Vec<SelLine> = (0..20).map(|i| line(i as f32 * 30.0)).collect();
-        let starts = reader_page_starts(&sel, &[], 600.0, 400.0, 1.0);
-        assert_eq!(starts, vec![0.0, 390.0]);
+        let pages = reader_pages(&sel, &[], 600.0, 400.0, 1.0);
+        let starts: Vec<Pt> = pages.iter().map(|page| page.top).collect();
+        assert_eq!(starts, vec![0.0, 330.0]);
+        // Lines 11 and 12 are the last two the first page holds and the first two the
+        // second one shows, which is the whole of what an overlap is.
+        assert_eq!(pages[0].first..pages[0].last, 0..13);
+        assert_eq!(pages[1].first..pages[1].last, 11..20);
+        assert_eq!(pages[0].last - pages[1].first, PAGE_OVERLAP_LINES);
+        for page in &pages {
+            assert!(page.foot <= page.top + 400.0 + 0.01, "a line is cut in half: {page:?}");
+        }
         let layout = page_stack_layout_for(1200.0, 900.0, 0.0);
         for (index, start) in starts.iter().copied().enumerate() {
             let window = page_content_height_for(&starts, index, 1.0, layout.content_height);
@@ -16519,6 +16723,173 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// The walk a press of the space bar makes, on a document longer than a page: every
+    /// page opens on a line's own top, two lines inside the page before it, and ends on
+    /// a line's own bottom -- so a page turn keeps the reader's handhold and never
+    /// leaves a line half-shown at the foot of a page.
+    #[test]
+    fn a_page_opens_two_lines_inside_the_one_before_it() {
+        let line = |y: f32| SelLine {
+            source_map: Vec::new(), source: None,
+            y,
+            h: 30.0,
+            join: Join::None,
+            chars: Vec::new(),
+            copies: Vec::new(),
+            xs: Vec::new(),
+            ends: Vec::new(),
+        };
+        let sel: Vec<SelLine> = (0..40).map(|i| line(i as f32 * 30.0)).collect();
+        let pages = reader_pages(&sel, &[], 1200.0, 400.0, 1.0);
+        assert_eq!(pages.iter().map(|page| page.first).collect::<Vec<_>>(), [0, 11, 22, 33]);
+        assert_eq!(pages.iter().map(|page| page.last).collect::<Vec<_>>(), [13, 24, 35, 40]);
+        assert_eq!(
+            pages.iter().map(|page| page.top).collect::<Vec<_>>(),
+            [0.0, 330.0, 660.0, 990.0]
+        );
+        for pair in pages.windows(2) {
+            let (before, after) = (pair[0], pair[1]);
+            // Two lines of the page before stand again at the top of the page after...
+            assert_eq!(before.last - after.first, PAGE_OVERLAP_LINES, "{after:?} after {before:?}");
+            // ...and the page after always brings new lines on, so a press is never a
+            // press that stands still.
+            assert!(after.last > before.last, "{after:?} brings nothing on after {before:?}");
+        }
+        for page in &pages {
+            assert_eq!(page.top % 30.0, 0.0, "a page must open on a line's own top: {page:?}");
+            assert_eq!(page.foot % 30.0, 0.0, "a page must end on a line's own bottom: {page:?}");
+            assert!(page.foot <= page.top + 400.0 + 0.01, "a line is cut in half: {page:?}");
+            assert!(page.first < page.last, "{page:?}");
+        }
+        // Every line is on some page: an overlap repeats lines, it never drops one.
+        for index in 0..sel.len() {
+            assert!(
+                pages.iter().any(|page| page.first <= index && index < page.last),
+                "line {index} is on no page"
+            );
+        }
+        // A document that fits one page is one page, and it holds all of it.
+        let short: Vec<SelLine> = (0..3).map(|i| line(i as f32 * 30.0)).collect();
+        assert_eq!(
+            reader_pages(&short, &[], 90.0, 400.0, 1.0),
+            vec![PageStop { top: 0.0, first: 0, last: 3, foot: 90.0 }]
+        );
+    }
+
+    /// A page too short to hold its own overlap still turns. The lines a page keeps are
+    /// clamped to what the page holds, so the reader is never left pressing a key that
+    /// moves nothing.
+    #[test]
+    fn a_page_shorter_than_its_overlap_still_turns() {
+        let line = |y: f32| SelLine {
+            source_map: Vec::new(), source: None,
+            y,
+            h: 30.0,
+            join: Join::None,
+            chars: Vec::new(),
+            copies: Vec::new(),
+            xs: Vec::new(),
+            ends: Vec::new(),
+        };
+        let sel: Vec<SelLine> = (0..6).map(|i| line(i as f32 * 30.0)).collect();
+        // Sixty points of page against thirty point lines: two lines a page, and the two
+        // lines of overlap are cut to the one line a turn has to leave room for.
+        let pages = reader_pages(&sel, &[], 200.0, 60.0, 1.0);
+        assert_eq!(pages.iter().map(|page| page.first).collect::<Vec<_>>(), [0, 1, 2, 3, 4]);
+        assert_eq!(pages.iter().map(|page| page.last).collect::<Vec<_>>(), [2, 3, 4, 5, 6]);
+        for pair in pages.windows(2) {
+            assert_eq!(pair[0].last - pair[1].first, 1, "a press must bring a line on");
+        }
+    }
+
+    /// A page turn in continuous scroll -- the mode every reader starts in -- lands
+    /// where the page stack's own pages begin, rather than a screenful further on: a
+    /// line's own top, two lines inside the page they were on, so the last lines they
+    /// read stand again at the top of the window.
+    #[test]
+    fn a_page_turn_in_continuous_scroll_lands_on_the_page_the_stack_means() {
+        let mut window = ResizeView::new(&chinese_pages());
+        assert!(!layout_needs_worker(&window.0.doc), "this must stay a window-thread layout");
+        window.0.relayout();
+        assert_eq!(window.0.reading_mode, ReadingMode::Scroll, "this is the default mode");
+        let hwnd = window.0.hwnd;
+        let starts = window.0.page_starts.clone();
+        assert!(starts.len() > 2, "this document must have pages to walk: {}", starts.len());
+        window.0.scroll = 0.0;
+        window.0.apply_command(Command::NextPage, hwnd);
+        assert_eq!(window.0.scroll, starts[1], "a page on is the next page's own top");
+        window.0.apply_command(Command::NextPage, hwnd);
+        assert_eq!(window.0.scroll, starts[2]);
+        window.0.apply_command(Command::PreviousPage, hwnd);
+        assert_eq!(window.0.scroll, starts[1], "and a page back is the page it came from");
+        // A page opens on a line's own top, so the top of the window is never halfway
+        // through a line of text.
+        let k = scale_of(window.0.dpi);
+        assert!(
+            window.0.sel_index.iter().any(|line| (line.y / k - starts[1]).abs() < 0.01),
+            "a page must open on a line's own top: {}",
+            starts[1]
+        );
+        // The end of the document is the end of the walk: the last stops the window
+        // cannot stand on are not pages, and a press there leaves the reader where the
+        // document ends rather than counting a page that never moves.
+        let view_h = (window.0.content_bottom() - TOPBAR_H).max(1.0) / k;
+        let end = max_scroll_of(window.0.content_h, window.0.theme.base, view_h);
+        window.0.scroll = end;
+        window.0.apply_command(Command::NextPage, hwnd);
+        assert_eq!(window.0.scroll, end, "the end of the document is the end of the walk");
+        window.0.apply_command(Command::PreviousPage, hwnd);
+        assert!(window.0.scroll < end, "and the way back is still there");
+    }
+
+    /// A held space bar turns a page at a reading pace: the repeats Windows sends are
+    /// answered, but not at the rate the keyboard sends them -- and the first press is
+    /// never held back.
+    #[test]
+    fn a_held_space_bar_turns_pages_at_a_reading_pace() {
+        let mut window = ResizeView::new(&chinese_pages());
+        assert!(!layout_needs_worker(&window.0.doc), "this must stay a window-thread layout");
+        window.0.relayout();
+        let hwnd = window.0.hwnd;
+        window.0.scroll = 0.0;
+        let start = Instant::now();
+        window.0.space_page(1, false, start, hwnd);
+        let first = window.0.scroll;
+        assert!(first > 0.0, "the first press must turn the page");
+        window.0.space_page(1, true, start + std::time::Duration::from_millis(250), hwnd);
+        let second = window.0.scroll;
+        assert!(second > first, "a repeat past the floor must turn the page");
+        window.0.space_page(1, true, start + std::time::Duration::from_millis(260), hwnd);
+        assert_eq!(window.0.scroll, second, "a repeat inside the floor must be dropped");
+        window.0.space_page(-1, false, start + std::time::Duration::from_millis(270), hwnd);
+        assert_eq!(window.0.scroll, first, "shift goes back to the page it came from");
+    }
+
+    /// A held key is a reader walking through the document rather than watching one page
+    /// become the next, and a system that asked for no animations is asking for the same
+    /// thing: both take the page stack straight to the page, with no transition left
+    /// behind. A plain press is animated on a system that asked for animations, and
+    /// straight on one that did not -- the system's own answer, whatever it is here.
+    #[test]
+    fn a_held_key_takes_the_page_stack_straight_to_the_page() {
+        let mut window = ResizeView::new(&chinese_pages());
+        assert!(!layout_needs_worker(&window.0.doc), "this must stay a window-thread layout");
+        window.0.reading_mode = ReadingMode::Stack;
+        window.0.relayout();
+        let hwnd = window.0.hwnd;
+        let start = Instant::now();
+        window.0.scroll = 0.0;
+        let to = window.0.page_start(1).expect("a second page");
+        window.0.space_page(1, true, start, hwnd);
+        assert_eq!(window.0.scroll, to, "a held key goes straight to the page");
+        assert!(window.0.page_transition.is_none(), "a held key must not animate");
+        assert!(!window.0.page_held, "the flag lives only as long as the turn that read it");
+        window.0.scroll = 0.0;
+        window.0.space_page(1, false, start, hwnd);
+        assert_eq!(window.0.page_transition.is_some(), animations_on(), "the system's answer");
+        assert_eq!(window.0.scroll, if animations_on() { 0.0 } else { to });
     }
 
     #[test]
