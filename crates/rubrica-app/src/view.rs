@@ -173,6 +173,12 @@ const TAB_OVERFLOW_W: Pt = 34.0;
 const TREE_ROW_H: Pt = 24.0;
 const TREE_MIN_W: f32 = 160.0;
 const TREE_MAX_W: f32 = 360.0;
+/// The room the panel's search box takes out of the top of the listing. The box is a
+/// child control placed in these points, and the rows begin below it: a row drawn under
+/// the box would be a row a click could not reach.
+const TREE_SEARCH_H: Pt = 30.0;
+/// The panel's search box, told apart from the find bar's by its id alone.
+const TREE_SEARCH_ID: usize = 0x5146;
 /// Wheel notch travel, in points.
 pub(crate) const WHEEL_STEP: Pt = 72.0;
 /// Appearance is polled, not pushed; see `WM_TIMER` below.
@@ -2165,6 +2171,17 @@ pub struct View {
     /// document at a time; this is the authority for what can be switched to next.
     workspace: Workspace,
     tree: Vec<TreeEntry>,
+    /// Every row the panel's folder holds, before the search box has had its say. The
+    /// listing above is this one with the query applied, so a keystroke filters rows
+    /// that are already in hand instead of reading the folder again.
+    tree_all: Vec<TreeEntry>,
+    /// What the search box held when the listing above was filtered: what the page
+    /// remembers, so that a page switched back to comes back with its own query in the
+    /// box rather than with the last page's.
+    tree_query: String,
+    /// The panel's search box: a child edit control, made when the panel is first opened
+    /// and kept, so that a query outlives the panel being closed and opened again.
+    search: Option<HWND>,
     /// The directory the entries above were listed from. `None` means they never
     /// were: the panel starts closed and unread, because no reader has asked for it.
     tree_root: Option<PathBuf>,
@@ -2430,6 +2447,8 @@ struct TabPage {
     anchor_tops: Vec<Pt>,
     wide_regions: Vec<WideRegion>,
     tree: Vec<TreeEntry>,
+    tree_all: Vec<TreeEntry>,
+    tree_query: String,
     chapter_index: Option<ChapterIndex>,
     chapter: usize,
     lazy_text: bool,
@@ -2472,6 +2491,8 @@ impl TabPage {
             anchor_tops: Vec::new(),
             wide_regions: Vec::new(),
             tree: Vec::new(),
+            tree_all: Vec::new(),
+            tree_query: String::new(),
             chapter_index: None,
             chapter: 0,
             lazy_text: false,
@@ -2849,6 +2870,19 @@ fn find_edit(client_w: f32, line: Pt) -> (i32, i32, i32, i32) {
         (x + FIND_PAD) as i32,
         (y + FIND_PAD) as i32,
         box_w as i32,
+        box_h as i32,
+    )
+}
+
+/// Where the panel's search box goes: across the panel, the same small air in from each
+/// edge that the panel leaves around its rows, and the height the rows were moved down by.
+fn tree_search_box(panel_w: f32, line: Pt) -> (i32, i32, i32, i32) {
+    let pad = 6.0;
+    let box_h = (line + 2.0 * pad).max(TREE_SEARCH_H - 2.0 * pad).max(12.0);
+    (
+        pad as i32,
+        (TOPBAR_H + pad) as i32,
+        (panel_w - 2.0 * pad).max(48.0) as i32,
         box_h as i32,
     )
 }
@@ -3807,6 +3841,9 @@ fn new_view(
         watcher_started: false,
         workspace: Workspace::default(),
         tree: Vec::new(),
+        tree_all: Vec::new(),
+        tree_query: String::new(),
+        search: None,
         tree_root: None,
         tree_visible: false,
         tree_width: 220.0,
@@ -4493,6 +4530,61 @@ unsafe fn edit_find_key(hwnd: HWND, vk: u32) -> Option<LRESULT> {
     Some(LRESULT(0))
 }
 
+/// What a child edit control holds. Both boxes in this window are read this way, so the
+/// two cannot disagree about what "the text in it" means.
+unsafe fn window_text(edit: HWND) -> String {
+    let len = SendMessageW(edit, WM_GETTEXTLENGTH, None, None).0.max(0) as usize;
+    let mut buf = vec![0u16; len + 1];
+    let n = GetWindowTextW(edit, &mut buf).max(0) as usize;
+    buf.truncate(n.min(len));
+    String::from_utf16_lossy(&buf)
+}
+
+/// The panel's search box, taught the two things the find bar's box is taught, and told
+/// apart from it by its own old procedure: a subclassed control keeps one, and two boxes
+/// sharing one would have the second asking the first's original procedure.
+static SEARCH_PROC: AtomicUsize = AtomicUsize::new(0);
+
+unsafe extern "system" fn search_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRESULT {
+    let previous: WNDPROC = core::mem::transmute_copy(&SEARCH_PROC.load(Ordering::Relaxed));
+    if msg == WM_KEYDOWN {
+        if let Some(answer) = search_key(hwnd, wp.0 as u32) {
+            return answer;
+        }
+    }
+    // A wheel is about the window the pointer is over, but Windows sends it to the window
+    // the keyboard is in -- and while the box is being typed into, the keyboard is in
+    // here. A single-line box has nothing to scroll, so the page under the panel would
+    // stand still for as long as the query lasts.
+    if msg == WM_MOUSEWHEEL {
+        if let Ok(parent) = GetParent(hwnd) {
+            return SendMessageW(parent, WM_MOUSEWHEEL, Some(wp), Some(lp));
+        }
+    }
+    // `TranslateMessage` has already turned the key down into this character by the time
+    // the procedure is asked about it: a `Return` and an `Escape` that mean the panel
+    // must not also be characters of the query.
+    if msg == WM_CHAR && matches!(wp.0 as u32, 0x0D | 0x1B) {
+        return LRESULT(0);
+    }
+    CallWindowProcW(previous, hwnd, msg, wp, lp)
+}
+
+/// `Escape` empties the panel's box: the folder comes back, the panel stays.
+unsafe fn search_key(hwnd: HWND, vk: u32) -> Option<LRESULT> {
+    if vk != VK_ESCAPE.0 as u32 {
+        return None;
+    }
+    let parent = GetParent(hwnd).ok()?;
+    let raw = GetWindowLongPtrW(parent, GWLP_USERDATA);
+    if raw == 0 {
+        return None;
+    }
+    let view = &mut *(raw as *mut View);
+    view.clear_tree_search(parent);
+    Some(LRESULT(0))
+}
+
 impl View {
     fn capture_resize_preview(&self) -> ResizePreview {
         let width = (self.client_w - self.content_dx()).max(1.0);
@@ -4546,6 +4638,7 @@ impl View {
             self.layout_epoch += 1;
             self.relayout_from_anchor(anchor);
             self.layout_find();
+            self.layout_search();
             let _ = InvalidateRect(Some(hwnd), None, false);
         }
     }
@@ -5091,6 +5184,7 @@ impl View {
                 // The edit is a child window, not part of the deferred display list.
                 // It must fit the live search panel throughout the drag.
                 self.layout_find();
+                self.layout_search();
                 let _ = InvalidateRect(Some(hwnd), None, false);
                 LRESULT(0)
             }
@@ -5130,6 +5224,7 @@ impl View {
                 // one that has gone: `layout_find` is what makes the next one, in the
                 // pixels of the monitor the window is now on.
                 self.layout_find();
+                self.layout_search();
                 let _ = InvalidateRect(Some(hwnd), None, false);
                 LRESULT(0)
             }
@@ -5370,6 +5465,14 @@ impl View {
                 if id == FIND_EDIT_ID && code == EN_CHANGE {
                     let query = self.edit_text();
                     self.apply_find(&query, true);
+                    let _ = InvalidateRect(Some(hwnd), None, false);
+                    LRESULT(0)
+                } else if id == TREE_SEARCH_ID && code == EN_CHANGE {
+                    // Asked about on every keystroke, like the find box and for the same
+                    // reason: a filter that waits is a reader typing `Enter` to find out
+                    // whether the file they meant is in the folder at all.
+                    self.tree_query = self.search_text();
+                    self.apply_tree_query();
                     let _ = InvalidateRect(Some(hwnd), None, false);
                     LRESULT(0)
                 } else {
@@ -5632,8 +5735,7 @@ impl View {
                 if let Some(index) = self.tree_at(x, y) {
                     if let Some(entry) = self.tree.get(index).cloned() {
                         if entry.kind == TreeEntryKind::Directory {
-                            self.tree = tree::scan(&entry.path, 2);
-                            self.tree_root = Some(entry.path);
+                            self.list_tree(&entry.path);
                         } else {
                             self.load_document(&entry.path, hwnd);
                         }
@@ -5813,6 +5915,7 @@ impl View {
                     self.layout_epoch += 1;
                     self.relayout_keeping_anchor();
                     self.layout_find();
+                    self.layout_search();
                     let _ = InvalidateRect(Some(hwnd), None, false);
                 } else if self.dragging {
                     self.scroll_to_thumb(y);
@@ -7018,6 +7121,7 @@ impl View {
                 self.layout_epoch += 1;
                 self.relayout_keeping_anchor();
                 unsafe { self.layout_find() };
+                unsafe { self.layout_search() };
             }
             Command::OpenRecent(index) => {
                 if let Some(path) = self.workspace.recent.items().get(index).map(|file| file.path.clone()) {
@@ -7031,8 +7135,7 @@ impl View {
             }
             Command::TreeDirectory(index) => {
                 if let Some(path) = self.tree.get(index).map(|entry| entry.path.clone()) {
-                    self.tree = tree::scan(&path, 2);
-                    self.tree_root = Some(path);
+                    self.list_tree(&path);
                 }
             }
             Command::ActivateTab(id) => { self.switch_to_tab(id, hwnd); }
@@ -8306,6 +8409,7 @@ impl View {
         let _ = ShowWindow(edit, SW_SHOW);
         self.find = Some(Find::default());
         self.layout_find();
+        self.layout_search();
         let query = self.edit_text();
         self.apply_find(&query, false);
         let _ = SetFocus(Some(edit));
@@ -8437,12 +8541,115 @@ impl View {
 
     /// What is in the box.
     unsafe fn edit_text(&self) -> String {
-        let Some(edit) = self.edit else { return String::new() };
-        let len = SendMessageW(edit, WM_GETTEXTLENGTH, None, None).0.max(0) as usize;
-        let mut buf = vec![0u16; len + 1];
-        let n = GetWindowTextW(edit, &mut buf).max(0) as usize;
-        buf.truncate(n.min(len));
-        String::from_utf16_lossy(&buf)
+        match self.edit {
+            Some(edit) => window_text(edit),
+            None => String::new(),
+        }
+    }
+
+    /// What is in the panel's search box.
+    unsafe fn search_text(&self) -> String {
+        match self.search {
+            Some(edit) => window_text(edit),
+            None => String::new(),
+        }
+    }
+
+    /// Make the panel's search box. Once, and its window kept: a box destroyed and remade
+    /// has lost the query, which is the only thing worth keeping there.
+    ///
+    /// No `WS_BORDER`, for the reason the find box has none: the system draws that as a
+    /// sunken bevel, and the panel is this view's own paint. The box is made only when
+    /// there is a panel to put it in, so a reader who never opens the sidebar never has
+    /// the control at all.
+    unsafe fn create_search(&mut self) {
+        // A view that has not been attached to a window yet has no parent to put a child
+        // in, and a null parent is the desktop: the box would be a window of its own.
+        if self.search.is_some() || self.hwnd.0.is_null() {
+            return;
+        }
+        let Ok(module) = GetModuleHandleW(None) else { return };
+        let style = WS_CHILD | WINDOW_STYLE(ES_AUTOHSCROLL as u32);
+        let Ok(edit) = CreateWindowExW(
+            Default::default(),
+            w!("EDIT"),
+            w!(""),
+            style,
+            0,
+            0,
+            10,
+            10,
+            Some(self.hwnd),
+            Some(HMENU(TREE_SEARCH_ID as *mut core::ffi::c_void)),
+            Some(module.into()),
+            None,
+        ) else {
+            return;
+        };
+        let previous = SetWindowLongPtrW(edit, GWLP_WNDPROC, search_proc as *const () as isize);
+        SEARCH_PROC.store(previous as usize, Ordering::Relaxed);
+        self.search = Some(edit);
+        self.update_search_cue();
+        // The query the page was left with goes back into the box: the panel belongs to
+        // the page, so a page switched away from and back keeps its own filter.
+        if !self.tree_query.is_empty() {
+            let query = utf16(&self.tree_query);
+            let _ = SetWindowTextW(edit, PCWSTR(query.as_ptr()));
+        }
+    }
+
+    /// The cue the box shows before anything is typed into it, in the reader's language.
+    unsafe fn update_search_cue(&self) {
+        let Some(edit) = self.search else { return };
+        let cue = utf16(i18n::t(self.lang, Key::TreeSearchCue));
+        let _ = SendMessageW(
+            edit,
+            EM_SETCUEBANNER,
+            Some(WPARAM(1)),
+            Some(LPARAM(cue.as_ptr() as isize)),
+        );
+    }
+
+    /// Put the panel's box where the panel is now, and show it only while the panel is
+    /// open. Called wherever the panel's width or the monitor's scale moves, because the
+    /// control is a child window placed in pixels while the panel is drawn in points.
+    unsafe fn layout_search(&mut self) {
+        if !self.tree_visible {
+            if let Some(edit) = self.search {
+                let _ = ShowWindow(edit, SW_HIDE);
+            }
+            return;
+        }
+        if self.search.is_none() {
+            self.create_search();
+        }
+        let Some(edit) = self.search else { return };
+        self.ensure_edit_font();
+        if let Some(font) = self.edit_font {
+            let _ = SendMessageW(edit, WM_SETFONT, Some(WPARAM(font.0 as usize)), Some(LPARAM(1)));
+        }
+        let line = self.theme.base * FIND_TEXT * scale_of(self.dpi);
+        let (x, y, w, h) = tree_search_box(self.tree_width, line);
+        // The panel is drawn in the render target's unit and the window manager places a
+        // child in pixels of its own -- the same conversion `position_edit` makes, and of
+        // 1.0 for the same reason: the target is pinned to `TARGET_DPI`, not because the
+        // monitor is at 96.
+        let k = unit_px(TARGET_DPI);
+        let at = |u: i32| (u as f32 * k) as i32;
+        let _ = MoveWindow(edit, at(x), at(y), at(w), at(h), true);
+        let _ = ShowWindow(edit, SW_SHOW);
+    }
+
+    /// Empty the box and put the whole folder back on the panel. What `Escape` means
+    /// here: a query is a filter over the folder in hand, and the way out of a filter is
+    /// to have none rather than to lose the panel.
+    unsafe fn clear_tree_search(&mut self, hwnd: HWND) {
+        if let Some(edit) = self.search {
+            let _ = SetWindowTextW(edit, w!(""));
+        }
+        self.tree_query.clear();
+        self.apply_tree_query();
+        let _ = InvalidateRect(Some(hwnd), None, false);
     }
 
     /// Ask the page where the query's characters are, and mark every place it found them.
@@ -10091,15 +10298,21 @@ impl View {
         if self.tree_visible { self.tree_width } else { 0.0 }
     }
 
+    /// Where the panel's rows begin: under the top bar and under the search box, which
+    /// sits in the panel's own top rather than over the page.
+    fn tree_row_top(&self) -> f32 {
+        TOPBAR_H + TREE_SEARCH_H
+    }
+
     fn tree_at(&self, x: f32, y: f32) -> Option<usize> {
-        if !self.tree_visible || x >= self.tree_width || y < TOPBAR_H { return None; }
-        let row = ((y - TOPBAR_H - 6.0) / TREE_ROW_H).floor();
+        if !self.tree_visible || x >= self.tree_width || y < self.tree_row_top() { return None; }
+        let row = ((y - self.tree_row_top() - 6.0) / TREE_ROW_H).floor();
         // Only a row the panel has drawn is a row a click can hit. The surface is
         // clipped to the viewport, so a list longer than the window is cut off
         // without the rows behind it going anywhere -- and a click in the empty
         // space below the last drawn row used to open a document that is not on
         // the screen at all.
-        let rows = ((self.content_bottom() - TOPBAR_H - 6.0) / TREE_ROW_H).ceil();
+        let rows = ((self.content_bottom() - self.tree_row_top() - 6.0) / TREE_ROW_H).ceil();
         (row >= 0.0).then_some(row as usize).filter(|row| *row < self.tree.len() && *row < rows as usize)
     }
 
@@ -10117,7 +10330,7 @@ impl View {
         let entries = self.tree.clone();
         let format = self.tab_format.clone();
         for (i, entry) in entries.iter().enumerate() {
-            let top = TOPBAR_H + 6.0 + i as f32 * TREE_ROW_H;
+            let top = self.tree_row_top() + 6.0 + i as f32 * TREE_ROW_H;
             let rect = D2D_RECT_F { left: 8.0 + entry.depth as f32 * 12.0, top, right: self.tree_width - 6.0, bottom: top + TREE_ROW_H - 2.0 };
             if let (Some(format), Some(brush)) = (format.as_ref(), muted.as_ref()) {
                 let text = utf16(&entry.name);
@@ -10565,6 +10778,8 @@ impl View {
         std::mem::swap(&mut page.anchor_tops, &mut self.anchor_tops);
         std::mem::swap(&mut page.wide_regions, &mut self.wide_regions);
         std::mem::swap(&mut page.tree, &mut self.tree);
+        std::mem::swap(&mut page.tree_all, &mut self.tree_all);
+        std::mem::swap(&mut page.tree_query, &mut self.tree_query);
         std::mem::swap(&mut page.chapter_index, &mut self.chapter_index);
         std::mem::swap(&mut page.chapter, &mut self.chapter);
         std::mem::swap(&mut page.lazy_text, &mut self.lazy_text);
@@ -10865,8 +11080,25 @@ impl View {
         let want = self.path.as_deref().and_then(Path::parent).map(Path::to_path_buf);
         if want != self.tree_root {
             self.tree_root = want.clone();
-            self.tree = want.map(|root| tree::scan(&root, 2)).unwrap_or_default();
+            self.tree_all = want.map(|root| tree::scan(&root, 2)).unwrap_or_default();
+            self.apply_tree_query();
         }
+    }
+
+    /// Put the search box's query over the rows in hand. The panel's listing is the
+    /// answer, so every way of reading it -- the rows it draws, the row a click lands
+    /// on, the rows its menu offers -- asks the same filtered list rather than the
+    /// folder again.
+    fn apply_tree_query(&mut self) {
+        let query = tree::Query::of(&self.tree_query);
+        self.tree = tree::filtered(&self.tree_all, &query);
+    }
+
+    /// List a folder in the panel and make it the folder the panel is showing.
+    fn list_tree(&mut self, root: &Path) {
+        self.tree_root = Some(root.to_path_buf());
+        self.tree_all = tree::scan(root, 2);
+        self.apply_tree_query();
     }
 
     /// Read a file and make it the page, saying whether that worked.

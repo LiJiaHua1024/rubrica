@@ -127,6 +127,8 @@ pub enum Key {
     SourceTag,
 
     FindCue,
+    /// What the sidebar's search box says before anything is typed in it.
+    TreeSearchCue,
     FindNoMatch,
     FindOneMatch,
     /// A footnote carried over onto the page below it, with the number in place of {n}.
@@ -310,6 +312,7 @@ fn translate_en(key: Key) -> &'static str {
         Key::SourceTag => "Source",
 
         Key::FindCue => "Find in document",
+        Key::TreeSearchCue => "Search files",
         Key::FindNoMatch => "no match",
         Key::FindOneMatch => "1 match",
         Key::FootnoteContinued => "Footnote {n} (continued)",
@@ -466,6 +469,7 @@ fn translate_zh_cn(key: Key) -> &'static str {
         Key::SourceTag => "源码",
 
         Key::FindCue => "在文档中查找",
+        Key::TreeSearchCue => "搜索文件",
         Key::FindNoMatch => "无匹配项",
         Key::FindOneMatch => "1 个匹配项",
         Key::FootnoteContinued => "第 {n} 条注释（续）",
@@ -622,6 +626,7 @@ fn translate_zh_tw(key: Key) -> &'static str {
         Key::SourceTag => "原始碼",
 
         Key::FindCue => "在文件中尋找",
+        Key::TreeSearchCue => "搜尋檔案",
         Key::FindNoMatch => "無相符項目",
         Key::FindOneMatch => "1 個相符項目",
         Key::FootnoteContinued => "第 {n} 則註解（繼）",
@@ -778,6 +783,7 @@ fn translate_ja(key: Key) -> &'static str {
         Key::SourceTag => "ソース",
 
         Key::FindCue => "ドキュメント内を検索",
+        Key::TreeSearchCue => "ファイルを検索",
         Key::FindNoMatch => "一致なし",
         Key::FindOneMatch => "1 件一致",
         Key::FootnoteContinued => "注 {n}（続き）",
@@ -934,6 +940,7 @@ fn translate_ko(key: Key) -> &'static str {
         Key::SourceTag => "소스",
 
         Key::FindCue => "문서에서 찾기",
+        Key::TreeSearchCue => "파일 검색",
         Key::FindNoMatch => "일치 항목 없음",
         Key::FindOneMatch => "1개 일치",
         Key::FootnoteContinued => "각주 {n}(계속)",
@@ -1090,6 +1097,7 @@ fn translate_fr(key: Key) -> &'static str {
         Key::SourceTag => "Source",
 
         Key::FindCue => "Rechercher dans le document",
+        Key::TreeSearchCue => "Rechercher des fichiers",
         Key::FindNoMatch => "aucune correspondance",
         Key::FindOneMatch => "1 correspondance",
         Key::FootnoteContinued => "Note {n} (suite)",
@@ -1246,6 +1254,7 @@ fn translate_de(key: Key) -> &'static str {
         Key::SourceTag => "Quelltext",
 
         Key::FindCue => "Im Dokument suchen",
+        Key::TreeSearchCue => "Dateien suchen",
         Key::FindNoMatch => "keine Treffer",
         Key::FindOneMatch => "1 Treffer",
         Key::FootnoteContinued => "Fußnote {n} (fortgesetzt)",
@@ -1402,6 +1411,7 @@ fn translate_es(key: Key) -> &'static str {
         Key::SourceTag => "Fuente",
 
         Key::FindCue => "Buscar en el documento",
+        Key::TreeSearchCue => "Buscar archivos",
         Key::FindNoMatch => "sin coincidencias",
         Key::FindOneMatch => "1 coincidencia",
         Key::FootnoteContinued => "Nota {n} (continuación)",
@@ -1558,6 +1568,7 @@ fn translate_ru(key: Key) -> &'static str {
         Key::SourceTag => "Исходный текст",
 
         Key::FindCue => "Найти в документе",
+        Key::TreeSearchCue => "Поиск файлов",
         Key::FindNoMatch => "нет совпадений",
         Key::FindOneMatch => "1 совпадение",
         Key::FootnoteContinued => "Сноска {n} (продолжение)",
@@ -1714,6 +1725,7 @@ fn translate_it(key: Key) -> &'static str {
         Key::SourceTag => "Sorgente",
 
         Key::FindCue => "Trova nel documento",
+        Key::TreeSearchCue => "Cerca file",
         Key::FindNoMatch => "nessuna corrispondenza",
         Key::FindOneMatch => "1 corrispondenza",
         Key::FootnoteContinued => "Nota {n} (continua)",
@@ -1870,6 +1882,7 @@ fn translate_pt(key: Key) -> &'static str {
         Key::SourceTag => "Código-fonte",
 
         Key::FindCue => "Localizar no documento",
+        Key::TreeSearchCue => "Procurar ficheiros",
         Key::FindNoMatch => "nenhuma correspondência",
         Key::FindOneMatch => "1 correspondência",
         Key::FootnoteContinued => "Nota {n} (continuação)",

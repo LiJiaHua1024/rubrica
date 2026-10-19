@@ -92,6 +92,21 @@ fn main() -> Result<()> {
         }
         return Ok(());
     }
+    if has_flag(&argv, "--list-tree") {
+        // The panel's listing without the panel: the rows the sidebar would draw, in the
+        // order it would draw them, and -- when a query is given -- the same rows the
+        // search box would leave. The rows come from `tree`'s own functions, so this is
+        // the panel's answer rather than a second guess at it.
+        let root = PathBuf::from(text_flag(&argv, "--list-tree").map(lossy).ok_or("--list-tree needs a directory")?);
+        if !root.is_dir() {
+            return Err(format!("--list-tree wants a directory, not {}", root.display()).into());
+        }
+        let query = tree::Query::of(&text_flag(&argv, "--tree-search").map(lossy).unwrap_or_default());
+        for line in tree::describe(&tree::scan(&root, 2), &root, &query) {
+            println!("{line}");
+        }
+        return Ok(());
+    }
     if has_flag(&argv, "--export-png") {
         let output = text_flag(&argv, "--export-png").ok_or("--export-png needs an output path")?;
         let width = flag(&argv, "--export-width").unwrap_or(1080.0);
@@ -190,6 +205,12 @@ fn main() -> Result<()> {
     // which is where every other unrecognised flag ends up.
     if has_flag(&argv, "--table-select") && !has_flag(&argv, "--report") {
         return Err("--table-select reads a table on the report's own page: add --report".into());
+    }
+    // The same reasoning for the sidebar's query: it filters the listing `--list-tree`
+    // prints, so a run that asked for one without the other has no listing to filter --
+    // and, left to fall through, would open a window instead.
+    if has_flag(&argv, "--tree-search") && !has_flag(&argv, "--list-tree") {
+        return Err("--tree-search filters the listing --list-tree prints: add --list-tree".into());
     }
     if has_flag(&argv, "--report") {
         let width = positive("--width", flag(&argv, "--width").unwrap_or(1080.0))?;
@@ -343,12 +364,13 @@ fn has_flag(argv: &[OsString], name: &str) -> bool {
 /// `--width` and friends. A double-click names one; a multi-selection "open with" names
 /// several, and each of them is wanted.
 fn positionals(argv: &[OsString]) -> Vec<PathBuf> {
-    const TAKES_VALUE: [&str; 23] = [
+    const TAKES_VALUE: [&str; 25] = [
         "--width", "--dpi", "--zoom", "--face", "--measure", "--profile",
         "--export-png", "--export-width", "--export-scale", "--export-pdf",
         "--pdf-width", "--pdf-height", "--theme", "--tables", "--inline-code",
         "--marker-inset", "--list-marker-gap", "--list-bullet-size", "--quote-bar-gap",
         "--narrow-align", "--code-ladder", "--code-language", "--table-select",
+        "--list-tree", "--tree-search",
     ];
     let mut skip_next = false;
     let mut flags_done = false;

@@ -168,7 +168,9 @@ page; a note too long for the bubble is cut with an ellipsis, and a click on the
 still goes to the whole of it. Every jump is undone with `Ctrl+Z`, so a reader who has
 followed a citation to the end of a long document has one keypress back to the sentence
 they left. Open documents are available as pinned/preview tabs (`Ctrl+Tab`,
-`Ctrl+W`), with recent files and a resizable docked workspace tree; the session is
+`Ctrl+W`), with recent files and a resizable docked workspace tree whose own search box
+filters its listing by name or extension -- `txt` finds `reading.txt`, `notes txt` asks for
+both words, `*.md` asks for the extension itself, and `Esc` empties the box; the session is
 restored on the next launch. TXT files keep chapter boundaries and lay out the active
 chapter window, with `Ctrl+Alt+Up/Down` for chapter navigation. `Ctrl+3` switches
 source view, `Ctrl+4` switches between continuous scrolling and the page stack, and
@@ -255,7 +257,7 @@ no longer set with.
 | `Shift` + arrows / `Home` / `End` | extend the selection |
 | `Alt` + `←` `→` | back and forward through where you have been |
 | `Enter` | step to the next find match |
-| `Esc` | give up the selection, the search, the page's marking |
+| `Esc` | give up the selection, the search, the page's marking, the workspace tree's filter |
 | `Apps` / `Shift+F10` | the menu, without a mouse |
 | mouse wheel | scroll the page · `Ctrl` zooms · `Shift` pans a table wider than the window |
 | click a figure | show it over the whole window: wheel zooms at the pointer · drag pans · `0` actual size · `F` fit · `+` `-` zoom · `Esc` puts it away |
