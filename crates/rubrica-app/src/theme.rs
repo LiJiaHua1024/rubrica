@@ -336,6 +336,11 @@ pub struct LayoutOverrides {
     pub list_bullet_size: Option<f32>,
     pub quote_bar_gap_em: Option<Pt>,
     pub narrow_ragged: Option<bool>,
+    /// Whether the five code inks stand on the lightness ladder. `None` is a command
+    /// line that said nothing about it, which leaves whatever preset the page carries.
+    pub code_ladder: Option<bool>,
+    /// Whether a fence's language is named in its corner, on the same terms.
+    pub code_lang_label: Option<bool>,
 }
 
 impl LayoutOverrides {
@@ -354,6 +359,12 @@ impl LayoutOverrides {
         }
         if let Some(on) = self.narrow_ragged {
             t.narrow_ragged = on;
+        }
+        if let Some(on) = self.code_ladder {
+            t.code_ladder = on;
+        }
+        if let Some(on) = self.code_lang_label {
+            t.code_lang_label = on;
         }
     }
 }
@@ -478,6 +489,22 @@ pub struct Theme {
     /// Which rules a table draws around and inside itself. Read by the grid's own
     /// layout, so switching it redraws nothing about a cell but its lines.
     pub table_lines: TableLines,
+    /// Whether the five code inks are re-spaced on a lightness ladder. Off by default:
+    /// the design's five are picked by hand, and every page a reader has seen was drawn
+    /// with them. On, the five keep their hues and their own order but stand a fixed step
+    /// apart in CIE L*, which is the distance that tells them apart at a glance on either
+    /// page -- the hand-picked set is a fifth of that apart, which is a difference the eye
+    /// reads as one ink rather than five.
+    ///
+    /// A switch rather than a new palette because the change is visible: a reader who
+    /// wants the design's own inks keeps them, and the ladder is applied over whatever
+    /// colour theme is on the page, because the spacing is what the reader asked for.
+    pub code_ladder: bool,
+    /// Whether a fence's language is named in the corner of its own panel. Off by
+    /// default: the words are the author's, and a page that named the language is ink the
+    /// design never put there. On, it is set small and quiet from the run's own size in
+    /// the panel's top right, and not one line of the page moves for it.
+    pub code_lang_label: bool,
 }
 
 impl Default for Theme {
@@ -527,6 +554,8 @@ impl Default for Theme {
             scripts_from: String::new(),
             code_capsule: false,
             table_lines: TableLines::default(),
+            code_ladder: false,
+            code_lang_label: false,
         }
     }
 }

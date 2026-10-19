@@ -525,6 +525,10 @@ struct Layer {
     /// switch and the width travel together, so a preset that narrows the width without
     /// saying anything about the switch keeps whatever the page under it decided.
     narrow_ragged: Option<bool>,
+    /// The two code switches, on the same terms: a preset that says nothing about one
+    /// leaves it to whoever asks -- the page under it, or the command line.
+    code_ladder: Option<bool>,
+    code_lang_label: Option<bool>,
     code_capsule: Option<bool>,
     table_lines: Option<TableLines>,
     extensions: Vec<String>,
@@ -544,6 +548,8 @@ impl Layer {
             numbers: numbers.map(Some),
             keep_korean_words: Some(profile.keep_korean_words),
             narrow_ragged: Some(profile.narrow_ragged),
+            code_ladder: Some(profile.code_ladder),
+            code_lang_label: Some(profile.code_lang_label),
             code_capsule: None,
             table_lines: None,
             extensions: Vec::new(),
@@ -560,6 +566,8 @@ impl Layer {
             numbers: std::array::from_fn(|_| None),
             keep_korean_words: None,
             narrow_ragged: None,
+            code_ladder: None,
+            code_lang_label: None,
             code_capsule: None,
             table_lines: None,
             extensions: Vec::new(),
@@ -584,6 +592,12 @@ impl Layer {
         }
         if let Some(value) = self.narrow_ragged {
             merged.narrow_ragged = Some(value);
+        }
+        if let Some(value) = self.code_ladder {
+            merged.code_ladder = Some(value);
+        }
+        if let Some(value) = self.code_lang_label {
+            merged.code_lang_label = Some(value);
         }
         if let Some(value) = self.code_capsule {
             merged.code_capsule = Some(value);
@@ -638,6 +652,11 @@ fn resolve(index: usize, layers: &[Layer], by_name: &HashMap<String, usize>) -> 
         // is on: the fallback is what every narrow column was set with before this
         // switch existed, and a file that never mentions it must not turn it off.
         narrow_ragged: merged.narrow_ragged.unwrap_or(true),
+        // The two code switches fall back the other way, because off is their design's
+        // own answer: a file that never mentions them leaves the page as every page was
+        // drawn before they existed.
+        code_ladder: merged.code_ladder.unwrap_or(false),
+        code_lang_label: merged.code_lang_label.unwrap_or(false),
     };
     // The form's own bounds, applied here rather than at draw time: a preset that cannot
     // be drawn with is a preset this reader cannot use, and the reader is told which one
@@ -730,6 +749,8 @@ fn parse(text: &str, path: &Path) -> Result<Layer, String> {
     let mut numbers: [Option<f32>; 21] = std::array::from_fn(|_| None);
     let mut keep_korean_words: Option<bool> = None;
     let mut narrow_ragged: Option<bool> = None;
+    let mut code_ladder: Option<bool> = None;
+    let mut code_lang_label: Option<bool> = None;
     let mut code_capsule: Option<bool> = None;
     let mut table_lines: Option<TableLines> = None;
     let mut extensions: Vec<String> = Vec::new();
@@ -836,6 +857,14 @@ fn parse(text: &str, path: &Path) -> Result<Layer, String> {
                     Ok(on) => narrow_ragged = Some(on),
                     Err(reason) => skipped.push(format!("flags.narrow_ragged: {reason}")),
                 },
+                "code_ladder" => match bool_value(value) {
+                    Ok(on) => code_ladder = Some(on),
+                    Err(reason) => skipped.push(format!("flags.code_ladder: {reason}")),
+                },
+                "code_lang_label" => match bool_value(value) {
+                    Ok(on) => code_lang_label = Some(on),
+                    Err(reason) => skipped.push(format!("flags.code_lang_label: {reason}")),
+                },
                 other => skipped.push(format!("flags.{other}: not a key this reader knows")),
             },
             Table::Bind => match key {
@@ -869,6 +898,8 @@ fn parse(text: &str, path: &Path) -> Result<Layer, String> {
     layer.numbers = numbers;
     layer.keep_korean_words = keep_korean_words;
     layer.narrow_ragged = narrow_ragged;
+    layer.code_ladder = code_ladder;
+    layer.code_lang_label = code_lang_label;
     layer.code_capsule = code_capsule;
     layer.table_lines = table_lines;
     layer.extensions = extensions;

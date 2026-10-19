@@ -123,6 +123,12 @@ pub struct Profile {
     /// it because it is a decision about how the page is set, like the width it works
     /// with: a page of tables wants it, a page of narrow poetry does not.
     pub narrow_ragged: bool,
+    /// Whether the five code inks stand on the lightness ladder, and whether a fence's
+    /// language is named in its corner. Both are decisions about how a page is drawn
+    /// rather than about how it is measured, and both travel with a preset for the same
+    /// reason the switch above does: a page of code wants them, a page of prose does not.
+    pub code_ladder: bool,
+    pub code_lang_label: bool,
 }
 
 impl Default for Profile {
@@ -180,6 +186,8 @@ impl Profile {
             ],
             keep_korean_words: t.keep_korean_words,
             narrow_ragged: t.narrow_ragged,
+            code_ladder: t.code_ladder,
+            code_lang_label: t.code_lang_label,
         }
     }
 
@@ -272,6 +280,8 @@ impl Profile {
         t.quote_bar_gap_em = self.numbers[20];
         t.keep_korean_words = self.keep_korean_words;
         t.narrow_ragged = self.narrow_ragged;
+        t.code_ladder = self.code_ladder;
+        t.code_lang_label = self.code_lang_label;
         t.face = crate::theme::TextFace::ALL
             .iter()
             .position(|f| f.body == self.fonts[0] && f.heading == self.fonts[1])
@@ -346,6 +356,11 @@ fn read_profile(name: &str) -> Profile {
     // A preset saved before this switch existed has no word of its own here, and reads as
     // the design's own answer rather than as the `false` a missing word would give.
     p.narrow_ragged = batch.word("NarrowRagged") != Some(0);
+    // The two code switches are the other way up: their design's own answer is off, so a
+    // word that was never written reads as off rather than as the `true` a missing word
+    // would give if this were written like the switch above.
+    p.code_ladder = batch.word("CodeLadder") == Some(1);
+    p.code_lang_label = batch.word("CodeLangLabel") == Some(1);
     if p.validate().is_ok() { p } else { Profile::default() }
 }
 
@@ -387,6 +402,8 @@ fn write_profile(name: &str, p: &Profile, lang: Language) -> Result<(), String> 
     }
     settings::try_write_word(&sub, "KeepKoreanWords", u32::from(p.keep_korean_words))?;
     settings::try_write_word(&sub, "NarrowRagged", u32::from(p.narrow_ragged))?;
+    settings::try_write_word(&sub, "CodeLadder", u32::from(p.code_ladder))?;
+    settings::try_write_word(&sub, "CodeLangLabel", u32::from(p.code_lang_label))?;
     settings::try_write_text(ROOT, "Names", &names[2..].join("\n"))?;
     Ok(())
 }

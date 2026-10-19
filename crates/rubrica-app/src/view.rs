@@ -509,6 +509,174 @@ impl Palette {
             ColorRole::Divider => self.divider,
         }
     }
+
+    /// Re-space the five code inks on the lightness ladder, keeping each one's hue and
+    /// the order the five were in.
+    ///
+    /// The order is the part that makes this the same palette rather than another one: a
+    /// keyword is the brightest ink on the night page and the dimmest on the paper one,
+    /// and sorting the five by role instead would recolour the page rather than hold its
+    /// own inks apart. The five hand-picked colours differ mostly in hue -- on the paper
+    /// page their lightnesses span 5.8 L*, which is what makes a keyword and a comment
+    /// read as one ink to a reader who cannot tell the two hues apart -- so the ladder
+    /// keeps the hues and spends the separation on L*.
+    pub(crate) fn apply_code_ladder(&mut self) {
+        let inks = [self.keyword, self.string, self.comment, self.number, self.ty];
+        let mut order: [usize; CODE_LADDER_INKS] = [0, 1, 2, 3, 4];
+        order.sort_by(|a, b| {
+            let (x, y) = (lab(inks[*a]).0, lab(inks[*b]).0);
+            x.partial_cmp(&y).unwrap_or(core::cmp::Ordering::Equal)
+        });
+        let rungs = ladder_rungs(self.dark, self.code_bg);
+        let mut spaced = inks;
+        for (rank, index) in order.iter().enumerate() {
+            let (_, a, b) = lab(inks[*index]);
+            spaced[*index] = rgb_in_gamut(rungs[rank], a, b);
+        }
+        self.keyword = spaced[0];
+        self.string = spaced[1];
+        self.comment = spaced[2];
+        self.number = spaced[3];
+        self.ty = spaced[4];
+    }
+}
+
+/// The step the code ladder puts between two of its five inks, in CIE L*.
+///
+/// The distance Telari names is 7.5; this reader steps eight, because a colour that has
+/// been through L*ab and back is a rounded one, and a promise met exactly is a promise
+/// one rounding away from being broken.
+pub(crate) const CODE_LADDER_STEP: f32 = 8.0;
+
+/// The distance the ladder promises, in CIE L*: the number the gap is written as, and the
+/// one the report prints, because a reader asking what the switch did wants the promise
+/// rather than this build's own step.
+pub(crate) const CODE_LADDER_GAP: f32 = 7.5;
+
+/// How many inks the ladder spaces. The five code roles, which is all the highlighter
+/// tells apart: see [`ColorRole::Keyword`] for why there are five and not twelve.
+const CODE_LADDER_INKS: usize = 5;
+
+/// The contrast every code ink is held to against the panel it is drawn on. The same bar
+/// the hand-picked five clear, and the reason the ladder starts where it does: a ladder
+/// that spread its rungs for the sake of the spacing alone would put the dimmest of them
+/// below the panel's own readability.
+const CODE_LADDER_BAR: f32 = 4.5;
+
+/// How far past that bar the nearest rung is placed. The rung is put at the L* whose
+/// contrast is the bar by construction, and a colour that has been through L*ab and back
+/// measures a hundredth under it; this is what keeps the promise rather than the
+/// arithmetic.
+const CODE_LADDER_MARGIN: f32 = 0.1;
+
+/// One sRGB channel as light rather than as a byte.
+fn srgb_to_linear(v: f32) -> f32 {
+    if v <= 0.04045 { v / 12.92 } else { ((v + 0.055) / 1.055).powf(2.4) }
+}
+
+/// And back.
+fn linear_to_srgb(v: f32) -> f32 {
+    if v <= 0.0031308 { v * 12.92 } else { 1.055 * v.powf(1.0 / 2.4) - 0.055 }
+}
+
+/// A colour's relative luminance, as the contrast bar is measured in.
+fn luminance(c: Rgb) -> f32 {
+    0.2126 * srgb_to_linear(c.r) + 0.7152 * srgb_to_linear(c.g) + 0.0722 * srgb_to_linear(c.b)
+}
+
+/// The CIE L* of a luminance: the ladder's own coordinate.
+fn lstar_of_y(y: f32) -> f32 {
+    let y = y.clamp(0.0, 1.0);
+    if y > 0.008856 { 116.0 * y.cbrt() - 16.0 } else { 903.3 * y }
+}
+
+/// sRGB to CIE L*a*b* under D65.
+///
+/// The space a lightness ladder can be built in at all. Two colours an equal number of
+/// steps apart in sRGB are not an equal distance apart to a reader, so a spacing decided
+/// in bytes would be a spacing that means nothing on the page.
+fn lab(c: Rgb) -> (f32, f32, f32) {
+    let (r, g, b) = (srgb_to_linear(c.r), srgb_to_linear(c.g), srgb_to_linear(c.b));
+    let x = (0.4124564 * r + 0.3575761 * g + 0.1804375 * b) / 0.95047;
+    let y = 0.2126729 * r + 0.7151522 * g + 0.0721750 * b;
+    let z = (0.0193339 * r + 0.119192 * g + 0.9503041 * b) / 1.08883;
+    let f = |t: f32| if t > 0.008856 { t.cbrt() } else { 7.787 * t + 16.0 / 116.0 };
+    let (fx, fy, fz) = (f(x), f(y), f(z));
+    (116.0 * fy - 16.0, 500.0 * (fx - fy), 200.0 * (fy - fz))
+}
+
+/// L*a*b* to sRGB, *without* clipping.
+///
+/// A channel outside 0..=1 is how this says the colour is outside the display's own
+/// gamut, which the ladder has to be able to ask rather than be handed a colour that has
+/// quietly changed hue on the way out.
+fn rgb_from_lab(l: f32, a: f32, b: f32) -> Rgb {
+    let fy = (l + 16.0) / 116.0;
+    let finv = |t: f32| if t > 0.206897 { t * t * t } else { (t - 16.0 / 116.0) / 7.787 };
+    let x = 0.95047 * finv(fy + a / 500.0);
+    let y = finv(fy);
+    let z = 1.08883 * finv(fy - b / 200.0);
+    let r = 3.2404542 * x - 1.5371385 * y - 0.4985314 * z;
+    let g = -0.969266 * x + 1.8760108 * y + 0.0415560 * z;
+    let blue = 0.0556434 * x - 0.2040259 * y + 1.0572252 * z;
+    Rgb { r: linear_to_srgb(r), g: linear_to_srgb(g), b: linear_to_srgb(blue) }
+}
+
+/// The nearest colour the display can show at this lightness and hue.
+///
+/// The chroma is given up rather than the hue, by bisection: clipping a channel shifts a
+/// hue, and the ladder's whole point is that the five inks keep the colours they had and
+/// move only in lightness.
+fn rgb_in_gamut(l: f32, a: f32, b: f32) -> Rgb {
+    let inside = |c: Rgb| {
+        (-0.0005..=1.0005).contains(&c.r)
+            && (-0.0005..=1.0005).contains(&c.g)
+            && (-0.0005..=1.0005).contains(&c.b)
+    };
+    let mut best = rgb_from_lab(l, 0.0, 0.0);
+    let (mut lo, mut hi) = (0.0f32, 1.0f32);
+    for _ in 0..24 {
+        let mid = (lo + hi) * 0.5;
+        let c = rgb_from_lab(l, a * mid, b * mid);
+        if inside(c) {
+            best = c;
+            lo = mid;
+        } else {
+            hi = mid;
+        }
+    }
+    Rgb { r: best.r.clamp(0.0, 1.0), g: best.g.clamp(0.0, 1.0), b: best.b.clamp(0.0, 1.0) }
+}
+
+/// The five rungs of the ladder, counted away from the panel they are drawn on.
+///
+/// The rung nearest the panel is the L* whose contrast against it is exactly the bar
+/// every code ink is held to, and the other four step away from the panel by
+/// [`CODE_LADDER_STEP`]: up on a night page, down on a paper one. Placed this way the
+/// ladder cannot buy its spacing with the dimmest ink -- which is what a ladder centred
+/// on the hand-picked five would do, since those five do not span the thirty-two L* five
+/// rungs need.
+///
+/// The rungs are handed back in the order the five inks were in, so the ladder climbs
+/// with that order on both pages: the dimmest ink of a night page sits at the limit and
+/// the rest rise away from it, and the brightest ink of a paper page sits there and the
+/// rest fall away -- the same ladder read from its other end.
+fn ladder_rungs(dark: bool, panel: Rgb) -> [f32; CODE_LADDER_INKS] {
+    let y = luminance(panel);
+    let bar = CODE_LADDER_BAR + CODE_LADDER_MARGIN;
+    let limit = if dark {
+        bar * (y + 0.05) - 0.05
+    } else {
+        (y + 0.05) / bar - 0.05
+    };
+    let nearest = lstar_of_y(limit);
+    let span = (CODE_LADDER_INKS as f32 - 1.0) * CODE_LADDER_STEP;
+    let mut rungs = [0.0; CODE_LADDER_INKS];
+    for (rank, rung) in rungs.iter_mut().enumerate() {
+        let step = rank as f32 * CODE_LADDER_STEP;
+        *rung = if dark { nearest + step } else { nearest - span + step };
+    }
+    rungs
 }
 
 pub(crate) fn d2d(c: Rgb) -> D2D1_COLOR_F {
@@ -7251,7 +7419,14 @@ impl View {
     /// The palette one appearance draws with: the pinned theme, the reader's own slot
     /// for that appearance, or the built-in default the slot falls back to.
     fn palette_for(&self, dark: bool) -> Palette {
-        opening_palette(&self.themes, &self.theme_slots, self.theme_pin.as_ref(), dark)
+        let mut palette = opening_palette(&self.themes, &self.theme_slots, self.theme_pin.as_ref(), dark);
+        // The ladder stands over whatever colour theme answered, because the spacing is
+        // what the reader asked for by name: a theme that named its own five inks and a
+        // reader who asked for a ladder are two decisions, and this one is the later.
+        if self.theme.code_ladder {
+            palette.apply_code_ladder();
+        }
+        palette
     }
 
     /// Draw with this palette, and say whether anything changed.
@@ -8602,6 +8777,56 @@ fn layout_diagram_error(
     baseline + descent + theme.base * 0.35
 }
 
+/// The panel a fence's language is named in: where its right edge and its top are, the
+/// size the block is set at, and the display's scale.
+#[derive(Clone, Copy)]
+struct CodeLabel {
+    right: Pt,
+    top: Pt,
+    size: Pt,
+    k: f32,
+}
+
+/// Name a fence's language in the corner of its own panel.
+///
+/// Drawn, never measured: the label is set small and quiet from the block's own face and
+/// reaches in from the panel's right edge, so turning the switch on moves no line of the
+/// page -- the same promise a capsule makes, and the reason it can be a switch at all. It
+/// is filed after the panel and before the block's own lines, because a background goes
+/// behind the words on it and this label is not one of those words.
+///
+/// The panel's own padding is what the label is inset by, so it stands inside the panel
+/// rather than in the margin beside it, and its baseline is the block's own top plus its
+/// own ascent: the tallest a label can be without reaching above the panel it names.
+fn layout_code_label(
+    font: &FontEngine,
+    face: &FaceRequest,
+    theme: &Theme,
+    lang: &str,
+    panel: CodeLabel,
+    ops: &mut Vec<Op>,
+    at: usize,
+) {
+    let pad = theme.base * 0.45;
+    let label_size = panel.size * 0.62;
+    let shaped = font.shape_runs(lang, 0..lang.len(), face, label_size, 0.0);
+    let width: Pt = shaped.iter().map(|r| r.width()).sum();
+    let ascent = shaped.iter().map(|r| r.ascent).fold(0.0f32, f32::max);
+    let mut x = panel.right - pad * 0.5 - width;
+    let baseline = panel.top + ascent;
+    let mut runs = Vec::new();
+    for r in &shaped {
+        if let Some(run) = paint_run(font, r, x, 0.0, panel.k, ColorRole::Comment, Some(lang)) {
+            x += r.width();
+            runs.push(run);
+        }
+    }
+    seat(&mut runs, baseline, panel.k);
+    if !runs.is_empty() {
+        ops.insert(at, Op::Runs(runs));
+    }
+}
+
 /// Typeset one block into the display list and return the new document y.
 /// Whether a block is set ragged-right.
 ///
@@ -9070,6 +9295,22 @@ fn layout_block(
                 color: role,
             },
         );
+        // The language the fence named, in the panel's own corner. A fence that named
+        // none says nothing: the honest page does not name a language the author did
+        // not, which is the same rule that leaves an unknown fence's words uncut.
+        if theme.code_lang_label {
+            if let Some(lang) = b.lang.as_deref().filter(|lang| !lang.is_empty()) {
+                layout_code_label(
+                    font,
+                    &styles[base].face,
+                    theme,
+                    lang,
+                    CodeLabel { right: left + column + pad, top: panel_top, size, k },
+                    ops,
+                    block_at + 1,
+                );
+            }
+        }
     }
     if b.quote_depth > 0 {
         // The bar down the side of the block, standing in front of the block's own ops
@@ -12725,7 +12966,14 @@ pub(crate) fn export_png(
     if pixel_width as u64 * pixel_height as u64 > 100_000_000 {
         return Err("export image is too large; reduce --export-width or --export-scale".into());
     }
-    unsafe { write_png(&page, output, pixel_width, pixel_height, palette, store.as_ref()) }
+    // The code ladder is a decision about ink rather than about measurement, so it is
+    // applied to the palette the caller handed in and not to the display list: the same
+    // page is drawn, in five inks that stand a measured distance apart.
+    let mut palette: Palette = palette.clone();
+    if theme.code_ladder {
+        palette.apply_code_ladder();
+    }
+    unsafe { write_png(&page, output, pixel_width, pixel_height, &palette, store.as_ref()) }
 }
 
 /// Paint a [`Page`] into a bitmap and write it out.
@@ -12969,7 +13217,13 @@ pub fn export_pdf(
         &mut objects,
         hyphenator.as_ref(),
     );
-    write_pdf(&page, &font, output, width, height, palette)
+    // The ladder, on the same terms the PNG export applies it: the PDF's own page is the
+    // same display list, and only the inks its roles resolve to change.
+    let mut palette: Palette = palette.clone();
+    if theme.code_ladder {
+        palette.apply_code_ladder();
+    }
+    write_pdf(&page, &font, output, width, height, &palette)
 }
 
 #[cfg(feature = "pdf")]
@@ -17229,6 +17483,94 @@ mod tests {
         assert_eq!(page.height, plain.height);
     }
 
+    /// A fence's language, named in the corner of its own panel: small and quiet, inside
+    /// the panel rather than in the margin, and drawn rather than measured, so not one
+    /// line of the page moves for it.
+    #[test]
+    fn a_fence_names_its_language_in_the_corner_of_its_panel() {
+        let Ok(mut font) = FontEngine::new() else { return };
+        if !font.probe() {
+            return;
+        }
+        let doc = Document::parse("```rust\nlet x = 1;\n```\n\n```\nplain\n```\n");
+        let theme = Theme { code_lang_label: true, ..Theme::default() };
+        let mut math = crate::math::MathStore::new();
+        let mut diagrams = crate::diagram::DiagramStore::new();
+        let mut objects = Objects::new(None, None, &mut math, &mut diagrams);
+        let page = build_ops(&mut font, &theme, &doc, 700.0, DPI, &mut objects, None);
+        let k = DPI / 72.0;
+        let pad = theme.base * 0.45;
+        // The labels: the panel's own quiet ink, which no line of this source is set in.
+        let labels: Vec<(usize, f32, f32, f32, Option<String>)> = page
+            .ops
+            .iter()
+            .enumerate()
+            .filter_map(|(i, op)| match op {
+                Op::Runs(runs) if runs.len() == 1 && runs[0].color == ColorRole::Comment => {
+                    Some((
+                        i,
+                        runs[0].x,
+                        runs[0].baseline,
+                        runs[0].advances.iter().sum::<f32>(),
+                        runs[0].source.clone(),
+                    ))
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(labels.len(), 1, "the fence that named a language, and only it: {labels:?}");
+        let (at, x, baseline, width, text) = labels[0].clone();
+        assert_eq!(text.as_deref(), Some("rust"), "the label is not the language the fence named");
+        // The panels: the first fence's is the one the label belongs to.
+        let panels: Vec<(f32, f32, f32, f32)> = page
+            .ops
+            .iter()
+            .filter_map(|op| match op {
+                Op::Rect { x, y, w, h, color: ColorRole::Surface } => Some((*x, *y, *w, *h)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(panels.len(), 2, "two fences are two panels");
+        let (px, py, pw, _) = panels[0];
+        // Inside the panel's own padding, and on the block's own top line rather than
+        // above the panel or below the first line of code.
+        assert!(
+            (x + width - (px + pw - pad * 0.5 * k)).abs() < 0.05,
+            "the label ends at {:.2}, the panel at {:.2}",
+            x + width,
+            px + pw,
+        );
+        assert!(x > px + pw * 0.5, "the label is not in the corner: {x:.2} in {px:.2}..{:.2}", px + pw);
+        assert!(
+            baseline > py && baseline < py + pad * 0.6 * k + theme.base * k,
+            "baseline {baseline:.2} is not on the panel's top line",
+        );
+        // Filed after the panel and before the lines: the op order is what the page's
+        // band search reads, so the label may not carry a top above the words after it.
+        let first_line = page.ops.iter().enumerate().find_map(|(i, op)| match op {
+            Op::Runs(runs) if i > at => runs.first().map(|r| (i, r.baseline)),
+            _ => None,
+        });
+        let Some((line_at, line_baseline)) = first_line else {
+            return;
+        };
+        assert!(at < line_at && baseline < line_baseline, "the label is not in front of the code");
+
+        // With the switch off there is no label, one op fewer, and not a line moved.
+        let off = Theme::default();
+        let mut objects = Objects::new(None, None, &mut math, &mut diagrams);
+        let plain = build_ops(&mut font, &off, &doc, 700.0, DPI, &mut objects, None);
+        assert!(
+            !plain.ops.iter().any(|op| matches!(
+                op,
+                Op::Runs(runs) if runs.len() == 1 && runs[0].color == ColorRole::Comment
+            )),
+            "a label was drawn with the switch off",
+        );
+        assert_eq!(page.ops.len(), plain.ops.len() + 1, "the label is one op and nothing else");
+        assert_eq!(page.height, plain.height, "the label moved the page");
+    }
+
     /// Two code spans split by a word are two capsules, not one box swallowing the word
     /// between them -- the reason a capsule is keyed by the span it belongs to rather
     /// than by the style the two spans share. And a cell's code span wears one too, laid
@@ -17944,6 +18286,76 @@ mod document_interaction_tests {
         // has a place to go.
         assert_eq!(bubble_cut(&[200.0], 120.0, 12.0), (0, Some(108.0)));
         assert_eq!(bubble_cut(&[], 120.0, 12.0), (0, None));
+    }
+
+    /// The code ladder, as a page would be drawn with it: five inks a measured distance
+    /// apart in L*, in the order they were, in the colours they were, and each still
+    /// readable on the panel behind it.
+    #[test]
+    fn the_code_ladder_stands_its_five_inks_a_step_apart() {
+        let inks = |p: &Palette| [p.keyword, p.string, p.comment, p.number, p.ty];
+        let rank = |set: &[Rgb; 5]| {
+            let mut order: Vec<usize> = (0..5).collect();
+            order.sort_by(|a, b| {
+                let (x, y) = (lab(set[*a]).0, lab(set[*b]).0);
+                x.partial_cmp(&y).unwrap_or(core::cmp::Ordering::Equal)
+            });
+            order
+        };
+        for dark in [false, true] {
+            let was = Palette::of(dark);
+            let mut now = Palette::of(dark);
+            now.apply_code_ladder();
+            let (before, after) = (inks(&was), inks(&now));
+            assert_eq!(rank(&before), rank(&after), "the ladder reordered the five inks");
+            for (i, (was, now)) in before.iter().zip(after.iter()).enumerate() {
+                let (_, a0, b0) = lab(*was);
+                let (_, a1, b1) = lab(*now);
+                let (c0, c1) = ((a0 * a0 + b0 * b0).sqrt(), (a1 * a1 + b1 * b1).sqrt());
+                // The same ray out of the neutral axis: where the display has no chroma
+                // to give the ladder gives it up, and it never turns an ink a new colour.
+                // The sine of the angle between the two, which is what a hue is.
+                assert!(
+                    (a0 * b1 - b0 * a1).abs() <= 0.02 * c0 * c1 + 0.35,
+                    "ink {i} changed hue: {a0:.2},{b0:.2} became {a1:.2},{b1:.2}",
+                );
+                assert!(c1 <= c0 * 1.02 + 0.35, "ink {i} gained chroma: {c0:.2} to {c1:.2}");
+            }
+            let mut ladders: Vec<f32> = after.iter().map(|c| lab(*c).0).collect();
+            ladders.sort_by(|a, b| a.partial_cmp(b).unwrap_or(core::cmp::Ordering::Equal));
+            let gaps: Vec<f32> = ladders.windows(2).map(|w| w[1] - w[0]).collect();
+            let closest = gaps.iter().copied().fold(f32::MAX, f32::min);
+            assert!(
+                closest >= 7.5,
+                "the closest two inks are {closest:.2} L* apart: {ladders:?}",
+            );
+            // And every rung is on the right side of the panel's own readability bar,
+            // which is what the ladder is counted from rather than the design's five.
+            for (name, ink) in [
+                ("keyword", after[0]),
+                ("string", after[1]),
+                ("comment", after[2]),
+                ("number", after[3]),
+                ("type", after[4]),
+            ] {
+                let ratio = {
+                    let (hi, lo) = {
+                        let (x, y) = (luminance(ink), luminance(was.code_bg));
+                        if x > y { (x, y) } else { (y, x) }
+                    };
+                    (hi + 0.05) / (lo + 0.05)
+                };
+                assert!(ratio >= 4.5, "{name} on the panel is {ratio:.2}:1");
+            }
+            // Printed so the numbers this page was drawn with can be read back rather
+            // than taken on trust: the report says the step, and this says the rungs.
+            println!(
+                "code ladder {}: {} L* (closest {:.2})",
+                if dark { "night" } else { "day" },
+                ladders.iter().map(|l| format!("{l:.2}")).collect::<Vec<_>>().join(" / "),
+                closest,
+            );
+        }
     }
 
     /// Every ink the window draws is drawn on a surface of its own palette, and a

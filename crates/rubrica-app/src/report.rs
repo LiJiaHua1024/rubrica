@@ -599,6 +599,18 @@ pub fn report(source: &str, path: Option<&str>, o: &Options) -> Result<()> {
         }
         println!("layout       : {}", moved.join(", "));
     }
+    // The two code switches, named for the same reason and on the same terms: a page
+    // whose inks stand on the ladder, or whose fences are labelled, says so -- and a
+    // reader of a page that turned neither on reads the report it always read.
+    if theme.code_ladder {
+        println!(
+            "code ladder  : five code inks at least {:.1} L* apart",
+            crate::view::CODE_LADDER_GAP
+        );
+    }
+    if theme.code_lang_label {
+        println!("code label   : each fence's language named in its corner");
+    }
     // Diagrams, counted from the store and the source rather than from the ops: the
     // ops hold what was drawn, and a fence that did not parse has its source on the
     // page and no drawing at all -- the interesting document is the one where those

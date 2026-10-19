@@ -190,6 +190,17 @@ the design every page was drawn with before the switches existed (the grid, and 
 code); a `--report` carries a `tables` or `inline code` line only when the other design
 was asked for.
 
+A fence's code has two more, and both are ink as well. The five syntax inks can be kept as
+the design picked them or set on a lightness ladder — the same five colours, held at least
+7.5 L\* apart in CIE L\*ab and each still clearing 4.5:1 against the panel behind it — and
+a fence that named a language can have that name set small and quiet in its panel's own
+corner. Neither moves a line: the ladder is spent on the resolved palette as it is handed
+to the painter, and the label is drawn into the display list after the panel and before
+the words, so the page's height and every coordinate are the ones it had. The headless
+runs take `--code-ladder design|ladder` and `--code-language none|corner`, both defaulting
+to the design every page was drawn with (the hand-picked five, and no label); a `--report`
+carries a `code ladder` or `code label` line only when the other design was asked for.
+
 A page's letters have a setting of their own, and a narrow column has two. The
 **Typography** form — the menu's *Typography ▸ Edit / Save Preset…* — carries the tracking
 every run is set with (the letter spacing, in ems), the *Ragged below* width that says when
@@ -326,6 +337,8 @@ marker_inset = 1.2
 [flags]                       # the drawing switches; all optional
 code_capsule = true
 table_lines = "booktabs"
+code_ladder = true
+code_lang_label = true
 
 [bind]                        # the extensions this preset is the one for
 extensions = "txt, log"
@@ -345,8 +358,11 @@ quantities this build added: `marker_inset` (0–6 em, how far a list's marker h
 `list_bullet_size` (0.4–2.5, how large the marker is drawn) and `quote_bar_gap` (0–4 em,
 how far a quotation's bar stands from the column it marks). `[flags]` holds `code_capsule`
 (`true`/`false`), `table_lines` (`"grid"` or `"booktabs"`), `keep_korean_words`
-(`true`/`false`) and `narrow_ragged` (`true`/`false`: the switch that stands beside
-`ragged_below`, saying whether a column narrower than that width is set to the left margin).
+(`true`/`false`), `narrow_ragged` (`true`/`false`: the switch that stands beside
+`ragged_below`, saying whether a column narrower than that width is set to the left margin),
+`code_ladder` (`true`/`false`: whether the five syntax inks are held on the lightness
+ladder) and `code_lang_label` (`true`/`false`: whether a fence's language is named in its
+panel's corner).
 
 Nothing is refused whole for one line this reader cannot read. A key it does not know, a
 number outside the range the form would take, a switch that is neither `true` nor

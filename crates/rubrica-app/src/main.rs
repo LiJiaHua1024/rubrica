@@ -332,12 +332,12 @@ fn has_flag(argv: &[OsString], name: &str) -> bool {
 /// `--width` and friends. A double-click names one; a multi-selection "open with" names
 /// several, and each of them is wanted.
 fn positionals(argv: &[OsString]) -> Vec<PathBuf> {
-    const TAKES_VALUE: [&str; 20] = [
+    const TAKES_VALUE: [&str; 22] = [
         "--width", "--dpi", "--zoom", "--face", "--measure", "--profile",
         "--export-png", "--export-width", "--export-scale", "--export-pdf",
         "--pdf-width", "--pdf-height", "--theme", "--tables", "--inline-code",
         "--marker-inset", "--list-marker-gap", "--list-bullet-size", "--quote-bar-gap",
-        "--narrow-align",
+        "--narrow-align", "--code-ladder", "--code-language",
     ];
     let mut skip_next = false;
     let mut flags_done = false;
@@ -434,6 +434,36 @@ fn narrow_align(argv: &[OsString]) -> Result<Option<bool>> {
     }
 }
 
+/// Whether the five code inks stand on the lightness ladder, from `--code-ladder`.
+///
+/// `design` is the design's own five, which is what every page has been drawn with;
+/// `ladder` keeps their hues and their order and sets them a measured distance apart in
+/// CIE L*. Refused rather than guessed at, for the reason `--tables` is.
+fn code_ladder(argv: &[OsString]) -> Result<Option<bool>> {
+    match text_flag(argv, "--code-ladder").map(lossy).as_deref() {
+        None => Ok(None),
+        Some("design") => Ok(Some(false)),
+        Some("ladder") => Ok(Some(true)),
+        Some(other) => {
+            Err(format!("--code-ladder wants `design` or `ladder`, not `{other}`").into())
+        }
+    }
+}
+
+/// Whether a fence's language is named in the corner of its own panel, from
+/// `--code-language`. `none` is the design's own answer -- the page says nothing -- and
+/// `corner` names the language the author wrote.
+fn code_language(argv: &[OsString]) -> Result<Option<bool>> {
+    match text_flag(argv, "--code-language").map(lossy).as_deref() {
+        None => Ok(None),
+        Some("none") => Ok(Some(false)),
+        Some("corner") => Ok(Some(true)),
+        Some(other) => {
+            Err(format!("--code-language wants `none` or `corner`, not `{other}`").into())
+        }
+    }
+}
+
 /// The typography preset this run sets its page with: the one the reader named, or the
 /// one this kind of document is set with.
 ///
@@ -478,6 +508,8 @@ fn layout_overrides(argv: &[OsString]) -> Result<theme::LayoutOverrides> {
         list_bullet_size: layout_number(argv, "--list-bullet-size", 0.4, 2.5)?,
         quote_bar_gap_em: layout_number(argv, "--quote-bar-gap", 0.0, 4.0)?,
         narrow_ragged: narrow_align(argv)?,
+        code_ladder: code_ladder(argv)?,
+        code_lang_label: code_language(argv)?,
     })
 }
 
