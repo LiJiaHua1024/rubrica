@@ -1,6 +1,6 @@
 # yaml-language-server: $schema=https://aka.ms/winget-manifest.defaultLocale.1.6.0.schema.json
 PackageIdentifier: Rubrica.Rubrica
-PackageVersion: 0.10.0
+PackageVersion: 0.10.1
 PackageLocale: en-US
 Publisher: LiJiaHua1024
 PublisherUrl: https://github.com/LiJiaHua1024
@@ -22,6 +22,6 @@ Tags:
   - reader
   - typesetting
   - pdf
-ReleaseNotesUrl: https://github.com/LiJiaHua1024/rubrica/releases/tag/v0.10.0
+ReleaseNotesUrl: https://github.com/LiJiaHua1024/rubrica/releases/tag/v0.10.1
 ManifestType: defaultLocale
 ManifestVersion: 1.6.0
