@@ -29,6 +29,7 @@ mod profiles;
 mod typography;
 mod sample;
 mod settings;
+mod shortcuts;
 mod tables;
 mod theme;
 mod themes;
@@ -105,6 +106,22 @@ fn main() -> Result<()> {
         let query = tree::Query::of(&text_flag(&argv, "--tree-search").map(lossy).unwrap_or_default());
         for line in tree::describe(&tree::scan(&root, 2), &root, &query) {
             println!("{line}");
+        }
+        return Ok(());
+    }
+    if has_flag(&argv, "--list-shortcuts") || has_flag(&argv, "--shortcuts-page") {
+        // Every action the menu offers beside the keys that ask for it, read from the one
+        // table both this and the page inside the reader are built from. With
+        // `--shortcuts-page` the page itself is printed, in the same Markdown the reader's
+        // own tab shows, so it can be handed to `--report` and laid out with no window.
+        // No value and no document: this is about the build, not about a page of a book.
+        let lang = settings::current_language();
+        if has_flag(&argv, "--shortcuts-page") {
+            print!("{}", shortcuts::page(lang));
+        } else {
+            for line in shortcuts::describe(lang) {
+                println!("{line}");
+            }
         }
         return Ok(());
     }
@@ -364,9 +381,11 @@ fn reopen() -> Option<PathBuf> {
     if let Some(snapshot) = settings::workspace() {
         match snapshot.session.active {
             Some(rubrica_workspace::DocumentRef::Sample) => None,
-            // The start page is made when it is shown, so a session that ended on it has
-            // nothing on disk to come back to: the sample is what is left.
+            // The start page and the page of keys are made when they are shown, so a
+            // session that ended on either has nothing on disk to come back to: the
+            // sample is what is left.
             Some(rubrica_workspace::DocumentRef::Start) => None,
+            Some(rubrica_workspace::DocumentRef::Shortcuts) => None,
             Some(rubrica_workspace::DocumentRef::File(file)) if settings::restorable_path(&file.path) => {
                 Some(file.path)
             }

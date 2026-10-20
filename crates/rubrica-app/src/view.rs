@@ -119,6 +119,7 @@ use crate::tree::{self, Entry as TreeEntry, EntryKind as TreeEntryKind};
 use rubrica_workspace::{DocumentRef, FileRef, FolderRef, Places, Tab, TabId, TabKind, Workspace};
 use crate::theme::{ColorRole, Leading, Measure, Role, TableLines, TextFace, Theme, Zoom};
 use crate::viewer::{self, Viewer};
+use crate::shortcuts::Shortcut;
 use crate::{Error, Result};
 
 /// The character drawn at a discretionary break, and the range to shape it from.
@@ -3038,6 +3039,8 @@ enum Command {
     FavouriteFolder,
     /// Show the page that lists the reader's folders and the documents they were last in.
     StartPage,
+    /// Show the page that lists every action the menu offers beside its keys.
+    ShortcutsPage,
     OpenTree(usize),
     TreeDirectory(usize),
     ActivateTab(TabId),
@@ -3111,6 +3114,112 @@ fn row(cmd: Command, label: impl Into<String>, enabled: bool) -> MenuRow {
 /// A row that names which of a group is the one in use.
 fn check(cmd: Command, label: impl Into<String>, on: bool) -> MenuRow {
     MenuRow::Row { cmd, label: label.into(), enabled: true, checked: on }
+}
+
+/// The action a command performs, with whatever it names set aside.
+///
+/// This is the join between the menu's commands and the keys: `shortcuts` holds one row
+/// per action, and the page it makes is the whole of what a reader is told about keys. The
+/// match is exhaustive on purpose and is the whole drift defence -- a command added to the
+/// enum does not compile until it is classified here, and the tests below then check that
+/// the actions the menu can actually reach are exactly the actions that table holds. A
+/// group of commands that name an argument -- a tab, a folder, a rung -- collapses to the
+/// one action that group is, because a key asks for the group and never for an argument.
+fn action_of(cmd: &Command) -> Shortcut {
+    match cmd {
+        Command::Typography => Shortcut::EditPreset,
+        Command::Profile(_) => Shortcut::Presets,
+        Command::GoBack => Shortcut::Back,
+        Command::GoForward => Shortcut::Forward,
+        Command::Heading(_) => Shortcut::Contents,
+        Command::Copy => Shortcut::Copy,
+        Command::SelectAll => Shortcut::SelectAll,
+        Command::SelectTable => Shortcut::SelectTable,
+        Command::Find => Shortcut::Find,
+        Command::OpenUrl(_) => Shortcut::OpenLink,
+        Command::CopyUrl(_) => Shortcut::CopyLink,
+        Command::ZoomIn => Shortcut::ZoomIn,
+        Command::ZoomOut => Shortcut::ZoomOut,
+        Command::ZoomReset => Shortcut::ZoomReset,
+        Command::Face(_) => Shortcut::Faces,
+        Command::Measure(_) => Shortcut::Measures,
+        Command::Palette(false) => Shortcut::Light,
+        Command::Palette(true) => Shortcut::Dark,
+        Command::FollowSystem => Shortcut::FollowSystem,
+        Command::ColorTheme(..) => Shortcut::ColourTheme,
+        Command::CopyAsMyTheme => Shortcut::CopyAsMyTheme,
+        Command::OpenThemesFolder => Shortcut::OpenThemesFolder,
+        Command::OpenFile => Shortcut::OpenFile,
+        Command::ToggleTree => Shortcut::WorkspaceTree,
+        Command::OpenRecent(_) => Shortcut::RecentDocuments,
+        Command::OpenFolder(_) => Shortcut::FavouriteFolders,
+        Command::OpenRecentFolder(_) => Shortcut::RecentFolders,
+        Command::FavouriteFolder => Shortcut::FavouriteFolder,
+        Command::StartPage => Shortcut::StartPage,
+        Command::ShortcutsPage => Shortcut::ShortcutsPage,
+        Command::OpenTree(_) | Command::TreeDirectory(_) => Shortcut::WorkspaceTree,
+        Command::ActivateTab(_) | Command::NextTab | Command::PreviousTab => Shortcut::OpenTabs,
+        Command::CloseTab(_) => Shortcut::CloseTab,
+        Command::CloseOtherTabs(_) => Shortcut::CloseOtherTabs,
+        Command::CloseAll => Shortcut::CloseAll,
+        Command::PinTab(_) => Shortcut::PinTab,
+        Command::Reload => Shortcut::Reload,
+        Command::DefaultLineBreaks(_) | Command::DocumentLineBreaks(_) => Shortcut::SingleNewlines,
+        Command::HtmlImages(_) => Shortcut::HtmlImages,
+        Command::Highlights(_) => Shortcut::Highlights,
+        Command::TableLines(_) => Shortcut::TableLines,
+        Command::InlineCode(_) => Shortcut::InlineCode,
+        Command::SourceView => Shortcut::SourceView,
+        Command::PlainText(None) => Shortcut::FormatExt,
+        Command::PlainText(Some(true)) => Shortcut::FormatPlain,
+        Command::PlainText(Some(false)) => Shortcut::FormatMarkdown,
+        Command::TextParagraphs(ParagraphRule::Auto) => Shortcut::ParagraphsAuto,
+        Command::TextParagraphs(ParagraphRule::Lines) => Shortcut::ParagraphsLines,
+        Command::TextParagraphs(ParagraphRule::BlankLines) => Shortcut::ParagraphsBlank,
+        Command::DetectChapters(_) => Shortcut::DetectChapters,
+        Command::TextEncoding(_) => Shortcut::TextEncoding,
+        Command::Neighbor(false) => Shortcut::PreviousFile,
+        Command::Neighbor(true) => Shortcut::NextFile,
+        Command::WideTableNarrow => Shortcut::WideTableNarrow,
+        Command::WideTableWiden => Shortcut::WideTableWiden,
+        Command::PreviousChapter => Shortcut::PreviousChapter,
+        Command::NextChapter => Shortcut::NextChapter,
+        Command::OpenEditor => Shortcut::OpenInEditor,
+        Command::ChooseEditor => Shortcut::ChooseEditor,
+        Command::TogglePeek => Shortcut::PeekEnabled,
+        Command::PeekSpace(crate::peek::SpaceMode::Tap) => Shortcut::PeekTap,
+        Command::PeekSpace(crate::peek::SpaceMode::Hold) => Shortcut::PeekHold,
+        Command::PeekSpace(crate::peek::SpaceMode::Mixed) => Shortcut::PeekMixed,
+        Command::PeekFocusClose => Shortcut::PeekFocusClose,
+        Command::PeekClickClose => Shortcut::PeekClickClose,
+        Command::Language(_) => Shortcut::Language,
+        Command::StatusItem(_) => Shortcut::StatusBar,
+        // The one key that swaps the two reading modes for each other: it is one key, so
+        // it is one action, and the row for each mode prints it nowhere in the menu (the
+        // key would promise to choose the row it stands beside, and it does not).
+        Command::TogglePageMode => Shortcut::PageStack,
+        Command::PageMode(true) => Shortcut::PageStack,
+        Command::PageMode(false) => Shortcut::ContinuousScroll,
+        Command::PreviousPage => Shortcut::PreviousPage,
+        Command::NextPage => Shortcut::NextPage,
+    }
+}
+
+/// A row's words with the key that performs it appended as Windows' accelerator column.
+///
+/// The key is not written here: it comes from the one table the shortcut page is built
+/// from, and the action is not named here either -- [`action_of`] answers that from the
+/// command, which is what keeps the two ends of the same fact together. A command whose
+/// action no key reaches prints its words alone.
+fn with_hint(label: &str, cmd: &Command) -> String {
+    let hint = crate::shortcuts::hint(action_of(cmd));
+    if hint.is_empty() {
+        return label.to_string();
+    }
+    let mut out = String::with_capacity(label.len() + hint.len());
+    out.push_str(label);
+    out.push_str(&hint);
+    out
 }
 
 /// What the page looks like from the place the menu was called, gathered because the
@@ -3227,18 +3336,18 @@ fn menu_items(s: &MenuState) -> Vec<MenuRow> {    // A tab in a menu string star
     // is standing next to, and the bracket keys step the measure rather than settling on
     // a rung, so a hint on either would promise a different thing from the one it keeps.
     let mut v = vec![
-        row(Command::GoBack, format!("{}\tCtrl+Z\tAlt+\u{2190}", i18n::t(s.lang, Key::MenuBack)), s.can_back),
-        row(Command::GoForward, format!("{}\tCtrl+Shift+Z\tAlt+\u{2192}", i18n::t(s.lang, Key::MenuForward)), s.can_forward),
+        row(Command::GoBack, with_hint(i18n::t(s.lang, Key::MenuBack), &Command::GoBack), s.can_back),
+        row(Command::GoForward, with_hint(i18n::t(s.lang, Key::MenuForward), &Command::GoForward), s.can_forward),
         MenuRow::Gap,
-        row(Command::Copy, format!("{}\tCtrl+C", i18n::t(s.lang, Key::MenuCopy)), s.selected || s.in_table),
-        row(Command::SelectAll, format!("{}\tCtrl+A", i18n::t(s.lang, Key::MenuSelectAll)), s.text),
+        row(Command::Copy, with_hint(i18n::t(s.lang, Key::MenuCopy), &Command::Copy), s.selected || s.in_table),
+        row(Command::SelectAll, with_hint(i18n::t(s.lang, Key::MenuSelectAll), &Command::SelectAll), s.text),
         // Beside `Select All` because that is the choice it is the other half of: on a
         // table, every cell is a table rather than a page of prose, and the two keys are
         // one press apart.
-        row(Command::SelectTable, format!("{}\tCtrl+Shift+A", i18n::t(s.lang, Key::MenuSelectTable)), s.in_table),
+        row(Command::SelectTable, with_hint(i18n::t(s.lang, Key::MenuSelectTable), &Command::SelectTable), s.in_table),
         // The one item on this menu a reader needs on a page too long to read at once,
         // and lit by the same question as `Select All`: is there any text here at all.
-        row(Command::Find, format!("{}\tCtrl+F", i18n::t(s.lang, Key::MenuFind)), s.text),
+        row(Command::Find, with_hint(i18n::t(s.lang, Key::MenuFind), &Command::Find), s.text),
     ];
     if let Some(url) = &s.link {
         v.push(MenuRow::Gap);
@@ -3254,16 +3363,16 @@ fn menu_items(s: &MenuState) -> Vec<MenuRow> {    // A tab in a menu string star
     }
     v.push(MenuRow::Gap);
     v.extend([
-        row(Command::ZoomIn, format!("{}\tCtrl++", i18n::t(s.lang, Key::MenuZoomIn)), true),
-        row(Command::ZoomOut, format!("{}\tCtrl+-", i18n::t(s.lang, Key::MenuZoomOut)), true),
-        row(Command::ZoomReset, format!("{}\tCtrl+0", i18n::t(s.lang, Key::MenuZoomReset)), true),
+        row(Command::ZoomIn, with_hint(i18n::t(s.lang, Key::MenuZoomIn), &Command::ZoomIn), true),
+        row(Command::ZoomOut, with_hint(i18n::t(s.lang, Key::MenuZoomOut), &Command::ZoomOut), true),
+        row(Command::ZoomReset, with_hint(i18n::t(s.lang, Key::MenuZoomReset), &Command::ZoomReset), true),
     ]);
     v.push(MenuRow::Sub { label: i18n::t(s.lang, Key::MenuReadingMode), items: vec![
         check(Command::PageMode(false), i18n::t(s.lang, Key::MenuContinuousScroll), s.reading_mode == ReadingMode::Scroll),
-        check(Command::PageMode(true), format!("{}\tCtrl+4", i18n::t(s.lang, Key::MenuPageStack)), s.reading_mode == ReadingMode::Stack),
+        check(Command::PageMode(true), with_hint(i18n::t(s.lang, Key::MenuPageStack), &Command::PageMode(true)), s.reading_mode == ReadingMode::Stack),
         MenuRow::Gap,
-        row(Command::PreviousPage, format!("{}\tPgUp", i18n::t(s.lang, Key::MenuPreviousPage)), s.reading_mode == ReadingMode::Scroll || s.page > 0),
-        row(Command::NextPage, format!("{}\tPgDn", i18n::t(s.lang, Key::MenuNextPage)), s.reading_mode == ReadingMode::Scroll || s.page + 1 < s.page_count),
+        row(Command::PreviousPage, with_hint(i18n::t(s.lang, Key::MenuPreviousPage), &Command::PreviousPage), s.reading_mode == ReadingMode::Scroll || s.page > 0),
+        row(Command::NextPage, with_hint(i18n::t(s.lang, Key::MenuNextPage), &Command::NextPage), s.reading_mode == ReadingMode::Scroll || s.page + 1 < s.page_count),
     ] });
     // What the status bar is showing, one checkbox an item. A bar with nothing checked
     // is not drawn at all: leaving the chrome off is the reader's answer to a page they
@@ -3336,9 +3445,10 @@ fn menu_items(s: &MenuState) -> Vec<MenuRow> {    // A tab in a menu string star
     v.push(MenuRow::Gap);
     v.extend([
         row(Command::ToggleTree, i18n::t(s.lang, Key::MenuWorkspaceTree), true),
-        row(Command::OpenFile, format!("{}\tCtrl+O", i18n::t(s.lang, Key::MenuOpenFile)), true),
+        row(Command::OpenFile, with_hint(i18n::t(s.lang, Key::MenuOpenFile), &Command::OpenFile), true),
         row(Command::StartPage, i18n::t(s.lang, Key::MenuStartPage), true),
-        row(Command::Reload, format!("{}\tCtrl+R", i18n::t(s.lang, Key::MenuReload)), s.from_file),
+        row(Command::ShortcutsPage, i18n::t(s.lang, Key::MenuShortcuts), true),
+        row(Command::Reload, with_hint(i18n::t(s.lang, Key::MenuReload), &Command::Reload), s.from_file),
     ]);
     if !s.tabs.is_empty() {
         let mut tab_items = Vec::new();
@@ -3387,9 +3497,9 @@ fn menu_items(s: &MenuState) -> Vec<MenuRow> {    // A tab in a menu string star
         check(Command::DocumentLineBreaks(Some(false)), i18n::t(s.lang, Key::MenuNewlineDocMerge), s.line_break_override == Some(false)),
         check(Command::DocumentLineBreaks(Some(true)), i18n::t(s.lang, Key::MenuNewlineDocKeep), s.line_break_override == Some(true)),
     ] });
-    v.insert(v.len() - 3, check(Command::SourceView, format!("{}\tCtrl+3", i18n::t(s.lang, Key::MenuReadSource)), s.source_view));
+    v.insert(v.len() - 3, check(Command::SourceView, with_hint(i18n::t(s.lang, Key::MenuReadSource), &Command::SourceView), s.source_view));
     v.insert(v.len() - 3, MenuRow::Sub { label: i18n::t(s.lang, Key::MenuExternalEditor), items: vec![
-        row(Command::OpenEditor, format!("{}\tCtrl+Shift+O", i18n::t(s.lang, Key::MenuOpenInEditor)), s.from_file),
+        row(Command::OpenEditor, with_hint(i18n::t(s.lang, Key::MenuOpenInEditor), &Command::OpenEditor), s.from_file),
         row(Command::ChooseEditor, i18n::t(s.lang, Key::MenuChooseEditor), true),
     ] });
     // An application-level switch among the document's own settings: it is placed
@@ -3431,8 +3541,8 @@ fn menu_items(s: &MenuState) -> Vec<MenuRow> {    // A tab in a menu string star
         check(Command::TextParagraphs(ParagraphRule::BlankLines), i18n::t(s.lang, Key::MenuParagraphsBlank), s.text_options.paragraphs == ParagraphRule::BlankLines),
         check(Command::DetectChapters(!s.text_options.chapters), i18n::t(s.lang, Key::MenuDetectChapters), s.text_options.chapters),
         MenuRow::Gap,
-        row(Command::PreviousChapter, format!("{}\tCtrl+Alt+Up", i18n::t(s.lang, Key::MenuPreviousChapter)), s.chapter > 0),
-        row(Command::NextChapter, format!("{}\tCtrl+Alt+Down", i18n::t(s.lang, Key::MenuNextChapter)), s.chapter + 1 < s.chapter_titles.len()),
+        row(Command::PreviousChapter, with_hint(i18n::t(s.lang, Key::MenuPreviousChapter), &Command::PreviousChapter), s.chapter > 0),
+        row(Command::NextChapter, with_hint(i18n::t(s.lang, Key::MenuNextChapter), &Command::NextChapter), s.chapter + 1 < s.chapter_titles.len()),
         row(Command::WideTableNarrow, i18n::t(s.lang, Key::MenuWideTableNarrow), true),
         row(Command::WideTableWiden, i18n::t(s.lang, Key::MenuWideTableWiden), true),
         // What a table is ruled with: every boundary of the grid, or the three rules
@@ -3442,8 +3552,8 @@ fn menu_items(s: &MenuState) -> Vec<MenuRow> {    // A tab in a menu string star
             check(Command::TableLines(TableLines::Grid), i18n::t(s.lang, Key::MenuTableGrid), s.table_lines == TableLines::Grid),
             check(Command::TableLines(TableLines::Booktabs), i18n::t(s.lang, Key::MenuTableBooktabs), s.table_lines == TableLines::Booktabs),
         ] },
-        row(Command::Neighbor(false), format!("{}\tCtrl+Alt+Left", i18n::t(s.lang, Key::MenuPreviousFile)), s.previous),
-        row(Command::Neighbor(true), format!("{}\tCtrl+Alt+Right", i18n::t(s.lang, Key::MenuNextFile)), s.next),
+        row(Command::Neighbor(false), with_hint(i18n::t(s.lang, Key::MenuPreviousFile), &Command::Neighbor(false)), s.previous),
+        row(Command::Neighbor(true), with_hint(i18n::t(s.lang, Key::MenuNextFile), &Command::Neighbor(true)), s.next),
     ] });
     let mut encodings: Vec<_> = Encoding::ALL.into_iter().map(|e|
         check(Command::TextEncoding(e), e.label(), e == s.encoding)).collect();
@@ -7154,6 +7264,7 @@ impl View {
                     let title = match &tab.document {
                         DocumentRef::Sample => i18n::t(self.lang, Key::SampleTitle).to_string(),
                         DocumentRef::Start => i18n::t(self.lang, Key::MenuStartPage).to_string(),
+                        DocumentRef::Shortcuts => i18n::t(self.lang, Key::MenuShortcuts).to_string(),
                         DocumentRef::File(file) => file.path.file_name()
                             .map(|name| name.to_string_lossy().into_owned())
                             .unwrap_or_else(|| file.path.to_string_lossy().into_owned()),
@@ -7272,13 +7383,23 @@ impl View {
     /// on a pill they can see, and the same act widened to the ones they cannot.
     fn open_tab_menu(&mut self, hwnd: HWND, id: TabId, x: i32, y: i32) {
         let count = self.workspace.tabs.items().len();
-        let rows = vec![
-            row(Command::CloseTab(id), format!("{}\tCtrl+W", i18n::t(self.lang, Key::MenuCloseTab)), true),
-            row(Command::CloseOtherTabs(id), i18n::t(self.lang, Key::MenuCloseOtherTabs), count > 1),
-            MenuRow::Gap,
-            row(Command::CloseAll, i18n::t(self.lang, Key::MenuCloseAllTabs), true),
-        ];
+        let rows = Self::tab_menu_rows(self.lang, id, count);
         self.run_menu(hwnd, &rows, x, y);
+    }
+
+    /// The rows a right press on a pill opens.
+    ///
+    /// A function of its own rather than a list written where the menu is built, because
+    /// the shortcut page promises that every action it lists can be asked for: the rows a
+    /// tab's own menu offers are part of that promise, and a test can only check them if
+    /// they can be built without a window.
+    fn tab_menu_rows(lang: Language, id: TabId, count: usize) -> Vec<MenuRow> {
+        vec![
+            row(Command::CloseTab(id), with_hint(i18n::t(lang, Key::MenuCloseTab), &Command::CloseTab(id)), true),
+            row(Command::CloseOtherTabs(id), i18n::t(lang, Key::MenuCloseOtherTabs), count > 1),
+            MenuRow::Gap,
+            row(Command::CloseAll, i18n::t(lang, Key::MenuCloseAllTabs), true),
+        ]
     }
 
     /// Do one of the things the menu offers, most of which are also keys.
@@ -7399,6 +7520,7 @@ impl View {
                 }
             }
             Command::StartPage => self.show_start_page(hwnd),
+            Command::ShortcutsPage => self.show_shortcuts_page(hwnd),
             Command::OpenTree(index) => {
                 if let Some(path) = self.tree.get(index).map(|entry| entry.path.clone()) {
                     self.load_document(&path, hwnd);
@@ -10394,6 +10516,7 @@ impl View {
         match &tab.document {
             DocumentRef::Sample => "Sample".to_string(),
             DocumentRef::Start => "Start".to_string(),
+            DocumentRef::Shortcuts => "Shortcuts".to_string(),
             DocumentRef::File(file) => file.path.file_name()
                 .map(|name| name.to_string_lossy().into_owned())
                 .unwrap_or_else(|| file.path.to_string_lossy().into_owned()),
@@ -11161,6 +11284,14 @@ impl View {
                         self.set_page(page, None, hwnd);
                         true
                     }
+                    DocumentRef::Shortcuts => {
+                        // Made from the table every time, for the same reason: a key bound
+                        // since the page was last shown belongs on it now, and a language
+                        // changed since then belongs on it in the new words.
+                        let page = crate::shortcuts::page(self.lang);
+                        self.set_page(page, None, hwnd);
+                        true
+                    }
                 };
                 if loaded {
                     self.remember_reading();
@@ -11406,6 +11537,13 @@ impl View {
     /// reader who asks for it twice comes back to the one that is already there.
     fn show_start_page(&mut self, hwnd: HWND) {
         let (id, _) = self.workspace.open_start_page();
+        self.switch_to_tab(id, hwnd);
+    }
+
+    /// The same for the page of keys: a page of its own in the strip, made when it is
+    /// shown, so a key bound since the last look is on it.
+    fn show_shortcuts_page(&mut self, hwnd: HWND) {
+        let (id, _) = self.workspace.open_shortcuts_page();
         self.switch_to_tab(id, hwnd);
     }
 
@@ -17941,6 +18079,174 @@ mod tests {
         // screen rather than the row it would be printed on, and the bracket keys step
         // the measure instead of settling on the rung they are next to.
         assert_eq!(got.iter().filter(|(_, l)| l.contains('\t')).count(), 12);
+    }
+
+    /// Every action the shortcut page lists is one the menu can actually be asked for.
+    ///
+    /// The page is generated from `shortcuts::TABLE`, and the menu from `menu_items`; the
+    /// two are kept in step by `action_of`, whose match on the command enum is exhaustive.
+    /// This test walks the menu in every state that changes what it offers -- a page with
+    /// a caret in a table, a link under the pointer, a document off a disk, a state with no
+    /// text at all, the tab lists and the folder shelves -- and checks that the set of
+    /// actions reached is exactly the set the table holds. An action added to the table but
+    /// never offered by the menu fails here, and so does the reverse.
+    #[test]
+    fn every_action_the_page_lists_is_one_the_menu_can_be_asked_for() {
+        // The menu offers a row only in the states that make it mean something: a link row
+        // needs a link, a table row needs a caret in a grid, and the shelf rows need
+        // something on the shelf. Asking about one state would report those as missing.
+        let mut states = Vec::new();
+        for selected in [false, true] {
+            for link in [None, Some("https://example.invalid/a")] {
+                for from_file in [false, true] {
+                    for text in [false, true] {
+                        states.push(state(selected, link, None, from_file, text));
+                    }
+                }
+            }
+        }
+        let mut in_a_table = state(false, None, None, true, true);
+        in_a_table.in_table = true;
+        states.push(in_a_table);
+        // The groups that are only built when they have something in them: one tab to pin
+        // and close, one recent document, one folder on the shelf, one folder last read, one
+        // row of the workspace tree, one heading in the outline, one chapter to step to.
+        let mut furnished = state(false, None, None, true, true);
+        furnished.tabs = vec![(TabId(1), "a.md".to_string(), true), (TabId(2), "b.md".to_string(), false)];
+        furnished.recent = vec![(0, "a.md".to_string())];
+        furnished.favourites = vec![(0, "C:\\keep".to_string())];
+        furnished.folders = vec![(0, "C:\\last".to_string())];
+        furnished.favourite_here = true;
+        furnished.already_favourite = true;
+        furnished.tree = vec![(0, "c.md".to_string(), false), (1, "sub".to_string(), true)];
+        furnished.headings = outline_of(&[(1, "One"), (2, "Two")]);
+        furnished.chapter_titles = vec!["First".to_string(), "Second".to_string()];
+        furnished.chapter = 0;
+        furnished.can_back = true;
+        furnished.can_forward = true;
+        furnished.previous = true;
+        furnished.next = true;
+        // The two groups the menu builds from what is installed: a preset to pick, and a
+        // theme on each appearance's shelf.
+        furnished.profiles = vec!["Default".to_string(), "Book".to_string()];
+        furnished.profile = "Default".to_string();
+        furnished.themes = ThemeMenu {
+            names: [vec!["Default Light".to_string()], vec!["Default Dark".to_string()]],
+            current: ["Default Light".to_string(), "Default Dark".to_string()],
+            fault: [None, None],
+        };
+        states.push(furnished);
+
+        // The menu a pill opens is a menu too: it offers closing the others and closing all,
+        // which the application menu leaves to the strip because it is where a tab is a
+        // thing rather than a name.
+        let tab_rows = View::tab_menu_rows(Language::EnUs, TabId(1), 2);
+        let reached_from_tabs: Vec<Shortcut> = tab_rows
+            .iter()
+            .filter_map(|r| match r {
+                MenuRow::Row { cmd, .. } => Some(action_of(cmd)),
+                MenuRow::Gap | MenuRow::Sub { .. } => None,
+            })
+            .collect();
+        let mut reached: Vec<Shortcut> = states
+            .iter()
+            .flat_map(all_rows)
+            .map(|(cmd, _, _)| action_of(&cmd))
+            .chain(reached_from_tabs)
+            .collect();
+        reached.sort_by_key(|action| format!("{action:?}"));
+        reached.dedup();
+
+        let mut listed: Vec<Shortcut> = crate::shortcuts::Shortcut::all().collect();
+        listed.sort_by_key(|action| format!("{action:?}"));
+
+        let missing: Vec<String> = listed
+            .iter()
+            .filter(|action| !reached.contains(action))
+            .map(|action| format!("{action:?}"))
+            .collect();
+        assert!(
+            missing.is_empty(),
+            "the page lists actions the menu never offers: {missing:?}",
+        );
+        let extra: Vec<String> = reached
+            .iter()
+            .filter(|action| !listed.contains(action))
+            .map(|action| format!("{action:?}"))
+            .collect();
+        assert!(
+            extra.is_empty(),
+            "the menu offers actions the page does not list: {extra:?}",
+        );
+        // And the count is the table's own, so a page that grew a row without the menu
+        // growing the way to ask for it is caught even if the two sets happened to agree.
+        assert_eq!(reached.len(), crate::shortcuts::Shortcut::count());
+    }
+
+    /// The page the menu opens and the listing a headless run prints are one text.
+    ///
+    /// Both are built from the same table by the same function, so this is a check on the
+    /// wiring rather than on the table: what the reader sees in the window and what
+    /// `--list-shortcuts` prints cannot say different things about a key.
+    #[test]
+    fn the_page_and_the_headless_listing_say_the_same_thing() {
+        let page = crate::shortcuts::page(Language::EnUs);
+        let listing = crate::shortcuts::describe(Language::EnUs);
+        // Every listing row is a line of the page's table: the label, then a column of keys
+        // that are the same keys, backtick-wrapped on the page and bare in the listing.
+        for line in listing.iter().take(crate::shortcuts::Shortcut::count()) {
+            let (label, keys) = line.split_once('\t').expect("a label and its keys");
+            let on_page = page
+                .lines()
+                .find(|row| row.starts_with(&format!("| {label} |")))
+                .unwrap_or_else(|| panic!("{label} is not on the page"));
+            if keys == "-" {
+                assert!(on_page.ends_with("| None |"), "{on_page}");
+                continue;
+            }
+            for key in keys.split(' ') {
+                assert!(on_page.contains(&format!("`{key}`")), "{label}: {key} missing from {on_page}");
+            }
+        }
+    }
+
+    /// A key that only turns a switch over is on the page and not in the menu.
+    ///
+    /// The menu prints a key beside the row that performs it, and `Ctrl`+`4` performs
+    /// neither of the two rows it could stand beside: it puts whichever mode is not on the
+    /// screen on. The page lists it on both, because a reader looking up "how do I get the
+    /// page stack" is answered by it.
+    #[test]
+    fn a_key_that_turns_a_switch_over_is_listed_but_not_printed_beside_a_row() {
+        let rows = all_rows(&state(false, None, None, true, true));
+        let labelled = |cmd: Command| {
+            rows.iter()
+                .find(|(c, _, _)| *c == cmd)
+                .map(|(_, _, _)| cmd.clone())
+                .is_some()
+        };
+        assert!(labelled(Command::PageMode(true)), "the page-stack row is there");
+        // And the page names the key on both of its rows.
+        let page = crate::shortcuts::page(Language::EnUs);
+        let key_rows: Vec<&str> = page.lines().filter(|line| line.contains("`Ctrl+4`")).collect();
+        assert_eq!(key_rows.len(), 2, "both reading modes list the key: {key_rows:?}");
+    }
+
+    #[test]
+    fn the_shortcut_page_opens_as_its_own_tab_and_only_once() {
+        // The page is a document in the strip like the start page: asking for it twice
+        // comes back to the one that is open rather than making a second.
+        let mut workspace = Workspace::default();
+        let (first, opened) = workspace.open_shortcuts_page();
+        assert!(opened);
+        let (again, opened_again) = workspace.open_shortcuts_page();
+        assert_eq!(again, first);
+        assert!(!opened_again, "one page, however often it is asked for");
+        // And it is not the start page, though the two are opened the same way.
+        let (start, _) = workspace.open_start_page();
+        assert_ne!(start, first);
+        workspace.activate(first);
+        assert_eq!(workspace.tabs.active().document, DocumentRef::Shortcuts);
     }
 
     #[test]

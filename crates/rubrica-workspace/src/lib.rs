@@ -30,6 +30,9 @@ pub enum DocumentRef {
     /// It is made when it is shown rather than read from anywhere, so the session file
     /// does not carry it and a restart simply does not have one.
     Start,
+    /// The page that lists every action the menu offers beside its keys. Made when it is
+    /// shown, for the same reason the start page is: there is nothing in it to write down.
+    Shortcuts,
     File(FileRef),
 }
 
@@ -109,14 +112,25 @@ impl TabSet {
     /// Open the start page, or come back to the one that is already open: it is a page
     /// like any other in the strip, and a reader who asks for it twice wants one of it.
     pub fn open_start_page(&mut self) -> (TabId, bool) {
-        if let Some(index) = self.items.iter().position(|tab| tab.document == DocumentRef::Start) {
+        self.open_made_page(DocumentRef::Start)
+    }
+
+    /// The same for the page that lists the keys.
+    pub fn open_shortcuts_page(&mut self) -> (TabId, bool) {
+        self.open_made_page(DocumentRef::Shortcuts)
+    }
+
+    /// Open a page this reader makes rather than reads, or come back to the one already
+    /// open. Both made pages behave alike, so both are opened by one function.
+    fn open_made_page(&mut self, document: DocumentRef) -> (TabId, bool) {
+        if let Some(index) = self.items.iter().position(|tab| tab.document == document) {
             let id = self.items[index].id;
             self.active = index;
             return (id, false);
         }
         let id = TabId(self.next_id);
         self.next_id += 1;
-        self.items.push(Tab { id, document: DocumentRef::Start, kind: TabKind::Pinned });
+        self.items.push(Tab { id, document, kind: TabKind::Pinned });
         self.active = self.items.len() - 1;
         self.trim();
         (id, true)
@@ -379,6 +393,8 @@ impl Workspace {
     pub fn close_all(&mut self) { self.tabs.close_all() }
     /// Open the start page, or come back to the one that is already open.
     pub fn open_start_page(&mut self) -> (TabId, bool) { self.tabs.open_start_page() }
+    /// The same for the page that lists the keys.
+    pub fn open_shortcuts_page(&mut self) -> (TabId, bool) { self.tabs.open_shortcuts_page() }
     pub fn pin(&mut self, id: TabId) -> bool { self.tabs.pin(id) }
     pub fn move_tab(&mut self, id: TabId, to: usize) -> bool { self.tabs.move_tab(id, to) }
     pub fn clear_recent(&mut self) { self.recent.clear(); }
@@ -387,7 +403,7 @@ impl Workspace {
     pub fn snapshot(&self) -> WorkspaceSnapshot {
         let tabs = self.tabs.items.iter().filter_map(|tab| match &tab.document {
             DocumentRef::File(file) => Some(SessionTab { document: file.clone(), kind: tab.kind }),
-            DocumentRef::Sample | DocumentRef::Start => None,
+            DocumentRef::Sample | DocumentRef::Start | DocumentRef::Shortcuts => None,
         }).collect();
         WorkspaceSnapshot {
             session: SessionSnapshot {
@@ -448,8 +464,9 @@ impl Workspace {
                 .position(|tab| matches!(&tab.document, DocumentRef::File(existing) if existing.same_file(&file))),
             Some(DocumentRef::Sample) => sample,
             // The start page is made rather than remembered, so a session that names it
-            // is a session whose page is gone: the sample is what is left to show.
-            Some(DocumentRef::Start) => None,
+            // is a session whose page is gone: the sample is what is left to show. The
+            // page of keys is the same kind of thing.
+            Some(DocumentRef::Start) | Some(DocumentRef::Shortcuts) => None,
             None if !fallback_to_sample => None,
             _ if fallback_to_sample => sample,
             _ => None,

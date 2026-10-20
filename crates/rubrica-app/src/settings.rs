@@ -975,6 +975,7 @@ pub fn encode_workspace(snapshot: &WorkspaceSnapshot) -> Option<Vec<u8>> {
         None => out.push(0),
         Some(DocumentRef::Sample) => out.push(1),
         Some(DocumentRef::Start) => out.push(3),
+        Some(DocumentRef::Shortcuts) => out.push(4),
         Some(DocumentRef::File(file)) => {
             out.push(2);
             put_workspace_file(&mut out, file)?;
@@ -1005,6 +1006,7 @@ pub fn decode_workspace(data: &[u8]) -> Option<WorkspaceSnapshot> {
         0 => None,
         1 => Some(DocumentRef::Sample),
         3 => Some(DocumentRef::Start),
+        4 => Some(DocumentRef::Shortcuts),
         2 => Some(DocumentRef::File(take_workspace_file(&mut input)?)),
         _ => return None,
     };

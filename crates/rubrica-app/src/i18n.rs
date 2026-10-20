@@ -302,6 +302,16 @@ pub enum Key {
     MenuRecentFolders,
     /// A group on the start page with nothing in it yet.
     StartPageEmpty,
+
+    /// The page that lists every action the menu offers beside the key that asks for it.
+    /// Its own title is also the menu row that opens it.
+    MenuShortcuts,
+    /// The column of action names on that page.
+    ShortcutsAction,
+    /// The column of keys.
+    ShortcutsKeys,
+    /// What the key column says for an action no key reaches.
+    ShortcutsNone,
 }
 
 pub fn t(lang: Language, key: Key) -> &'static str {
@@ -481,6 +491,10 @@ fn translate_en(key: Key) -> &'static str {
         Key::MenuFavouriteFolders => "Favourite folders",
         Key::MenuRecentFolders => "Recent folders",
         Key::StartPageEmpty => "Nothing here yet.",
+        Key::MenuShortcuts => "Keyboard shortcuts",
+        Key::ShortcutsAction => "Action",
+        Key::ShortcutsKeys => "Keys",
+        Key::ShortcutsNone => "None",
     }
 }
 
@@ -645,6 +659,10 @@ fn translate_zh_cn(key: Key) -> &'static str {
         Key::MenuFavouriteFolders => "收藏的文件夹",
         Key::MenuRecentFolders => "最近文件夹",
         Key::StartPageEmpty => "这里还是空的。",
+        Key::MenuShortcuts => "快捷键",
+        Key::ShortcutsAction => "动作",
+        Key::ShortcutsKeys => "键位",
+        Key::ShortcutsNone => "无",
     }
 }
 
@@ -809,6 +827,10 @@ fn translate_zh_tw(key: Key) -> &'static str {
         Key::MenuFavouriteFolders => "收藏的資料夾",
         Key::MenuRecentFolders => "最近資料夾",
         Key::StartPageEmpty => "這裡還是空的。",
+        Key::MenuShortcuts => "快速鍵",
+        Key::ShortcutsAction => "動作",
+        Key::ShortcutsKeys => "鍵位",
+        Key::ShortcutsNone => "無",
     }
 }
 
@@ -973,6 +995,10 @@ fn translate_ja(key: Key) -> &'static str {
         Key::MenuFavouriteFolders => "お気に入りのフォルダー",
         Key::MenuRecentFolders => "最近のフォルダー",
         Key::StartPageEmpty => "まだ何もありません。",
+        Key::MenuShortcuts => "キーボードショートカット",
+        Key::ShortcutsAction => "操作",
+        Key::ShortcutsKeys => "キー",
+        Key::ShortcutsNone => "なし",
     }
 }
 
@@ -1137,6 +1163,10 @@ fn translate_ko(key: Key) -> &'static str {
         Key::MenuFavouriteFolders => "즐겨찾는 폴더",
         Key::MenuRecentFolders => "최근 폴더",
         Key::StartPageEmpty => "아직 아무것도 없습니다.",
+        Key::MenuShortcuts => "키보드 단축키",
+        Key::ShortcutsAction => "동작",
+        Key::ShortcutsKeys => "키",
+        Key::ShortcutsNone => "없음",
     }
 }
 
@@ -1301,6 +1331,10 @@ fn translate_fr(key: Key) -> &'static str {
         Key::MenuFavouriteFolders => "Dossiers favoris",
         Key::MenuRecentFolders => "Dossiers récents",
         Key::StartPageEmpty => "Rien pour l'instant.",
+        Key::MenuShortcuts => "Raccourcis clavier",
+        Key::ShortcutsAction => "Action",
+        Key::ShortcutsKeys => "Touches",
+        Key::ShortcutsNone => "Aucune",
     }
 }
 
@@ -1465,6 +1499,10 @@ fn translate_de(key: Key) -> &'static str {
         Key::MenuFavouriteFolders => "Favoriten",
         Key::MenuRecentFolders => "Zuletzt verwendete Ordner",
         Key::StartPageEmpty => "Noch nichts hier.",
+        Key::MenuShortcuts => "Tastenkürzel",
+        Key::ShortcutsAction => "Aktion",
+        Key::ShortcutsKeys => "Tasten",
+        Key::ShortcutsNone => "Keine",
     }
 }
 
@@ -1629,6 +1667,10 @@ fn translate_es(key: Key) -> &'static str {
         Key::MenuFavouriteFolders => "Carpetas favoritas",
         Key::MenuRecentFolders => "Carpetas recientes",
         Key::StartPageEmpty => "Todavía no hay nada.",
+        Key::MenuShortcuts => "Atajos de teclado",
+        Key::ShortcutsAction => "Acción",
+        Key::ShortcutsKeys => "Teclas",
+        Key::ShortcutsNone => "Ninguna",
     }
 }
 
@@ -1793,6 +1835,10 @@ fn translate_ru(key: Key) -> &'static str {
         Key::MenuFavouriteFolders => "Избранные папки",
         Key::MenuRecentFolders => "Недавние папки",
         Key::StartPageEmpty => "Здесь пока ничего нет.",
+        Key::MenuShortcuts => "Сочетания клавиш",
+        Key::ShortcutsAction => "Действие",
+        Key::ShortcutsKeys => "Клавиши",
+        Key::ShortcutsNone => "Нет",
     }
 }
 
@@ -1957,6 +2003,10 @@ fn translate_it(key: Key) -> &'static str {
         Key::MenuFavouriteFolders => "Cartelle preferite",
         Key::MenuRecentFolders => "Cartelle recenti",
         Key::StartPageEmpty => "Ancora niente qui.",
+        Key::MenuShortcuts => "Scorciatoie da tastiera",
+        Key::ShortcutsAction => "Azione",
+        Key::ShortcutsKeys => "Tasti",
+        Key::ShortcutsNone => "Nessuno",
     }
 }
 
@@ -2121,6 +2171,10 @@ fn translate_pt(key: Key) -> &'static str {
         Key::MenuFavouriteFolders => "Pastas favoritas",
         Key::MenuRecentFolders => "Pastas recentes",
         Key::StartPageEmpty => "Ainda não há nada aqui.",
+        Key::MenuShortcuts => "Atalhos de teclado",
+        Key::ShortcutsAction => "Ação",
+        Key::ShortcutsKeys => "Teclas",
+        Key::ShortcutsNone => "Nenhuma",
     }
 }
 

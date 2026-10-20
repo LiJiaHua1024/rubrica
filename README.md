@@ -268,6 +268,18 @@ justification at every width unticks the switch. Headless runs take
 `layout` line a `--report` carries names whichever of these numbers or switches the page is
 no longer set with.
 
+The menu's **Keyboard shortcuts** row opens a page of its own in the tab strip: every
+action the menu can be asked to perform, in the menu's own order and its own words, beside
+the keys that ask for it -- and, for an action no key reaches, the reader's word for there
+being none rather than an empty cell. The page is read-only and is generated from the one
+table the window's own key handling is defined by, so it cannot fall behind a key that is
+bound or an action that is added; the same table is what `--list-shortcuts` prints, one
+`action` and its keys per line under a count, and `--shortcuts-page` prints the page's own
+Markdown, which can be handed to `--report` to be laid out with no window.
+
+The table below is the reader's own moving about the window -- arrows, the wheel, the
+caret -- which the menu has no rows for and therefore the page does not list.
+
 | Key | |
 | --- | --- |
 | `Ctrl+O` / `Ctrl+R` | open a document · read it again from disk |
