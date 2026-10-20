@@ -255,6 +255,10 @@ pub fn daemon() -> crate::Result<()> {
         let _ = CoInitializeEx(None, COINIT_APARTMENTTHREADED | COINIT_DISABLE_OLE1DDE);
     }
 
+    // The service's own menu is drawn by the shell, which reads this answer before the
+    // window that opens it exists. The preview follows the reader's remembered choice,
+    // or the desktop when there is none, so its menu follows the same one.
+    crate::view::prefer_dark_shell(settings::load().dark.unwrap_or_else(system_prefers_dark));
     let hwnd = unsafe { create_service_window() }?;
     let (keyboard, mouse) = install_hooks()?;
     // A foreground change ends the invalid-key cooldown: the window the typing
@@ -704,6 +708,9 @@ impl Service {
     }
 
     fn tray_menu(&mut self) {
+        // Read fresh at the click: the reader may have changed their mind since the last
+        // preview, and this is the moment the menu is drawn.
+        crate::view::prefer_dark_shell(settings::load().dark.unwrap_or_else(system_prefers_dark));
         unsafe {
             let Ok(menu) = CreatePopupMenu() else { return };
             let lang = crate::settings::current_language();

@@ -28,7 +28,7 @@ use printpdf::{
     Rect as PdfRect, DictItem,
     Rgb as PdfRgb, TextItem, TextMatrix as PdfTextMatrix, XObjectTransform,
 };
-use windows::core::{w, BOOL, Interface, PCWSTR};
+use windows::core::{w, BOOL, Interface, PCSTR, PCWSTR};
 use windows::Win32::Foundation::GENERIC_WRITE;
 use windows::Win32::Foundation::{COLORREF, D2DERR_RECREATE_TARGET, FILETIME, HWND, LPARAM, LRESULT, POINT, RECT, SYSTEMTIME, WPARAM};
 use windows::Win32::Graphics::Direct2D::Common::{
@@ -62,7 +62,7 @@ use windows::Win32::Graphics::Gdi::{
 use windows::Win32::System::Com::{
     CoInitializeEx, COINIT_APARTMENTTHREADED, COINIT_DISABLE_OLE1DDE, COINIT_MULTITHREADED,
 };
-use windows::Win32::System::LibraryLoader::GetModuleHandleW;
+use windows::Win32::System::LibraryLoader::{GetModuleHandleW, GetProcAddress, LoadLibraryW};
 use windows::Win32::System::Registry::{RRF_RT_DWORD, RegGetValueW, HKEY_CURRENT_USER};
 use windows::Win32::UI::HiDpi::{
     DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2, GetDpiForWindow, GetSystemMetricsForDpi, SetProcessDpiAwarenessContext,
@@ -4184,6 +4184,9 @@ fn opening_palette(
 
 pub fn run(path: Option<PathBuf>, extra: Vec<PathBuf>, start_theme: Option<String>) -> Result<()> {
     let (mut view, saved) = new_view(path, extra, start_theme)?;
+    // Before the first window exists: the shell reads this answer when it themes a menu,
+    // and a menu opened over a page has to belong to the page from the first right press.
+    prefer_dark_shell(view.palette.dark);
     const CLASS: &str = "Rubrica.Main";
     unsafe {
         let hinst = GetModuleHandleW(None)?;
@@ -4466,6 +4469,55 @@ pub(crate) fn system_prefers_dark() -> bool {
         )
     };
     r.is_ok() && value == 0
+}
+
+/// Tell the shell which appearance to draw the parts of a window this program does not
+/// paint itself -- the popup menus above all.
+///
+/// A menu handed to `TrackPopupMenuEx` is drawn by USER32 from a theme of its own. It
+/// follows neither the palette this window paints with nor `DwmSetWindowAttribute`,
+/// which is how a night page could carry a sheet of daylight over it. The one switch
+/// that reaches it is `uxtheme.dll`'s `SetPreferredAppMode`, an API that has never had a
+/// header and is reached by ordinal. The mode is *forced* rather than allowed to follow
+/// the desktop, because this reader's appearance is the reader's: a night page on a
+/// daylight desktop still wants night menus, and a daylight page on a night desktop
+/// wants daylight ones. The menu theme table is flushed after the switch because it
+/// caches what it was last told.
+///
+/// A Windows that does not export the two entry points simply keeps the menus it always
+/// drew, which is the same answer the system gave before the call existed.
+pub(crate) fn prefer_dark_shell(dark: bool) {
+    // `uxtheme`'s own `PreferredAppMode`: Default, AllowDark, ForceDark, ForceLight. A
+    // menu belongs to the page it stands over, so it is forced rather than allowed.
+    const FORCE_DARK: i32 = 2;
+    const FORCE_LIGHT: i32 = 3;
+
+    /// The two entry points, read once and kept for the life of the process.
+    struct Shell {
+        set_mode: unsafe extern "system" fn(i32) -> i32,
+        flush: Option<unsafe extern "system" fn()>,
+    }
+
+    // `LoadLibraryW` rather than `GetModuleHandleW`: uxtheme is usually loaded already,
+    // but "usually" is not a reason for the first menu of a run to come out light. The
+    // handle is never released because the library is needed for the life of the process
+    // and this is the only place that asks for it.
+    static SHELL: LazyLock<Option<Shell>> = LazyLock::new(|| unsafe {
+        let module = LoadLibraryW(w!("uxtheme.dll")).ok()?;
+        // Ordinals rather than names: these two are exported by number only.
+        let set_mode = GetProcAddress(module, PCSTR(135 as *const u8))?;
+        let set_mode: unsafe extern "system" fn(i32) -> i32 = std::mem::transmute(set_mode);
+        let flush = GetProcAddress(module, PCSTR(136 as *const u8)).map(|flush| {
+            std::mem::transmute::<unsafe extern "system" fn() -> isize, unsafe extern "system" fn()>(flush)
+        });
+        Some(Shell { set_mode, flush })
+    });
+
+    let Some(shell) = SHELL.as_ref() else { return };
+    let _ = unsafe { (shell.set_mode)(if dark { FORCE_DARK } else { FORCE_LIGHT }) };
+    if let Some(flush) = shell.flush {
+        unsafe { flush() }
+    }
 }
 
 /// Whether the reader's system asks for animations.
@@ -8515,6 +8567,8 @@ impl View {
         if palette == self.palette {
             return false;
         }
+        let dark = palette.dark;
+        let appearance_moved = dark != self.palette.dark;
         self.palette = palette;
         self.brushes.clear();
         self.sel_brush = None;
@@ -8529,6 +8583,12 @@ impl View {
         }
         if let Some(e) = self.edit {
             unsafe { let _ = InvalidateRect(Some(e), None, true); }
+        }
+        // The popup menus are drawn by the shell rather than by this paint, so a move
+        // between appearances has to be told to it too; a theme that only changed a
+        // colour of one appearance leaves them where they are.
+        if appearance_moved {
+            prefer_dark_shell(dark);
         }
         unsafe { self.apply_dark_titlebar(hwnd) };
         true
