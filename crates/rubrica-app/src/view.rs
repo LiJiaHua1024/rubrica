@@ -3093,6 +3093,18 @@ enum Command {
     /// Add or remove one item from the status bar, by its bit in
     /// [`crate::settings::STATUS_ITEMS`].
     StatusItem(u32),
+    /// Read the release channel beside the program, say what it holds, and offer the
+    /// release page when it holds something newer. Nothing is downloaded: the file is on
+    /// disk and the download is the browser's.
+    CheckUpdates,
+    /// Turn the Labs channel on or off, and check again under the new answer.
+    UpdateLabs(bool),
+    /// Open the issue tracker, which is where a reader says a thing went wrong.
+    SendFeedback,
+    /// Show the page that says what this program does with a document.
+    PrivacyPolicy,
+    /// Show the two licences the source is under.
+    License,
 }
 
 /// One row of that menu.
@@ -3202,6 +3214,11 @@ fn action_of(cmd: &Command) -> Shortcut {
         Command::PageMode(false) => Shortcut::ContinuousScroll,
         Command::PreviousPage => Shortcut::PreviousPage,
         Command::NextPage => Shortcut::NextPage,
+        Command::CheckUpdates => Shortcut::CheckUpdates,
+        Command::UpdateLabs(_) => Shortcut::UpdateLabs,
+        Command::SendFeedback => Shortcut::SendFeedback,
+        Command::PrivacyPolicy => Shortcut::PrivacyPolicy,
+        Command::License => Shortcut::License,
     }
 }
 
@@ -3270,6 +3287,9 @@ struct MenuState {
     peek_space: crate::peek::SpaceMode,
     peek_focus_close: bool,
     peek_click_close: bool,
+    /// Whether the reader is offered release candidates, which is the one thing the
+    /// update rows' checked state and the check itself both read.
+    update_labs: bool,
     /// Whether a step back or forward has a page to land on. A reader who has opened one
     /// document and never followed a link out of it has no road behind them, and a `Back`
     /// that does nothing when pressed teaches them the menu is not to be believed.
@@ -3569,6 +3589,23 @@ fn menu_items(s: &MenuState) -> Vec<MenuRow> {    // A tab in a menu string star
         lang_items.push(check(Command::Language(Some(l)), l.native_name(), s.lang_choice == Some(l)));
     }
     v.insert(v.len() - 3, MenuRow::Sub { label: i18n::t(s.lang, Key::MenuLanguage), items: lang_items });
+    // The rows about the program rather than about the page: which version is running and
+    // how a newer one would be got, where to say a thing went wrong, and the two pages a
+    // reader is owed before they trust any program with their files. They sit above the
+    // three rows that have always closed this menu, so `Reload` stays the last thing on it.
+    let about = [
+        MenuRow::Gap,
+        row(Command::CheckUpdates, i18n::t(s.lang, Key::MenuCheckUpdates), true),
+        check(Command::UpdateLabs(!s.update_labs), i18n::t(s.lang, Key::MenuUpdateLabs), s.update_labs),
+        MenuRow::Gap,
+        row(Command::SendFeedback, i18n::t(s.lang, Key::MenuSendFeedback), true),
+        row(Command::PrivacyPolicy, i18n::t(s.lang, Key::MenuPrivacy), true),
+        row(Command::License, i18n::t(s.lang, Key::MenuLicense), true),
+    ];
+    let at = v.len() - 3;
+    for (offset, item) in about.into_iter().enumerate() {
+        v.insert(at + offset, item);
+    }
     v
 }
 
@@ -3783,6 +3820,74 @@ fn show_error(hwnd: HWND, message: &str) {
     let message = utf16(message);
     let title = utf16(i18n::t(Language::EnUs, Key::DialogTitle));
     unsafe { MessageBoxW(Some(hwnd), PCWSTR(message.as_ptr()), PCWSTR(title.as_ptr()), MB_OK | MB_ICONERROR); }
+}
+
+/// How many of a release's notes the box shows before it stops counting: a release can
+/// carry a long list, and a message box is not a page a reader can scroll.
+const NOTES_SHOWN: usize = 12;
+
+/// A box with something to read and one button to press: the update check's answer when
+/// there is no decision left for the reader to make.
+fn show_info(hwnd: HWND, message: &str, lang: Language) {
+    use windows::Win32::UI::WindowsAndMessaging::{MessageBoxW, MB_ICONINFORMATION, MB_OK};
+    let message = utf16(message);
+    let title = utf16(i18n::t(lang, Key::DialogTitle));
+    unsafe { MessageBoxW(Some(hwnd), PCWSTR(message.as_ptr()), PCWSTR(title.as_ptr()), MB_OK | MB_ICONINFORMATION); }
+}
+
+/// A box that asks one question: `true` when the reader said yes.
+///
+/// The two button words are Windows' own rather than the reader's language choice, which
+/// is the one place in this program that happens -- and it is deliberate: the box is drawn
+/// by the system, and a system-localised button under a sentence in the reader's language
+/// is still the pair of buttons they expect on this machine.
+fn ask_yes_no(hwnd: HWND, message: &str, lang: Language) -> bool {
+    use windows::Win32::UI::WindowsAndMessaging::{MessageBoxW, IDYES, MB_ICONINFORMATION, MB_YESNO};
+    let message = utf16(message);
+    let title = utf16(i18n::t(lang, Key::DialogTitle));
+    let answer = unsafe {
+        MessageBoxW(Some(hwnd), PCWSTR(message.as_ptr()), PCWSTR(title.as_ptr()), MB_YESNO | MB_ICONINFORMATION)
+    };
+    answer.0 == IDYES.0
+}
+
+/// A file that shipped beside the program, if it is there.
+///
+/// The archive holds the two licence texts and the privacy page; a single executable
+/// copied out of it holds none of them, which is a copy with nothing to open rather than a
+/// copy that is wrong.
+fn beside_program(name: &str) -> Option<std::path::PathBuf> {
+    let exe = std::env::current_exe().ok()?;
+    let path = exe.parent()?.join(name);
+    path.is_file().then_some(path)
+}
+
+/// Open a page the archive ships, or the same page in the repository when this copy was
+/// installed without it: a row that answers with silence is worse than a browser opening
+/// on the file the row names.
+fn show_page(name: &str) {
+    match beside_program(name) {
+        Some(path) => open_path(&path.to_string_lossy()),
+        None => open_url(&format!("{}/blob/main/{name}", crate::update::REPOSITORY)),
+    }
+}
+
+/// Open both licence texts, when both are there.
+///
+/// The source is dual-licensed, so a row that showed one of the two would be answering
+/// half the question. A copy without them is sent to the repository, where they are the
+/// same two files under the same two names.
+fn show_licence() {
+    let mut opened = false;
+    for name in ["LICENSE-MIT", "LICENSE-APACHE"] {
+        if let Some(path) = beside_program(name) {
+            open_path(&path.to_string_lossy());
+            opened = true;
+        }
+    }
+    if !opened {
+        open_url(&format!("{}/blob/main/LICENSE-MIT", crate::update::REPOSITORY));
+    }
 }
 
 pub(crate) fn document_open_error(path: &Path, error: &std::io::Error) -> String {
@@ -7303,6 +7408,7 @@ impl View {
             peek_space: crate::peek::space_mode(),
             peek_focus_close: crate::peek::focus_close(),
             peek_click_close: crate::peek::click_close(),
+            update_labs: crate::settings::update_labs(),
             can_back: self.history.leads(true),
             can_forward: self.history.leads(false),
             themes: self.theme_menu(),
@@ -7400,6 +7506,68 @@ impl View {
             MenuRow::Gap,
             row(Command::CloseAll, i18n::t(lang, Key::MenuCloseAllTabs), true),
         ]
+    }
+
+    /// Read the release channel beside the program and say what it holds.
+    ///
+    /// The window's answer to `--check-update`: the same file, the same comparison and the
+    /// same sentences, in front of the reader rather than on a console. It downloads
+    /// nothing. A newer release is offered as its page, and the download is the browser's,
+    /// which is the program that already knows how to fetch a file safely.
+    fn check_for_updates(&self, hwnd: HWND) {
+        let channel = if crate::settings::update_labs() { crate::update::Channel::Labs } else { crate::update::Channel::Stable };
+        let Some(source) = crate::update::default_source() else {
+            show_info(hwnd, &i18n::update_no_channel(self.lang), self.lang);
+            return;
+        };
+        // A copy with no channel file beside it is not an error: it is this program
+        // running from somewhere an archive was never unpacked into, and the sentence for
+        // that says so rather than naming a path the reader never asked about.
+        if !source.is_file() {
+            show_info(hwnd, &i18n::update_no_channel(self.lang), self.lang);
+            return;
+        }
+        let release = match crate::update::read_release(&source) {
+            Ok(release) => release,
+            Err(error) => {
+                show_error(hwnd, &error);
+                return;
+            }
+        };
+        let current = match crate::update::Version::parse(crate::update::VERSION) {
+            Some(version) => version,
+            None => {
+                show_error(hwnd, &format!("this build's own version `{}` is not a version", crate::update::VERSION));
+                return;
+            }
+        };
+        match crate::update::check(&current, &release, channel.allows_prerelease()) {
+            crate::update::Outcome::UpToDate => {
+                show_info(hwnd, &i18n::update_up_to_date(self.lang, &current.to_string()), self.lang);
+            }
+            crate::update::Outcome::Skipped { version } => {
+                show_info(hwnd, &i18n::update_skipped(self.lang, &version.to_string()), self.lang);
+            }
+            crate::update::Outcome::Newer { version, notes, url } => {
+                let mut message = i18n::update_available(self.lang, &version.to_string(), &current.to_string());
+                if !notes.is_empty() {
+                    message.push_str("\n\n");
+                    for note in notes.iter().take(NOTES_SHOWN) {
+                        message.push_str("\u{2022} ");
+                        message.push_str(note);
+                        message.push('\n');
+                    }
+                    if notes.len() > NOTES_SHOWN {
+                        message.push_str("\u{2022} \u{2026}");
+                    }
+                }
+                message.push_str("\n\n");
+                message.push_str(i18n::t(self.lang, Key::UpdateOpenPage));
+                if ask_yes_no(hwnd, &message, self.lang) {
+                    open_url(url.as_deref().unwrap_or(crate::update::RELEASES_URL));
+                }
+            }
+        }
     }
 
     /// Do one of the things the menu offers, most of which are also keys.
@@ -7721,6 +7889,20 @@ impl View {
                 }
                 self.apply_profile(name, hwnd);
             }
+            // The four rows about the program. None of them makes a request: the channel
+            // is a file on disk, and the three pages are opened where pages are opened --
+            // beside the program when the archive put them there, at the repository when
+            // this copy was installed without them.
+            Command::CheckUpdates => self.check_for_updates(hwnd),
+            Command::UpdateLabs(on) => {
+                crate::settings::record_update_labs(on);
+                // A switch whose effect is the answer beside it is worth pressing: the
+                // check runs again under the channel that was just chosen.
+                self.check_for_updates(hwnd);
+            }
+            Command::SendFeedback => open_url(crate::update::ISSUES_URL),
+            Command::PrivacyPolicy => show_page("PRIVACY.md"),
+            Command::License => show_licence(),
         }
         let _ = unsafe { InvalidateRect(Some(hwnd), None, false) };
     }
@@ -18079,6 +18261,61 @@ mod tests {
         // screen rather than the row it would be printed on, and the bracket keys step
         // the measure instead of settling on the rung they are next to.
         assert_eq!(got.iter().filter(|(_, l)| l.contains('\t')).count(), 12);
+    }
+
+    /// The rows about the program itself: a version to compare, a switch for the channel
+    /// that comparison looks at, and the three pages a reader is owed.
+    ///
+    /// The Labs row is a switch rather than a pair of radio rows, so what it offers is the
+    /// *other* channel -- pressing a row that says it is already on must turn it off --
+    /// and its tick is the remembered answer rather than a probe of anything.
+    #[test]
+    fn the_program_rows_offer_the_version_the_channel_and_the_three_pages() {
+        let mut s = state(false, None, None, false, true);
+        s.update_labs = false;
+        let all = all_rows(&s);
+        for cmd in [Command::CheckUpdates, Command::SendFeedback, Command::PrivacyPolicy, Command::License] {
+            let found = all.iter().find(|(c, _, _)| *c == cmd).unwrap_or_else(|| panic!("{cmd:?} is on the menu"));
+            assert!(found.1, "{cmd:?} is something a reader can always ask for");
+            assert!(!found.2, "{cmd:?} is not a switch and cannot be ticked");
+        }
+        let labs = all
+            .iter()
+            .find(|(c, _, _)| matches!(c, Command::UpdateLabs(_)))
+            .unwrap_or_else(|| panic!("the Labs switch is on the menu"));
+        assert_eq!(labs.0, Command::UpdateLabs(true), "off, the row offers the other answer");
+        assert!(!labs.2, "and nothing the reader has not asked for is ticked");
+        // What the menu says is the table's own words, so the page that lists every action
+        // and the row that offers one cannot drift apart.
+        let menu = menu_items(&s);
+        let words = menu
+            .iter()
+            .find_map(|r| match r {
+                MenuRow::Row { label, cmd: Command::UpdateLabs(_), .. } => Some(label.clone()),
+                _ => None,
+            })
+            .unwrap_or_else(|| panic!("the row's own words"));
+        assert_eq!(words, i18n::t(s.lang, Key::MenuUpdateLabs));
+
+        // Asked for, it says so, and pressing it would take the reader back off.
+        s.update_labs = true;
+        let all = all_rows(&s);
+        let labs = all
+            .iter()
+            .find(|(c, _, _)| matches!(c, Command::UpdateLabs(_)))
+            .unwrap_or_else(|| panic!("the Labs switch is on the menu"));
+        assert_eq!(labs.0, Command::UpdateLabs(false));
+        assert!(labs.2, "the switch shows the answer it was given");
+
+        // The rows sit above the three that have always closed this menu, so the program's
+        // own rows do not move `Reload` off the end of it.
+        let top = rows(&s);
+        assert_eq!(top.last().map(|(c, _, _)| c.clone()), Some(Command::Reload));
+        let reachable = top.iter().map(|(c, _, _)| c.clone()).collect::<Vec<_>>();
+        for cmd in [Command::CheckUpdates, Command::SendFeedback, Command::PrivacyPolicy, Command::License] {
+            assert!(reachable.contains(&cmd), "{cmd:?} is one level down is fine, but not at all is not");
+        }
+        assert!(reachable.iter().any(|c| matches!(c, Command::UpdateLabs(_))));
     }
 
     /// Every action the shortcut page lists is one the menu can actually be asked for.

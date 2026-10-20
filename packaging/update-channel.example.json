@@ -1,0 +1,9 @@
+{
+  "version": "0.9.1",
+  "channel": "stable",
+  "notes": [
+    "Shipped beside the program so that Check for updates has something to read.",
+    "Replace the version with the newest published one; the notes are shown as they are."
+  ],
+  "url": "https://github.com/LiJiaHua1024/rubrica/releases"
+}

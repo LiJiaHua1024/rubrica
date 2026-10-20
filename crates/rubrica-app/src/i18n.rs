@@ -312,6 +312,28 @@ pub enum Key {
     ShortcutsKeys,
     /// What the key column says for an action no key reaches.
     ShortcutsNone,
+
+    /// The row that reads the update channel beside the program and says what it found.
+    MenuCheckUpdates,
+    /// The switch beside it: whether release candidates are offered as well.
+    MenuUpdateLabs,
+    /// The row that opens a new issue in the reader's browser.
+    MenuSendFeedback,
+    /// The page that says what this program does and does not do with a document.
+    MenuPrivacy,
+    /// The page the two licences the source is under are printed on.
+    MenuLicense,
+    /// The check's answer when the copy is the channel's release, or newer than it.
+    UpdateUpToDate,
+    /// And when the channel carries something newer, with both numbers in it.
+    UpdateAvailable,
+    /// And when it carries a release candidate and the stable channel is on.
+    UpdateSkipped,
+    /// And when there is no channel file to read at all.
+    UpdateNoChannel,
+    /// The question the newer-release box asks, whose answers are the box's own two
+    /// buttons: the download happens in the browser, so opening the page is the offer.
+    UpdateOpenPage,
 }
 
 pub fn t(lang: Language, key: Key) -> &'static str {
@@ -495,6 +517,17 @@ fn translate_en(key: Key) -> &'static str {
         Key::ShortcutsAction => "Action",
         Key::ShortcutsKeys => "Keys",
         Key::ShortcutsNone => "None",
+
+        Key::MenuCheckUpdates => "Check for Updates\u{2026}",
+        Key::MenuUpdateLabs => "Include Pre-releases (Labs)",
+        Key::MenuSendFeedback => "Send Feedback\u{2026}",
+        Key::MenuPrivacy => "Privacy Policy",
+        Key::MenuLicense => "Licences",
+        Key::UpdateUpToDate => "Rubrica {version} is up to date.",
+        Key::UpdateAvailable => "Rubrica {version} is ready. This copy is {current}.",
+        Key::UpdateSkipped => "Rubrica {version} is a pre-release. Switch on Labs to be offered it.",
+        Key::UpdateNoChannel => "No update channel was found beside the program. Rubrica does not use the network: the release page names the newest version.",
+        Key::UpdateOpenPage => "Open the release page to download it?",
     }
 }
 
@@ -663,6 +696,17 @@ fn translate_zh_cn(key: Key) -> &'static str {
         Key::ShortcutsAction => "动作",
         Key::ShortcutsKeys => "键位",
         Key::ShortcutsNone => "无",
+
+        Key::MenuCheckUpdates => "检查更新\u{2026}",
+        Key::MenuUpdateLabs => "包含预发布版（Labs）",
+        Key::MenuSendFeedback => "发送反馈\u{2026}",
+        Key::MenuPrivacy => "隐私政策",
+        Key::MenuLicense => "许可证",
+        Key::UpdateUpToDate => "Rubrica {version} 已是最新版本。",
+        Key::UpdateAvailable => "Rubrica {version} 已发布，当前版本为 {current}。",
+        Key::UpdateSkipped => "Rubrica {version} 是预发布版，开启 Labs 后才会收到。",
+        Key::UpdateNoChannel => "程序旁边没有找到更新通道文件。Rubrica 不访问网络：最新版本以发布页面为准。",
+        Key::UpdateOpenPage => "要打开发布页面下载吗？",
     }
 }
 
@@ -831,6 +875,17 @@ fn translate_zh_tw(key: Key) -> &'static str {
         Key::ShortcutsAction => "動作",
         Key::ShortcutsKeys => "鍵位",
         Key::ShortcutsNone => "無",
+
+        Key::MenuCheckUpdates => "檢查更新\u{2026}",
+        Key::MenuUpdateLabs => "包含預發佈版（Labs）",
+        Key::MenuSendFeedback => "傳送意見\u{2026}",
+        Key::MenuPrivacy => "隱私權政策",
+        Key::MenuLicense => "授權條款",
+        Key::UpdateUpToDate => "Rubrica {version} 已是最新版本。",
+        Key::UpdateAvailable => "Rubrica {version} 已發佈，目前版本為 {current}。",
+        Key::UpdateSkipped => "Rubrica {version} 是預發佈版，開啟 Labs 後才會收到。",
+        Key::UpdateNoChannel => "程式旁邊沒有找到更新通道檔案。Rubrica 不存取網路：最新版本以發佈頁面為準。",
+        Key::UpdateOpenPage => "要開啟發佈頁面下載嗎？",
     }
 }
 
@@ -999,6 +1054,17 @@ fn translate_ja(key: Key) -> &'static str {
         Key::ShortcutsAction => "操作",
         Key::ShortcutsKeys => "キー",
         Key::ShortcutsNone => "なし",
+
+        Key::MenuCheckUpdates => "更新を確認\u{2026}",
+        Key::MenuUpdateLabs => "プレリリースを含める（Labs）",
+        Key::MenuSendFeedback => "フィードバックを送る\u{2026}",
+        Key::MenuPrivacy => "プライバシーポリシー",
+        Key::MenuLicense => "ライセンス",
+        Key::UpdateUpToDate => "Rubrica {version} は最新です。",
+        Key::UpdateAvailable => "Rubrica {version} が公開されています。現在の版は {current} です。",
+        Key::UpdateSkipped => "Rubrica {version} はプレリリースです。Labs を有効にすると通知されます。",
+        Key::UpdateNoChannel => "プログラムの隣に更新チャンネルが見つかりません。Rubrica はネットワークを使いません。最新版はリリースページにあります。",
+        Key::UpdateOpenPage => "リリースページを開いてダウンロードしますか？",
     }
 }
 
@@ -1167,6 +1233,17 @@ fn translate_ko(key: Key) -> &'static str {
         Key::ShortcutsAction => "동작",
         Key::ShortcutsKeys => "키",
         Key::ShortcutsNone => "없음",
+
+        Key::MenuCheckUpdates => "업데이트 확인\u{2026}",
+        Key::MenuUpdateLabs => "사전 출시판 포함(Labs)",
+        Key::MenuSendFeedback => "의견 보내기\u{2026}",
+        Key::MenuPrivacy => "개인정보 처리방침",
+        Key::MenuLicense => "라이선스",
+        Key::UpdateUpToDate => "Rubrica {version}이(가) 최신입니다.",
+        Key::UpdateAvailable => "Rubrica {version}이(가) 나왔습니다. 현재 판은 {current}입니다.",
+        Key::UpdateSkipped => "Rubrica {version}은(는) 사전 출시판입니다. Labs를 켜야 알려 드립니다.",
+        Key::UpdateNoChannel => "프로그램 옆에서 업데이트 채널을 찾지 못했습니다. Rubrica는 네트워크를 쓰지 않습니다. 최신판은 릴리스 페이지에 있습니다.",
+        Key::UpdateOpenPage => "릴리스 페이지를 열어 내려받을까요?",
     }
 }
 
@@ -1335,6 +1412,17 @@ fn translate_fr(key: Key) -> &'static str {
         Key::ShortcutsAction => "Action",
         Key::ShortcutsKeys => "Touches",
         Key::ShortcutsNone => "Aucune",
+
+        Key::MenuCheckUpdates => "Rechercher des mises à jour\u{2026}",
+        Key::MenuUpdateLabs => "Inclure les préversions (Labs)",
+        Key::MenuSendFeedback => "Envoyer un commentaire\u{2026}",
+        Key::MenuPrivacy => "Politique de confidentialité",
+        Key::MenuLicense => "Licences",
+        Key::UpdateUpToDate => "Rubrica {version} est à jour.",
+        Key::UpdateAvailable => "Rubrica {version} est disponible. Cette copie est la {current}.",
+        Key::UpdateSkipped => "Rubrica {version} est une préversion. Activez Labs pour qu'elle vous soit proposée.",
+        Key::UpdateNoChannel => "Aucun canal de mise à jour n'a été trouvé à côté du programme. Rubrica n'utilise pas le réseau : la page des versions donne la plus récente.",
+        Key::UpdateOpenPage => "Ouvrir la page des versions pour le télécharger ?",
     }
 }
 
@@ -1503,6 +1591,17 @@ fn translate_de(key: Key) -> &'static str {
         Key::ShortcutsAction => "Aktion",
         Key::ShortcutsKeys => "Tasten",
         Key::ShortcutsNone => "Keine",
+
+        Key::MenuCheckUpdates => "Nach Updates suchen\u{2026}",
+        Key::MenuUpdateLabs => "Vorabversionen einschließen (Labs)",
+        Key::MenuSendFeedback => "Rückmeldung senden\u{2026}",
+        Key::MenuPrivacy => "Datenschutzhinweise",
+        Key::MenuLicense => "Lizenzen",
+        Key::UpdateUpToDate => "Rubrica {version} ist aktuell.",
+        Key::UpdateAvailable => "Rubrica {version} ist verfügbar. Diese Kopie ist {current}.",
+        Key::UpdateSkipped => "Rubrica {version} ist eine Vorabversion. Labs einschalten, um sie angeboten zu bekommen.",
+        Key::UpdateNoChannel => "Neben dem Programm wurde kein Update-Kanal gefunden. Rubrica nutzt kein Netzwerk: die neueste Version steht auf der Release-Seite.",
+        Key::UpdateOpenPage => "Die Release-Seite zum Herunterladen öffnen?",
     }
 }
 
@@ -1671,6 +1770,17 @@ fn translate_es(key: Key) -> &'static str {
         Key::ShortcutsAction => "Acción",
         Key::ShortcutsKeys => "Teclas",
         Key::ShortcutsNone => "Ninguna",
+
+        Key::MenuCheckUpdates => "Buscar actualizaciones\u{2026}",
+        Key::MenuUpdateLabs => "Incluir versiones preliminares (Labs)",
+        Key::MenuSendFeedback => "Enviar comentarios\u{2026}",
+        Key::MenuPrivacy => "Política de privacidad",
+        Key::MenuLicense => "Licencias",
+        Key::UpdateUpToDate => "Rubrica {version} está al día.",
+        Key::UpdateAvailable => "Rubrica {version} ya está disponible. Esta copia es la {current}.",
+        Key::UpdateSkipped => "Rubrica {version} es una versión preliminar. Activa Labs para que se te ofrezca.",
+        Key::UpdateNoChannel => "No hay ningún canal de actualización junto al programa. Rubrica no usa la red: la página de versiones indica la más reciente.",
+        Key::UpdateOpenPage => "¿Abrir la página de versiones para descargarla?",
     }
 }
 
@@ -1839,6 +1949,17 @@ fn translate_ru(key: Key) -> &'static str {
         Key::ShortcutsAction => "Действие",
         Key::ShortcutsKeys => "Клавиши",
         Key::ShortcutsNone => "Нет",
+
+        Key::MenuCheckUpdates => "Проверить обновления\u{2026}",
+        Key::MenuUpdateLabs => "Включая предварительные версии (Labs)",
+        Key::MenuSendFeedback => "Отправить отзыв\u{2026}",
+        Key::MenuPrivacy => "Политика конфиденциальности",
+        Key::MenuLicense => "Лицензии",
+        Key::UpdateUpToDate => "Rubrica {version} — последняя версия.",
+        Key::UpdateAvailable => "Доступна Rubrica {version}. Сейчас запущена {current}.",
+        Key::UpdateSkipped => "Rubrica {version} — предварительная версия. Включите Labs, чтобы её предлагали.",
+        Key::UpdateNoChannel => "Рядом с программой нет файла канала обновлений. Rubrica не использует сеть: последняя версия указана на странице выпусков.",
+        Key::UpdateOpenPage => "Открыть страницу выпусков, чтобы скачать её?",
     }
 }
 
@@ -2007,6 +2128,17 @@ fn translate_it(key: Key) -> &'static str {
         Key::ShortcutsAction => "Azione",
         Key::ShortcutsKeys => "Tasti",
         Key::ShortcutsNone => "Nessuno",
+
+        Key::MenuCheckUpdates => "Verifica aggiornamenti\u{2026}",
+        Key::MenuUpdateLabs => "Includi versioni preliminari (Labs)",
+        Key::MenuSendFeedback => "Invia un commento\u{2026}",
+        Key::MenuPrivacy => "Informativa sulla privacy",
+        Key::MenuLicense => "Licenze",
+        Key::UpdateUpToDate => "Rubrica {version} è aggiornata.",
+        Key::UpdateAvailable => "Rubrica {version} è disponibile. Questa copia è la {current}.",
+        Key::UpdateSkipped => "Rubrica {version} è una versione preliminare. Attiva Labs per riceverla.",
+        Key::UpdateNoChannel => "Nessun canale di aggiornamento accanto al programma. Rubrica non usa la rete: la versione più recente è nella pagina delle release.",
+        Key::UpdateOpenPage => "Aprire la pagina delle release per scaricarla?",
     }
 }
 
@@ -2175,6 +2307,17 @@ fn translate_pt(key: Key) -> &'static str {
         Key::ShortcutsAction => "Ação",
         Key::ShortcutsKeys => "Teclas",
         Key::ShortcutsNone => "Nenhuma",
+
+        Key::MenuCheckUpdates => "Verificar atualizações\u{2026}",
+        Key::MenuUpdateLabs => "Incluir pré-lançamentos (Labs)",
+        Key::MenuSendFeedback => "Enviar comentários\u{2026}",
+        Key::MenuPrivacy => "Política de privacidade",
+        Key::MenuLicense => "Licenças",
+        Key::UpdateUpToDate => "Rubrica {version} está atualizado.",
+        Key::UpdateAvailable => "Rubrica {version} está disponível. Esta cópia é a {current}.",
+        Key::UpdateSkipped => "Rubrica {version} é um pré-lançamento. Ative o Labs para recebê-lo.",
+        Key::UpdateNoChannel => "Nenhum canal de atualização foi encontrado ao lado do programa. O Rubrica não usa a rede: a página de versões traz a mais recente.",
+        Key::UpdateOpenPage => "Abrir a página de versões para baixá-la?",
     }
 }
 
@@ -2609,6 +2752,25 @@ pub fn filter_applications(lang: Language) -> String {
     format!("{apps}\0*.exe\0{all}\0*.*\0\0")
 }
 
+/// The check's four answers, each with its versions filled in after the language has
+/// decided where they go: a sentence assembled from pieces would put a number in the
+/// wrong half of a translation that orders it differently.
+pub fn update_up_to_date(lang: Language, version: &str) -> String {
+    t(lang, Key::UpdateUpToDate).replace("{version}", version)
+}
+
+pub fn update_available(lang: Language, version: &str, current: &str) -> String {
+    t(lang, Key::UpdateAvailable).replace("{version}", version).replace("{current}", current)
+}
+
+pub fn update_skipped(lang: Language, version: &str) -> String {
+    t(lang, Key::UpdateSkipped).replace("{version}", version)
+}
+
+pub fn update_no_channel(lang: Language) -> String {
+    t(lang, Key::UpdateNoChannel).to_string()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2663,6 +2825,41 @@ mod tests {
                 assert!(!t(lang, status_item_key(item)).is_empty());
             }
             assert!(status_reading_time(lang, 12).contains("12"));
+        }
+    }
+
+    /// The update rows and the check's four answers, in every language: a menu row with
+    /// an empty label is a blank line in a menu, and an answer that dropped its number
+    /// would tell a reader nothing about which version they are being offered.
+    #[test]
+    fn every_language_names_the_update_rows_and_fills_in_the_versions() {
+        for lang in Language::ALL {
+            for key in [
+                Key::MenuCheckUpdates,
+                Key::MenuUpdateLabs,
+                Key::MenuSendFeedback,
+                Key::MenuPrivacy,
+                Key::MenuLicense,
+                Key::UpdateUpToDate,
+                Key::UpdateAvailable,
+                Key::UpdateSkipped,
+                Key::UpdateNoChannel,
+                Key::UpdateOpenPage,
+            ] {
+                assert!(!t(lang, key).is_empty(), "{key:?} in {}", lang.code());
+            }
+            // The templates keep their placeholders, so the filling below is doing work
+            // rather than tidying a string that already said the number.
+            assert!(t(lang, Key::UpdateUpToDate).contains("{version}"));
+            assert!(t(lang, Key::UpdateAvailable).contains("{version}"));
+            assert!(t(lang, Key::UpdateAvailable).contains("{current}"));
+            assert!(t(lang, Key::UpdateSkipped).contains("{version}"));
+            assert!(update_up_to_date(lang, "0.9.1").contains("0.9.1"));
+            let offered = update_available(lang, "0.9.2", "0.9.1");
+            assert!(offered.contains("0.9.2") && offered.contains("0.9.1"), "{}: {offered}", lang.code());
+            assert!(!offered.contains('{'), "{}: an unfilled placeholder: {offered}", lang.code());
+            assert!(update_skipped(lang, "1.0.0-rc.1").contains("1.0.0-rc.1"));
+            assert!(!update_no_channel(lang).is_empty());
         }
     }
 }

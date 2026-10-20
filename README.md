@@ -58,8 +58,90 @@ cargo clippy --workspace --all-targets
 
 The [build workflow](https://github.com/LiJiaHua1024/rubrica/actions/workflows/build.yml)
 produces a Windows x64 artifact on pushes to `main`, version tags, and manual runs.
-Download `rubrica-windows-x64` from a run's Artifacts section. It contains the
-executable, both licenses, this README, and `SHA256SUMS`; GitHub retains it for 30 days.
+Download `rubrica-windows-x64` from a run's Artifacts section. GitHub retains it for 30 days.
+
+## Installing
+
+A release is one archive:
+
+```
+rubrica-v0.9.1-win-x64.zip
+  rubrica-app.exe          the reader
+  install.ps1              one step: files, Start Menu shortcut, PATH, the uninstaller
+  uninstall.ps1            removes exactly what install.ps1 created
+  README.md  PRIVACY.md  LICENSE-MIT  LICENSE-APACHE
+  update-channel.json      what --check-update compares against
+```
+
+Unpack it and run `install.ps1`. Nothing needs an administrator, and nothing leaves your
+own profile:
+
+```
+powershell -ExecutionPolicy Bypass -File install.ps1
+```
+
+It copies the files to `%LOCALAPPDATA%\Programs\Rubrica`, adds a Start Menu shortcut, puts
+the folder on your `PATH`, registers the program under `App Paths` so the Run box finds it,
+and writes `install.json` naming everything it touched. Running it again upgrades in place
+without adding a second `PATH` entry. `uninstall.ps1` — installed beside the program, and
+also the one in the archive — removes those files, that shortcut, that `PATH` entry and that
+key, restoring the `PATH` string character for character, and keeps your reading settings
+unless you pass `-Purge`.
+
+If you would rather install nothing, `rubrica-app.exe` is a single executable: it runs from
+wherever you unpacked it and writes nothing but its settings.
+
+`packaging\package.ps1` makes the archive and `-Verify` proves it: entries sorted, one fixed
+timestamp, unpacked and compared byte for byte, then packed a second time to show the same
+hash. `packaging\verify-manifests.ps1` checks the winget and scoop manifests against
+`Cargo.toml`. Both manifests name this release archive and its SHA-256, which only the
+archive's own build can supply, so they are filled in and submitted after a tag is built;
+`winget install Rubrica.Rubrica` and `scoop install rubrica` work once that submission is
+accepted.
+
+## Checking for updates
+
+`--check-update` compares this build with the release a channel file names, and prints what
+it found. It is a comparison and nothing more: one small JSON file is read, no socket is
+opened, and the executable never replaces itself.
+
+```
+rubrica-app --check-update                                 # update-channel.json beside the .exe
+rubrica-app --check-update --update-channel labs           # accept pre-releases as well
+rubrica-app --check-update --update-source .\channel.json  # or a file of your own
+```
+
+```
+current      : 0.9.1
+latest       : 0.9.2
+has newer    : yes
+channel      : stable (pre-releases skipped)
+source       : ...\update-channel.json
+file channel : stable
+notes        : Fix a table rule that doubled on a continued header
+notes        : Faster start on a very large book
+url          : https://github.com/LiJiaHua1024/rubrica/releases/tag/v0.9.2
+```
+
+The file is `{"version": "0.9.2", "channel": "stable", "notes": ["…"], "url": "…"}`, of which
+only `version` is required. Versions are ordered by precedence rather than as strings, so
+`1.2.3-rc.1` is older than `1.2.3` and `1.2` is the same version as `1.2.0`. A candidate the
+channel skips is reported rather than offered:
+
+```
+latest       : 0.9.2-rc.1
+has newer    : no
+channel      : stable (pre-releases skipped)
+skipped      : 0.9.2-rc.1 is a pre-release, and this channel skips those
+```
+
+The same comparison is on the reader's menu: **Check for Updates** says what the check found,
+*Update channel* switches between stable and labs and is remembered in the settings, and a
+newer release offers to open its page — the download and the replacement happen in your
+browser, not in the reader. Next to them, **Send feedback** opens the issue tracker, and
+**Privacy Policy** and **Licence** open the two documents that ship beside the executable.
+[PRIVACY.md](PRIVACY.md) is the whole policy: no telemetry, no network access, and no update
+that installs itself.
 
 ## Verifying a page without opening a window
 
@@ -523,7 +605,7 @@ typesetting) happens off the keystroke, after a posted message.
 | `rubrica-doc` | Markdown to blocks, spans, tables, footnotes and inline objects |
 | `rubrica-math` | a LaTeX subset to boxes, measured through a `MathMeasure` the caller implements |
 | `rubrica-mermaid` | Mermaid fences to scenes: a parser, a layered layout and shape primitives, with no dependencies at all |
-| `rubrica-app` | the window: Direct2D/DirectWrite painting, selection, hit-testing, themes, settings, workspace navigation, `--report`, PNG/PDF export, and the `--peek` spacebar service |
+| `rubrica-app` | the window: Direct2D/DirectWrite painting, selection, hit-testing, themes, settings, workspace navigation, `--report`, PNG/PDF export, the `--peek` spacebar service, and the update comparison |
 | `rubrica-workspace` | tab identity, preview/pinned state, recent files and folders, the folder shelf, and versioned session snapshots |
 
 The first three have no dependency on Windows and no dependency on each other's
@@ -532,7 +614,8 @@ only through its public API, which is why the whole engine is testable from a co
 
 ## Known limitations
 
-- Windows-only by construction, and no installer: it is a single `.exe`.
+- Windows-only by construction. The reader itself is a single `.exe`; the release archive
+  adds the two scripts that give it a shortcut, a `PATH` entry and an uninstaller.
 - Large TXT books (UTF-8 and explicit legacy code pages) are indexed and read by chapter, with the next chapter prefetched in the background.
 
 ## Licence

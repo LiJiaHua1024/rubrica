@@ -35,14 +35,25 @@ jobs:
           if ($tag -ne "v$version") { throw "tag $tag does not match workspace version $version" }
       - name: Build release binary
         run: cargo build --package rubrica-app --release --locked --target x86_64-pc-windows-msvc
-      - name: Prepare distribution
+      # One archive, packed the same way every time: packaging/package.ps1 sorts the entries
+      # and fixes their timestamps, so the same executable always produces the same bytes,
+      # and -Verify unpacks it again and compares every file it put in.
+      - name: Pack the release archive
         shell: pwsh
         run: |
-          New-Item -ItemType Directory -Path dist | Out-Null
-          Copy-Item -LiteralPath target/x86_64-pc-windows-msvc/release/rubrica-app.exe -Destination dist/
-          Copy-Item -LiteralPath README.md, LICENSE-MIT, LICENSE-APACHE -Destination dist/
-          $hash = (Get-FileHash -LiteralPath dist/rubrica-app.exe -Algorithm SHA256).Hash.ToLowerInvariant()
-          "$hash  rubrica-app.exe" | Set-Content -LiteralPath dist/SHA256SUMS -Encoding ascii
+          ./packaging/package.ps1 -Exe target/x86_64-pc-windows-msvc/release/rubrica-app.exe -SkipBuild -Verify
+      # The winget and scoop manifests cannot name the archive's hash until the archive
+      # exists, and a hash from a build made anywhere else is not this one. They are updated
+      # and submitted by hand after the release is published: `winget install` and
+      # `scoop install` are not part of cutting a tag.
+      - name: Print the hash the manifests need
+        shell: pwsh
+        run: |
+          $version = (Select-String -Path Cargo.toml -Pattern '^version = "(.*)"$').Matches[0].Groups[1].Value
+          $zip = "dist/rubrica-v$version-win-x64.zip"
+          $hash = (Get-FileHash -LiteralPath $zip -Algorithm SHA256).Hash.ToLowerInvariant()
+          Write-Host "packaging/winget/Rubrica.Rubrica.installer.yaml  InstallerSha256: $hash"
+          Write-Host "packaging/scoop/rubrica.json                     hash: $hash"
       - name: Write release notes
         shell: pwsh
         run: |
@@ -60,4 +71,14 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          gh release create "${{ github.ref_name }}" --title "Rubrica ${{ github.ref_name }}" --notes-file release-notes.md dist/rubrica-app.exe dist/README.md dist/LICENSE-MIT dist/LICENSE-APACHE dist/SHA256SUMS
+          $version = (Select-String -Path Cargo.toml -Pattern '^version = "(.*)"$').Matches[0].Groups[1].Value
+          $assets = @(
+            'dist/rubrica-app.exe',
+            "dist/rubrica-v$version-win-x64.zip",
+            'dist/README.md',
+            'dist/PRIVACY.md',
+            'dist/LICENSE-MIT',
+            'dist/LICENSE-APACHE',
+            'dist/SHA256SUMS'
+          )
+          gh release create "${{ github.ref_name }}" --title "Rubrica ${{ github.ref_name }}" --notes-file release-notes.md @assets

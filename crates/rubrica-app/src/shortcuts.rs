@@ -103,6 +103,11 @@ pub(crate) enum Shortcut {
     PeekMixed,
     PeekFocusClose,
     PeekClickClose,
+    CheckUpdates,
+    UpdateLabs,
+    SendFeedback,
+    PrivacyPolicy,
+    License,
 }
 
 impl Shortcut {
@@ -237,6 +242,13 @@ const TABLE: &[Line] = &[
     silent(Shortcut::PeekMixed, &[]),
     silent(Shortcut::PeekFocusClose, &[]),
     silent(Shortcut::PeekClickClose, &[]),
+    // The rows about the program rather than about the page: none of them is a key,
+    // because none of them is something a reader does while reading.
+    silent(Shortcut::CheckUpdates, &[]),
+    silent(Shortcut::UpdateLabs, &[]),
+    silent(Shortcut::SendFeedback, &[]),
+    silent(Shortcut::PrivacyPolicy, &[]),
+    silent(Shortcut::License, &[]),
 ];
 
 /// The row this action holds, if it holds one.
@@ -338,6 +350,11 @@ fn label(lang: Language, action: Shortcut) -> String {
         Shortcut::PeekMixed => Key::MenuPeekMixed,
         Shortcut::PeekFocusClose => Key::MenuPeekFocusClose,
         Shortcut::PeekClickClose => Key::MenuPeekClickClose,
+        Shortcut::CheckUpdates => Key::MenuCheckUpdates,
+        Shortcut::UpdateLabs => Key::MenuUpdateLabs,
+        Shortcut::SendFeedback => Key::MenuSendFeedback,
+        Shortcut::PrivacyPolicy => Key::MenuPrivacy,
+        Shortcut::License => Key::MenuLicense,
         Shortcut::Presets => {
             let mut out = String::new();
             for (i, name) in ["Default", "Book"].into_iter().enumerate() {

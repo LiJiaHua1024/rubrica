@@ -1,0 +1,27 @@
+# yaml-language-server: $schema=https://aka.ms/winget-manifest.defaultLocale.1.6.0.schema.json
+PackageIdentifier: Rubrica.Rubrica
+PackageVersion: 0.9.1
+PackageLocale: en-US
+Publisher: LiJiaHua1024
+PublisherUrl: https://github.com/LiJiaHua1024
+PublisherSupportUrl: https://github.com/LiJiaHua1024/rubrica/issues
+PackageName: Rubrica
+PackageUrl: https://github.com/LiJiaHua1024/rubrica
+License: MIT OR Apache-2.0
+LicenseUrl: https://github.com/LiJiaHua1024/rubrica/blob/main/LICENSE-MIT
+Copyright: Copyright (c) 2026 LiJiaHua1024
+ShortDescription: A Markdown reader for Windows built around a typesetting engine rather than a browser.
+Description: |-
+  Rubrica sets a document the way a typesetter would: it solves each paragraph's line breaks as a
+  whole, measures every formula from the font's own MATH table, and draws the result directly with
+  Direct2D and DirectWrite. There is no webview, no Electron, no HTML or CSS anywhere in the
+  pipeline. It reads Markdown, opens PDF, and exports what it draws.
+Moniker: rubrica
+Tags:
+  - markdown
+  - reader
+  - typesetting
+  - pdf
+ReleaseNotesUrl: https://github.com/LiJiaHua1024/rubrica/releases/tag/v0.9.1
+ManifestType: defaultLocale
+ManifestVersion: 1.6.0

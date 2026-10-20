@@ -34,6 +34,7 @@ mod tables;
 mod theme;
 mod themes;
 mod tree;
+mod update;
 mod view;
 mod viewer;
 
@@ -66,6 +67,14 @@ fn main() -> Result<()> {
     // `panic = "abort"` a panic here is a process that dies before a window exists, and
     // there is no console to say so on.
     let argv: Vec<OsString> = std::env::args_os().collect();
+    if has_flag(&argv, "--version") {
+        // The number the update check compares against, so a reader can see which of the
+        // two ends is the one that is out of date. It comes from the crate's own manifest
+        // -- the workspace version every crate inherits -- rather than from a second
+        // place a release would have to remember to edit.
+        println!("Rubrica {}", update::VERSION);
+        return Ok(());
+    }
     if has_flag(&argv, "--peek") {
         // The spacebar peek service: a background watcher that previews what the
         // user has selected. It holds no mutex the reader wants and shares no
@@ -141,6 +150,22 @@ fn main() -> Result<()> {
             for line in places::describe(start) {
                 println!("{line}");
             }
+        }
+        return Ok(());
+    }
+    if has_flag(&argv, "--check-update") {
+        // A check with no network in it: the channel file is read from disk, the two
+        // versions are compared and the release's own notes are printed before anything
+        // would be downloaded -- the download itself is the browser's, from the release
+        // page the file names. The same facts the window's own check shows, so what the
+        // menu does can be checked without a window.
+        let channel = update_channel(&argv)?;
+        let source = text_flag(&argv, "--update-source")
+            .map(PathBuf::from)
+            .or_else(update::default_source)
+            .ok_or("--check-update cannot tell where it is running from: pass --update-source")?;
+        for line in update::inspect(&source, channel).map_err(|error| -> Error { error.into() })? {
+            println!("{line}");
         }
         return Ok(());
     }
@@ -272,6 +297,14 @@ fn main() -> Result<()> {
     // and, left to fall through, would open a window instead.
     if has_flag(&argv, "--tree-search") && !has_flag(&argv, "--list-tree") {
         return Err("--tree-search filters the listing --list-tree prints: add --list-tree".into());
+    }
+    // And the two switches the update check reads: a channel or a source without the
+    // check has nothing to say, and left to fall through would open a window instead.
+    if has_flag(&argv, "--update-source") && !has_flag(&argv, "--check-update") {
+        return Err("--update-source names the channel file --check-update reads: add --check-update".into());
+    }
+    if has_flag(&argv, "--update-channel") && !has_flag(&argv, "--check-update") {
+        return Err("--update-channel says which releases to accept: add --check-update".into());
     }
     if has_flag(&argv, "--report") {
         let width = positive("--width", flag(&argv, "--width").unwrap_or(1080.0))?;
@@ -427,18 +460,32 @@ fn has_flag(argv: &[OsString], name: &str) -> bool {
     argv.iter().any(|a| a.to_string_lossy() == name)
 }
 
+/// Which releases a check on the command line accepts, from `--update-channel`.
+///
+/// The stable channel unless the word says otherwise: a reader who has not asked for
+/// release candidates is not handed one, and a word this build does not know is refused
+/// rather than guessed at, for the reason `--tables` refuses one.
+fn update_channel(argv: &[OsString]) -> Result<update::Channel> {
+    match text_flag(argv, "--update-channel").map(lossy).as_deref() {
+        None => Ok(update::Channel::Stable),
+        Some("stable") => Ok(update::Channel::Stable),
+        Some("labs") => Ok(update::Channel::Labs),
+        Some(other) => Err(format!("--update-channel wants `stable` or `labs`, not `{other}`").into()),
+    }
+}
+
 /// Every document path on the command line, in order, skipping the values that belong to
 /// `--width` and friends. A double-click names one; a multi-selection "open with" names
 /// several, and each of them is wanted.
 fn positionals(argv: &[OsString]) -> Vec<PathBuf> {
-    const TAKES_VALUE: [&str; 28] = [
+    const TAKES_VALUE: [&str; 29] = [
         "--width", "--dpi", "--zoom", "--face", "--measure", "--profile",
         "--export-png", "--export-width", "--export-scale", "--export-pdf",
         "--pdf-width", "--pdf-height", "--theme", "--tables", "--inline-code",
         "--marker-inset", "--list-marker-gap", "--list-bullet-size", "--quote-bar-gap",
         "--narrow-align", "--code-ladder", "--code-language", "--table-select",
         "--list-tree", "--tree-search", "--favourite-folder", "--unfavourite-folder",
-        "--page-stops",
+        "--page-stops", "--update-source",
     ];
     let mut skip_next = false;
     let mut flags_done = false;
@@ -796,5 +843,28 @@ mod tests {
             positionals(&line(&["rubrica", "--width", "900", "b.md"])),
             vec![PathBuf::from("b.md")]
         );
+    }
+
+    /// The check's own two switches: the channel is a word this build knows or a refusal,
+    /// and the file it reads is a value rather than a document.
+    #[test]
+    fn an_update_check_reads_a_channel_and_a_file_rather_than_a_document() {
+        assert_eq!(
+            update_channel(&line(&["rubrica", "--check-update"])).expect("the default"),
+            update::Channel::Stable
+        );
+        assert_eq!(
+            update_channel(&line(&["rubrica", "--check-update", "--update-channel", "labs"])).expect("labs"),
+            update::Channel::Labs
+        );
+        for bad in ["Labs", "beta", "", "stable, labs"] {
+            let argv = line(&["rubrica", "--check-update", "--update-channel", bad]);
+            assert!(update_channel(&argv).is_err(), "`{bad}` was taken as a channel");
+        }
+        // Neither the source nor its value is a document to open, and neither is a flag.
+        let argv = line(&["rubrica", "--check-update", "--update-source", "C:/app/update-channel.json"]);
+        assert!(positionals(&argv).is_empty(), "the channel file is not a document");
+        assert_eq!(text_flag(&argv, "--update-source").map(lossy).as_deref(), Some("C:/app/update-channel.json"));
+        assert!(!has_flag(&argv, "--check-update=false"));
     }
 }

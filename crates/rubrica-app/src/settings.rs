@@ -385,6 +385,24 @@ pub fn record_peek_enabled(on: bool) {
     write_word(SUBKEY, "Peek", u32::from(on));
 }
 
+/// Whether the reader is willing to be offered release candidates: the Labs switch on
+/// the menu, and the same answer `--update-channel labs` gives one run at a time.
+///
+/// A missing value means off, because a reader who has not asked for a candidate is on
+/// the channel releases arrive on -- and a number this build never wrote is no request
+/// at all.
+pub fn update_labs() -> bool {
+    update_labs_of(word(SUBKEY, "UpdateLabs"))
+}
+
+fn update_labs_of(stored: Option<u32>) -> bool {
+    stored == Some(1)
+}
+
+pub fn record_update_labs(on: bool) {
+    write_word(SUBKEY, "UpdateLabs", u32::from(on));
+}
+
 /// One plain number under the reader's own key, for the peek's preferences, which
 /// are neither the four numbers of the appearance row nor any document's own.
 pub(crate) fn plain_word(name: &str) -> Option<u32> {
@@ -1645,5 +1663,17 @@ mod tests {    use super::*;
         let places = decode_places(&out).expect("a long list still reads");
         assert_eq!(places.favourites().len(), rubrica_workspace::MAX_FAVOURITES);
         assert_eq!(places.favourites()[0].path, std::path::Path::new("C:\\f0"));
+    }
+
+    /// The Labs switch reads as the reader left it, and everything that is not the one
+    /// value this program writes reads as off: a reader who asked for nothing is on the
+    /// channel releases arrive on, not on whatever a stray number happens to mean.
+    #[test]
+    fn only_the_labs_switch_that_was_written_puts_a_reader_on_labs() {
+        assert!(!update_labs_of(None), "no memory is no request");
+        assert!(update_labs_of(Some(1)));
+        for stored in [Some(0), Some(2), Some(u32::MAX)] {
+            assert!(!update_labs_of(stored), "{stored:?} is not the switch this wrote");
+        }
     }
 }
