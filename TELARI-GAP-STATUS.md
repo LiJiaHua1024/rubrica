@@ -171,7 +171,7 @@
 
 | # | 条目 | 状态 | 证据 |
 | --- | --- | --- | --- |
-| 17 | 系统级 Quick Look 扩展（macOS 专属） | 未开始 | — |
+| 17 | 系统级 Quick Look 扩展（macOS 专属） | 无需改动 | §3-G17（**用户拍板，覆盖验收口径原写的"预期阻塞待决策"**；差距文档自述是 macOS 专属，属平台差异；Windows 上已有等价能力 `--peek`：`peek.rs` 2434 行、托盘 ＋ `WH_KEYBOARD_LL`/`WH_MOUSE_LL` 钩子 ＋ `WS_EX_NOACTIVATE` 置顶窗 ＋ `SW_SHOWNOACTIVATE`，三语义 `SpaceMode{Tap,Hold,Mixed}`；不做 Explorer 预览扩展的理由与代价已写明） |
 | 18 | 分发与更新（子项 a–d 见 §3.18） | 未开始 | — |
 | 19 | 平台与商业配套（子项 a–d 见 §3.19） | 未开始 | — |
 
@@ -892,7 +892,14 @@
 ### G17 明细（系统级 Quick Look）
 
 - **验收口径**：macOS 专属，Windows 仓库内不可完成；评估 Windows 对应物（Explorer 预览扩展）是否值得做，预期 `阻塞待决策` 并写明外部条件（平台/需人拍板的架构选择）。
-- 证据：—
+- **状态：`无需改动`（2026-10-20，用户拍板；覆盖验收口径原写的"预期 `阻塞待决策`"）**。这处口径变更记在此以免日后误读：验收口径写"预期阻塞待决策"，用户明确选择 **`无需改动`** —— 理由是 Rubrica 在 Windows 上已有等价能力（`--peek`），而差距文档自己写明 Telari 那侧是 **macOS 专属**的 Quick Look 扩展，属**平台差异**而非能力缺失。
+- **支持该结论的可复现证据（master 亲核，2026-10-20）**：
+  - **能力在位**：`crates/rubrica-app/src/peek.rs` 共 **2434 行**（`#[cfg(test)]` 在 2312，测试 **8 个**）；`main.rs:69` 的 `--peek` 直接 `return peek::daemon()`。它是托盘程序 ＋ **低级键盘/鼠标钩子**（`SetWindowsHookExW(WH_KEYBOARD_LL / WH_MOUSE_LL)`，`peek.rs:328`/`:334`）＋ 自绘置顶窗。
+  - **"不抢焦点"是结构性的、不是口头承诺**：窗口样式 `WS_EX_TOOLWINDOW | WS_EX_TOPMOST | WS_EX_NOACTIVATE`（`peek.rs:1510`），显示走 `ShowWindow(SW_SHOWNOACTIVATE)`（`peek.rs:1555`）⇒ **永不激活**。这对"用户在打游戏"的场景尤其关键，也正是 §0 红线要求的形态。
+  - **三语义齐**：`SpaceMode { Tap, Hold, Mixed }`（`peek.rs:134`，`Mixed` 为默认）并持久化在注册表 `PeekSpace`（`space_mode()`/`record_space_mode()`）；另有 `PeekFocusClose`/`PeekClickClose` 两个关闭策略。
+  - **覆盖面差异如实记录**：差距文档说 Rubrica 的 peek "不是系统集成，覆盖面取决于 shell 焦点窗口判定"——**这是真的**，也是平台差异的必然结果（要成为"系统预览"就得写 shell 扩展）。本轮**不**把它当已完成能力，而记入需人工确认。
+- **为什么不做 Explorer 预览扩展（技术判断，供日后参考）**：Windows 的 Quick Look 等价物是 `IPreviewHandler` shell 扩展，需要（a）COM 组件 ＋ 注册，（b）写 `HKCR\*\ShellEx\{8895b1c6-…}` 这类**全机器**注册表项（要管理员权限），（c）把渲染器拆成独立 DLL 且**崩溃会拖垮 Explorer**，（d）无法用现有 `--report` /PNG 逐字节回归验证。这与本仓库"单 exe、无安装器、无 shell 扩展"的既有形态（README: "Windows-only by construction, and no installer: it is a single `.exe`"）直接冲突，收益与代价不成比例。**用户已拍板不做。**
+- **需人工确认项（不阻塞）**：① `--peek` 在真机上"按空格预览"的手感与覆盖面（哪些程序在前台时它认得出）——只有人工能验，§0 禁跑 GUI；② 是否接受"平台差异"这个结论本身（Telari 的 Finder 内预览在 Windows 上**没有**无需 shell 扩展的等价物）。
 
 ### G18 明细（分发与更新）
 
