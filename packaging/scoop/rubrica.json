@@ -1,11 +1,11 @@
 {
-  "version": "0.9.1",
+  "version": "0.10.0",
   "description": "A Markdown reader for Windows built around a typesetting engine rather than a browser.",
   "homepage": "https://github.com/LiJiaHua1024/rubrica",
   "license": "MIT OR Apache-2.0",
   "architecture": {
     "64bit": {
-      "url": "https://github.com/LiJiaHua1024/rubrica/releases/download/v0.9.1/rubrica-v0.9.1-win-x64.zip",
+      "url": "https://github.com/LiJiaHua1024/rubrica/releases/download/v0.10.0/rubrica-v0.10.0-win-x64.zip",
       "hash": "REPLACE_WITH_RELEASE_SHA256"
     }
   },

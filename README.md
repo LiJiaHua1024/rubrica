@@ -65,7 +65,7 @@ Download `rubrica-windows-x64` from a run's Artifacts section. GitHub retains it
 A release is one archive:
 
 ```
-rubrica-v0.9.1-win-x64.zip
+rubrica-v0.10.0-win-x64.zip
   rubrica-app.exe          the reader
   install.ps1              one step: files, Start Menu shortcut, PATH, the uninstaller
   uninstall.ps1            removes exactly what install.ps1 created
@@ -112,27 +112,27 @@ rubrica-app --check-update --update-source .\channel.json  # or a file of your o
 ```
 
 ```
-current      : 0.9.1
-latest       : 0.9.2
+current      : 0.10.0
+latest       : 0.10.1
 has newer    : yes
 channel      : stable (pre-releases skipped)
 source       : ...\update-channel.json
 file channel : stable
 notes        : Fix a table rule that doubled on a continued header
 notes        : Faster start on a very large book
-url          : https://github.com/LiJiaHua1024/rubrica/releases/tag/v0.9.2
+url          : https://github.com/LiJiaHua1024/rubrica/releases/tag/v0.10.1
 ```
 
-The file is `{"version": "0.9.2", "channel": "stable", "notes": ["…"], "url": "…"}`, of which
+The file is `{"version": "0.10.1", "channel": "stable", "notes": ["…"], "url": "…"}`, of which
 only `version` is required. Versions are ordered by precedence rather than as strings, so
 `1.2.3-rc.1` is older than `1.2.3` and `1.2` is the same version as `1.2.0`. A candidate the
 channel skips is reported rather than offered:
 
 ```
-latest       : 0.9.2-rc.1
+latest       : 0.10.1-rc.1
 has newer    : no
 channel      : stable (pre-releases skipped)
-skipped      : 0.9.2-rc.1 is a pre-release, and this channel skips those
+skipped      : 0.10.1-rc.1 is a pre-release, and this channel skips those
 ```
 
 The same comparison is on the reader's menu: **Check for Updates** says what the check found,

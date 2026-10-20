@@ -867,12 +867,12 @@ control"]}"#,
         let path = scratch("channel.json");
         std::fs::write(
             &path,
-            r#"{"version":"0.9.2","channel":"stable","notes":["one","two"],"url":"https://example.invalid/r"}"#,
+            r#"{"version":"0.10.1","channel":"stable","notes":["one","two"],"url":"https://example.invalid/r"}"#,
         )
         .expect("a channel file on disk");
         let lines = inspect(&path, Channel::Stable).expect("the channel reads");
         assert_eq!(lines[0], format!("current      : {VERSION}"));
-        assert_eq!(lines[1], "latest       : 0.9.2");
+        assert_eq!(lines[1], "latest       : 0.10.1");
         assert_eq!(lines[2], "has newer    : yes");
         assert_eq!(lines[3], "channel      : stable (pre-releases skipped)");
         assert_eq!(lines[4], format!("source       : {}", path.display()));
