@@ -6,7 +6,7 @@
   "architecture": {
     "64bit": {
       "url": "https://github.com/LiJiaHua1024/rubrica/releases/download/v0.10.1/rubrica-v0.10.1-win-x64.zip",
-      "hash": "REPLACE_WITH_RELEASE_SHA256"
+      "hash": "d119cbf22253d4be1bdbe69f81b841517d82b32ebaee123cac0e7820a411c54f"
     }
   },
   "bin": "rubrica-app.exe",
