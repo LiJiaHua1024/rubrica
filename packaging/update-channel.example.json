@@ -1,5 +1,5 @@
 {
-  "version": "0.10.2",
+  "version": "0.10.3",
   "channel": "stable",
   "notes": [
     "Shipped beside the program so that Check for updates has something to read.",

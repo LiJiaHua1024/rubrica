@@ -5363,18 +5363,27 @@ impl View {
                 self.sel_brush = Some(b);
             }
         }
-        // A hit is the same accent and less of it, because everything the search has found
-        // is a suggestion of where a word might be -- and the one the reader is on is more
-        // of it still, which is what tells a page with forty hits which of them the next
-        // `Enter` is about to move away from.
+        // A hit is a highlighter's yellow rather than a tint of the page's accent. The
+        // accent is the ink the page already gives to links and headings, so a band of it
+        // read as part of the prose -- on a pale page it was nearly the grey of a
+        // selection, and a search has to be louder than that. Yellow is the one colour a
+        // reader has already been taught to read as "this is what you were looking for".
+        //
+        // The band lies over the words and is kept translucent, because the words under it
+        // are the answer: a mark opaque enough to hide them would be a mark the reader has
+        // to scroll away from to read what it found. The dark page takes less of it, since
+        // an overlay there costs the light text more of its contrast.
         if self.hit_brush.is_none() {
-            let mut c = d2d(self.palette.accent);
-            c.a = 0.16;
+            let mut c = d2d(Rgb { r: 0.99, g: 0.85, b: 0.15 });
+            c.a = if self.palette.dark { 0.30 } else { 0.38 };
             self.hit_brush = unsafe { rt.CreateSolidColorBrush(&c, None).ok() };
         }
+        // The hit the reader is on is the same pen pressed harder, with a touch of orange
+        // in it: a page with forty marks has to say which one `Enter` is about to leave,
+        // and a difference only in strength is one a glance can miss.
         if self.focus_brush.is_none() {
-            let mut c = d2d(self.palette.accent);
-            c.a = 0.45;
+            let mut c = d2d(Rgb { r: 1.0, g: 0.64, b: 0.06 });
+            c.a = if self.palette.dark { 0.45 } else { 0.55 };
             self.focus_brush = unsafe { rt.CreateSolidColorBrush(&c, None).ok() };
         }
         // The frame has to be quiet. It is there to say where a field begins and stops,
@@ -7298,6 +7307,42 @@ impl View {
         } else if bottom > self.scroll + view {
             self.scroll = bottom - view;
         }
+        self.clamp_scroll();
+    }
+
+    /// Bring a search hit to the middle of the window.
+    ///
+    /// A search is not a caret: the reader has asked for a word they cannot see, and the
+    /// answer to that is the middle of the window rather than the least scroll that
+    /// uncovers it. The least scroll leaves the hit against an edge, where the eye still
+    /// has to find it -- and it measured the window by its whole client height rather
+    /// than by the band the page is drawn in, so a hit near the foot of a page was
+    /// counted as shown while its line lay under the status bar, or below the window
+    /// altogether. The middle is the same answer whether the hit is above or below the
+    /// reader, and it is what makes two hits a line apart land on visibly different
+    /// places instead of both appearing at an edge.
+    ///
+    /// A page stack has no middle to land on -- a page is shown whole or not at all --
+    /// so there the hit's own page is the answer, as it is for a caret.
+    fn scroll_to_hit(&mut self, c: Caret) {
+        self.cancel_page_transition();
+        let Some(l) = self.sel_index.get(c.line) else { return };
+        let k = scale_of(self.dpi);
+        if self.reading_mode == ReadingMode::Stack {
+            let index = page_index_at(&self.page_starts, l.y / k);
+            if let Some(scroll) = self.page_start(index) {
+                self.scroll = scroll;
+            }
+            self.clamp_scroll();
+            return;
+        }
+        // The band the page is drawn in, not the whole client: the strip above it and the
+        // status bar below are not glass a reader can read a hit through.
+        let view = (self.content_bottom() - TOPBAR_H).max(1.0) / k;
+        let middle = (l.y + l.h * 0.5) / k;
+        self.scroll = middle - view * 0.5;
+        // Near either end of the document there is no middle to reach, and the clamp is
+        // what keeps the hit itself on the page instead of the paper above or below it.
         self.clamp_scroll();
     }
 
@@ -9308,13 +9353,14 @@ impl View {
         let marks: Vec<Selection> =
             needle.hits(query).iter().filter_map(|h| needle.span(h)).collect();
         // A window scrolled past the last line is looking at nothing, and there is no
-        // line to start a search at. The last hit is the one nearest it, and the page is
-        // not scrolled: there is nowhere below the end of the document for it to go.
+        // line to start a search at. The last hit is the nearest one to the reader, and
+        // it is what the bar calls the hit they are on -- an answer that may well be
+        // above them, which is why it is scrolled to as any other hit is.
         let top = self.top_line();
         let focus = find_focus(&marks, top);
-        if scroll && top.is_some() {
+        if scroll {
             if let Some(m) = marks.get(focus) {
-                self.scroll_to_caret(m.from);
+                self.scroll_to_hit(m.from);
             }
         }
         self.find = Some(Find { query: query.to_string(), marks, focus });
@@ -9340,7 +9386,7 @@ impl View {
         if let Some(f) = self.find.as_mut() {
             f.focus = focus;
         }
-        self.scroll_to_caret(at);
+        self.scroll_to_hit(at);
         self.shape_find_label();
         let _ = unsafe { InvalidateRect(Some(hwnd), None, false) };
     }
@@ -12962,7 +13008,13 @@ impl View {
     /// document's line index, so a page change never renumbers a selection.
     unsafe fn draw_page_overlays(&self, target: &ID2D1RenderTarget, up: Pt, top: Pt, bottom: Pt) {
         if let Some(f) = self.find.as_ref() {
-            for (i, m) in f.marks.iter().enumerate() {
+            // The current hit is drawn last. Hits can overlap -- a search for `aa` in
+            // `aaaa` stands at every character -- and a neighbour's band laid over the
+            // one mark in orange would tint away the only answer to "which of these is
+            // `Enter` about to leave". Every other hit goes underneath it.
+            let others = f.marks.iter().enumerate().filter(|(i, _)| *i != f.focus);
+            let current = f.marks.get(f.focus).map(|m| (f.focus, m));
+            for (i, m) in others.chain(current) {
                 let brush = if i == f.focus { &self.focus_brush } else { &self.hit_brush };
                 let Some(brush) = brush.clone() else { continue };
                 for (x, y, w, h) in selection_rects(&self.sel_index, *m) {
@@ -16412,6 +16464,58 @@ mod tests {
         assert!(window.0.layout_job.is_some());
         assert!(cancel.load(Ordering::Relaxed), "release must cancel the old-width run");
         assert_eq!(window.0.pending_anchor, Some(10));
+    }
+
+    /// A search asks the page where a word is, and the answer belongs where the reader is
+    /// already looking: the middle of the band the page is drawn in. A hit left against an
+    /// edge -- or measured against the whole client height and so left under the status bar
+    /// or below the window -- is a word the reader has to hunt for after the search has
+    /// already found it.
+    #[test]
+    fn a_search_hit_lands_in_the_middle_of_the_window() {
+        let filler = "Filler paragraph with enough words to take a line of the page.\n\n";
+        let source = format!("{}needle here\n\n{}", filler.repeat(200), filler.repeat(200));
+        let mut window = ResizeView::new(&source);
+        window.0.apply_find("needle", true);
+
+        let find = window.0.find.as_ref().expect("a search");
+        assert_eq!(find.marks.len(), 1, "the word stands once on the page");
+        let line = window.0.sel_index.get(find.marks[0].from.line).expect("the hit's line");
+        let k = scale_of(window.0.dpi);
+        let view = (window.0.content_bottom() - TOPBAR_H).max(1.0) / k;
+        let middle = (line.y + line.h * 0.5) / k;
+        let shown = window.0.scroll + view * 0.5;
+        assert!(
+            (middle - shown).abs() < 1.0,
+            "the hit's line centre sits at {middle}, the window's at {shown}"
+        );
+        assert!(line.y / k >= window.0.scroll, "the hit's top is on the page's band");
+        assert!(
+            (line.y + line.h) / k <= window.0.scroll + view,
+            "and its bottom is too -- not under the status bar"
+        );
+    }
+
+    /// Dense hits are the case the current one has to survive: with a dozen matches in
+    /// one paragraph, every `Enter` has to move the mark drawn in the focus colour -- and
+    /// the count beside the box -- rather than leave the same band current. They all
+    /// share a line here, so the page cannot move the eye from one to the next either.
+    #[test]
+    fn enter_walks_the_dense_hits_of_one_page_one_at_a_time() {
+        let mut window = ResizeView::new(&"needle ".repeat(12));
+        window.0.apply_find("needle", true);
+        assert_eq!(window.0.find.as_ref().expect("a search").marks.len(), 12);
+        let hwnd = window.0.hwnd;
+        for step in 1..=12 {
+            window.0.step_find(false, hwnd);
+            assert_eq!(
+                window.0.find.as_ref().expect("a search").focus,
+                step % 12,
+                "Enter takes the focus one hit on, and wraps at the end"
+            );
+        }
+        window.0.step_find(true, hwnd);
+        assert_eq!(window.0.find.as_ref().expect("a search").focus, 11, "Shift+Enter takes it back");
     }
 
     #[test]
