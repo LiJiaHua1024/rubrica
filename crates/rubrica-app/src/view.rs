@@ -2478,6 +2478,10 @@ struct TabPage {
     page_starts: Vec<Pt>,
     page_place: Option<(Pt, usize)>,
     sel_index: Vec<SelLine>,
+    /// The grids this page's layout filed, which answer a pointer and spell a copied
+    /// table. They are places in this wrapping like the lines beside them, so they
+    /// travel with the page rather than staying with the window.
+    cells: Vec<crate::cells::CellBox>,
     hotspots: Vec<Hot>,
     note_tops: Vec<Pt>,
     anchor_tops: Vec<Pt>,
@@ -2522,6 +2526,7 @@ impl TabPage {
             page_starts: Vec::new(),
             page_place: None,
             sel_index: Vec::new(),
+            cells: Vec::new(),
             hotspots: Vec::new(),
             note_tops: Vec::new(),
             anchor_tops: Vec::new(),
@@ -11403,6 +11408,7 @@ impl View {
         std::mem::swap(&mut page.reading_mode, &mut self.reading_mode);
         std::mem::swap(&mut page.page_starts, &mut self.page_starts);
         std::mem::swap(&mut page.sel_index, &mut self.sel_index);
+        std::mem::swap(&mut page.cells, &mut self.cells);
         self.sel_version += 1;
         std::mem::swap(&mut page.hotspots, &mut self.hotspots);
         std::mem::swap(&mut page.note_tops, &mut self.note_tops);
@@ -11449,6 +11455,8 @@ impl View {
         self.wide_active = None;
         self.wide_offset = 0.0;
         self.selection = None;
+        self.cell_rect = None;
+        self.cell_anchor = None;
         self.press_caret = None;
         self.caret = None;
         self.pressed = None;
@@ -16106,6 +16114,68 @@ mod tests {
                 let _ = DestroyWindow(self.0.hwnd);
             }
         }
+    }
+
+    const TABLE_PAGE: &str = "| Name | Note |\n| --- | --- |\n| alpha | beta |\n";
+
+    #[test]
+    fn a_pages_cells_leave_and_return_with_its_wrapping() {
+        let mut window = ResizeView::new(TABLE_PAGE);
+        let cells = window.0.cells.len();
+        assert!(cells > 0, "the fixture must lay out a grid");
+        let mut page = TabPage::empty();
+        window.0.take_page(&mut page);
+        assert!(window.0.cells.is_empty(), "the grid belongs to the page that left");
+        assert_eq!(page.cells.len(), cells);
+        window.0.give_page(&mut page);
+        assert_eq!(window.0.cells.len(), cells, "the page brought back answers with its own grid");
+    }
+
+    #[test]
+    fn a_warm_tab_switch_does_not_leave_the_last_pages_cells_behind() {
+        let mut window = ResizeView::new(TABLE_PAGE);
+        let cells = window.0.cells.len();
+        assert!(cells > 0, "the fixture must lay out a grid");
+        let mut table_page = TabPage::empty();
+        window.0.take_page(&mut table_page);
+
+        // The page that a warm switch hands back: it has no table of its own, so a
+        // grid left in the view would be the page that was here before.
+        window.0.doc = Arc::new(Document::parse("# Prose\n\nNothing here is a grid.\n"));
+        window.0.relayout();
+        assert!(window.0.cells.is_empty());
+        let mut prose_page = TabPage::empty();
+        window.0.take_page(&mut prose_page);
+
+        window.0.give_page(&mut table_page);
+        assert_eq!(window.0.cells.len(), cells, "the table page must bring its own grid back");
+        let cell = &window.0.cells[0];
+        assert_eq!(
+            crate::cells::cell_at(&window.0.cells, cell.x + 1.0, cell.y + 1.0),
+            Some(0),
+            "a point in the returned page's grid is answered by that page"
+        );
+
+        // And the other direction: coming back to the page with no table must not
+        // answer a click in its prose with the grid that page just left.
+        window.0.take_page(&mut table_page);
+        window.0.give_page(&mut prose_page);
+        assert!(window.0.cells.is_empty(), "the prose page must not inherit the table page's grid");
+    }
+
+    #[test]
+    fn a_tab_switch_puts_the_cell_marks_away() {
+        let mut window = ResizeView::new(TABLE_PAGE);
+        let grid = crate::cells::grid_of(&window.0.cells, 0).expect("the fixture's first grid").0;
+        window.0.cell_rect = Some(crate::cells::CellRect {
+            grid,
+            anchor: (0, 0),
+            head: (0, 0),
+        });
+        window.0.cell_anchor = Some((grid, 0, 0));
+        window.0.after_switch(window.0.hwnd);
+        assert!(window.0.cell_rect.is_none(), "a grid marked on the page just left is not marked here");
+        assert!(window.0.cell_anchor.is_none(), "nor is a drag still aimed at one of its cells");
     }
 
     #[test]

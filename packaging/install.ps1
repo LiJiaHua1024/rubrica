@@ -33,7 +33,7 @@
     powershell -ExecutionPolicy Bypass -File install.ps1
 
 .EXAMPLE
-    powershell -ExecutionPolicy Bypass -File install.ps1 -Zip .\rubrica-v0.10.1-win-x64.zip
+    powershell -ExecutionPolicy Bypass -File install.ps1 -Zip .\rubrica-v0.10.2-win-x64.zip
 #>
 [CmdletBinding()]
 param(

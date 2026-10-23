@@ -1,6 +1,6 @@
 # yaml-language-server: $schema=https://aka.ms/winget-manifest.installer.1.6.0.schema.json
 PackageIdentifier: Rubrica.Rubrica
-PackageVersion: 0.10.1
+PackageVersion: 0.10.2
 InstallerType: zip
 NestedInstallerType: portable
 NestedInstallerFiles:
@@ -8,10 +8,10 @@ NestedInstallerFiles:
     PortableCommandAlias: rubrica
 Installers:
   - Architecture: x64
-    InstallerUrl: https://github.com/LiJiaHua1024/rubrica/releases/download/v0.10.1/rubrica-v0.10.1-win-x64.zip
+    InstallerUrl: https://github.com/LiJiaHua1024/rubrica/releases/download/v0.10.2/rubrica-v0.10.2-win-x64.zip
     # Filled in by the release job: the hash of the archive it uploaded. winget will not
     # accept a placeholder, so the submission happens after the tag is built, never before.
-    InstallerSha256: d119cbf22253d4be1bdbe69f81b841517d82b32ebaee123cac0e7820a411c54f
-    ReleaseDate: 2026-10-20
+    InstallerSha256: REPLACE_WITH_RELEASE_SHA256
+    ReleaseDate: 2026-10-23
 ManifestType: installer
 ManifestVersion: 1.6.0
