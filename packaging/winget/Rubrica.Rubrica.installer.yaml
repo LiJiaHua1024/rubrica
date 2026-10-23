@@ -11,7 +11,7 @@ Installers:
     InstallerUrl: https://github.com/LiJiaHua1024/rubrica/releases/download/v0.10.2/rubrica-v0.10.2-win-x64.zip
     # Filled in by the release job: the hash of the archive it uploaded. winget will not
     # accept a placeholder, so the submission happens after the tag is built, never before.
-    InstallerSha256: REPLACE_WITH_RELEASE_SHA256
+    InstallerSha256: d8e991abf95b5ef960a9e78ded8b6e633d7e717987471a3d3b2faca169beb044
     ReleaseDate: 2026-10-23
 ManifestType: installer
 ManifestVersion: 1.6.0
